@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.providers.base import (
+    Capability,
+    CreateServerRequest,
+    ProviderImage,
+    ProviderLocation,
+    ProviderPlan,
+    ProviderServer,
+)
+from cloud_platform.providers.errors import (
+    ProviderAuthError,
+    ProviderConflict,
+    ProviderError,
+    ProviderNotFound,
+    ProviderRateLimited,
+    ProviderUnavailable,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RateLimitSnapshot:
+    limit: int | None
+    remaining: int | None
+    reset_at_unix: int | None
+
+
+class HetznerCloudProvider:
+    key = "hetzner"
+    capabilities = frozenset(
+        {
+            Capability.COMPUTE,
+            Capability.POWER,
+            Capability.REBUILD,
+            Capability.RESCUE,
+            Capability.SNAPSHOT,
+            Capability.BACKUP,
+            Capability.FIREWALL,
+            Capability.NETWORK,
+            Capability.VOLUME,
+            Capability.FLOATING_IP,
+            Capability.PRIMARY_IP,
+            Capability.RDNS,
+        }
+    )
+
+    def __init__(self, token: str, base_url: str = "https://api.hetzner.cloud/v1") -> None:
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=httpx.Timeout(30.0),
+        )
+        self.last_rate_limit = RateLimitSnapshot(None, None, None)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def list_locations(self) -> list[ProviderLocation]:
+        payload = await self._request("GET", "/locations")
+        return [
+            ProviderLocation(
+                id=str(item["id"]),
+                name=item["name"],
+                country_code=item["country"],
+                city=item.get("city"),
+                network_zone=item.get("network_zone"),
+                metadata={"description": item.get("description")},
+            )
+            for item in payload.get("locations", [])
+        ]
+
+    async def list_plans(self) -> list[ProviderPlan]:
+        payload = await self._request("GET", "/server_types")
+        return [
+            ProviderPlan(
+                id=str(item["id"]),
+                name=item["name"],
+                architecture=item.get("architecture", "unknown"),
+                vcpu=int(item["cores"]),
+                memory_mb=int(float(item["memory"]) * 1024),
+                disk_gb=int(item["disk"]),
+                metadata={"cpu_type": item.get("cpu_type")},
+            )
+            for item in payload.get("server_types", [])
+        ]
+
+    async def list_images(self) -> list[ProviderImage]:
+        payload = await self._request("GET", "/images", params={"type": "system"})
+        return [
+            ProviderImage(
+                id=str(item["id"]),
+                name=item.get("name") or item.get("description") or str(item["id"]),
+                os_family=item.get("os_flavor") or "unknown",
+                architecture=item.get("architecture", "unknown"),
+                metadata={"os_version": item.get("os_version")},
+            )
+            for item in payload.get("images", [])
+        ]
+
+    async def get_server(self, provider_server_id: str) -> ProviderServer | None:
+        try:
+            payload = await self._request("GET", f"/servers/{provider_server_id}")
+        except ProviderNotFound:
+            return None
+        return self._map_server(payload["server"])
+
+    async def create_server(
+        self, request: CreateServerRequest, idempotency_key: IdempotencyKey
+    ) -> ProviderServer:
+        # Hetzner does not provide a generic Idempotency-Key contract for this endpoint.
+        # We therefore persist our own operation before the provider call, label resources
+        # with operation identity, and reconcile on timeout/retry. The key is intentionally
+        # accepted by the provider port so every adapter must participate in idempotency.
+        body: dict[str, Any] = {
+            "name": request.name,
+            "server_type": request.plan_id,
+            "image": request.image_id,
+            "location": request.location_id,
+            "ssh_keys": list(request.ssh_key_ids),
+            "labels": {**request.labels, "platform-operation": idempotency_key.value[:63]},
+        }
+        if request.user_data is not None:
+            body["user_data"] = request.user_data
+        payload = await self._request("POST", "/servers", json=body)
+        return self._map_server(payload["server"])
+
+    async def delete_server(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
+        del idempotency_key
+        try:
+            await self._request("DELETE", f"/servers/{provider_server_id}")
+        except ProviderNotFound:
+            return
+
+    async def power_on(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
+        del idempotency_key
+        await self._request("POST", f"/servers/{provider_server_id}/actions/poweron")
+
+    async def power_off(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
+        del idempotency_key
+        await self._request("POST", f"/servers/{provider_server_id}/actions/poweroff")
+
+    async def reboot(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
+        del idempotency_key
+        await self._request("POST", f"/servers/{provider_server_id}/actions/reboot")
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        try:
+            response = await self._client.request(method, path, **kwargs)
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise ProviderUnavailable(str(exc)) from exc
+
+        self.last_rate_limit = RateLimitSnapshot(
+            _int_or_none(response.headers.get("RateLimit-Limit")),
+            _int_or_none(response.headers.get("RateLimit-Remaining")),
+            _int_or_none(response.headers.get("RateLimit-Reset")),
+        )
+
+        if response.status_code == 401 or response.status_code == 403:
+            raise ProviderAuthError(_error_message(response))
+        if response.status_code == 404:
+            raise ProviderNotFound(_error_message(response))
+        if response.status_code in {409, 423}:
+            raise ProviderConflict(_error_message(response))
+        if response.status_code == 429:
+            raise ProviderRateLimited(_error_message(response), self.last_rate_limit.reset_at_unix)
+        if response.status_code >= 500:
+            raise ProviderUnavailable(_error_message(response))
+        if response.is_error:
+            raise ProviderError(_error_message(response))
+        if response.status_code == 204 or not response.content:
+            return {}
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ProviderError("provider returned unexpected JSON shape")
+        return data
+
+    @staticmethod
+    def _map_server(item: dict[str, Any]) -> ProviderServer:
+        public_net = item.get("public_net") or {}
+        ipv4 = (public_net.get("ipv4") or {}).get("ip")
+        ipv6 = (public_net.get("ipv6") or {}).get("ip")
+        return ProviderServer(
+            id=str(item["id"]),
+            name=item["name"],
+            status=item["status"],
+            ipv4=ipv4,
+            ipv6=ipv6,
+            metadata={"labels": item.get("labels", {})},
+        )
+
+
+def _int_or_none(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _error_message(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        error = payload.get("error", {})
+        return str(error.get("message") or error.get("code") or response.text)
+    except Exception:
+        return response.text or f"HTTP {response.status_code}"

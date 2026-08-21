@@ -1,0 +1,54 @@
+# --- Environment & secrets (local only; .env.example stays tracked) ---
+.env
+.env.local
+.env.*.local
+!.env.example
+.envrc
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Tool caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.pytype/
+
+# --- Coverage ---
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# --- Databases & local data ---
+*.sqlite3
+*.sqlite3-*
+*.sqlite
+*.db
+*.db3
+*.log
+*.pid
+
+# --- Local state / logs ---
+logs/
+tmp/
+
+# --- Editor / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

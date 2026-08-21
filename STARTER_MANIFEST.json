@@ -1,0 +1,8 @@
+{
+  "project": "cloud-server-platform-starter",
+  "generated": "2026-08-21",
+  "files": 65,
+  "tasks": 139,
+  "milestones": 17,
+  "architecture": "modular monolith with provider adapters and async workers"
+}
