@@ -6,7 +6,6 @@ from aiogram.types import Message
 
 from cloud_platform.core.config import get_settings
 
-
 dp = Dispatcher()
 
 

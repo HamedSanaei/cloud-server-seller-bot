@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
@@ -84,7 +85,24 @@ class CloudProvider(Protocol):
     async def create_server(
         self, request: CreateServerRequest, idempotency_key: IdempotencyKey
     ) -> ProviderServer: ...
-    async def delete_server(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None: ...
+    async def delete_server(
+        self, provider_server_id: str, idempotency_key: IdempotencyKey
+    ) -> None: ...
     async def power_on(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None: ...
     async def power_off(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None: ...
     async def reboot(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None: ...
+
+
+def supports(provider: CloudProvider, capability: Capability) -> bool:
+    """Return True if ``provider`` advertises support for ``capability``."""
+    return capability in provider.capabilities
+
+
+def supports_all(provider: CloudProvider, capabilities: Iterable[Capability]) -> bool:
+    """Return True if ``provider`` advertises support for every capability in ``capabilities``."""
+    return frozenset(capabilities).issubset(provider.capabilities)
+
+
+def supports_any(provider: CloudProvider, capabilities: Iterable[Capability]) -> bool:
+    """Return True if ``provider`` advertises support for any capability in ``capabilities``."""
+    return not provider.capabilities.isdisjoint(capabilities)

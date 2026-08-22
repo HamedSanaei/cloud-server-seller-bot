@@ -16,15 +16,55 @@ class ServerLifecycleState(StrEnum):
 
 
 _ALLOWED: dict[ServerLifecycleState, frozenset[ServerLifecycleState]] = {
-    ServerLifecycleState.REQUESTED: frozenset({ServerLifecycleState.PROVISIONING, ServerLifecycleState.ERROR}),
-    ServerLifecycleState.PROVISIONING: frozenset({ServerLifecycleState.RUNNING, ServerLifecycleState.ERROR, ServerLifecycleState.MANUAL_REVIEW}),
-    ServerLifecycleState.RUNNING: frozenset({ServerLifecycleState.STOPPED, ServerLifecycleState.DELETE_REQUESTED, ServerLifecycleState.ERROR}),
-    ServerLifecycleState.STOPPED: frozenset({ServerLifecycleState.RUNNING, ServerLifecycleState.DELETE_REQUESTED, ServerLifecycleState.ERROR}),
-    ServerLifecycleState.ERROR: frozenset({ServerLifecycleState.PROVISIONING, ServerLifecycleState.DELETE_REQUESTED, ServerLifecycleState.MANUAL_REVIEW}),
-    ServerLifecycleState.DELETE_REQUESTED: frozenset({ServerLifecycleState.DELETING, ServerLifecycleState.DELETED, ServerLifecycleState.MANUAL_REVIEW}),
-    ServerLifecycleState.DELETING: frozenset({ServerLifecycleState.DELETED, ServerLifecycleState.MANUAL_REVIEW}),
+    ServerLifecycleState.REQUESTED: frozenset(
+        {ServerLifecycleState.PROVISIONING, ServerLifecycleState.ERROR}
+    ),
+    ServerLifecycleState.PROVISIONING: frozenset(
+        {
+            ServerLifecycleState.RUNNING,
+            ServerLifecycleState.ERROR,
+            ServerLifecycleState.MANUAL_REVIEW,
+        }
+    ),
+    ServerLifecycleState.RUNNING: frozenset(
+        {
+            ServerLifecycleState.STOPPED,
+            ServerLifecycleState.DELETE_REQUESTED,
+            ServerLifecycleState.ERROR,
+        }
+    ),
+    ServerLifecycleState.STOPPED: frozenset(
+        {
+            ServerLifecycleState.RUNNING,
+            ServerLifecycleState.DELETE_REQUESTED,
+            ServerLifecycleState.ERROR,
+        }
+    ),
+    ServerLifecycleState.ERROR: frozenset(
+        {
+            ServerLifecycleState.PROVISIONING,
+            ServerLifecycleState.DELETE_REQUESTED,
+            ServerLifecycleState.MANUAL_REVIEW,
+        }
+    ),
+    ServerLifecycleState.DELETE_REQUESTED: frozenset(
+        {
+            ServerLifecycleState.DELETING,
+            ServerLifecycleState.DELETED,
+            ServerLifecycleState.MANUAL_REVIEW,
+        }
+    ),
+    ServerLifecycleState.DELETING: frozenset(
+        {ServerLifecycleState.DELETED, ServerLifecycleState.MANUAL_REVIEW}
+    ),
     ServerLifecycleState.DELETED: frozenset(),
-    ServerLifecycleState.MANUAL_REVIEW: frozenset({ServerLifecycleState.PROVISIONING, ServerLifecycleState.DELETE_REQUESTED, ServerLifecycleState.DELETED}),
+    ServerLifecycleState.MANUAL_REVIEW: frozenset(
+        {
+            ServerLifecycleState.PROVISIONING,
+            ServerLifecycleState.DELETE_REQUESTED,
+            ServerLifecycleState.DELETED,
+        }
+    ),
 }
 
 

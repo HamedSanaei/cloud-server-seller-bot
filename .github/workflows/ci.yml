@@ -18,3 +18,9 @@ jobs:
       - run: uv run mypy src
       - run: uv run pytest
       - run: uv run python scripts/validate_tasks.py
+      - run: uv run pre-commit run --all-files
+        env:
+          GIT_AUTHOR_NAME: "ci"
+          GIT_AUTHOR_EMAIL: "ci@ci.ci"
+          GIT_COMMITTER_NAME: "ci"
+          GIT_COMMITTER_EMAIL: "ci@ci.ci"

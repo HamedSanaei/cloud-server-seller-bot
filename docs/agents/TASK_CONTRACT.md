@@ -1,6 +1,14 @@
 # Sub-agent task contract template
 
-Copy this for every delegated task.
+Copy this for every delegated task. The supervisor can auto-generate this
+contract using:
+
+```bash
+uv run python scripts/assign_task.py <TASK_ID> --agent <agent-name>
+```
+
+This script reads `docs/roadmap/TASKS.yaml` and produces a contract with
+dependencies, acceptance criteria, and handoff fields pre-filled.
 
 ```text
 TASK: <ID> — <title>

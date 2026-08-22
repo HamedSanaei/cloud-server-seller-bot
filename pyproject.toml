@@ -8,6 +8,7 @@ dependencies = [
   "alembic>=1.16,<2",
   "arq>=0.26,<1",
   "asyncpg>=0.30,<1",
+  "cryptography>=44,<46",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
@@ -21,10 +22,13 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  "detect-secrets>=1.5.0",
   "mypy>=1.17,<2",
+  "pre-commit>=4.6.2",
   "pytest>=8.4,<9",
   "pytest-asyncio>=1.1,<2",
   "pytest-cov>=6.2,<7",
+  "pyyaml>=6.0.3",
   "respx>=0.22,<1",
   "ruff>=0.12,<1",
 ]

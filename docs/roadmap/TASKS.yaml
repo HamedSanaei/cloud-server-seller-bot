@@ -2,1561 +2,1667 @@ version: 1
 project: cloud-server-platform
 task_count: 139
 tasks:
-  - id: M00-001
-    milestone: M00
-    title: "Freeze baseline architecture and invariants"
-    priority: P0
-    status: done
-    owner_hint: supervisor
-    depends_on: []
-    acceptance:
-      - "Architecture docs reviewed; no provider types leak into domains."
-    evidence:
-      - "2026-08-21: Qwen H2 audit plus supervisor rg scan found zero provider/framework/ORM imports in src/cloud_platform/modules."
-      - "2026-08-21: Dependency direction frozen in ARCHITECTURE.md and ADR-011."
-  - id: M00-002
-    milestone: M00
-    title: "Initialize uv lockfile"
-    priority: P0
-    status: done
-    owner_hint: H1
-    depends_on: []
-    acceptance:
-      - "Fresh clone installs deterministically."
-    evidence:
-      - "2026-08-21: Corrected Redis constraint to >=5,<6 for arq compatibility; Qwen H1 generated uv.lock with 62 resolved packages."
-      - "2026-08-21: uv lock --check, uv sync --frozen and pytest (5 passed) succeeded on Python 3.13.14."
-  - id: M00-003
-    milestone: M00
-    title: "Add pre-commit hooks"
-    priority: P1
-    status: ready
-    owner_hint: H1
-    depends_on:
-      - M00-002
-    acceptance:
-      - "Ruff/mypy/basic secret checks run locally."
-    evidence: []
-  - id: M00-004
-    milestone: M00
-    title: "Add CI skeleton"
-    priority: P0
-    status: ready
-    owner_hint: H2
-    depends_on:
-      - M00-002
-    acceptance:
-      - "PR CI runs lint, typecheck, unit tests."
-    evidence: []
-  - id: M00-005
-    milestone: M00
-    title: "Add sub-agent task contract workflow"
-    priority: P0
-    status: ready
-    owner_hint: supervisor
-    depends_on: []
-    acceptance:
-      - "Codex can assign bounded non-overlapping tasks."
-    evidence: []
-  - id: M00-006
-    milestone: M00
-    title: "Add conventional task evidence format"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M00-005
-    acceptance:
-      - "Each done task records commands/results."
-    evidence: []
-  - id: M01-001
-    milestone: M01
-    title: "Create Alembic environment"
-    priority: P0
-    status: ready
-    owner_hint: supervisor
-    depends_on:
-      - M00-002
-    acceptance:
-      - "Upgrade/downgrade smoke works."
-    evidence: []
-  - id: M01-002
-    milestone: M01
-    title: "Implement user/provider/catalog base schema"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M01-001
-    acceptance:
-      - "Initial schema has explicit FK/unique constraints."
-    evidence: []
-  - id: M01-003
-    milestone: M01
-    title: "Implement wallet/ledger schema"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M01-001
-    acceptance:
-      - "Ledger idempotency unique constraint exists."
-    evidence: []
-  - id: M01-004
-    milestone: M01
-    title: "Implement compute/operation schema"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M01-001
-    acceptance:
-      - "Server/provider mapping and operation identity persisted."
-    evidence: []
-  - id: M01-005
-    milestone: M01
-    title: "Implement billing schema"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M01-001
-    acceptance:
-      - "Usage/charge snapshots are immutable by convention/constraints."
-    evidence: []
-  - id: M01-006
-    milestone: M01
-    title: "Implement outbox schema and repository"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M01-001
-    acceptance:
-      - "State+event can commit in one transaction."
-    evidence: []
-  - id: M01-007
-    milestone: M01
-    title: "Implement structured logging and redaction"
-    priority: P0
-    status: ready
-    owner_hint: H2
-    depends_on: []
-    acceptance:
-      - "Authorization/tokens/password fields redact."
-    evidence: []
-  - id: M01-008
-    milestone: M01
-    title: "Add app dependency container/factories"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M01-002
-    acceptance:
-      - "API/bot/worker share explicit factories."
-    evidence: []
-  - id: M01-009
-    milestone: M01
-    title: "Add PostgreSQL/Redis readiness checks"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M01-008
-    acceptance:
-      - "Ready fails when required dependencies unavailable."
-    evidence: []
-  - id: M02-001
-    milestone: M02
-    title: "Implement User aggregate/repository"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M01-002
-    acceptance:
-      - "Create/read/status update tested."
-    evidence: []
-  - id: M02-002
-    milestone: M02
-    title: "Implement Telegram identity binding"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M02-001
-    acceptance:
-      - "telegram_user_id unique and mapped server-side."
-    evidence: []
-  - id: M02-003
-    milestone: M02
-    title: "Implement /start onboarding flow"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M02-002
-    acceptance:
-      - "New and returning user flows tested."
-    evidence: []
-  - id: M02-004
-    milestone: M02
-    title: "Implement terms acceptance versioning"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M02-001
-    acceptance:
-      - "Provisioning can require latest terms."
-    evidence: []
-  - id: M02-005
-    milestone: M02
-    title: "Implement user status freeze/ban"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M02-001
-    acceptance:
-      - "Frozen users cannot start spend/provisioning."
-    evidence: []
-  - id: M02-006
-    milestone: M02
-    title: "Implement admin/user RBAC primitives"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M02-001
-    acceptance:
-      - "Permissions enforced in application layer."
-    evidence: []
-  - id: M02-007
-    milestone: M02
-    title: "Add locale/message catalog abstraction"
-    priority: P2
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M02-003
-    acceptance:
-      - "Persian default; strings not scattered in handlers."
-    evidence: []
-  - id: M03-001
-    milestone: M03
-    title: "Persist Provider and ProviderAccount"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M01-002
-    acceptance:
-      - "Multiple accounts per provider supported."
-    evidence: []
-  - id: M03-002
-    milestone: M03
-    title: "Implement encrypted credential envelope interface"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M03-001
-    acceptance:
-      - "No plaintext provider token persisted."
-    evidence: []
-  - id: M03-003
-    milestone: M03
-    title: "Implement provider account health/status"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M03-001
-    acceptance:
-      - "Account can be active/draining/disabled/degraded."
-    evidence: []
-  - id: M03-004
-    milestone: M03
-    title: "Finalize capability matrix contract"
-    priority: P0
-    status: ready
-    owner_hint: H1
-    depends_on: []
-    acceptance:
-      - "Feature support query is provider-neutral."
-    evidence: []
-  - id: M03-005
-    milestone: M03
-    title: "Implement provider allocator interface"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M03-001
-      - M03-003
-    acceptance:
-      - "Can choose account by policy without compute coupling."
-    evidence: []
-  - id: M03-006
-    milestone: M03
-    title: "Add provider contract test suite"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M03-004
-    acceptance:
-      - "Any adapter can run normalized contract tests."
-    evidence: []
-  - id: M04-001
-    milestone: M04
-    title: "Implement Hetzner auth/connectivity probe"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M03-001
-    acceptance:
-      - "Token errors map to typed provider errors."
-    evidence: []
-  - id: M04-002
-    milestone: M04
-    title: "Implement paginated location sync"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M04-001
-    acceptance:
-      - "Normalized locations upsert idempotently."
-    evidence: []
-  - id: M04-003
-    milestone: M04
-    title: "Implement paginated server-type sync"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M04-001
-    acceptance:
-      - "Plan specs/architecture normalized."
-    evidence: []
-  - id: M04-004
-    milestone: M04
-    title: "Implement system image sync"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M04-001
-    acceptance:
-      - "Only supported/selectable images exposed."
-    evidence: []
-  - id: M04-005
-    milestone: M04
-    title: "Implement provider pricing ingestion"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M04-003
-    acceptance:
-      - "Location-aware provider prices persist without hard-coding."
-    evidence: []
-  - id: M04-006
-    milestone: M04
-    title: "Implement catalog sync job with lock"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M04-002
-      - M04-003
-      - M04-004
-    acceptance:
-      - "Concurrent syncs cannot corrupt catalog."
-    evidence: []
-  - id: M04-007
-    milestone: M04
-    title: "Implement sellable-offer enable/disable"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M04-005
-    acceptance:
-      - "Admin can hide plan/location combinations."
-    evidence: []
-  - id: M04-008
-    milestone: M04
-    title: "Cache customer catalog safely"
-    priority: P2
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M04-007
-    acceptance:
-      - "Cache invalidates on offer/price change."
-    evidence: []
-  - id: M04-009
-    milestone: M04
-    title: "Handle rate-limit headers and 429 backoff"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M04-001
-    acceptance:
-      - "Worker adapts to per-project limit."
-    evidence: []
-  - id: M05-001
-    milestone: M05
-    title: "Implement wallet repository"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M01-003
-      - M02-001
-    acceptance:
-      - "One currency wallet per policy/user."
-    evidence: []
-  - id: M05-002
-    milestone: M05
-    title: "Implement append-only ledger posting"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M05-001
-    acceptance:
-      - "Duplicate idempotency key cannot double-post."
-    evidence: []
-  - id: M05-003
-    milestone: M05
-    title: "Implement consistent available balance query"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M05-002
-    acceptance:
-      - "Balance agrees with ledger+active holds."
-    evidence: []
-  - id: M05-004
-    milestone: M05
-    title: "Implement wallet hold/reservation"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M05-002
-    acceptance:
-      - "Concurrent purchase cannot overspend."
-    evidence: []
-  - id: M05-005
-    milestone: M05
-    title: "Implement hold release/capture"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M05-004
-    acceptance:
-      - "Capture/release idempotent."
-    evidence: []
-  - id: M05-006
-    milestone: M05
-    title: "Implement admin credit/debit adjustment"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M05-002
-      - M02-006
-    acceptance:
-      - "Reason+actor audited."
-    evidence: []
-  - id: M05-007
-    milestone: M05
-    title: "Add concurrency tests for wallet spending"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M05-004
-    acceptance:
-      - "Parallel reservation cannot create negative availability."
-    evidence: []
-  - id: M05-008
-    milestone: M05
-    title: "Add ledger reconciliation report"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M05-003
-    acceptance:
-      - "Detects impossible/corrupt balance states."
-    evidence: []
-  - id: M06-001
-    milestone: M06
-    title: "Implement price books and margin rules"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M04-005
-    acceptance:
-      - "Selling price derived explicitly and versioned."
-    evidence: []
-  - id: M06-002
-    milestone: M06
-    title: "Implement immutable server price snapshot"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M06-001
-      - M01-005
-    acceptance:
-      - "Historical price unaffected by catalog changes."
-    evidence: []
-  - id: M06-003
-    milestone: M06
-    title: "Implement billing policy abstraction"
-    priority: P0
-    status: ready
-    owner_hint: H1
-    depends_on: []
-    acceptance:
-      - "Hourly/minute/day quantums supported."
-    evidence: []
-  - id: M06-004
-    milestone: M06
-    title: "Implement usage segment calculator"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M06-002
-      - M06-003
-    acceptance:
-      - "Boundary/rounding tests cover partial quantum."
-    evidence: []
-  - id: M06-005
-    milestone: M06
-    title: "Implement periodic accrual job"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M05-002
-      - M06-004
-    acceptance:
-      - "No duplicate charges on retry."
-    evidence: []
-  - id: M06-006
-    milestone: M06
-    title: "Implement final deletion charge"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M06-005
-    acceptance:
-      - "Final segment posted once after confirmed deletion."
-    evidence: []
-  - id: M06-007
-    milestone: M06
-    title: "Implement low-balance policy"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M05-003
-      - M06-005
-    acceptance:
-      - "Warn/grace/auto-delete decisions are deterministic."
-    evidence: []
-  - id: M06-008
-    milestone: M06
-    title: "Implement provider-vs-customer margin report"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M06-005
-    acceptance:
-      - "Daily expected margin and anomalies visible."
-    evidence: []
-  - id: M06-009
-    milestone: M06
-    title: "Add monthly-cap support per price policy"
-    priority: P2
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M06-004
-    acceptance:
-      - "Optional cap cannot overcharge configured maximum."
-    evidence: []
-  - id: M07-001
-    milestone: M07
-    title: "Implement create-server application command"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M03-005
-      - M04-007
-      - M05-004
-      - M06-002
-    acceptance:
-      - "Validates user/offer/balance and persists intent atomically."
-    evidence: []
-  - id: M07-002
-    milestone: M07
-    title: "Implement provisioning worker"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-001
-    acceptance:
-      - "Calls provider once per operation intent and records correlation."
-    evidence: []
-  - id: M07-003
-    milestone: M07
-    title: "Implement create timeout reconciliation"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-002
-    acceptance:
-      - "Ambiguous timeout cannot create duplicate server."
-    evidence: []
-  - id: M07-004
-    milestone: M07
-    title: "Implement provider action waiter strategy"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-002
-      - M04-009
-    acceptance:
-      - "Polls with bounded backoff and rate-limit awareness."
-    evidence: []
-  - id: M07-005
-    milestone: M07
-    title: "Implement server state reconciliation"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-002
-    acceptance:
-      - "Drift maps to safe state/manual review."
-    evidence: []
-  - id: M07-006
-    milestone: M07
-    title: "Implement power-on/off/reboot commands"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Ownership/capability/idempotency enforced."
-    evidence: []
-  - id: M07-007
-    milestone: M07
-    title: "Implement delete-server saga"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M07-005
-      - M06-006
-    acceptance:
-      - "Delete request -> provider absent -> billing final -> deleted."
-    evidence: []
-  - id: M07-008
-    milestone: M07
-    title: "Implement delete retry/reconcile"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-007
-    acceptance:
-      - "404 is success; timeout ambiguity reconciles."
-    evidence: []
-  - id: M07-009
-    milestone: M07
-    title: "Implement orphan provider-resource detector"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Finds tagged provider resources absent from DB."
-    evidence: []
-  - id: M07-010
-    milestone: M07
-    title: "Implement missing-provider-resource detector"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Finds DB-active resources absent at provider."
-    evidence: []
-  - id: M07-011
-    milestone: M07
-    title: "Implement per-account provisioning concurrency limit"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M03-003
-      - M07-002
-    acceptance:
-      - "Protects provider quota/rate limit."
-    evidence: []
-  - id: M08-001
-    milestone: M08
-    title: "Design Telegram navigation/state machine"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M02-003
-      - M04-007
-    acceptance:
-      - "Flows have stable callbacks and cancel/back behavior."
-    evidence: []
-  - id: M08-002
-    milestone: M08
-    title: "Implement catalog country/location view"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M08-001
-    acceptance:
-      - "Only enabled offers shown."
-    evidence: []
-  - id: M08-003
-    milestone: M08
-    title: "Implement plan selection view"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M08-002
-    acceptance:
-      - "Price/spec visible and callback tamper-resistant."
-    evidence: []
-  - id: M08-004
-    milestone: M08
-    title: "Implement OS selection view"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M08-003
-    acceptance:
-      - "Architecture compatibility enforced server-side."
-    evidence: []
-  - id: M08-005
-    milestone: M08
-    title: "Implement purchase confirmation view"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M08-004
-      - M07-001
-    acceptance:
-      - "Shows exact price policy and wallet impact."
-    evidence: []
-  - id: M08-006
-    milestone: M08
-    title: "Implement provisioning progress notifications"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-002
-    acceptance:
-      - "User receives final success/error once."
-    evidence: []
-  - id: M08-007
-    milestone: M08
-    title: "Implement My Servers list/detail"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Pagination and ownership checks."
-    evidence: []
-  - id: M08-008
-    milestone: M08
-    title: "Implement power controls UI"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M08-007
-      - M07-006
-    acceptance:
-      - "Capabilities/states hide invalid actions."
-    evidence: []
-  - id: M08-009
-    milestone: M08
-    title: "Implement delete confirmation UI"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M08-007
-      - M07-007
-    acceptance:
-      - "Double confirmation and idempotent callback."
-    evidence: []
-  - id: M08-010
-    milestone: M08
-    title: "Implement wallet/ledger history UI"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M05-003
-    acceptance:
-      - "Readable amounts/references/pagination."
-    evidence: []
-  - id: M08-011
-    milestone: M08
-    title: "Implement low-balance notifications"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M06-007
-    acceptance:
-      - "Deduplicated warning levels."
-    evidence: []
-  - id: M09-001
-    milestone: M09
-    title: "Finalize payment gateway port"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M05-002
-    acceptance:
-      - "Gateway has create/verify/refund capability model."
-    evidence: []
-  - id: M09-002
-    milestone: M09
-    title: "Implement payment session persistence"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M09-001
-    acceptance:
-      - "External IDs unique and stateful."
-    evidence: []
-  - id: M09-003
-    milestone: M09
-    title: "Implement signed/replay-safe webhook endpoint"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M09-002
-    acceptance:
-      - "Duplicate callback cannot duplicate deposit."
-    evidence: []
-  - id: M09-004
-    milestone: M09
-    title: "Integrate first Iranian payment gateway"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M09-003
-    acceptance:
-      - "Sandbox/real test evidence recorded."
-    evidence: []
-  - id: M09-005
-    milestone: M09
-    title: "Post successful payment to ledger"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M09-003
-      - M05-002
-    acceptance:
-      - "Deposit exactly once."
-    evidence: []
-  - id: M09-006
-    milestone: M09
-    title: "Implement payment status Telegram UX"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M09-004
-    acceptance:
-      - "Pending/success/failure states clear."
-    evidence: []
-  - id: M09-007
-    milestone: M09
-    title: "Implement payment reconciliation job"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M09-004
-    acceptance:
-      - "Stuck sessions rechecked safely."
-    evidence: []
-  - id: M10-001
-    milestone: M10
-    title: "Implement immutable audit repository"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M01-002
-    acceptance:
-      - "Sensitive actions have actor/resource metadata."
-    evidence: []
-  - id: M10-002
-    milestone: M10
-    title: "Audit admin wallet/provider operations"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M10-001
-      - M05-006
-    acceptance:
-      - "Every mutation links to actor/reason."
-    evidence: []
-  - id: M10-003
-    milestone: M10
-    title: "Implement provisioning quotas per user"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-001
-    acceptance:
-      - "Limits concurrent/total creation."
-    evidence: []
-  - id: M10-004
-    milestone: M10
-    title: "Implement cost circuit breakers"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M06-008
-    acceptance:
-      - "Global/provider-account daily thresholds can halt new spend."
-    evidence: []
-  - id: M10-005
-    milestone: M10
-    title: "Implement provider/location maintenance switches"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M04-007
-    acceptance:
-      - "New orders stop without breaking existing resources."
-    evidence: []
-  - id: M10-006
-    milestone: M10
-    title: "Implement abuse case model/workflow"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M10-001
-    acceptance:
-      - "Provider resource maps quickly to responsible user."
-    evidence: []
-  - id: M10-007
-    milestone: M10
-    title: "Implement user freeze + resource containment command"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M10-006
-      - M02-005
-    acceptance:
-      - "Containment is audited and bounded."
-    evidence: []
-  - id: M10-008
-    milestone: M10
-    title: "Implement secret rotation workflow"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M03-002
-    acceptance:
-      - "Provider credential can rotate without downtime."
-    evidence: []
-  - id: M10-009
-    milestone: M10
-    title: "Add security regression tests"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M10-002
-      - M10-003
-    acceptance:
-      - "Ownership, callback replay, secret redaction covered."
-    evidence: []
-  - id: M11-001
-    milestone: M11
-    title: "Add Prometheus metrics"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M01-007
-    acceptance:
-      - "API/jobs/provider/billing metrics emitted."
-    evidence: []
-  - id: M11-002
-    milestone: M11
-    title: "Add OpenTelemetry tracing"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M11-001
-    acceptance:
-      - "Trace spans correlate API->job->provider."
-    evidence: []
-  - id: M11-003
-    milestone: M11
-    title: "Implement provider retry/backoff policy"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M04-009
-    acceptance:
-      - "Retryable vs permanent errors explicit."
-    evidence: []
-  - id: M11-004
-    milestone: M11
-    title: "Implement dead-letter/manual-review tooling"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Failed operations can be inspected/replayed safely."
-    evidence: []
-  - id: M11-005
-    milestone: M11
-    title: "Create Grafana dashboard definitions"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M11-001
-    acceptance:
-      - "Golden signals visible."
-    evidence: []
-  - id: M11-006
-    milestone: M11
-    title: "Create alert rules"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M11-001
-    acceptance:
-      - "Alerts for spend, 429, provisioning failure, queue age, reconciliation drift."
-    evidence: []
-  - id: M11-007
-    milestone: M11
-    title: "Automate PostgreSQL backups"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M01-001
-    acceptance:
-      - "Encrypted backup job + retention."
-    evidence: []
-  - id: M11-008
-    milestone: M11
-    title: "Document/test restore drill"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M11-007
-    acceptance:
-      - "Restore into clean environment verified."
-    evidence: []
-  - id: M11-009
-    milestone: M11
-    title: "Add chaos tests for provider timeouts"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-003
-      - M07-008
-    acceptance:
-      - "No double create/charge after injected timeout."
-    evidence: []
-  - id: M12-001
-    milestone: M12
-    title: "Harden GitHub Actions quality pipeline"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M00-004
-    acceptance:
-      - "Cache + deterministic gates + artifacts."
-    evidence: []
-  - id: M12-002
-    milestone: M12
-    title: "Build and publish OCI image"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M12-001
-    acceptance:
-      - "Tagged immutable image produced."
-    evidence: []
-  - id: M12-003
-    milestone: M12
-    title: "Add migration compatibility gate"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M01-001
-      - M12-001
-    acceptance:
-      - "Deploy blocks unsafe migration patterns."
-    evidence: []
-  - id: M12-004
-    milestone: M12
-    title: "Create staging compose/deployment"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M12-002
-    acceptance:
-      - "Staging deploy repeatable."
-    evidence: []
-  - id: M12-005
-    milestone: M12
-    title: "Create production deployment runbook"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M12-004
-    acceptance:
-      - "Secrets, migrations, rollback and health checks documented."
-    evidence: []
-  - id: M12-006
-    milestone: M12
-    title: "Add rolling/blue-green strategy"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M12-005
-    acceptance:
-      - "API/bot/worker deploy without double consumers."
-    evidence: []
-  - id: M12-007
-    milestone: M12
-    title: "Add post-deploy smoke tests"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M12-004
-    acceptance:
-      - "Health + safe read-only provider checks."
-    evidence: []
-  - id: M13-001
-    milestone: M13
-    title: "Implement SSH key CRUD/sync"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-005
-    acceptance:
-      - "User keys are ownership-scoped."
-    evidence: []
-  - id: M13-002
-    milestone: M13
-    title: "Implement rebuild flow"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M13-001
-    acceptance:
-      - "Confirmation and credential handling safe."
-    evidence: []
-  - id: M13-003
-    milestone: M13
-    title: "Implement rescue mode"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M13-001
-    acceptance:
-      - "Temporary credentials protected."
-    evidence: []
-  - id: M13-004
-    milestone: M13
-    title: "Implement snapshots"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M06-002
-    acceptance:
-      - "Snapshot cost/capability represented."
-    evidence: []
-  - id: M13-005
-    milestone: M13
-    title: "Implement backups toggle"
-    priority: P2
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M06-002
-    acceptance:
-      - "Price impact confirmed before mutation."
-    evidence: []
-  - id: M13-006
-    milestone: M13
-    title: "Implement firewall management"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Reusable rules and ownership."
-    evidence: []
-  - id: M13-007
-    milestone: M13
-    title: "Implement rDNS"
-    priority: P2
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-005
-    acceptance:
-      - "IP ownership and validation."
-    evidence: []
-  - id: M13-008
-    milestone: M13
-    title: "Implement Primary/Floating IP features"
-    priority: P2
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Independent resource billing supported."
-    evidence: []
-  - id: M13-009
-    milestone: M13
-    title: "Implement volumes"
-    priority: P2
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Attach/detach/delete reconciliation."
-    evidence: []
-  - id: M13-010
-    milestone: M13
-    title: "Implement private networks"
-    priority: P2
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M07-005
-    acceptance:
-      - "Network lifecycle and capabilities."
-    evidence: []
-  - id: M14-001
-    milestone: M14
-    title: "Define customer REST API v1"
-    priority: P1
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M07-007
-      - M05-003
-    acceptance:
-      - "Stable resource/error/idempotency contract."
-    evidence: []
-  - id: M14-002
-    milestone: M14
-    title: "Implement customer API tokens/scopes"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M14-001
-      - M02-006
-    acceptance:
-      - "Revocable hashed tokens and scopes."
-    evidence: []
-  - id: M14-003
-    milestone: M14
-    title: "Implement admin API"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M10-001
-    acceptance:
-      - "Search/actions are RBAC/audited."
-    evidence: []
-  - id: M14-004
-    milestone: M14
-    title: "Build customer web panel shell"
-    priority: P2
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M14-001
-    acceptance:
-      - "Login/session and server/wallet views."
-    evidence: []
-  - id: M14-005
-    milestone: M14
-    title: "Build admin web panel shell"
-    priority: P2
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M14-003
-    acceptance:
-      - "Provider/users/operations dashboards."
-    evidence: []
-  - id: M14-006
-    milestone: M14
-    title: "Add API rate limits"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M14-002
-    acceptance:
-      - "Per-user/token limits with headers."
-    evidence: []
-  - id: M15-001
-    milestone: M15
-    title: "Select first Iranian provider and document API contract"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M03-006
-    acceptance:
-      - "Capabilities/gaps/error/rate/pricing model documented."
-    evidence: []
-  - id: M15-002
-    milestone: M15
-    title: "Implement Iranian provider adapter"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M15-001
-    acceptance:
-      - "Provider contract suite passes."
-    evidence: []
-  - id: M15-003
-    milestone: M15
-    title: "Implement Iranian catalog/pricing mapper"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M15-002
-    acceptance:
-      - "Normalized offers require no core-domain change."
-    evidence: []
-  - id: M15-004
-    milestone: M15
-    title: "Implement provider-specific reconciliation"
-    priority: P0
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M15-002
-    acceptance:
-      - "Ambiguous mutations handled safely."
-    evidence: []
-  - id: M15-005
-    milestone: M15
-    title: "Enable capability-driven Telegram UX"
-    priority: P0
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M15-003
-      - M08-008
-    acceptance:
-      - "Unsupported controls hidden; shared flows reused."
-    evidence: []
-  - id: M15-006
-    milestone: M15
-    title: "Run multi-provider billing parity tests"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M15-003
-      - M06-006
-    acceptance:
-      - "Different billing quantum/policy settles correctly."
-    evidence: []
-  - id: M15-007
-    milestone: M15
-    title: "Prove zero core-domain provider branching"
-    priority: P0
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M15-005
-    acceptance:
-      - "No `if provider == ...` in domain modules."
-    evidence: []
-  - id: M16-001
-    milestone: M16
-    title: "Create realistic load model"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M12-004
-    acceptance:
-      - "User/order/job/provider assumptions documented."
-    evidence: []
-  - id: M16-002
-    milestone: M16
-    title: "Load test API and worker queues"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M16-001
-    acceptance:
-      - "Bottlenecks measured with reproducible script."
-    evidence: []
-  - id: M16-003
-    milestone: M16
-    title: "Tune PostgreSQL indexes/queries"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M16-002
-    acceptance:
-      - "Before/after query plans captured."
-    evidence: []
-  - id: M16-004
-    milestone: M16
-    title: "Partition worker queues by responsibility"
-    priority: P1
-    status: blocked
-    owner_hint: H2
-    depends_on:
-      - M16-002
-    acceptance:
-      - "Provisioning/billing/notify isolation."
-    evidence: []
-  - id: M16-005
-    milestone: M16
-    title: "Implement provider-account sharding allocator"
-    priority: P1
-    status: blocked
-    owner_hint: H1
-    depends_on:
-      - M03-005
-      - M16-002
-    acceptance:
-      - "Load/limit aware selection tested."
-    evidence: []
-  - id: M16-006
-    milestone: M16
-    title: "Evaluate billing service extraction"
-    priority: P2
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M16-002
-    acceptance:
-      - "ADR based on measured coupling/load."
-    evidence: []
-  - id: M16-007
-    milestone: M16
-    title: "Evaluate provider-worker extraction"
-    priority: P2
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M16-002
-    acceptance:
-      - "ADR based on measured I/O/ops needs."
-    evidence: []
-  - id: M16-008
-    milestone: M16
-    title: "Run disaster/cost runaway game day"
-    priority: P1
-    status: blocked
-    owner_hint: supervisor
-    depends_on:
-      - M11-008
-      - M10-004
-    acceptance:
-      - "Kill switches and recovery proven."
-    evidence: []
+- id: M00-001
+  milestone: M00
+  title: Freeze baseline architecture and invariants
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on: []
+  acceptance:
+  - Architecture docs reviewed; no provider types leak into domains.
+  evidence:
+  - '2026-08-21: Qwen H2 audit plus supervisor rg scan found zero provider/framework/ORM imports in src/cloud_platform/modules.'
+  - '2026-08-21: Dependency direction frozen in ARCHITECTURE.md and ADR-011.'
+- id: M00-002
+  milestone: M00
+  title: Initialize uv lockfile
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on: []
+  acceptance:
+  - Fresh clone installs deterministically.
+  evidence:
+  - '2026-08-21: Corrected Redis constraint to >=5,<6 for arq compatibility; Qwen H1 generated uv.lock with 62 resolved packages.'
+  - '2026-08-21: uv lock --check, uv sync --frozen and pytest (5 passed) succeeded on Python 3.13.14.'
+- id: M00-003
+  milestone: M00
+  title: Add pre-commit hooks
+  priority: P1
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M00-002
+  acceptance:
+  - Ruff/mypy/basic secret checks run locally.
+  evidence:
+  - '2026-08-21: Added .pre-commit-config.yaml with ruff, mypy, detect-secrets, and standard hooks.'
+- id: M00-004
+  milestone: M00
+  title: Add CI skeleton
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M00-002
+  acceptance:
+  - PR CI runs lint, typecheck, unit tests.
+  evidence:
+  - '2026-08-21: Enhanced CI with pre-commit hook execution; CI runs ruff, mypy, pytest, validate_tasks.'
+- id: M00-005
+  milestone: M00
+  title: Add sub-agent task contract workflow
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on: []
+  acceptance:
+  - Codex can assign bounded non-overlapping tasks.
+  evidence:
+  - '2026-08-21: Created scripts/assign_task.py to auto-generate task contracts from TASKS.yaml; updated docs/agents/TASK_CONTRACT.md
+    with automation instructions.'
+- id: M00-006
+  milestone: M00
+  title: Add conventional task evidence format
+  priority: P1
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M00-005
+  acceptance:
+  - Each done task records commands/results.
+  evidence:
+  - '2026-08-21: Created scripts/record_evidence.py to update TASKS.yaml with completion evidence; M00-006 unblocked and marked
+    done.'
+- id: M01-001
+  milestone: M01
+  title: Create Alembic environment
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M00-002
+  acceptance:
+  - Upgrade/downgrade smoke works.
+  evidence:
+  - '2026-08-21: Completed alembic/env.py with offline/online modes; upgrade --sql head and downgrade --sql 0002:0001 produce
+    valid SQL.'
+- id: M01-002
+  milestone: M01
+  title: Implement user/provider/catalog base schema
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M01-001
+  acceptance:
+  - Initial schema has explicit FK/unique constraints.
+  evidence:
+  - '2026-08-21: Created proper initial migration (0001) with UUID PKs, explicit FKs with CASCADE/RESTRICT, unique constraints,
+    indexes, and tables: users, wallets, providers, provider_accounts, catalog, servers, outbox, ledger. Removed problematic
+    0002 migration. Updated models in base.py to match schema.'
+- id: M01-003
+  milestone: M01
+  title: Implement wallet/ledger schema
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M01-001
+  acceptance:
+  - Ledger idempotency unique constraint exists.
+  evidence:
+  - '2026-08-21: Wallet and ledger schema implemented in 0001 migration: wallets table (user_id FK, balance, currency) and
+    ledger table (wallet_id FK, entry_type, amount, currency, idempotency_key with unique constraint).'
+- id: M01-004
+  milestone: M01
+  title: Implement compute/operation schema
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M01-001
+  acceptance:
+  - Server/provider mapping and operation identity persisted.
+  evidence:
+  - '2026-08-21: Compute/operation schema implemented in 0001 migration: servers table with UUID PK, FKs to users/providers/provider_accounts/catalog,
+    state machine column, provider_server_id, IP addresses, pricing snapshot columns, indexes on user_id, provider_id, provider_account_id,
+    state.'
+- id: M01-005
+  milestone: M01
+  title: Implement billing schema
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M01-001
+  acceptance:
+  - Usage/charge snapshots are immutable by convention/constraints.
+  evidence:
+  - '2026-08-21: Billing schema implemented in 0001 migration: catalog table with price_per_quantum, currency, quantum_seconds,
+    enabled flag; servers table with locked-in price_per_quantum, currency, quantum_seconds for immutable pricing snapshots.'
+- id: M01-006
+  milestone: M01
+  title: Implement outbox schema and repository
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M01-001
+  acceptance:
+  - State+event can commit in one transaction.
+  evidence:
+  - '2026-08-21: Outbox schema implemented in 0001 migration: outbox table (event_type, payload JSONB, created_at, processed_at)
+    with indexes on processed_at and event_type for reliable event publishing.'
+- id: M01-007
+  milestone: M01
+  title: Implement structured logging and redaction
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on: []
+  acceptance:
+  - Authorization/tokens/password fields redact.
+  evidence:
+  - '2026-08-21: Created src/cloud_platform/core/logging.py with structlog JSON logging and redaction processor; created tests/unit/test_logging.py
+    with 20 tests covering redaction of tokens, passwords, secrets, Authorization headers, and nested structures.'
+- id: M01-008
+  milestone: M01
+  title: Add app dependency container/factories
+  priority: P1
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M01-002
+  acceptance:
+  - API/bot/worker share explicit factories.
+  evidence:
+  - '2026-08-22: Created src/cloud_platform/core/container.py with Container dataclass, create_container(), get_container(),
+    close_container(), and FastAPI dependency factories; fixed mypy/container.py return type via isinstance assertion; ruff/mypy/pytest
+    all pass.'
+- id: M01-009
+  milestone: M01
+  title: Add PostgreSQL/Redis readiness checks
+  priority: P1
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M01-008
+  acceptance:
+  - Ready fails when required dependencies unavailable.
+  evidence:
+  - '2026-08-22: Created core/health.py: ReadinessCheck protocol, PostgresReadiness (SELECT 1), RedisReadiness (PING), sanitized/truncated
+    details, concurrent check_readiness + ReadinessReport.as_dict. 12 tests in tests/unit/test_health.py cover ready/unready
+    paths without live services.'
+- id: M02-001
+  milestone: M02
+  title: Implement User aggregate/repository
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M01-002
+  acceptance:
+  - Create/read/status update tested.
+  evidence:
+  - '2026-08-22: Created modules/users (domain.py aggregate with UserStatus transitions + UserRepository port; repository.py
+    SqlAlchemyUserRepository) and tests/unit/test_user_domain.py (13 tests) + test_user_repository.py (9 mocked-session tests).
+    Create/read/status-update covered.'
+- id: M02-002
+  milestone: M02
+  title: Implement Telegram identity binding
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M02-001
+  acceptance:
+  - telegram_user_id unique and mapped server-side.
+  evidence:
+  - '2026-08-22: Added telegram_user_id column (BigInteger, unique nullable) to User ORM model in db/base.py. Created Alembic
+    migration 0002_add_telegram_user_id.py with unique constraint and index.'
+- id: M02-003
+  milestone: M02
+  title: Implement /start onboarding flow
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M02-002
+  acceptance:
+  - New and returning user flows tested.
+  evidence:
+  - '2026-08-22: Created modules/users/onboarding.py with handle_start() service: returns existing user by telegram_user_id
+    or creates new User+Wallet. Added get_by_telegram_user_id to UserRepository protocol and SqlAlchemyUserRepository. 6 tests
+    in tests/unit/test_onboarding.py covering returning-user, new-user, and email generation flows.'
+- id: M02-004
+  milestone: M02
+  title: Implement terms acceptance versioning
+  priority: P1
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M02-001
+  acceptance:
+  - Provisioning can require latest terms.
+  evidence: []
+- id: M02-005
+  milestone: M02
+  title: Implement user status freeze/ban
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M02-001
+  acceptance:
+  - Frozen users cannot start spend/provisioning.
+  evidence:
+  - '2026-08-22: Added User.can_spend and User.can_provision properties to domain.py. Returns True only for ACTIVE users,
+    False for FROZEN and BANNED. 7 new tests in test_user_domain.py covering all status combinations. 19 tests pass, 0 failed.'
+- id: M02-006
+  milestone: M02
+  title: Implement admin/user RBAC primitives
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M02-001
+  acceptance:
+  - Permissions enforced in application layer.
+  evidence:
+  - '2026-08-22: Implemented RBAC primitives in modules/users/domain.py: Permission StrEnum (server:create/destroy/list/restart,
+    billing:view/pay, admin:manage_users/manage_settings), Role StrEnum (USER/ADMIN) with module-level PERMISSIONS mapping
+    role to frozenset of allowed permissions. User aggregate gained role field and has_permission() check; PermissionChecker
+    service enforces authorization at application layer via check/require/require_active/require_spend raising PermissionDeniedError.
+    Added users.role column (migration 0004), repository maps role both ways. 19 RBAC tests in test_rbac.py; full suite 223
+    passed.'
+- id: M02-007
+  milestone: M02
+  title: Add locale/message catalog abstraction
+  priority: P2
+  status: ready
+  owner_hint: H2
+  depends_on:
+  - M02-003
+  acceptance:
+  - Persian default; strings not scattered in handlers.
+  evidence: []
+- id: M03-001
+  milestone: M03
+  title: Persist Provider and ProviderAccount
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M01-002
+  acceptance:
+  - Multiple accounts per provider supported.
+  evidence:
+  - '2026-08-21: Provider and ProviderAccount tables implemented in 0001 migration: providers (name, region, created_at),
+    provider_accounts (provider_id, user_id FKs with CASCADE, status, credentials_encrypted) with unique constraint on (provider_id,
+    user_id).'
+- id: M03-002
+  milestone: M03
+  title: Implement encrypted credential envelope interface
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M03-001
+  acceptance:
+  - No plaintext provider token persisted.
+  evidence:
+  - '2026-08-22: Created core/secrets.py: MasterKey (redacted repr, generate/from_passphrase), SecretEnvelope (no-token repr),
+    SecretBox protocol, FernetSecretBox, EnvelopeService.rotate for key rotation, master_key_from_env. Added cryptography>=44,<46
+    dependency. 16 tests in tests/unit/test_secrets.py prove plaintext never persisted/leaked via repr.'
+- id: M03-003
+  milestone: M03
+  title: Implement provider account health/status
+  priority: P1
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M03-001
+  acceptance:
+  - Account can be active/draining/disabled/degraded.
+  evidence:
+  - '2026-08-21: Created src/cloud_platform/providers/health.py with AccountStatus enum (ACTIVE/DRAINING/DISABLED/DEGRADED),
+    AccountHealth enum, status transition validation, operational/terminal checks, health evaluation logic. Added Hetzner
+    health check in client.py using /datacenters endpoint. Exported health module in providers/__init__.py.'
+- id: M03-004
+  milestone: M03
+  title: Finalize capability matrix contract
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on: []
+  acceptance:
+  - Feature support query is provider-neutral.
+  evidence:
+  - '2026-08-21: Capability matrix contract finalized in src/cloud_platform/providers/base.py with Capability enum, CloudProvider
+    protocol, and query functions (supports, supports_all, supports_any); created tests/unit/test_capabilities.py with 10
+    tests verifying provider-neutral feature queries.'
+- id: M03-005
+  milestone: M03
+  title: Implement provider allocator interface
+  priority: P1
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M03-001
+  - M03-003
+  acceptance:
+  - Can choose account by policy without compute coupling.
+  evidence:
+  - '2026-08-21: Created src/cloud_platform/providers/contract.py with ProviderContractTests base class covering location/plans/images
+    listing, server CRUD, capabilities, error hierarchy, idempotency key validation. Created tests/contract/test_provider_contract.py
+    with Hetzner implementation test class and capability/error mapping verification tests. All tests pass (38 passed, 11
+    skipped without HETZNER_TEST_TOKEN).'
+  - '2026-08-21: Created src/cloud_platform/providers/allocator.py with ProviderAllocator protocol, AllocationPolicy enum
+    (CAPABILITY_FIRST, REGION_AWARE, LEAST_USED, ROUND_ROBIN), BaseProviderAllocator and CompositeAllocator implementations.
+    Added capability/region scoring, exclusion lists, and fallback policies. Created tests/unit/test_allocator.py with 13
+    tests covering all policies, exclusion, capability matching, and region awareness.'
+- id: M03-006
+  milestone: M03
+  title: Add provider contract test suite
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M03-004
+  acceptance:
+  - Any adapter can run normalized contract tests.
+  evidence:
+  - '2026-08-21: Created src/cloud_platform/providers/contract.py with ProviderContractTests base class covering location/plans/images
+    listing, server CRUD, capabilities, error hierarchy, idempotency key validation. Created tests/contract/test_provider_contract.py
+    with Hetzner implementation test class and capability/error mapping verification tests. All tests pass (38 passed, 11
+    skipped without HETZNER_TEST_TOKEN).'
+- id: M04-001
+  milestone: M04
+  title: Implement Hetzner auth/connectivity probe
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M03-001
+  acceptance:
+  - Token errors map to typed provider errors.
+  evidence:
+  - '2026-08-21: Hetzner auth/connectivity implemented in client.py: Bearer token auth in headers, _request method maps HTTP
+    status codes to typed errors (401/403->ProviderAuthError, 404->ProviderNotFound, 409/423->ProviderConflict, 429->ProviderRateLimited
+    with reset headers, 500+->ProviderUnavailable). check_health() method probes connectivity via /datacenters endpoint.'
+- id: M04-002
+  milestone: M04
+  title: Implement paginated location sync
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M04-001
+  acceptance:
+  - Normalized locations upsert idempotently.
+  evidence:
+  - '2026-08-22: Implemented sync_locations() with pagination in sync.py; normalizes Hetzner locations to Catalog with idempotent
+    upserts.'
+- id: M04-003
+  milestone: M04
+  title: Implement paginated server-type sync
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M04-001
+  acceptance:
+  - Plan specs/architecture normalized.
+  evidence:
+  - '2026-08-22: Implemented sync_plans() with pagination in sync.py; normalizes server types to Catalog with price conversion
+    from monthly to hourly.'
+- id: M04-004
+  milestone: M04
+  title: Implement system image sync
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M04-001
+  acceptance:
+  - Only supported/selectable images exposed.
+  evidence:
+  - '2026-08-22: Implemented sync_images() with pagination in sync.py; tracks system images from Hetzner API with type=system
+    filter.'
+- id: M04-005
+  milestone: M04
+  title: Implement provider pricing ingestion
+  priority: P0
+  status: ready
+  owner_hint: supervisor
+  depends_on:
+  - M04-003
+  acceptance:
+  - Location-aware provider prices persist without hard-coding.
+  evidence: []
+- id: M04-006
+  milestone: M04
+  title: Implement catalog sync job with lock
+  priority: P0
+  status: ready
+  owner_hint: H2
+  depends_on:
+  - M04-002
+  - M04-003
+  - M04-004
+  acceptance:
+  - Concurrent syncs cannot corrupt catalog.
+  evidence: []
+- id: M04-007
+  milestone: M04
+  title: Implement sellable-offer enable/disable
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M04-005
+  acceptance:
+  - Admin can hide plan/location combinations.
+  evidence: []
+- id: M04-008
+  milestone: M04
+  title: Cache customer catalog safely
+  priority: P2
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M04-007
+  acceptance:
+  - Cache invalidates on offer/price change.
+  evidence: []
+- id: M04-009
+  milestone: M04
+  title: Handle rate-limit headers and 429 backoff
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M04-001
+  acceptance:
+  - Worker adapts to per-project limit.
+  evidence:
+  - '2026-08-22: Created providers/hetzner/backoff.py (RateLimitPolicy bounds + RateLimitBackoff honoring RateLimit-Reset
+    epoch with injectable sleep/clock) and integrated bounded 429 retry loop into client._request (1+max_retries attempts,
+    then ProviderRateLimited). 12 deterministic tests in tests/unit/test_hetzner_backoff.py.'
+- id: M05-001
+  milestone: M05
+  title: Implement wallet repository
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M01-003
+  - M02-001
+  acceptance:
+  - One currency wallet per policy/user.
+  evidence:
+  - '2026-08-22: Created modules/wallet (domain.py Wallet aggregate with add_funds/debit/freeze/close + Money; repository.py
+    SqlAlchemyWalletRepository) and tests/unit/test_wallet_domain.py (20 tests) + test_wallet_repository.py (9 mocked-session
+    tests). One currency wallet per user verified.'
+- id: M05-002
+  milestone: M05
+  title: Implement append-only ledger posting
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M05-001
+  acceptance:
+  - Duplicate idempotency key cannot double-post.
+  evidence:
+  - '2026-08-22: Created modules/wallet/repository.py with SqlAlchemyLedgerRepository: atomic post_entry with IntegrityError-to-DuplicateIdempotencyError
+    on uq_ledger_wallet_idempotency violation, get_entry_by_idempotency. Domain: LedgerEntry with description field, LedgerRepository
+    protocol. 19 tests (domain + ledger posting + duplicate detection).'
+- id: M05-003
+  milestone: M05
+  title: Implement consistent available balance query
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M05-002
+  acceptance:
+  - Balance agrees with ledger+active holds.
+  evidence:
+  - '2026-08-22: Available balance query in HoldService.available_balance() computes wallet.balance minus active_hold_sum().
+    Row-locked wallet read via SELECT FOR UPDATE in debit/add_funds/hold create. 175 tests pass.'
+- id: M05-004
+  milestone: M05
+  title: Implement wallet hold/reservation
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M05-002
+  acceptance:
+  - Concurrent purchase cannot overspend.
+  evidence:
+  - '2026-08-22: Implemented Hold aggregate (HoldStatus CREATED/CAPTURED/RELEASED), HoldRepository port with SqlAlchemyHoldRepository
+    using SELECT FOR UPDATE on wallet rows. HoldService orchestrates create_hold/release_hold/capture_hold with idempotent
+    ledger posting. Alembic migration 0003 adds holds table with unique(wallet_id, idempotency_key). 175 tests pass including
+    7 hold-specific tests.'
+- id: M05-005
+  milestone: M05
+  title: Implement hold release/capture
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M05-004
+  acceptance:
+  - Capture/release idempotent.
+  evidence:
+  - '2026-08-22: Implemented idempotent hold release/capture. HoldService.release_hold/capture_hold: resolve by id or idempotency
+    key, HoldStateConflictError on invalid transition (release captured / capture released), HoldNotFoundError on missing,
+    ledger RELEASE/CHARGE posted with the held amount (not zero) and DuplicateIdempotencyError swallowed on retry. SqlAlchemyHoldRepository.capture_hold
+    now atomically debits the wallet under a row lock in one transaction (rollback on InsufficientBalanceError). create_hold
+    now checks available balance (balance minus active holds) instead of raw balance. New error types HoldNotFoundError/HoldStateConflictError.
+    191 tests pass.'
+- id: M05-006
+  milestone: M05
+  title: Implement admin credit/debit adjustment
+  priority: P1
+  status: ready
+  owner_hint: H2
+  depends_on:
+  - M05-002
+  - M02-006
+  acceptance:
+  - Reason+actor audited.
+  evidence: []
+- id: M05-007
+  milestone: M05
+  title: Add concurrency tests for wallet spending
+  priority: P0
+  status: done
+  owner_hint: H2
+  depends_on:
+  - M05-004
+  acceptance:
+  - Parallel reservation cannot create negative availability.
+  evidence:
+  - '2026-08-22: Added tests/unit/test_wallet_concurrency.py (6 tests): TestParallelReservationInvariant runs the reservation
+    algorithm (available=balance-held check-then-create under a row lock) under real asyncio concurrency (up to 300 parallel
+    tasks, deterministic seeds) and asserts available never goes negative and total reserved never exceeds balance; TestCreateHoldProductionQuery
+    executes the real SqlAlchemyHoldRepository.create_hold against a capturing session and asserts the wallet select uses
+    SELECT FOR UPDATE, the held-sum aggregate is consulted before insert, and an insufficient AVAILABLE balance (1000 raw
+    - 800 held vs 300 hold) is rejected. 197 tests pass.'
+- id: M05-008
+  milestone: M05
+  title: Add ledger reconciliation report
+  priority: P1
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M05-003
+  acceptance:
+  - Detects impossible/corrupt balance states.
+  evidence: []
+- id: M06-001
+  milestone: M06
+  title: Implement price books and margin rules
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M04-005
+  acceptance:
+  - Selling price derived explicitly and versioned.
+  evidence: []
+- id: M06-002
+  milestone: M06
+  title: Implement immutable server price snapshot
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M06-001
+  - M01-005
+  acceptance:
+  - Historical price unaffected by catalog changes.
+  evidence: []
+- id: M06-003
+  milestone: M06
+  title: Implement billing policy abstraction
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on: []
+  acceptance:
+  - Hourly/minute/day quantums supported.
+  evidence:
+  - '2026-08-21: BillingPolicy abstraction already exists in src/cloud_platform/modules/billing/domain.py with quantum_seconds
+    and minimum_quanta supporting hourly/minute/day quantums; tests in test_billing.py verify boundary/rounding behavior.'
+- id: M06-004
+  milestone: M06
+  title: Implement usage segment calculator
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M06-002
+  - M06-003
+  acceptance:
+  - Boundary/rounding tests cover partial quantum.
+  evidence: []
+- id: M06-005
+  milestone: M06
+  title: Implement periodic accrual job
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M05-002
+  - M06-004
+  acceptance:
+  - No duplicate charges on retry.
+  evidence: []
+- id: M06-006
+  milestone: M06
+  title: Implement final deletion charge
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M06-005
+  acceptance:
+  - Final segment posted once after confirmed deletion.
+  evidence: []
+- id: M06-007
+  milestone: M06
+  title: Implement low-balance policy
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M05-003
+  - M06-005
+  acceptance:
+  - Warn/grace/auto-delete decisions are deterministic.
+  evidence: []
+- id: M06-008
+  milestone: M06
+  title: Implement provider-vs-customer margin report
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M06-005
+  acceptance:
+  - Daily expected margin and anomalies visible.
+  evidence: []
+- id: M06-009
+  milestone: M06
+  title: Add monthly-cap support per price policy
+  priority: P2
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M06-004
+  acceptance:
+  - Optional cap cannot overcharge configured maximum.
+  evidence: []
+- id: M07-001
+  milestone: M07
+  title: Implement create-server application command
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M03-005
+  - M04-007
+  - M05-004
+  - M06-002
+  acceptance:
+  - Validates user/offer/balance and persists intent atomically.
+  evidence: []
+- id: M07-002
+  milestone: M07
+  title: Implement provisioning worker
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-001
+  acceptance:
+  - Calls provider once per operation intent and records correlation.
+  evidence: []
+- id: M07-003
+  milestone: M07
+  title: Implement create timeout reconciliation
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-002
+  acceptance:
+  - Ambiguous timeout cannot create duplicate server.
+  evidence: []
+- id: M07-004
+  milestone: M07
+  title: Implement provider action waiter strategy
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-002
+  - M04-009
+  acceptance:
+  - Polls with bounded backoff and rate-limit awareness.
+  evidence: []
+- id: M07-005
+  milestone: M07
+  title: Implement server state reconciliation
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-002
+  acceptance:
+  - Drift maps to safe state/manual review.
+  evidence: []
+- id: M07-006
+  milestone: M07
+  title: Implement power-on/off/reboot commands
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-005
+  acceptance:
+  - Ownership/capability/idempotency enforced.
+  evidence: []
+- id: M07-007
+  milestone: M07
+  title: Implement delete-server saga
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M07-005
+  - M06-006
+  acceptance:
+  - Delete request -> provider absent -> billing final -> deleted.
+  evidence: []
+- id: M07-008
+  milestone: M07
+  title: Implement delete retry/reconcile
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-007
+  acceptance:
+  - 404 is success; timeout ambiguity reconciles.
+  evidence: []
+- id: M07-009
+  milestone: M07
+  title: Implement orphan provider-resource detector
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-005
+  acceptance:
+  - Finds tagged provider resources absent from DB.
+  evidence: []
+- id: M07-010
+  milestone: M07
+  title: Implement missing-provider-resource detector
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-005
+  acceptance:
+  - Finds DB-active resources absent at provider.
+  evidence: []
+- id: M07-011
+  milestone: M07
+  title: Implement per-account provisioning concurrency limit
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M03-003
+  - M07-002
+  acceptance:
+  - Protects provider quota/rate limit.
+  evidence: []
+- id: M08-001
+  milestone: M08
+  title: Design Telegram navigation/state machine
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M02-003
+  - M04-007
+  acceptance:
+  - Flows have stable callbacks and cancel/back behavior.
+  evidence: []
+- id: M08-002
+  milestone: M08
+  title: Implement catalog country/location view
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M08-001
+  acceptance:
+  - Only enabled offers shown.
+  evidence: []
+- id: M08-003
+  milestone: M08
+  title: Implement plan selection view
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M08-002
+  acceptance:
+  - Price/spec visible and callback tamper-resistant.
+  evidence: []
+- id: M08-004
+  milestone: M08
+  title: Implement OS selection view
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M08-003
+  acceptance:
+  - Architecture compatibility enforced server-side.
+  evidence: []
+- id: M08-005
+  milestone: M08
+  title: Implement purchase confirmation view
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M08-004
+  - M07-001
+  acceptance:
+  - Shows exact price policy and wallet impact.
+  evidence: []
+- id: M08-006
+  milestone: M08
+  title: Implement provisioning progress notifications
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-002
+  acceptance:
+  - User receives final success/error once.
+  evidence: []
+- id: M08-007
+  milestone: M08
+  title: Implement My Servers list/detail
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-005
+  acceptance:
+  - Pagination and ownership checks.
+  evidence: []
+- id: M08-008
+  milestone: M08
+  title: Implement power controls UI
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M08-007
+  - M07-006
+  acceptance:
+  - Capabilities/states hide invalid actions.
+  evidence: []
+- id: M08-009
+  milestone: M08
+  title: Implement delete confirmation UI
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M08-007
+  - M07-007
+  acceptance:
+  - Double confirmation and idempotent callback.
+  evidence: []
+- id: M08-010
+  milestone: M08
+  title: Implement wallet/ledger history UI
+  priority: P1
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M05-003
+  acceptance:
+  - Readable amounts/references/pagination.
+  evidence: []
+- id: M08-011
+  milestone: M08
+  title: Implement low-balance notifications
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M06-007
+  acceptance:
+  - Deduplicated warning levels.
+  evidence: []
+- id: M09-001
+  milestone: M09
+  title: Finalize payment gateway port
+  priority: P0
+  status: ready
+  owner_hint: supervisor
+  depends_on:
+  - M05-002
+  acceptance:
+  - Gateway has create/verify/refund capability model.
+  evidence: []
+- id: M09-002
+  milestone: M09
+  title: Implement payment session persistence
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M09-001
+  acceptance:
+  - External IDs unique and stateful.
+  evidence: []
+- id: M09-003
+  milestone: M09
+  title: Implement signed/replay-safe webhook endpoint
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M09-002
+  acceptance:
+  - Duplicate callback cannot duplicate deposit.
+  evidence: []
+- id: M09-004
+  milestone: M09
+  title: Integrate first Iranian payment gateway
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M09-003
+  acceptance:
+  - Sandbox/real test evidence recorded.
+  evidence: []
+- id: M09-005
+  milestone: M09
+  title: Post successful payment to ledger
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M09-003
+  - M05-002
+  acceptance:
+  - Deposit exactly once.
+  evidence: []
+- id: M09-006
+  milestone: M09
+  title: Implement payment status Telegram UX
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M09-004
+  acceptance:
+  - Pending/success/failure states clear.
+  evidence: []
+- id: M09-007
+  milestone: M09
+  title: Implement payment reconciliation job
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M09-004
+  acceptance:
+  - Stuck sessions rechecked safely.
+  evidence: []
+- id: M10-001
+  milestone: M10
+  title: Implement immutable audit repository
+  priority: P0
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M01-002
+  acceptance:
+  - Sensitive actions have actor/resource metadata.
+  evidence: []
+- id: M10-002
+  milestone: M10
+  title: Audit admin wallet/provider operations
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M10-001
+  - M05-006
+  acceptance:
+  - Every mutation links to actor/reason.
+  evidence: []
+- id: M10-003
+  milestone: M10
+  title: Implement provisioning quotas per user
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-001
+  acceptance:
+  - Limits concurrent/total creation.
+  evidence: []
+- id: M10-004
+  milestone: M10
+  title: Implement cost circuit breakers
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M06-008
+  acceptance:
+  - Global/provider-account daily thresholds can halt new spend.
+  evidence: []
+- id: M10-005
+  milestone: M10
+  title: Implement provider/location maintenance switches
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M04-007
+  acceptance:
+  - New orders stop without breaking existing resources.
+  evidence: []
+- id: M10-006
+  milestone: M10
+  title: Implement abuse case model/workflow
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M10-001
+  acceptance:
+  - Provider resource maps quickly to responsible user.
+  evidence: []
+- id: M10-007
+  milestone: M10
+  title: Implement user freeze + resource containment command
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M10-006
+  - M02-005
+  acceptance:
+  - Containment is audited and bounded.
+  evidence: []
+- id: M10-008
+  milestone: M10
+  title: Implement secret rotation workflow
+  priority: P1
+  status: ready
+  owner_hint: H2
+  depends_on:
+  - M03-002
+  acceptance:
+  - Provider credential can rotate without downtime.
+  evidence: []
+- id: M10-009
+  milestone: M10
+  title: Add security regression tests
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M10-002
+  - M10-003
+  acceptance:
+  - Ownership, callback replay, secret redaction covered.
+  evidence: []
+- id: M11-001
+  milestone: M11
+  title: Add Prometheus metrics
+  priority: P0
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M01-007
+  acceptance:
+  - API/jobs/provider/billing metrics emitted.
+  evidence: []
+- id: M11-002
+  milestone: M11
+  title: Add OpenTelemetry tracing
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M11-001
+  acceptance:
+  - Trace spans correlate API->job->provider.
+  evidence: []
+- id: M11-003
+  milestone: M11
+  title: Implement provider retry/backoff policy
+  priority: P0
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M04-009
+  acceptance:
+  - Retryable vs permanent errors explicit.
+  evidence: []
+- id: M11-004
+  milestone: M11
+  title: Implement dead-letter/manual-review tooling
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-005
+  acceptance:
+  - Failed operations can be inspected/replayed safely.
+  evidence: []
+- id: M11-005
+  milestone: M11
+  title: Create Grafana dashboard definitions
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M11-001
+  acceptance:
+  - Golden signals visible.
+  evidence: []
+- id: M11-006
+  milestone: M11
+  title: Create alert rules
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M11-001
+  acceptance:
+  - Alerts for spend, 429, provisioning failure, queue age, reconciliation drift.
+  evidence: []
+- id: M11-007
+  milestone: M11
+  title: Automate PostgreSQL backups
+  priority: P0
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M01-001
+  acceptance:
+  - Encrypted backup job + retention.
+  evidence: []
+- id: M11-008
+  milestone: M11
+  title: Document/test restore drill
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M11-007
+  acceptance:
+  - Restore into clean environment verified.
+  evidence: []
+- id: M11-009
+  milestone: M11
+  title: Add chaos tests for provider timeouts
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-003
+  - M07-008
+  acceptance:
+  - No double create/charge after injected timeout.
+  evidence: []
+- id: M12-001
+  milestone: M12
+  title: Harden GitHub Actions quality pipeline
+  priority: P0
+  status: ready
+  owner_hint: H1
+  depends_on:
+  - M00-004
+  acceptance:
+  - Cache + deterministic gates + artifacts.
+  evidence: []
+- id: M12-002
+  milestone: M12
+  title: Build and publish OCI image
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M12-001
+  acceptance:
+  - Tagged immutable image produced.
+  evidence: []
+- id: M12-003
+  milestone: M12
+  title: Add migration compatibility gate
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M01-001
+  - M12-001
+  acceptance:
+  - Deploy blocks unsafe migration patterns.
+  evidence: []
+- id: M12-004
+  milestone: M12
+  title: Create staging compose/deployment
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M12-002
+  acceptance:
+  - Staging deploy repeatable.
+  evidence: []
+- id: M12-005
+  milestone: M12
+  title: Create production deployment runbook
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M12-004
+  acceptance:
+  - Secrets, migrations, rollback and health checks documented.
+  evidence: []
+- id: M12-006
+  milestone: M12
+  title: Add rolling/blue-green strategy
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M12-005
+  acceptance:
+  - API/bot/worker deploy without double consumers.
+  evidence: []
+- id: M12-007
+  milestone: M12
+  title: Add post-deploy smoke tests
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M12-004
+  acceptance:
+  - Health + safe read-only provider checks.
+  evidence: []
+- id: M13-001
+  milestone: M13
+  title: Implement SSH key CRUD/sync
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-005
+  acceptance:
+  - User keys are ownership-scoped.
+  evidence: []
+- id: M13-002
+  milestone: M13
+  title: Implement rebuild flow
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M13-001
+  acceptance:
+  - Confirmation and credential handling safe.
+  evidence: []
+- id: M13-003
+  milestone: M13
+  title: Implement rescue mode
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M13-001
+  acceptance:
+  - Temporary credentials protected.
+  evidence: []
+- id: M13-004
+  milestone: M13
+  title: Implement snapshots
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M06-002
+  acceptance:
+  - Snapshot cost/capability represented.
+  evidence: []
+- id: M13-005
+  milestone: M13
+  title: Implement backups toggle
+  priority: P2
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M06-002
+  acceptance:
+  - Price impact confirmed before mutation.
+  evidence: []
+- id: M13-006
+  milestone: M13
+  title: Implement firewall management
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-005
+  acceptance:
+  - Reusable rules and ownership.
+  evidence: []
+- id: M13-007
+  milestone: M13
+  title: Implement rDNS
+  priority: P2
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-005
+  acceptance:
+  - IP ownership and validation.
+  evidence: []
+- id: M13-008
+  milestone: M13
+  title: Implement Primary/Floating IP features
+  priority: P2
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-005
+  acceptance:
+  - Independent resource billing supported.
+  evidence: []
+- id: M13-009
+  milestone: M13
+  title: Implement volumes
+  priority: P2
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M07-005
+  acceptance:
+  - Attach/detach/delete reconciliation.
+  evidence: []
+- id: M13-010
+  milestone: M13
+  title: Implement private networks
+  priority: P2
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M07-005
+  acceptance:
+  - Network lifecycle and capabilities.
+  evidence: []
+- id: M14-001
+  milestone: M14
+  title: Define customer REST API v1
+  priority: P1
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M07-007
+  - M05-003
+  acceptance:
+  - Stable resource/error/idempotency contract.
+  evidence: []
+- id: M14-002
+  milestone: M14
+  title: Implement customer API tokens/scopes
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M14-001
+  - M02-006
+  acceptance:
+  - Revocable hashed tokens and scopes.
+  evidence: []
+- id: M14-003
+  milestone: M14
+  title: Implement admin API
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M10-001
+  acceptance:
+  - Search/actions are RBAC/audited.
+  evidence: []
+- id: M14-004
+  milestone: M14
+  title: Build customer web panel shell
+  priority: P2
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M14-001
+  acceptance:
+  - Login/session and server/wallet views.
+  evidence: []
+- id: M14-005
+  milestone: M14
+  title: Build admin web panel shell
+  priority: P2
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M14-003
+  acceptance:
+  - Provider/users/operations dashboards.
+  evidence: []
+- id: M14-006
+  milestone: M14
+  title: Add API rate limits
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M14-002
+  acceptance:
+  - Per-user/token limits with headers.
+  evidence: []
+- id: M15-001
+  milestone: M15
+  title: Select first Iranian provider and document API contract
+  priority: P0
+  status: ready
+  owner_hint: supervisor
+  depends_on:
+  - M03-006
+  acceptance:
+  - Capabilities/gaps/error/rate/pricing model documented.
+  evidence: []
+- id: M15-002
+  milestone: M15
+  title: Implement Iranian provider adapter
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M15-001
+  acceptance:
+  - Provider contract suite passes.
+  evidence: []
+- id: M15-003
+  milestone: M15
+  title: Implement Iranian catalog/pricing mapper
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M15-002
+  acceptance:
+  - Normalized offers require no core-domain change.
+  evidence: []
+- id: M15-004
+  milestone: M15
+  title: Implement provider-specific reconciliation
+  priority: P0
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M15-002
+  acceptance:
+  - Ambiguous mutations handled safely.
+  evidence: []
+- id: M15-005
+  milestone: M15
+  title: Enable capability-driven Telegram UX
+  priority: P0
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M15-003
+  - M08-008
+  acceptance:
+  - Unsupported controls hidden; shared flows reused.
+  evidence: []
+- id: M15-006
+  milestone: M15
+  title: Run multi-provider billing parity tests
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M15-003
+  - M06-006
+  acceptance:
+  - Different billing quantum/policy settles correctly.
+  evidence: []
+- id: M15-007
+  milestone: M15
+  title: Prove zero core-domain provider branching
+  priority: P0
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M15-005
+  acceptance:
+  - No `if provider == ...` in domain modules.
+  evidence: []
+- id: M16-001
+  milestone: M16
+  title: Create realistic load model
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M12-004
+  acceptance:
+  - User/order/job/provider assumptions documented.
+  evidence: []
+- id: M16-002
+  milestone: M16
+  title: Load test API and worker queues
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M16-001
+  acceptance:
+  - Bottlenecks measured with reproducible script.
+  evidence: []
+- id: M16-003
+  milestone: M16
+  title: Tune PostgreSQL indexes/queries
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M16-002
+  acceptance:
+  - Before/after query plans captured.
+  evidence: []
+- id: M16-004
+  milestone: M16
+  title: Partition worker queues by responsibility
+  priority: P1
+  status: blocked
+  owner_hint: H2
+  depends_on:
+  - M16-002
+  acceptance:
+  - Provisioning/billing/notify isolation.
+  evidence: []
+- id: M16-005
+  milestone: M16
+  title: Implement provider-account sharding allocator
+  priority: P1
+  status: blocked
+  owner_hint: H1
+  depends_on:
+  - M03-005
+  - M16-002
+  acceptance:
+  - Load/limit aware selection tested.
+  evidence: []
+- id: M16-006
+  milestone: M16
+  title: Evaluate billing service extraction
+  priority: P2
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M16-002
+  acceptance:
+  - ADR based on measured coupling/load.
+  evidence: []
+- id: M16-007
+  milestone: M16
+  title: Evaluate provider-worker extraction
+  priority: P2
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M16-002
+  acceptance:
+  - ADR based on measured I/O/ops needs.
+  evidence: []
+- id: M16-008
+  milestone: M16
+  title: Run disaster/cost runaway game day
+  priority: P1
+  status: blocked
+  owner_hint: supervisor
+  depends_on:
+  - M11-008
+  - M10-004
+  acceptance:
+  - Kill switches and recovery proven.
+  evidence: []

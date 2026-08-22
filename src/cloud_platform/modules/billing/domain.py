@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING
+from decimal import ROUND_CEILING, Decimal
 
 from cloud_platform.core.money import Money
 
@@ -31,7 +31,9 @@ class UsageCharge:
     customer_charge: Money
 
 
-def calculate_usage_charge(started_at: datetime, ended_at: datetime, price: PriceSnapshot) -> UsageCharge:
+def calculate_usage_charge(
+    started_at: datetime, ended_at: datetime, price: PriceSnapshot
+) -> UsageCharge:
     if ended_at < started_at:
         raise ValueError("ended_at cannot be before started_at")
     elapsed = Decimal(str((ended_at - started_at).total_seconds()))
@@ -40,6 +42,12 @@ def calculate_usage_charge(started_at: datetime, ended_at: datetime, price: Pric
     quanta = max(price.policy.minimum_quanta, quanta)
     return UsageCharge(
         quanta=quanta,
-        provider_cost=Money(price.provider_cost_per_quantum.amount * quanta, price.provider_cost_per_quantum.currency),
-        customer_charge=Money(price.customer_price_per_quantum.amount * quanta, price.customer_price_per_quantum.currency),
+        provider_cost=Money(
+            price.provider_cost_per_quantum.amount * quanta,
+            price.provider_cost_per_quantum.currency,
+        ),
+        customer_charge=Money(
+            price.customer_price_per_quantum.amount * quanta,
+            price.customer_price_per_quantum.currency,
+        ),
     )

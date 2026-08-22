@@ -22,6 +22,8 @@ from cloud_platform.providers.errors import (
     ProviderRateLimited,
     ProviderUnavailable,
 )
+from cloud_platform.providers.health import AccountHealth
+from cloud_platform.providers.hetzner.backoff import RateLimitBackoff, RateLimitPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,16 +52,37 @@ class HetznerCloudProvider:
         }
     )
 
-    def __init__(self, token: str, base_url: str = "https://api.hetzner.cloud/v1") -> None:
+    def __init__(
+        self,
+        token: str,
+        base_url: str = "https://api.hetzner.cloud/v1",
+        rate_limit_policy: RateLimitPolicy | None = None,
+    ) -> None:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {token}"},
             timeout=httpx.Timeout(30.0),
         )
         self.last_rate_limit = RateLimitSnapshot(None, None, None)
+        self._backoff = RateLimitBackoff(rate_limit_policy or RateLimitPolicy())
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    async def check_health(self) -> AccountHealth:
+        """Check the health of this Hetzner account.
+
+        Makes a lightweight API call to verify credentials and connectivity.
+
+        Returns:
+            AccountHealth status
+        """
+        try:
+            # Use a lightweight endpoint to check connectivity
+            await self._request("GET", "/datacenters")
+            return AccountHealth.HEALTHY
+        except Exception:
+            return AccountHealth.UNHEALTHY
 
     async def list_locations(self) -> list[ProviderLocation]:
         payload = await self._request("GET", "/locations")
@@ -150,17 +173,29 @@ class HetznerCloudProvider:
         await self._request("POST", f"/servers/{provider_server_id}/actions/reboot")
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        try:
-            response = await self._client.request(method, path, **kwargs)
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise ProviderUnavailable(str(exc)) from exc
+        max_retries = self._backoff.policy.max_retries
+        attempt = 0
+        response: httpx.Response | None = None
+        while True:
+            try:
+                response = await self._client.request(method, path, **kwargs)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                raise ProviderUnavailable(str(exc)) from exc
 
-        self.last_rate_limit = RateLimitSnapshot(
-            _int_or_none(response.headers.get("RateLimit-Limit")),
-            _int_or_none(response.headers.get("RateLimit-Remaining")),
-            _int_or_none(response.headers.get("RateLimit-Reset")),
-        )
+            self.last_rate_limit = RateLimitSnapshot(
+                _int_or_none(response.headers.get("RateLimit-Limit")),
+                _int_or_none(response.headers.get("RateLimit-Remaining")),
+                _int_or_none(response.headers.get("RateLimit-Reset")),
+            )
 
+            # Retry bounded times on 429, honoring the per-project reset epoch;
+            # every other status is handled once below.
+            if response.status_code != 429 or attempt >= max_retries:
+                break
+            await self._backoff.wait_before_retry(attempt, self.last_rate_limit)
+            attempt += 1
+
+        assert response is not None
         if response.status_code == 401 or response.status_code == 403:
             raise ProviderAuthError(_error_message(response))
         if response.status_code == 404:

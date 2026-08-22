@@ -1,0 +1,61 @@
+# Pre-commit hooks for cloud-server-platform
+# Install with: uv run pre-commit install
+# Run manually: uv run pre-commit run --all-files
+
+repos:
+  # Ruff: Fast Python linter and formatter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.0
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # MyPy: Static type checker
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.17.0
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - pydantic>=2.11,<3
+          - pydantic-settings>=2.10,<3
+          - sqlalchemy[asyncio]>=2.0.40,<3
+          - fastapi>=0.116,<1
+          - aiogram>=3.20,<4
+          - httpx>=0.28,<1
+          - redis>=5,<6
+          - asyncpg>=0.30,<1
+          - alembic>=1.16,<2
+          - arq>=0.26,<1
+          - python-json-logger>=3.3,<4
+          - structlog>=25,<26
+          - uvicorn[standard]>=0.35,<1
+
+  # Secret detection
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: ^(.*\.lock|uv\.lock|.*\.pyc|.*\.png|.*\.jpg|.*\.gif)
+
+  # Check for merge conflicts
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+
+  # Ensure pyproject.toml is valid
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-toml
+
+# Configuration for detect-secrets
+# Run `uv run detect-secrets scan > .secrets.baseline` to create baseline

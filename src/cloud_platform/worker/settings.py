@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from arq.connections import RedisSettings
 
 from cloud_platform.core.config import get_settings
@@ -17,7 +19,7 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
 
 
 class WorkerSettings:
-    functions = [reconcile_provider_resources]
+    functions: ClassVar[list] = [reconcile_provider_resources]  # type: ignore[type-arg]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)

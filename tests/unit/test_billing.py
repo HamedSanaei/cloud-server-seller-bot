@@ -2,7 +2,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from cloud_platform.core.money import Money
-from cloud_platform.modules.billing.domain import BillingPolicy, PriceSnapshot, calculate_usage_charge
+from cloud_platform.modules.billing.domain import (
+    BillingPolicy,
+    PriceSnapshot,
+    calculate_usage_charge,
+)
 
 
 def test_hourly_policy_rounds_partial_hour_up() -> None:
