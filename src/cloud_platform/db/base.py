@@ -198,12 +198,14 @@ class Server(Base):
     )
     catalog_id = Column(PG_UUID, ForeignKey("catalog.id", ondelete="RESTRICT"), nullable=False)
     state = Column(String, nullable=False, server_default="requested")
+    contained_from = Column(String, nullable=True)
     provider_server_id = Column(String, nullable=True)
     ipv4 = Column(String, nullable=True)
     ipv6 = Column(String, nullable=True)
     price_per_quantum = Column(BigInteger, nullable=False)
     currency = Column(String(3), nullable=False, server_default="EUR")
     quantum_seconds = Column(Integer, nullable=False, server_default="3600")
+    idempotency_key = Column(String, unique=True, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
     deleted_at = Column(DateTime, nullable=True)
@@ -303,3 +305,237 @@ class Hold(Base):
     released_at = Column(DateTime, nullable=True)
 
     # Unique constraint on (wallet_id, idempotency_key) is in migration
+
+
+# ---------------------------------------------------------------------------
+# AuditEvent model — append-only log of sensitive actions
+# ---------------------------------------------------------------------------
+
+
+class AuditEvent(Base):
+    """Immutable audit record: who did what to which resource, and why.
+
+    The table is append-only: a database trigger rejects UPDATE and DELETE.
+    The ORM attribute for the metadata column is ``event_metadata`` because
+    ``metadata`` is reserved by SQLAlchemy's declarative base; the database
+    column itself is named ``metadata``.
+
+    Attributes:
+        id: Primary key
+        actor_type: Kind of actor (user/admin/system)
+        actor_id: Id of the acting user, when applicable
+        action: Machine-readable action name (e.g. "wallet.adjust")
+        resource_type: Kind of resource affected (e.g. "wallet")
+        resource_id: Identifier of the affected resource
+        reason: Human-readable justification
+        event_metadata: Structured extra data (DB column ``metadata``, JSONB)
+        occurred_at: When the event happened
+    """
+
+    __tablename__ = "audit_events"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    actor_type = Column(String, nullable=False)
+    actor_id = Column(PG_UUID, nullable=True)
+    action = Column(String, nullable=False)
+    resource_type = Column(String, nullable=False)
+    resource_id = Column(String, nullable=True)
+    reason = Column(Text, nullable=False, server_default="")
+    event_metadata = Column("metadata", JSONB, nullable=False, server_default="{}")
+    occurred_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+    # Append-only trigger + indexes are in migration 0005
+
+
+# ---------------------------------------------------------------------------
+# PaymentSession model — gateway-side inbound payment attempts (M09-002)
+# ---------------------------------------------------------------------------
+
+
+class PaymentSession(Base):
+    """Persistent record of one inbound payment attempt at a gateway.
+
+    The (gateway_key, gateway_payment_id) pair carries a UNIQUE constraint
+    (migration 0006): a replayed webhook cannot create a second session for
+    the same external payment.
+
+    Attributes:
+        id: Primary key
+        user_id: Wallet owner the deposit belongs to
+        gateway_key: Identifier of the payment gateway
+        gateway_payment_id: External id assigned by the gateway (nullable)
+        amount_minor: Positive integer minor units
+        currency: ISO-4217 3-letter uppercase code
+        status: pending | succeeded | failed
+        idempotency_key: Key sent to the gateway on creation
+        credited_at: When the matching ledger deposit was posted
+        created_at / updated_at: Timestamps
+    """
+
+    __tablename__ = "payment_sessions"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, nullable=False)
+    gateway_key = Column(String, nullable=False)
+    gateway_payment_id = Column(String, nullable=True)
+    amount_minor = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False)
+    status = Column(String, nullable=False, server_default="pending")
+    idempotency_key = Column(String, nullable=False)
+    credited_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+
+# ---------------------------------------------------------------------------
+# AbuseCase model — reported abuse mapped to responsible users (M10-006)
+# ---------------------------------------------------------------------------
+
+
+class AbuseCase(Base):
+    """One reported abuse finding, linked to the responsible user.
+
+    Attributes:
+        id: Primary key
+        provider_key: Provider that owns the reported resource
+        resource_type: provider_server | ipv4 | ipv6
+        resource_id: The reported resource identifier
+        user_id: Responsible user (resolved at intake)
+        server_id: Internal server, when the resource maps to one
+        reason: Human-readable abuse description
+        reporter: Who/what reported it (provider name, email, admin)
+        status: open | investigating | resolved | dismissed
+        created_at / updated_at / resolved_at: Timestamps
+    """
+
+    __tablename__ = "abuse_cases"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_key = Column(String, nullable=False)
+    resource_type = Column(String, nullable=False)
+    resource_id = Column(String, nullable=False)
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="SET NULL"), nullable=True)
+    reason = Column(Text, nullable=False)
+    reporter = Column(String, nullable=False)
+    status = Column(String, nullable=False, server_default="open")
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    resolved_at = Column(DateTime, nullable=True)
+
+    # user_id + status indexes are in migration 0007
+
+
+# ---------------------------------------------------------------------------
+# PriceBookVersion model — versioned price books (M06-001)
+# ---------------------------------------------------------------------------
+
+
+class PriceBookVersion(Base):
+    """One immutable version of a named price book.
+
+    Attributes:
+        id: Primary key
+        book_name: Book identifier (e.g. "retail-eur")
+        version: Monotonic version number (>= 1), unique per book
+        effective_at: Instant from which this version prices sales
+        rules: Margin rules as JSONB (see pricing.domain.rule_to_dict)
+        created_at: Record creation timestamp
+    """
+
+    __tablename__ = "price_book_versions"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    book_name = Column(String, nullable=False)
+    version = Column(Integer, nullable=False)
+    effective_at = Column(DateTime(timezone=True), nullable=False)
+    rules = Column(JSONB, nullable=False, server_default="[]")
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+    # uq (book_name, version) + (book_name, effective_at) index in migration 0009
+
+
+# ---------------------------------------------------------------------------
+# ServerPriceSnapshot model — immutable per-server price (M06-002)
+# ---------------------------------------------------------------------------
+
+
+class ServerPriceSnapshot(Base):
+    """The immutable price of one server, fixed at provisioning.
+
+    Billing reads this row — never the catalog or price book — so historical
+    prices are unaffected by later catalog or price-book changes. One row per
+    server; the row is never updated.
+
+    Attributes:
+        id: Primary key
+        server_id: Unique internal server the snapshot is pinned to
+        provider_key / plan_id / location_id / currency: The offer pinned
+        cost_minor: Provider cost per quantum (minor units)
+        selling_minor: Customer selling price per quantum (minor units)
+        book_name / book_version: Price book version the price was derived from
+        margin_rule: The margin rule applied (JSONB, see rule_to_dict)
+        priced_at: Instant the price was fixed
+        created_at: Record creation timestamp
+    """
+
+    __tablename__ = "server_price_snapshots"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    server_id = Column(
+        PG_UUID,
+        ForeignKey("servers.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    provider_key = Column(String, nullable=False)
+    plan_id = Column(String, nullable=False)
+    location_id = Column(String, nullable=False)
+    currency = Column(String, nullable=False)
+    cost_minor = Column(BigInteger, nullable=False)
+    selling_minor = Column(BigInteger, nullable=False)
+    book_name = Column(String, nullable=False)
+    book_version = Column(Integer, nullable=False)
+    margin_rule = Column(JSONB, nullable=False)
+    priced_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+
+# ---------------------------------------------------------------------------
+# Operation model — provider-mutation intent ledger (M07-002)
+# ---------------------------------------------------------------------------
+
+
+class Operation(Base):
+    """Durable intent for one provider-mutating action.
+
+    The unique ``operation_key`` is also the IdempotencyKey sent to the
+    provider, so the provider applies the mutation at most once per intent.
+
+    Attributes:
+        id: Primary key
+        operation_key: Unique, deterministic intent key
+        operation_type: server_create | ...
+        resource_type / resource_id: The target (e.g. server + its id)
+        provider_key: Provider that owns the mutation
+        status: pending | in_flight | completed | failed
+        provider_response: Recorded correlation (JSONB, e.g. provider server id)
+        error: Last error, for failed/re-queued operations
+        attempts: Number of execution attempts
+        created_at / updated_at: Timestamps
+    """
+
+    __tablename__ = "operations"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    operation_key = Column(String, unique=True, nullable=False)
+    operation_type = Column(String, nullable=False)
+    resource_type = Column(String, nullable=False)
+    resource_id = Column(PG_UUID, nullable=False)
+    provider_key = Column(String, nullable=False)
+    status = Column(String, nullable=False, server_default="pending")
+    provider_response = Column(JSONB, nullable=True)
+    error = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")

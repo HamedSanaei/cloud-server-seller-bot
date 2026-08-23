@@ -140,3 +140,20 @@ class TestPermissionChecker:
         user = User(id=uuid4(), username="alice", email="alice@example.com")
         checker = PermissionChecker(user)
         assert checker.user is user
+
+
+class TestWalletAdjustPermission:
+    def test_admin_has_wallet_adjust(self) -> None:
+        assert Permission.WALLET_ADJUST in PERMISSIONS[Role.ADMIN]
+
+    def test_regular_user_lacks_wallet_adjust(self) -> None:
+        assert Permission.WALLET_ADJUST not in PERMISSIONS[Role.USER]
+
+    def test_admin_user_passes_check(self) -> None:
+        admin = User(id=uuid4(), username="boss", email="boss@example.com", role=Role.ADMIN)
+        assert admin.has_permission(Permission.WALLET_ADJUST) is True
+
+    def test_regular_user_fails_check(self) -> None:
+        user = User(id=uuid4(), username="alice", email="alice@example.com", role=Role.USER)
+        checker = PermissionChecker(user)
+        assert checker.check(Permission.WALLET_ADJUST) is False

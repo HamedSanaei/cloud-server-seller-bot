@@ -10,6 +10,7 @@ import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -19,6 +20,9 @@ from cloud_platform.db.base import (
     Catalog,
     Provider,
 )
+from cloud_platform.modules.catalog.domain import PlanPricing, ProviderPriceEntry
+from cloud_platform.modules.catalog.repository import SqlAlchemyCatalogRepository
+from cloud_platform.modules.catalog.service import PricingIngestionService
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderConflict,
@@ -29,6 +33,11 @@ from cloud_platform.providers.errors import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Hetzner's identity and billing currency. Provider metadata, not prices —
+#: all price values are ingested from the API payload (M04-005).
+PROVIDER_KEY = "hetzner"
+CURRENCY = "EUR"
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,80 +291,31 @@ class HetznerCatalogSyncer:
         )
 
     async def _upsert_plans(self, plans_data: list[dict[str, Any]]) -> tuple[int, int]:
-        """Upsert server types (plans) to database. Returns (upserted, skipped)."""
+        """Upsert server types via location-aware pricing ingestion (M04-005).
+
+        Every per-location price reported by Hetzner is persisted as its own
+        catalog row; prices are computed in Decimal from the provider payload
+        (never float, never hard-coded).
+        """
         if not plans_data:
             return 0, 0
 
+        service = PricingIngestionService(SqlAlchemyCatalogRepository(self._session_factory))
+
         upserted = 0
         skipped = 0
-
-        async with self._session_factory() as session:
-            from sqlalchemy import select
-
-            provider = await session.get(Provider, "hetzner")
-            if not provider:
-                provider = Provider(
-                    id="hetzner",
-                    name="Hetzner",
-                    region="global",
-                )
-                session.add(provider)
-                await session.flush()
-
-            for item in plans_data:
-                plan_id = str(item["id"])
-
-                stmt = select(Catalog).where(
-                    Catalog.provider_id == provider.id,
-                    Catalog.provider_plan_id == plan_id,
-                    Catalog.provider_location_id == "global",
-                )
-                result = await session.execute(stmt)
-                existing = result.scalar_one_or_none()
-
-                if existing:
-                    existing.name = item["name"]
-                    existing.architecture = item.get("architecture", "unknown")
-                    existing.vcpu = int(item["cores"])
-                    existing.memory_mb = int(float(item["memory"]) * 1024)
-                    existing.disk_gb = int(item["disk"])
-                    existing.price_per_quantum = int(
-                        float(item["prices"][0]["price_monthly"]["gross"]) * 100 / 720
-                    )  # Convert monthly to hourly (in cents)
-                    existing.currency = "EUR"
-                    existing.quantum_seconds = 3600
-                    existing.enabled = True
-                    existing.metadata = {
-                        "cpu_type": item.get("cpu_type"),
-                        "storage_type": item.get("storage_type"),
-                    }
-                    skipped += 1
-                else:
-                    catalog_entry = Catalog(
-                        name=item["name"],
-                        description=item.get("description"),
-                        provider_id=provider.id,
-                        provider_plan_id=plan_id,
-                        provider_location_id="global",
-                        architecture=item.get("architecture", "unknown"),
-                        vcpu=int(item["cores"]),
-                        memory_mb=int(float(item["memory"]) * 1024),
-                        disk_gb=int(item["disk"]),
-                        price_per_quantum=int(
-                            float(item["prices"][0]["price_monthly"]["gross"]) * 100 / 720
-                        ),
-                        currency="EUR",
-                        quantum_seconds=3600,
-                        enabled=True,
-                        metadata={
-                            "cpu_type": item.get("cpu_type"),
-                            "storage_type": item.get("storage_type"),
-                        },
-                    )
-                    session.add(catalog_entry)
+        for item in plans_data:
+            try:
+                plan = _plan_pricing_from_hetzner(item)
+            except (KeyError, ValueError) as exc:
+                logger.error("Skipping plan %s: %s", item.get("id"), exc)
+                continue
+            result = await service.ingest_plan(PROVIDER_KEY, plan)
+            for price in result.prices:
+                if price.created:
                     upserted += 1
-
-            await session.commit()
+                else:
+                    skipped += 1
 
         return upserted, skipped
 
@@ -468,6 +428,51 @@ def _int_or_none(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    """Parse a provider price string into a Decimal, or None if absent."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Decimal(text)
+
+
+def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:
+    """Map one Hetzner /server_types entry to provider-neutral PlanPricing.
+
+    Every per-location price entry is preserved (location-aware, M04-005).
+    Memory is converted GB->MB with Decimal arithmetic (no float).
+    """
+    prices: list[ProviderPriceEntry] = []
+    for raw in item.get("prices", []):
+        if not isinstance(raw, dict):
+            continue
+        location_id = str(raw.get("location") or raw.get("location_name") or "unknown")
+        prices.append(
+            ProviderPriceEntry(
+                location_id=location_id,
+                currency=CURRENCY,
+                hourly=_decimal_or_none((raw.get("hourly") or {}).get("gross")),
+                monthly=_decimal_or_none((raw.get("monthly") or {}).get("gross")),
+            )
+        )
+
+    memory_gb = Decimal(str(item.get("memory") or 0))
+    return PlanPricing(
+        plan_id=str(item["id"]),
+        name=str(item.get("name") or item["id"]),
+        architecture=str(item.get("architecture") or "unknown"),
+        vcpu=int(item.get("cores") or 0),
+        memory_mb=int(memory_gb * 1024),
+        disk_gb=int(item.get("disk") or 0),
+        prices=tuple(prices),
+        description=item.get("description"),
+        cpu_type=item.get("cpu_type"),
+        storage_type=item.get("storage_type"),
+    )
 
 
 def _error_message(response: httpx.Response) -> str:

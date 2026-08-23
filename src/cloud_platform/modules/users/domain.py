@@ -26,6 +26,7 @@ class Permission(StrEnum):
     SERVER_RESTART = "server:restart"
     BILLING_VIEW = "billing:view"
     BILLING_PAY = "billing:pay"
+    WALLET_ADJUST = "wallet:adjust"
     ADMIN_MANAGE_USERS = "admin:manage_users"
     ADMIN_MANAGE_SETTINGS = "admin:manage_settings"
 
@@ -56,6 +57,7 @@ PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.SERVER_RESTART,
             Permission.BILLING_VIEW,
             Permission.BILLING_PAY,
+            Permission.WALLET_ADJUST,
             Permission.ADMIN_MANAGE_USERS,
             Permission.ADMIN_MANAGE_SETTINGS,
         }

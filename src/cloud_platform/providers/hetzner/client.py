@@ -133,6 +133,18 @@ class HetznerCloudProvider:
             return None
         return self._map_server(payload["server"])
 
+    async def list_servers(self) -> list[ProviderServer]:
+        servers: list[ProviderServer] = []
+        page = 1
+        while True:
+            payload = await self._request("GET", "/servers", params={"page": page})
+            servers.extend(self._map_server(item) for item in payload.get("servers", []))
+            pagination = (payload.get("meta") or {}).get("pagination") or {}
+            next_page = pagination.get("next_page")
+            if not isinstance(next_page, int) or next_page <= page:
+                return servers
+            page = next_page
+
     async def create_server(
         self, request: CreateServerRequest, idempotency_key: IdempotencyKey
     ) -> ProviderServer:

@@ -24,10 +24,12 @@ from cloud_platform.modules.wallet.repository import (
     SqlAlchemyLedgerRepository,
     SqlAlchemyWalletRepository,
 )
+from cloud_platform.modules.wallet.service import HoldAdminService, WalletAdminService
 
 __all__ = [
     "DuplicateIdempotencyError",
     "Hold",
+    "HoldAdminService",
     "HoldError",
     "HoldNotFoundError",
     "HoldRepository",
@@ -43,6 +45,7 @@ __all__ = [
     "SqlAlchemyLedgerRepository",
     "SqlAlchemyWalletRepository",
     "Wallet",
+    "WalletAdminService",
     "WalletError",
     "WalletRepository",
     "WalletStatus",

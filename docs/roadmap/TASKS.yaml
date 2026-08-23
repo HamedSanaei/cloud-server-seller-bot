@@ -435,13 +435,24 @@ tasks:
   milestone: M04
   title: Implement provider pricing ingestion
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M04-003
   acceptance:
   - Location-aware provider prices persist without hard-coding.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented provider pricing ingestion in modules/catalog. Domain: ProviderPriceEntry (per-location hourly/monthly
+    as Decimal, >=1 price required, negatives rejected), PlanPricing (specs + tuple of location entries), hourly_minor() -
+    provider hourly price is authoritative, else monthly/720 with ROUND_HALF_UP - and to_minor_units() (Decimal-only, no float
+    anywhere). CatalogEntrySpec + CatalogRepository port. SqlAlchemyCatalogRepository upserts on the existing uq_catalog_provider_plan_location
+    unique constraint; providers resolved by name and created with deterministic uuid5 when missing (fixes the old string-id
+    Provider bug). PricingIngestionService persists one catalog row per (provider, plan, location). Hetzner syncer _upsert_plans
+    rewritten: parses the real per-location API shape (location + hourly.gross + monthly.gross) into PlanPricing and routes
+    through the ingestion service - removing the float monthly/720 truncation (5.83/month used to store 0 cents/hour, now
+    1) and the hardcoded ''global'' location / first-price-only logic. 34 tests: Decimal-vs-float rounding proof (2.675 ->
+    268), hourly precedence, monthly derivation, validation, service forwarding, repository create/update/provider-creation
+    paths, and updated syncer test asserting per-location rows with correct minor units; full suite 434 passed.'
 - id: M04-006
   milestone: M04
   title: Implement catalog sync job with lock
@@ -459,18 +470,28 @@ tasks:
   milestone: M04
   title: Implement sellable-offer enable/disable
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M04-005
   acceptance:
   - Admin can hide plan/location combinations.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented sellable-offer enable/disable in modules/catalog. Domain: OfferRef (provider/plan/location, validated,
+    stable .key), OfferState (frozen), CatalogError/OfferNotFoundError; CatalogRepository port extended with get_offer and
+    set_offer_enabled. SqlAlchemyCatalogRepository: lookup-only provider resolution, get_offer maps rows to OfferState (unknown
+    provider or combination -> None), set_offer_enabled updates the enabled flag on the unique (provider, plan, location)
+    row (LookupError when unknown). OfferVisibilityService.set_offer_visibility: admin:manage_settings gate, non-empty reason
+    required, idempotent no-op when state unchanged (no DB write, no audit), audited catalog.offer_hide/catalog.offer_show
+    events with admin actor, catalog_offer resource, offer key, and provider/plan/location metadata. Hiding keeps the row
+    and its prices (no deletion). 18 tests: ref/state validation and immutability, hide/show with full audit linkage, idempotent
+    replay, unknown offer, non-admin denial before I/O, empty reason rejection, repository mapping/lookup/update paths; full
+    suite 452 passed.'
 - id: M04-008
   milestone: M04
   title: Cache customer catalog safely
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M04-007
@@ -569,14 +590,21 @@ tasks:
   milestone: M05
   title: Implement admin credit/debit adjustment
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M05-002
   - M02-006
   acceptance:
   - Reason+actor audited.
-  evidence: []
+  evidence:
+  - '2026-08-22: Implemented WalletAdminService in modules/wallet/service.py: adjust_balance(admin, user_id, amount, reason,
+    idempotency_key) enforces Permission.WALLET_ADJUST at application layer via PermissionChecker, requires non-empty reason,
+    credits via add_funds or debits abs(amount) via debit (InsufficientBalanceError propagates without ledger/audit writes),
+    posts ADJUSTMENT ledger entry with idempotency key and reason as description, appends AuditEvent(actor=admin, action=wallet.adjust)
+    with amount/currency metadata to the immutable audit log; same-key retries replay prior outcome without double-applying.
+    Added granular wallet:adjust permission granted to ADMIN role only. 9 service tests + 4 RBAC boundary tests; full suite
+    249 passed.'
 - id: M05-007
   milestone: M05
   title: Add concurrency tests for wallet spending
@@ -609,25 +637,53 @@ tasks:
   milestone: M06
   title: Implement price books and margin rules
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M04-005
   acceptance:
   - Selling price derived explicitly and versioned.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented price books and margin rules in new modules/pricing module. Domain: MarginRule (provider/plan/location
+    wildcard patterns, Decimal margin_factor > 0, non-negative fixed_minor, specificity scoring, duplicate patterns rejected
+    per version), OfferCost, PriceBookVersion (version >= 1, tz-aware effective_at, non-empty unique rule patterns), SellingPrice
+    (carries rule + version + priced_at for full reproducibility). Derivation is pure and Decimal-only: selling_minor = cost_minor
+    * margin_factor + fixed_minor, ROUND_HALF_UP; most-specific rule wins; NoMarginRuleError when nothing matches. Versioning
+    is explicit: active_version picks the latest version with effective_at <= at, so historical prices are reproducible. Persistence:
+    price_book_versions table (migration 0009, unique (book_name, version), rules as JSONB with Decimal-as-string), repository
+    maps rows with naive->aware UTC normalization and maps IntegrityError to DuplicateBookVersionError. PriceBookService:
+    publish_version is admin:manage_settings gated, requires a non-empty reason, assigns max+1 version (unique constraint
+    makes concurrent publishes fail loudly), validates via the domain aggregate before persistence, and audits pricing.publish_book_version
+    with version/effective_at/rule_count metadata; sell_price is a read-only versioned derivation (NoActiveVersionError for
+    unknown book or instant before first version). 45 tests covering pattern validation, specificity precedence, half-up rounding
+    (20.5 -> 21), fixed offsets, version selection windows, publish audit and version increment, non-admin denial, duplicate
+    version, repository round-trips; full suite 497 passed.'
 - id: M06-002
   milestone: M06
   title: Implement immutable server price snapshot
   priority: P0
-  status: blocked
+  status: done
   owner_hint: supervisor
   depends_on:
   - M06-001
   - M01-005
   acceptance:
   - Historical price unaffected by catalog changes.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented immutable server price snapshot in modules/pricing (M06-002). Domain: ServerPriceSnapshot frozen
+    aggregate (server_id, pinned OfferCost, selling_minor, book_name/book_version, applied MarginRule, tz-aware priced_at)
+    with validation; snapshot_from_selling_price builds it from a versioned SellingPrice; SnapshotAlreadyExistsError + MissingPriceSnapshotError;
+    ServerPriceSnapshotRepository port. Billing source-of-truth contract: billing reads the snapshot, never the catalog or
+    price book. Persistence: server_price_snapshots table (migration 0010) with unique server_id, BigInteger minor units,
+    JSONB margin rule, FK to servers RESTRICT (a priced server can never be hard-deleted without reconciliation), row is insert-only
+    (no update path anywhere). Repository maps rows with naive->aware UTC normalization and maps IntegrityError to SnapshotAlreadyExistsError.
+    ServerPriceSnapshotService: create_snapshot accepts system (None) or admin actor (ADMIN_MANAGE_SETTINGS gate + non-empty
+    reason), builds via snapshot_from_selling_price, persists, audits pricing.snapshot_server with book/version/selling/cost/currency
+    metadata; a duplicate create raises and is not audited. require_snapshot raises MissingPriceSnapshotError so an unpriced
+    server can never be charged. 14 tests including the acceptance proof: a snapshot fixed at T0 (107, book v1) is returned
+    unchanged after the catalog cost rises to 200 and price book v2 (factor 1.5, would price 300) is published, and a second
+    snapshot can never replace it; plus domain validation, frozen check, admin/system audit paths, non-admin denial, duplicate
+    no-audit, and repository round-trips. Full suite 511 passed.'
 - id: M06-003
   milestone: M06
   title: Implement billing policy abstraction
@@ -644,7 +700,7 @@ tasks:
   milestone: M06
   title: Implement usage segment calculator
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M06-002
@@ -713,7 +769,7 @@ tasks:
   milestone: M07
   title: Implement create-server application command
   priority: P0
-  status: blocked
+  status: done
   owner_hint: supervisor
   depends_on:
   - M03-005
@@ -722,34 +778,90 @@ tasks:
   - M06-002
   acceptance:
   - Validates user/offer/balance and persists intent atomically.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the create-server application command (M07-001). CreateServerService in modules/compute/service.py
+    validates then persists the intent, and never calls a provider (provisioning is M07-002). Validation order: user must
+    be persisted and ACTIVE (frozen/banned rejected before any reads), offer must exist and be enabled (OfferNotFoundError
+    / OfferDisabledError), user must have an ACTIVE account with the offer''s provider (new modules/provider_accounts module:
+    domain + SqlAlchemy adapter filtering status=active), selling price derived from the versioned price book (PriceBookService.sell_price),
+    wallet must exist (NoWalletError) and cover the first quantum via an idempotent hold (InsufficientHoldBalanceError). Persistence:
+    servers.idempotency_key unique column (migration 0011) makes retries structural - a replay check returns the original
+    outcome (replayed=True, no re-reservation, no second audit) and a concurrent duplicate resolves to the original via the
+    constraint; the server row is created in REQUESTED state pinned to the exact catalog offer (OfferState now carries the
+    catalog row id for the FK), then an immutable price snapshot fixes the price, then a USER-actor audit event server.create_requested
+    with offer/selling/book/hold metadata. Compensation: any failure after the hold is placed releases the hold (best effort),
+    and a snapshot failure additionally marks the intent ERROR, so a failed command leaves no orphaned reservation or live
+    intent. Cross-module: OfferState gained id (catalog), compute gained ServerRepository protocol + ServerCreateIntent +
+    create/get_by_idempotency_key, provider_accounts module added. 22 tests: full happy-path wiring (hold key derived, intent
+    fields, audit), replay, cross-user key rejection, concurrent duplicate, all validation rejections, and both compensation
+    paths; full suite 533 passed.'
 - id: M07-002
   milestone: M07
   title: Implement provisioning worker
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M07-001
   acceptance:
   - Calls provider once per operation intent and records correlation.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the provisioning worker (M07-002). New modules/operations module: Operation aggregate (PENDING
+    -> IN_FLIGHT -> COMPLETED/FAILED, terminal states immutable, InvalidOperationTransition on illegal moves), OperationRepository
+    port, operations ledger table (migration 0012, unique operation_key, status + resource indexes), SqlAlchemyOperationRepository
+    with conditional UPDATE claim (rowcount-gated, so two workers cannot run the same operation) and concurrent get_or_create
+    resolved by the unique key. ProvisioningWorker (modules/operations/service.py) processes REQUESTED intents: deterministic
+    operation key server-create:{server_id} is ALSO the IdempotencyKey sent to provider.create_server, so the provider applies
+    the mutation at most once per intent and a re-send after an unresolved failure returns the same resource, never a duplicate;
+    the correlation (provider_server_id, provider_status, idempotency_key) is persisted on the operation before the server
+    row advances (REQUESTED -> PROVISIONING with provider_server_id). Retryable provider errors (classified via providers/retry)
+    re-queue the operation with the same key and audit server.provisioning_requeued; permanent errors fail the operation,
+    move the server to ERROR, release the create hold (derived key, best effort) and audit server.provisioning_failed. Recovery:
+    a completed operation with a recorded correlation repairs a row that crashed before the save, without any provider call.
+    Supporting: compute gained list_requested + get_provisioning_spec (server -> pinned catalog join for plan/location/currency),
+    CloudServer.idempotency_key mapped, FirstLinuxImageSelector (injectable ImageSelector strategy). 34 tests: exactly-once
+    + correlation recording, idempotent re-run (no second call), claim race skip, retryable re-queue then success with the
+    SAME key, permanent failure with hold release, missing spec/unknown provider/no image failures, crash recovery, state
+    guards, run_once batch with per-intent keys; full suite 567 passed.'
 - id: M07-003
   milestone: M07
   title: Implement create timeout reconciliation
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M07-002
   acceptance:
   - Ambiguous timeout cannot create duplicate server.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented create timeout reconciliation (M07-003). CreateTimeoutReconciler in modules/operations/service.py
+    resolves the ambiguous window left by the provisioning worker, with two hard safety rules that make a duplicate server
+    impossible: (1) it NEVER issues a new idempotency key - a stale IN_FLIGHT create operation is re-resolved by calling provider.create_server
+    again with the SAME operation key, so the provider deduplicates and returns the same resource (or the already-recorded
+    provider server id is verified); (2) it NEVER deletes a provider resource - any state it cannot resolve safely is contained
+    to MANUAL_REVIEW (server.contain() remembers the prior state) for a human. It scans three candidate classes with snapshotted
+    lists (one consistent view per round): (a) IN_FLIGHT create operations past in_flight_timeout (default 15m, injectable
+    clock) - same-key re-send: success completes the operation with the correlation and advances the row to PROVISIONING with
+    audit server.provisioning_recovered; retryable error re-queues to PENDING (audit server.provisioning_requeued); permanent
+    error fails the operation, moves the server to ERROR, releases the create hold and audits server.provisioning_failed;
+    a server that left the create window (e.g. DELETING) or whose row is gone fails the op and refunds the hold. (b) REQUESTED
+    servers whose operation row is missing (crash before the worker created it) - the operation is recreated with the deterministic
+    key as PENDING (it has never called the provider), so the worker can claim it safely. (c) PROVISIONING servers past provisioning_timeout
+    (default 1h) whose operation is COMPLETED: provider.get_server(provider_server_id) - resource exists but not finished
+    -> MANUAL_REVIEW (uncertain, human decides); resource vanished -> server ERROR + hold release + audit server.provisioning_lost;
+    provider status-check error -> LEFT_UNCHANGED (inconclusive, retry next round, never assumed gone); missing/mismatched
+    operation -> MANUAL_REVIEW. Shared plumbing extracted: server_operation_key() and build_create_request() are now module-level
+    and used by both worker and reconciler (deterministic request so provider dedup holds); ports extended with OperationRepository.get_by_key
+    + list_in_flight and ServerRepository.list_provisioning (SQL implementations). 15 tests: same-key re-resolution (provider
+    called with [OP_KEY] only), never-a-new-key across a failed+retried re-send (two sends, one key), fresh in-flight skipped,
+    retryable requeue, permanent failure with hold release, missing server row, left-window refund, stuck-with-live-remote
+    to review, vanished-remote fail+refund, get-error left unchanged, missing-operation to review, fresh provisioning skipped,
+    missing-operation recreation, existing-pending left alone, non-positive timeout rejected. Full suite 582 passed.'
 - id: M07-004
   milestone: M07
   title: Implement provider action waiter strategy
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M07-002
@@ -761,24 +873,63 @@ tasks:
   milestone: M07
   title: Implement server state reconciliation
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M07-002
   acceptance:
   - Drift maps to safe state/manual review.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented server state reconciliation (M07-005). New domain primitives in modules/operations/domain.py:
+    ProviderServerState neutral enum (CREATING/RUNNING/STOPPED/DELETING/NOT_FOUND/UNKNOWN), lenient case-insensitive normalize_provider_status()
+    (keyword-based so it stays provider-neutral for Iranian providers too; unrecognized -> UNKNOWN), StateAction/StatePlan
+    and pure plan_state_repair(local, remote) with a full decision table: matching states -> NONE; PROVISIONING+creating ->
+    IN_PROGRESS (the waiter''s job); PROVISIONING+running / RUNNING+stopped / STOPPED+running -> REPAIR to the target local
+    state; provider deleting, unknown status, or vanished resource (NOT_FOUND) -> CONTAIN; deletion-flow local states are
+    out of scope (NONE). ServerStateReconciler (modules/operations/service.py) scans PROVISIONING+RUNNING+STOPPED servers
+    (snapshot lists), calls provider.get_server(provider_server_id) and applies the plan: CONSISTENT (no write), IN_PROGRESS
+    (no write), REPAIRED (row transition_to target + save + audit server.state_reconciled with from/to metadata), CONTAINED
+    (server.contain() -> MANUAL_REVIEW remembering contained_from + save + audit server.state_review), INCONCLUSIVE (provider
+    query error: retry next round, never assumed gone), SKIPPED (no provider id / unknown provider). It NEVER deletes or destroys
+    a provider resource - a vanished or deleting remote is contained for a human, never auto-deleted or marked DELETED. Compute
+    port gained list_running/list_stopped (SQL implemented). 39 tests: 13-case normalization table, 13-case pure plan table
+    (parametrized), 13 reconciler scenarios (consistent, running->stopped repair with audit metadata, stopped->running repair,
+    provisioning in-progress no-write, provisioning finished repair, provider-deleting contained with contained_from recorded,
+    vanished-resource contained NOT deleted, unknown-status contained, provider-error inconclusive, no-provider-id skipped,
+    unknown-provider skipped, deletion-flow not scanned, mixed batch counts). Full suite 621 passed.'
 - id: M07-006
   milestone: M07
   title: Implement power-on/off/reboot commands
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M07-005
   acceptance:
   - Ownership/capability/idempotency enforced.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented power-on/off/reboot commands (M07-006). PowerAction (power_on/power_off/reboot) with OperationType
+    rows POWER_ON/POWER_OFF/REBOOT and ledger keys power_{action}:{server_id}:{command_key} (unique per command key, 128-char
+    bound validated). PowerCommandService enforces the acceptance in the application layer: OWNERSHIP - server must belong
+    to the acting user, a foreign or missing server is indistinguishable (NotServerOwnerError ''server not found'', no op
+    row created); CAPABILITY - local state must allow the action (power_on only from STOPPED, power_off/reboot only from RUNNING;
+    MANUAL_REVIEW/ERROR/deletion states all rejected), the provider must be registered and advertise the POWER capability,
+    and the server must have a provider resource id; IDEMPOTENCY - one ledger operation per (action, server, command key);
+    the operation key is the IdempotencyKey sent to provider.power_on/power_off/reboot so a retry can never double-act. Replay
+    semantics resolve from the ledger BEFORE any state gate so a completed command stays idempotent after the state moved:
+    COMPLETED -> replayed result with no provider call; FAILED -> recorded error surfaced; IN_FLIGHT -> PowerOperationInProgressError;
+    PENDING -> claim (rowcount-gated) and execute inline. Provider success completes the operation with the correlation, transitions
+    the row (STOPPED->RUNNING / RUNNING->STOPPED; reboot unchanged) and audits server.powered_on/off / server.rebooted by
+    the acting USER; retryable provider errors requeue the operation (audit server.power_requeued, state untouched); permanent
+    errors fail it (audit server.power_failed). PowerOperationExecutor is shared by the command path (actor=USER) and the
+    worker path and re-guards the state at execution time: if the server left the expected state between intent creation and
+    execution the operation fails WITHOUT a provider call. ProvisioningWorker.process_pending_power(limit) claims PENDING
+    power operations (crash recovery + requeue retries) as SYSTEM actor and returns executed/requeued/failed/contended counts;
+    create operations are excluded from the power queue. 26 tests: ownership indistinguishability, missing server, 6 wrong-state
+    rejections, no-POWER-capability, unknown provider, missing provider id, empty key, execute-once with correlation + audit
+    actor, same-key replay with no second call, different key = new intent, in-flight rejection, retryable requeue, permanent
+    failure, failed-replay surfaces error, power_off state update, reboot no-op state, worker system-actor execution, requeue/failed/contended
+    counts, create-op exclusion. Full suite 647 passed.'
 - id: M07-007
   milestone: M07
   title: Implement delete-server saga
@@ -806,29 +957,58 @@ tasks:
   milestone: M07
   title: Implement orphan provider-resource detector
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M07-005
   acceptance:
   - Finds tagged provider resources absent from DB.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the orphan provider-resource detector (M07-009). OrphanDetector in modules/operations/service.py
+    scans every registered provider via the new CloudProvider.list_servers() port method (Hetzner adapter implements it with
+    page-based pagination over GET /servers) and flags provider servers carrying the platform_server_id label whose claimed
+    platform row has no DB record - i.e. resources the provider bills but the platform cannot bill to or manage (pure cost
+    leak). The label name is now a shared constant PLATFORM_SERVER_ID_LABEL used by build_create_request (worker/reconciler)
+    and the detector, so tag and scan cannot drift apart; the reader handles both top-level metadata and Hetzner''s metadata[''labels'']
+    nesting. A claimed id with a row in ANY state - including DELETED - is not an orphan (the deletion flow owns that row);
+    only a missing row (or an unparseable label, which is still reported so nothing is silently dropped) is flagged. The detector
+    NEVER deletes a provider resource: it reports the OrphanResource list (provider_key, provider_server_id, name, status,
+    claimed_server_id) and audits one provider.orphan_detected SYSTEM event per orphan with provider_key/claimed_server_id/status
+    metadata. A provider whose list_servers fails is logged and skipped without aborting the scan of other providers. 11 tests:
+    tagged-without-row orphan + audit event fields, tagged-with-RUNNING-row not orphan, tagged-with-DELETED-row not orphan,
+    untagged ignored, malformed label reported, blank label ignored, top-level label placement, provider error skipped not
+    fatal (other providers still scanned), multi-provider aggregation with correct provider keys, empty registry, and a delete
+    spy asserting the detector never calls delete_server. Full suite 658 passed.'
 - id: M07-010
   milestone: M07
   title: Implement missing-provider-resource detector
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M07-005
   acceptance:
   - Finds DB-active resources absent at provider.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the missing-provider-resource detector (M07-010). MissingResourceDetector in modules/operations/service.py
+    is the mirror of the orphan detector: it scans platform rows in active states (PROVISIONING, RUNNING, STOPPED - the states
+    in which a provider resource must exist) via the existing list_provisioning/list_running/list_stopped repository methods
+    and checks each server.provider_server_id with provider.get_server(). A server whose provider resource is absent (get_server
+    returns None) is reported as MissingResource (provider_key, provider_server_id, server_id, state) and audited as one provider.missing_resource_detected
+    SYSTEM event per finding (metadata provider_key/provider_server_id/state). Design boundary: the detector REPORTS and audits
+    only - it never changes server state (that is the M07-005 state reconciler''s job, which already contains NOT_FOUND drift
+    to MANUAL_REVIEW) and never deletes anything (delete-spy asserted zero in tests). Exclusions, all deliberate: REQUESTED
+    (not created yet - M07-003''s window), ERROR/MANUAL_REVIEW (already out of the healthy path), DELETE_REQUESTED/DELETING/DELETED
+    (absence expected during deletion); a server without a provider_server_id is skipped (nothing to check); a provider query
+    error is inconclusive (logged, counted, NOT reported as missing); an unknown provider key is skipped. 15 tests: running/stopped/provisioning
+    absent-found with audit fields, present-not-found, 6 non-active states not scanned (parametrized, zero provider calls),
+    missing provider id skipped, provider error inconclusive, unknown provider skipped, mixed batch only-missing reported,
+    and never-deletes with no state mutation (repo.saved empty, state unchanged). Full suite 673 passed.'
 - id: M07-011
   milestone: M07
   title: Implement per-account provisioning concurrency limit
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M03-003
@@ -840,7 +1020,7 @@ tasks:
   milestone: M08
   title: Design Telegram navigation/state machine
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M02-003
@@ -897,7 +1077,7 @@ tasks:
   milestone: M08
   title: Implement provisioning progress notifications
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M07-002
@@ -908,7 +1088,7 @@ tasks:
   milestone: M08
   title: Implement My Servers list/detail
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M07-005
@@ -965,40 +1145,66 @@ tasks:
   milestone: M09
   title: Finalize payment gateway port
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M05-002
   acceptance:
   - Gateway has create/verify/refund capability model.
-  evidence: []
+  evidence:
+  - '2026-08-22: Finalized PaymentGateway port in providers/base.py following the CloudProvider conventions: GatewayCapability
+    enum (create_payment/verify_payment/refund), PaymentStatus enum, frozen PaymentIntent and GatewayRefund value objects
+    with integer minor-unit amounts (never float) and 3-letter ISO-4217 currency validation, IdempotencyKey required on create/refund
+    so retries cannot double-charge or double-refund. CapabilityGatedGateway mixin structurally enforces the capability model
+    - non-advertised operations raise UnsupportedGatewayOperation before any I/O; advertised-but-unimplemented operations
+    fail loudly instead of silently no-oping. gateway_supports helper mirrors supports(). Exported via providers package __init__.
+    12 tests in test_payment_gateway.py covering capability gating, amount/currency validation, idempotency-derived ids, verify
+    of unknown payments; full suite 270 passed.'
 - id: M09-002
   milestone: M09
   title: Implement payment session persistence
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M09-001
   acceptance:
   - External IDs unique and stateful.
-  evidence: []
+  evidence:
+  - '2026-08-22: Implemented payment session persistence in new modules/payments module. Domain: frozen PaymentSession aggregate
+    (user_id, gateway_key, external gateway_payment_id, integer minor-unit amount with currency validation, idempotency_key)
+    with guarded state machine - mark_succeeded/mark_failed only from PENDING and both bind a non-empty external id; mark_credited
+    records ledger deposit posting and is only reachable from SUCCEEDED, giving webhook handlers an explicit dedup marker.
+    Persistence: payment_sessions model + migration 0006 with UNIQUE index on (gateway_key, gateway_payment_id) so replayed
+    callbacks cannot create duplicate sessions (Postgres NULL-distinct semantics allow pre-external-id sessions); SqlAlchemyPaymentSessionRepository
+    maps IntegrityError to DuplicateExternalIdError and offers create/get/get_by_external_id/save. 18 tests across domain
+    and repository; full suite 288 passed.'
 - id: M09-003
   milestone: M09
   title: Implement signed/replay-safe webhook endpoint
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M09-002
   acceptance:
   - Duplicate callback cannot duplicate deposit.
-  evidence: []
+  evidence:
+  - '2026-08-22: Implemented signed, replay-safe payment webhook endpoint. Core HMAC-SHA256 helpers in core/webhooks.py sign
+    and verify raw request bodies with per-gateway secrets using constant-time comparison (malformed/non-ASCII signatures
+    fail safely). FastAPI route POST /webhooks/payments/{gateway_key} resolves the gateway secret from settings (404 unknown
+    gateway), rejects missing/tampered signatures with 401 (tamper-evident: inflated amounts in the body fail the signature),
+    validates the JSON payload (400 on bad JSON/UUID/float amounts), and delegates to PaymentWebhookService. The service makes
+    a duplicate callback unable to duplicate the deposit: unique (gateway_key, external_id) session identity, deterministic
+    ledger key deposit-{gateway}-{external_id}, credited_at short-circuit before wallet I/O, ledger-entry existence check
+    before crediting, and tolerance of concurrent DuplicateIdempotencyError. Outcomes: credited / late_credit / duplicate_ignored
+    / failed_recorded. Container exposes get_payment_webhook_service DI. 30 tests: signature helpers, service replay matrix,
+    and TestClient endpoint integration including an actual replay delivery; full suite 318 passed.'
 - id: M09-004
   milestone: M09
   title: Integrate first Iranian payment gateway
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M09-003
@@ -1009,14 +1215,24 @@ tasks:
   milestone: M09
   title: Post successful payment to ledger
   priority: P0
-  status: blocked
+  status: done
   owner_hint: supervisor
   depends_on:
   - M09-003
   - M05-002
   acceptance:
   - Deposit exactly once.
-  evidence: []
+  evidence:
+  - '2026-08-22: Post successful payment to ledger is implemented by PaymentWebhookService._credit (built under M09-003).
+    Deposit exactly once is guaranteed by four layers: (1) unique (gateway_key, gateway_payment_id) payment-session identity
+    in the DB; (2) deterministic ledger idempotency key deposit-{gateway}-{external_id} so the append-only ledger itself dedupes;
+    (3) credited_at short-circuit - an already-credited session returns DUPLICATE_IGNORED before any wallet I/O; (4) ledger-entry
+    existence check (get_entry_by_idempotency) skips add_funds when the DEPOSIT entry already exists, plus tolerance of a
+    concurrent DuplicateIdempotencyError with the DB unique constraint as arbiter. Verified by 7 tests: duplicate success
+    callback does not re-credit, endpoint-level replay delivery credits the wallet exactly once (add_funds awaited once across
+    two deliveries), late credit for an uncredited succeeded session, ledger replay skips wallet debit, concurrent duplicate
+    ledger post tolerated, first callback credits, and existing pending session credited. Full suite 318 passed; ruff/mypy
+    clean.'
 - id: M09-006
   milestone: M09
   title: Implement payment status Telegram UX
@@ -1043,30 +1259,42 @@ tasks:
   milestone: M10
   title: Implement immutable audit repository
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M01-002
   acceptance:
   - Sensitive actions have actor/resource metadata.
-  evidence: []
+  evidence:
+  - '2026-08-22: Implemented append-only audit log. Domain: frozen AuditEvent dataclass (actor_type/actor_id/action/resource_type/resource_id/reason/metadata)
+    with ActorType enum and AuditRepository port (append/get_by_resource/get_by_actor). ORM model audit_events in db/base.py
+    with JSONB metadata column named event_metadata (metadata is reserved by declarative base). Migration 0005 adds table
+    + resource/actor indexes + Postgres trigger rejecting UPDATE/DELETE for true immutability. Repository exposes no mutation
+    operations by design. 13 tests in test_audit_domain.py and test_audit_repository.py; full suite 236 passed.'
 - id: M10-002
   milestone: M10
   title: Audit admin wallet/provider operations
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M10-001
   - M05-006
   acceptance:
   - Every mutation links to actor/reason.
-  evidence: []
+  evidence:
+  - '2026-08-22: Audit linkage made structural via AuditTrail facade in modules/audit/service.py: all services record mutations
+    through record_mutation which raises AuditError when an ADMIN-actor mutation lacks a non-empty reason, so no admin mutation
+    can reach the append-only log without actor+justification. WalletAdminService refactored onto the facade; new HoldAdminService.force_release
+    adds authorization (Permission.WALLET_ADJUST) plus audited forced hold release (action wallet.force_release with hold_id/amount/currency
+    metadata) - previously an unaudited admin wallet mutation; state conflicts propagate without audit writes. Provider provisioning
+    service does not exist yet; its future mutations are mandated to route through AuditTrail (port-level ops already require
+    idempotency keys). 9 tests added (5 facade + 4 force-release); full suite 258 passed.'
 - id: M10-003
   milestone: M10
   title: Implement provisioning quotas per user
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M07-001
@@ -1088,7 +1316,7 @@ tasks:
   milestone: M10
   title: Implement provider/location maintenance switches
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M04-007
@@ -1099,25 +1327,46 @@ tasks:
   milestone: M10
   title: Implement abuse case model/workflow
   priority: P0
-  status: blocked
+  status: done
   owner_hint: supervisor
   depends_on:
   - M10-001
   acceptance:
   - Provider resource maps quickly to responsible user.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented abuse case model/workflow in new modules/abuse module. Domain: ResourceRef (provider_key, provider_server/ipv4/ipv6,
+    resource_id), Ownership (user_id, server_id), AbuseCase aggregate with open -> investigating -> resolved/dismissed state
+    machine (terminal states reject all moves, resolved_at set on terminal), ResourceOwnershipResolver and AbuseCaseRepository
+    ports. SqlAlchemyOwnershipResolver maps a reported provider resource to the responsible user by provider name + server
+    table lookup on provider_server_id/ipv4/ipv6 (deleted servers still map). AbuseIntakeService.intake enforces admin:manage_users
+    for user reporters, raises ResourceNotManagedError for unmapped resources, creates the case carrying the user/server mapping,
+    and records an abuse.intake audit event (admin or system actor, user resource, reason, provider/resource metadata); transition()
+    drives audited state changes and rejects invalid moves before persistence. abuse_cases model + migration 0007 (user/status
+    indexes, cascade to users, set-null to servers). 32 tests across domain, resolver, and service; full suite 368 passed.'
 - id: M10-007
   milestone: M10
   title: Implement user freeze + resource containment command
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M10-006
   - M02-005
   acceptance:
   - Containment is audited and bounded.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented user freeze + resource containment command in new modules/containment module. Compute domain
+    extended: CONTAINABLE_STATES (provisioning/running/stopped/error/delete_requested/deleting), MANUAL_REVIEW now reachable
+    from running/stopped and releasable to every containable state, CloudServer.contained_from records the pre-containment
+    state, contain()/release() are exact and idempotent (double-contain returns original state; release without recorded prior
+    state raises). ContainmentService.contain_user: admin:manage_users gate, non-empty reason required, freezes active user
+    (banned skipped - already more strictly contained), moves every containable server to MANUAL_REVIEW (requested/deleted
+    skipped, never destroyed), idempotent replays emit no audit events; release_user reverses a freeze exactly (banned users
+    refused - release never reverses a ban). Every mutation audited via AuditTrail (user.freeze/server.contain/user.unfreeze/server.release)
+    with actor linkage, reason, and optional abuse case_id metadata. New SqlAlchemyServerRepository (compute) maps servers+providers
+    join, persists state/contained_from; servers.contained_from column added in migration 0008. 32 tests: transition matrix,
+    contain/release exactness and idempotency, service authorization, mixed-state containment, banned/skipped handling, system
+    vs admin actors, metadata linkage, frozen result; full suite 400 passed.'
 - id: M10-008
   milestone: M10
   title: Implement secret rotation workflow
@@ -1167,18 +1416,27 @@ tasks:
   milestone: M11
   title: Implement provider retry/backoff policy
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M04-009
   acceptance:
   - Retryable vs permanent errors explicit.
-  evidence: []
+  evidence:
+  - '2026-08-22: Implemented provider retry/backoff policy in providers/retry.py. Explicit classification: PERMANENT set (ProviderAuthError,
+    ProviderNotFound, ProviderConflict, UnsupportedGatewayOperation) is raised immediately with no retry; everything else
+    - known transient (ProviderRateLimited, ProviderUnavailable), timeouts, connection errors, unknowns - is RETRYABLE and
+    bounded by the attempt cap. RetryPolicy (max_attempts, base/max exponential delay, bounded jitter) validated in __post_init__;
+    RetryExecutor.execute retries only retryable errors, honors a ProviderRateLimited reset_at_unix window (clamped to max_delay),
+    applies exponential backoff with optional deterministic jitter, and propagates the last error on exhaustion. Sleep/clock/rng
+    injectable for deterministic tests. Exported via providers package __init__. 18 tests covering classification matrix,
+    policy validation, first-try success, retry-then-success, immediate permanent propagation, exhaustion, reset-window delays,
+    max-delay clamping, jitter bounds, and seed-independence at zero jitter; full suite 336 passed.'
 - id: M11-004
   milestone: M11
   title: Implement dead-letter/manual-review tooling
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M07-005
@@ -1323,7 +1581,7 @@ tasks:
   milestone: M13
   title: Implement SSH key CRUD/sync
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M07-005
@@ -1356,7 +1614,7 @@ tasks:
   milestone: M13
   title: Implement snapshots
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M06-002
@@ -1367,7 +1625,7 @@ tasks:
   milestone: M13
   title: Implement backups toggle
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M06-002
@@ -1378,7 +1636,7 @@ tasks:
   milestone: M13
   title: Implement firewall management
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M07-005
@@ -1389,7 +1647,7 @@ tasks:
   milestone: M13
   title: Implement rDNS
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M07-005
@@ -1400,7 +1658,7 @@ tasks:
   milestone: M13
   title: Implement Primary/Floating IP features
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M07-005
@@ -1411,7 +1669,7 @@ tasks:
   milestone: M13
   title: Implement volumes
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M07-005
@@ -1422,7 +1680,7 @@ tasks:
   milestone: M13
   title: Implement private networks
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M07-005
@@ -1457,7 +1715,7 @@ tasks:
   milestone: M14
   title: Implement admin API
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M10-001

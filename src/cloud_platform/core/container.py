@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from cloud_platform.core.config import get_settings
 from cloud_platform.db.session import SessionFactory, get_session
+from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeAllocator
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
@@ -158,3 +159,20 @@ async def get_provider_allocator() -> CompositeAllocator:
     allocator = container.provider_allocator
     assert isinstance(allocator, CompositeAllocator)
     return allocator
+
+
+async def get_payment_webhook_service() -> PaymentWebhookService:
+    """FastAPI dependency for the replay-safe payment webhook service."""
+    from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
+    from cloud_platform.modules.payments.service import PaymentWebhookService
+    from cloud_platform.modules.wallet.repository import (
+        SqlAlchemyLedgerRepository,
+        SqlAlchemyWalletRepository,
+    )
+
+    container = await get_container()
+    return PaymentWebhookService(
+        payments_repo=SqlAlchemyPaymentSessionRepository(container.session_factory),
+        wallet_repo=SqlAlchemyWalletRepository(container.session_factory),
+        ledger_repo=SqlAlchemyLedgerRepository(container.session_factory),
+    )
