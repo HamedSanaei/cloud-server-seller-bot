@@ -91,6 +91,9 @@ class FakeOpRepo:
     async def save(self, operation: Operation) -> Operation:
         return operation
 
+    async def list_in_flight(self, operation_type: OperationType) -> list[Operation]:
+        return []
+
 
 class FakeServerRepo:
     def __init__(

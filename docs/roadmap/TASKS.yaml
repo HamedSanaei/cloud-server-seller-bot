@@ -457,7 +457,7 @@ tasks:
   milestone: M04
   title: Implement catalog sync job with lock
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M04-002
@@ -465,7 +465,22 @@ tasks:
   - M04-004
   acceptance:
   - Concurrent syncs cannot corrupt catalog.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the catalog sync job with lock (M04-006). Domain (modules/catalog/domain.py): CatalogSyncLock
+    protocol (guard() async context manager yielding whether the lock was won), CatalogSyncStep (named async step), CatalogSyncStepReport
+    and CatalogSyncRunReport, and CatalogSyncJob which runs all steps exclusively under the lock: the loser of the race skips
+    the entire run (no partial writes), a step that raises is recorded as a failed step report and the run continues (next
+    scheduled run retries), and the lock is always released. Adapter (modules/catalog/repository.py): PostgresAdvisoryCatalogSyncLock
+    uses pg_try_advisory_lock/pg_advisory_unlock with a stable uuid5-derived 64-bit key; acquire and release happen on the
+    SAME session held open for the whole guarded interval (Postgres binds session advisory locks to the acquiring backend),
+    with session close as the crash backstop. Wiring (providers/hetzner/sync.py): build_catalog_sync_job(syncer, lock) adapts
+    the existing paginated sync_locations/sync_plans/sync_images into three domain steps under one lock hold. 11 tests: steps
+    run in order under the lock with release, held lock skips the entire run with zero writes, failing step recorded while
+    the run continues, lock released when every step fails, empty steps rejected, advisory lock acquire-true unlocks on the
+    same session (statement order + identity asserted), acquire-false never unlocks, unlock still runs when guarded code raises,
+    the acceptance proof (two jobs racing through an advisory-style lock: exactly one ran, the other skipped, every step executed
+    exactly once, catalog left in a consistent complete state), and the builder wires all three steps reusing one lock hold.
+    Full suite 707 passed.'
 - id: M04-007
   milestone: M04
   title: Implement sellable-offer enable/disable
@@ -700,19 +715,34 @@ tasks:
   milestone: M06
   title: Implement usage segment calculator
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M06-002
   - M06-003
   acceptance:
   - Boundary/rounding tests cover partial quantum.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the usage segment calculator in modules/billing/domain.py (M06-004). calculate_usage_segments(started_at,
+    ended_at, schedule) splits a usage window into quantum-grid slices and prices each one: boundaries are the window start,
+    every UTC-aligned quantum-grid instant strictly inside (floor(epoch/quantum)*quantum, so hour/minute/day policies share
+    one code path), and the window end. Each slice is charged with the existing calculate_usage_charge primitive (ceiling
+    rounding: a partial quantum bills as a full one, floored by the policy minimum per slice) at the price from the PricedPeriod
+    schedule whose effective_from covers the slice start, so a price change applies from the next grid boundary - never mid-slice.
+    Zero-length window yields no segments and the minimum-quantum floor never fires on an empty window. Validation: tz-aware
+    required on all datetimes, ended>=started, non-empty ascending schedule, and a window before the first priced period raises.
+    sum_segments aggregates quanta/cost/charge with a currency-mismatch guard. 23 boundary/rounding tests (the acceptance
+    line) cover: sub-quantum slice bills one full quantum, 1h01m over two grid hours bills 3, exact-grid window bills exact
+    quanta with no zero-length prefix or tail, zero-length window empty, end-on-grid included in last slice, day-quantum midnight
+    span (23:50 to 00:10) bills two full days, 45s of a minute quantum bills one, segment contiguity/coverage, grid-aligned
+    total equals the flat single-interval charge, price change from next grid boundary with exact per-segment amounts, mid-slice
+    price step defers to the boundary, per-segment minimum floor, non-UTC offset (Tehran +3:30) normalized to the UTC grid,
+    and all validation errors. Full suite 696 passed.'
 - id: M06-005
   milestone: M06
   title: Implement periodic accrual job
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M05-002
@@ -758,7 +788,7 @@ tasks:
   milestone: M06
   title: Add monthly-cap support per price policy
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M06-004
@@ -1008,31 +1038,56 @@ tasks:
   milestone: M07
   title: Implement per-account provisioning concurrency limit
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M03-003
   - M07-002
   acceptance:
   - Protects provider quota/rate limit.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the per-account provisioning concurrency limit (M07-011). ProvisioningWorker takes concurrency_limit
+    (default 3, must be >= 1) and run_once now snapshots the in-flight SERVER_CREATE operations once per run (_in_flight_counts_by_account
+    maps provider_key,provider_account_id to counts by resolving each op''s server row; ops whose server row is gone do not
+    occupy quota) and skips any candidate whose account would exceed the cap with the new ProvisioningOutcome.SKIPPED_RATE_LIMITED.
+    The gate is (existing_in_flight + 1) > limit: parallel worker runs cannot push one provider account past its quota/rate
+    limit, and because the run processes servers sequentially (each op completes before the next starts) at most one extra
+    slot is ever in use from the run itself. The skipped server keeps its REQUESTED state and its pending op, so the next
+    run retries it once a slot frees. 10 tests: account at limit skips its candidate while another account proceeds, zero
+    remaining slots skips all, sequential run never exceeds the limit (provider-call concurrency tracked: pre-existing 1 +
+    run max 1 <= 2), accounts limited independently (no shared pool), in-flight op for a deleted row does not count, sequential
+    run with limit 1 still provisions every candidate, power ops in flight are not counted as create concurrency, invalid
+    limit rejected, default limit 3 honored, limit=0 short-circuits. Also added list_in_flight to the existing worker test''s
+    FakeOpRepo (port compliance). Full suite 717 passed.'
 - id: M08-001
   milestone: M08
   title: Design Telegram navigation/state machine
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M02-003
   - M04-007
   acceptance:
   - Flows have stable callbacks and cancel/back behavior.
-  evidence: []
+  evidence:
+  - '2026-08-23: Designed the Telegram navigation/state machine (M08-001) as a framework-free domain module (modules/navigation):
+    NavScreen (flow,name) with MAIN and DONE singletons; entry flows buy/servers/wallet/recharge with start_flow; an explicit
+    per-screen transition table (NavAction vocabulary: back/cancel/select/open/confirm/history/delete/power_on/power_off/reboot)
+    so undeclared actions raise InvalidNavigationTransition; cancel reaches MAIN from every screen except MAIN and DONE; back
+    is declared per screen (entry screens back to MAIN, done is terminal); all_sheets/all_screens helpers. Stable tamper-resistant
+    callbacks: wire form v1|flow:screen:arg...|hmac-sha256-16, deterministic (same inputs -> same string), fields restricted
+    to [A-Za-z0-9._-]+, constant-time signature check; decode_callback rejects malformed shapes, unsupported versions, signature
+    mismatch, wrong key, and invalid fields with CallbackError. 40 tests: roundtrips (with/without args), stability, wire
+    form, tampered flow/arg/signature rejected, wrong key/version rejected, 8 malformed strings rejected, empty signing key
+    rejected, invalid fields rejected on encode, flow starts, full purchase forward path, back at each step, cancel from every
+    screen, back on every non-entry screen, entry back to main, 7 undeclared-action rejections, server detail power/delete
+    paths, wallet history roundtrip, recharge flow, and decode-yields-navigable-screen integration. Full suite 757 passed.'
 - id: M08-002
   milestone: M08
   title: Implement catalog country/location view
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M08-001

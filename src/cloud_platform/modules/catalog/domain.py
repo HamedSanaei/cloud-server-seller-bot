@@ -11,10 +11,15 @@ absent is it derived as ``monthly / HOURS_PER_MONTH`` with ``ROUND_HALF_UP``.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Protocol
 from uuid import UUID
+
+logger = logging.getLogger(__name__)
 
 # Billing-hours basis used to derive an hourly price from a monthly one.
 HOURS_PER_MONTH: Decimal = Decimal(720)
@@ -210,3 +215,92 @@ class CatalogRepository(Protocol):
             LookupError: If the combination does not exist.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Catalog sync job with lock (M04-006)
+# ---------------------------------------------------------------------------
+
+
+class CatalogSyncLock(Protocol):
+    """Port for a lock that serializes catalog sync runs.
+
+    ``guard`` yields True when the lock was acquired and False when another
+    sync already holds it. The implementation must keep the lock held for the
+    whole duration of the context and release it on exit (including errors).
+    """
+
+    def guard(self) -> AbstractAsyncContextManager[bool]:
+        """Enter the sync critical section; yields whether the lock was won."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSyncStepReport:
+    """Outcome of one sync step (e.g. locations, plans, images)."""
+
+    name: str
+    fetched: int = 0
+    upserted: int = 0
+    skipped: int = 0
+    errors: tuple[str, ...] = ()
+    error: str | None = None  # step-level failure, when the step raised
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSyncRunReport:
+    """Outcome of one catalog sync job run."""
+
+    ran: bool
+    steps: tuple[CatalogSyncStepReport, ...] = ()
+    reason: str | None = None  # set when the run was skipped (lock held)
+
+    @property
+    def skipped(self) -> bool:
+        return not self.ran
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSyncStep:
+    """One named sync unit the job executes while holding the lock."""
+
+    name: str
+    run: Callable[[], Awaitable[CatalogSyncStepReport]]
+
+
+class CatalogSyncJob:
+    """Runs catalog sync steps exclusively under a lock.
+
+    The lock makes concurrent syncs serialize: the loser skips the whole run
+    (no partial writes), so two syncs can never interleave their upserts and
+    corrupt the catalog. A step that raises is recorded as a failed step
+    report (the run continues with the remaining steps — the next scheduled
+    run retries the failed unit) and the lock is always released.
+    """
+
+    def __init__(
+        self,
+        lock: CatalogSyncLock,
+        steps: tuple[CatalogSyncStep, ...] | list[CatalogSyncStep],
+    ) -> None:
+        if not steps:
+            raise ValueError("a catalog sync job needs at least one step")
+        self._lock = lock
+        self._steps = tuple(steps)
+
+    async def run(self) -> CatalogSyncRunReport:
+        """Execute the sync, or skip it when another sync holds the lock."""
+        async with self._lock.guard() as acquired:
+            if not acquired:
+                return CatalogSyncRunReport(
+                    ran=False,
+                    reason="catalog sync lock is held by another sync",
+                )
+            reports: list[CatalogSyncStepReport] = []
+            for step in self._steps:
+                try:
+                    reports.append(await step.run())
+                except Exception as exc:
+                    logger.exception("catalog sync step %r failed", step.name)
+                    reports.append(CatalogSyncStepReport(name=step.name, error=str(exc)))
+            return CatalogSyncRunReport(ran=True, steps=tuple(reports))

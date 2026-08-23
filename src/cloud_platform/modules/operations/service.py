@@ -125,6 +125,7 @@ class ProvisioningOutcome(StrEnum):
     SKIPPED_STATE = "skipped_state"
     REQUEUED = "requeued"
     FAILED = "failed"
+    SKIPPED_RATE_LIMITED = "skipped_rate_limited"
 
 
 class ProvisioningWorker:
@@ -141,7 +142,10 @@ class ProvisioningWorker:
         hold_repo: HoldRepository,
         audit_repo: AuditRepository,
         power_executor: PowerOperationExecutor | None = None,
+        concurrency_limit: int = 3,
     ) -> None:
+        if concurrency_limit < 1:
+            raise ValueError("concurrency_limit must be at least 1")
         self._ops = operation_repo
         self._servers = server_repo
         self._registry = provider_registry
@@ -149,6 +153,7 @@ class ProvisioningWorker:
         self._wallets = wallet_repo
         self._holds = hold_repo
         self._audit = AuditTrail(audit_repo)
+        self._concurrency_limit = concurrency_limit
         self._power = power_executor or PowerOperationExecutor(
             operation_repo=operation_repo,
             server_repo=server_repo,
@@ -259,13 +264,44 @@ class ProvisioningWorker:
         return ProvisioningOutcome.PROVISIONED
 
     async def run_once(self, limit: int = 10) -> dict[ProvisioningOutcome, int]:
-        """Process up to ``limit`` REQUESTED servers; returns outcome counts."""
+        """Process up to ``limit`` REQUESTED servers; returns outcome counts.
+
+        Per-account concurrency is capped at ``concurrency_limit``: a server
+        is skipped (``SKIPPED_RATE_LIMITED``) when its provider account
+        already has that many in-flight create operations, so parallel worker
+        runs cannot push a provider past its quota/rate limit. The count is a
+        fresh snapshot of IN_FLIGHT create ops taken once at the start of the
+        run; the run itself processes servers sequentially (each op completes
+        before the next starts), so at most one extra slot is in use.
+        """
         if limit <= 0:
             return {}
         counts: dict[ProvisioningOutcome, int] = {}
-        for server in (await self._servers.list_requested())[:limit]:
+        candidates = (await self._servers.list_requested())[:limit]
+        if not candidates:
+            return counts
+        in_flight_counts = await self._in_flight_counts_by_account()
+        for server in candidates:
+            account = (server.provider_key, server.provider_account_id)
+            if in_flight_counts.get(account, 0) + 1 > self._concurrency_limit:
+                counts[ProvisioningOutcome.SKIPPED_RATE_LIMITED] = (
+                    counts.get(ProvisioningOutcome.SKIPPED_RATE_LIMITED, 0) + 1
+                )
+                continue
             outcome = await self.process_server(server.id)
             counts[outcome] = counts.get(outcome, 0) + 1
+        return counts
+
+    async def _in_flight_counts_by_account(self) -> dict[tuple[str, UUID], int]:
+        """Map (provider_key, provider_account_id) -> in-flight create ops."""
+        in_flight = await self._ops.list_in_flight(OperationType.SERVER_CREATE)
+        counts: dict[tuple[str, UUID], int] = {}
+        for op in in_flight:
+            server = await self._servers.get(op.resource_id)
+            if server is None:
+                continue  # row gone (deletion); not occupying provider quota
+            account = (server.provider_key, server.provider_account_id)
+            counts[account] = counts.get(account, 0) + 1
         return counts
 
     async def process_pending_power(self, limit: int = 10) -> dict[str, int]:

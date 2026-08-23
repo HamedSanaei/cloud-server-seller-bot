@@ -10,11 +10,11 @@ step.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import Catalog as _CatalogModel
@@ -23,6 +23,12 @@ from cloud_platform.modules.catalog.domain import CatalogEntrySpec, OfferRef, Of
 
 #: Namespace for deriving stable provider UUIDs from provider keys.
 _PROVIDER_UUID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:provider")
+
+#: Stable big-int key for the catalog sync advisory lock (Postgres 64-bit).
+_CATALOG_SYNC_LOCK_KEY = int.from_bytes(
+    uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:catalog-sync-lock").bytes[:8],
+    "big",
+)
 
 
 def provider_key_to_uuid(provider_key: str) -> uuid.UUID:
@@ -164,3 +170,40 @@ class SqlAlchemyCatalogRepository:
 
             await session.commit()
             return created
+
+
+class PostgresAdvisoryCatalogSyncLock:
+    """Catalog sync lock backed by a Postgres session-level advisory lock.
+
+    ``pg_try_advisory_lock`` is non-blocking: it returns True when this
+    backend acquires the lock and False when another backend holds it, which
+    serializes concurrent sync jobs across the whole process pool. The
+    advisory lock is bound to the backend (connection) that acquires it, so
+    the SAME session acquires and releases it and stays open for the whole
+    guarded interval; closing the session is a backstop that releases any
+    lock a crashed run left behind.
+    """
+
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+        key: int = _CATALOG_SYNC_LOCK_KEY,
+    ) -> None:
+        self._session_factory = session_factory
+        self._key = key
+
+    @asynccontextmanager
+    async def guard(self) -> AsyncIterator[bool]:
+        """Yield True if the lock was acquired; always releases on exit."""
+        async with self._session_factory() as session:
+            result = await session.execute(
+                text("SELECT pg_try_advisory_lock(:key)"), {"key": self._key}
+            )
+            acquired = bool(result.scalar_one())
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    await session.execute(
+                        text("SELECT pg_advisory_unlock(:key)"), {"key": self._key}
+                    )

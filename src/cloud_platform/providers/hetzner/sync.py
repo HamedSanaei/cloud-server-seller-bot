@@ -20,7 +20,14 @@ from cloud_platform.db.base import (
     Catalog,
     Provider,
 )
-from cloud_platform.modules.catalog.domain import PlanPricing, ProviderPriceEntry
+from cloud_platform.modules.catalog.domain import (
+    CatalogSyncJob,
+    CatalogSyncLock,
+    CatalogSyncStep,
+    CatalogSyncStepReport,
+    PlanPricing,
+    ProviderPriceEntry,
+)
 from cloud_platform.modules.catalog.repository import SqlAlchemyCatalogRepository
 from cloud_platform.modules.catalog.service import PricingIngestionService
 from cloud_platform.providers.errors import (
@@ -482,3 +489,34 @@ def _error_message(response: httpx.Response) -> str:
         return str(error.get("message") or error.get("code") or response.text)
     except Exception:
         return response.text or f"HTTP {response.status_code}"
+
+
+def build_catalog_sync_job(syncer: HetznerCatalogSyncer, lock: CatalogSyncLock) -> CatalogSyncJob:
+    """Wire the Hetzner syncer's steps into a locked catalog sync job (M04-006).
+
+    Each step is the syncer's paginated sync method adapted to the domain's
+    step report; the job holds the lock across all three, so concurrent
+    invocations serialize instead of interleaving their upserts.
+    """
+
+    def _step(name: str, method: Callable[[], Any]) -> CatalogSyncStep:
+        async def run() -> CatalogSyncStepReport:
+            result: SyncResult = await method()
+            return CatalogSyncStepReport(
+                name=name,
+                fetched=result.total_fetched,
+                upserted=result.total_upserted,
+                skipped=result.total_skipped,
+                errors=tuple(result.errors),
+            )
+
+        return CatalogSyncStep(name=name, run=run)
+
+    return CatalogSyncJob(
+        lock,
+        (
+            _step("locations", syncer.sync_locations),
+            _step("plans", syncer.sync_plans),
+            _step("images", syncer.sync_images),
+        ),
+    )
