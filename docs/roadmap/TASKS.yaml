@@ -3329,11 +3329,28 @@ tasks:
   milestone: M16
   title: Run disaster/cost runaway game day
   priority: P1
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M11-008
   - M10-004
   acceptance:
   - Kill switches and recovery proven.
-  evidence: []
+  evidence:
+  - '2026-08-24: Disaster/cost runaway game day (M16-008); acceptance ''Kill switches and recovery proven'' holds. RUNBOOK
+    docs/ops/game_day.md documents roles (drill lead/operator/scribe), three scenario injects each with KILL SWITCH + RECOVERY
+    sections, explicit pass criteria (kill switch engages without DB edits; no money moved or double-acted during incident;
+    recovery via documented commands only; every operator action audited with a reason), and a manual staging replay checklist
+    referencing the chaos transport from M11-009. AUTOMATED DRILL tests/unit/test_game_day.py replays the scenarios in CI
+    against real service logic (fakes only at repo boundaries). SCENARIO 1 COST RUNAWAY: fleet accrues 900 EUR vs a 500 EUR
+    global daily cap - CostCircuitBreakerService.check returns the tripped CostLimitTrigger naming the scope, new orders are
+    refused via the breaker gate before any hold, then the operator RAISES the cap and check returns None - ordering resumes
+    with no restart since the breaker reads live accruals. SCENARIO 2 PROVIDER INCIDENT: MaintenanceSwitchService blocks hetzner
+    with reason INC-42 (audited SYSTEM actor, reason carried on the event), is_order_blocked true for that provider only (arvancloud
+    unaffected), unblock with its own audited reason lifts the switch (repo removal asserted), second unblock is a no-op.
+    SCENARIO 3 OPERATION LOSS DURING OUTAGE: a confirmed rebuild hits ProviderUnavailable -> operation requeued under its
+    ORIGINAL ledger key with attempts incremented; duplicate client request during outage creates NO second operation; after
+    the provider heals RebuildWorker drains the queue to COMPLETED using deterministic image lookup; total provider calls
+    = failed attempt + duplicate-request retry + recovered worker attempt = 3, all with the SAME image; completed command
+    then replays with zero further provider calls - nothing lost, nothing double-acted. Full gates: ruff format/check clean,
+    mypy clean (127 files), 1700 passed 11 skipped, provider-branching gate 73 modules clean.'
