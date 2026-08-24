@@ -28,6 +28,7 @@ from cloud_platform.modules.credentials.service import CredentialRotationService
 from cloud_platform.modules.firewalls.repository import SqlAlchemyFirewallRepository
 from cloud_platform.modules.firewalls.service import FirewallService
 from cloud_platform.modules.networking.ip_service import IpService
+from cloud_platform.modules.networking.network_service import NetworkService
 from cloud_platform.modules.networking.volume_service import VolumeService
 from cloud_platform.modules.operations.service import PowerCommandService
 from cloud_platform.modules.payments.service import PaymentWebhookService
@@ -150,6 +151,19 @@ class Container:
 
         return VolumeService(
             repo=SqlAlchemyVolumeRepository(self.session_factory),
+            audit_repo=_audit_repository(self.session_factory),
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+        )
+
+    def network_service(self) -> NetworkService:
+        """Ownership-scoped private-network lifecycle service (M13-010)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.networking.network_repository import (
+            SqlAlchemyNetworkRepository,
+        )
+
+        return NetworkService(
+            repo=SqlAlchemyNetworkRepository(self.session_factory),
             audit_repo=_audit_repository(self.session_factory),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
         )

@@ -933,3 +933,28 @@ class VolumeRow(Base):
     location_id = Column(String(32), nullable=True)
     server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+
+
+class NetworkRow(Base):
+    """A user-owned private network (M13-010).
+
+    ``ip_range`` is the canonical RFC-1918 CIDR; ``server_ids`` (JSONB
+    array of platform server UUIDs) tracks current membership and is kept
+    in step with the provider's attach/detach actions.
+    """
+
+    __tablename__ = "networks"
+    __table_args__ = (
+        UniqueConstraint("provider_key", "provider_network_id", name="uq_networks_provider"),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    provider_account_id = Column(PG_UUID, nullable=False)
+    provider_key = Column(String(32), nullable=False)
+    provider_network_id = Column(String(64), nullable=False)
+    name = Column(String(64), nullable=False)
+    ip_range = Column(String(32), nullable=False)
+    server_ids = Column(JSONB, nullable=False, server_default="[]")
+    location_id = Column(String(32), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")

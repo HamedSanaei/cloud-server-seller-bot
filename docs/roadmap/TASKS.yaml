@@ -2861,13 +2861,27 @@ tasks:
   milestone: M13
   title: Implement private networks
   priority: P2
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M07-005
   acceptance:
   - Network lifecycle and capabilities.
-  evidence: []
+  evidence:
+  - '2026-08-24: Private networks (M13-010); acceptance ''Network lifecycle and capabilities'' holds. DOMAIN: NEW modules/networking/networks.py
+    Network validates the CIDR strictly (ipaddress strict=False masking to canonical network, IPv4-only, RFC-1918 private
+    enforced - public 8.8.8.0/24 rejected) and name length. LIFECYCLE PROVEN BY TESTS in test_networks.py: create is self-service
+    only (foreign actor reads as missing), quota''d (max_networks_per_user), audited network.created with canonical range;
+    attach_server requires owning BOTH the network AND the target server (stranger servers read as missing) and is IDEMPOTENT
+    for an already-joined member (zero extra provider calls); detach of a non-member is a no-op without provider calls while
+    a real member leaves with a detach call; delete drops the local row and is 404-idempotent at the provider (second delete
+    reads as missing). Every mutation audited as USER actor (network.created/server_attached/server_detached/deleted). CAPABILITIES:
+    network_port_of probe requires all four methods on optional provider.networks attribute (half-ported adapters and providers
+    without the attribute rejected) - no per-provider branches anywhere (gate scans 91 modules clean). HetznerNetworkApi maps
+    POST /networks {name,ip_range}, actions/attach_to_network + detach_from_network {server}, DELETE idempotent via ProviderNotFound
+    catch (create endpoint test with fake transport). PERSISTENCE: NetworkRow + migration 0028_add_networks (unique provider_key+provider_network_id,
+    JSONB server_ids membership; smoke head bumped to 0028, migration gate passed). Container network_service() wired. Full
+    gates: ruff format/check clean, mypy clean (145 files), 1776 passed 11 skipped.'
 - id: M14-001
   milestone: M14
   title: Define customer REST API v1

@@ -62,8 +62,7 @@ class ProviderVolumePort(Protocol):
 
 
 class ServerLookupPort(Protocol):
-    async def get(self, server_id: UUID) -> Any:
-        ...
+    async def get(self, server_id: UUID) -> Any: ...
 
 
 def volume_port_of(provider: object) -> ProviderVolumePort | None:

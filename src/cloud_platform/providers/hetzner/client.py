@@ -202,6 +202,45 @@ class HetznerVolumeApi:
         return out
 
 
+class HetznerNetworkApi:
+    """Private-network lifecycle against the Hetzner Cloud API (M13-010).
+
+    ``GET/POST /networks`` (``{"name","ip_range"}``),
+    ``POST /networks/{id}/actions/attach_to_network`` and
+    ``.../detach_from_network`` with ``{"server": id}``,
+    ``DELETE /networks/{id}`` (404-idempotent).
+    """
+
+    def __init__(self, provider: HetznerCloudProvider) -> None:
+        self._provider = provider
+
+    async def create_network(self, name: str, ip_range: str) -> str:
+        payload = await self._provider._request(
+            "POST", "/networks", json={"name": name, "ip_range": ip_range}
+        )
+        return str(payload["network"]["id"])
+
+    async def attach_server(self, provider_network_id: str, provider_server_id: str) -> None:
+        await self._provider._request(
+            "POST",
+            f"/networks/{provider_network_id}/actions/attach_to_network",
+            json={"server": int(provider_server_id)},
+        )
+
+    async def detach_server(self, provider_network_id: str, provider_server_id: str) -> None:
+        await self._provider._request(
+            "POST",
+            f"/networks/{provider_network_id}/actions/detach_from_network",
+            json={"server": int(provider_server_id)},
+        )
+
+    async def delete_network(self, provider_network_id: str) -> None:
+        try:
+            await self._provider._request("DELETE", f"/networks/{provider_network_id}")
+        except ProviderNotFound:
+            return  # already gone - deletion is idempotent
+
+
 class HetznerSshKeyApi:
     """SSH-key management against the Hetzner Cloud API (M13-001).
 
@@ -283,6 +322,7 @@ class HetznerCloudProvider:
         self.firewalls = HetznerFirewallApi(self)
         self.floating_ips = HetznerFloatingIpApi(self)
         self.volumes = HetznerVolumeApi(self)
+        self.networks = HetznerNetworkApi(self)
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
