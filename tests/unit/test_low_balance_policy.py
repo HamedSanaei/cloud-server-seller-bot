@@ -113,6 +113,7 @@ class Fakes:
         self.balances = balances
         self.saved: list[CloudServer] = []
         self.notified: list[tuple[UUID, UUID, LowBalanceDecision, int]] = []
+        self.episodes: list[object] = []
 
     async def list_running(self) -> list[CloudServer]:
         return list(self.servers)
@@ -124,8 +125,9 @@ class Fakes:
     async def wallet_get(self, user_id) -> Wallet | None:
         return Wallet(USER_ID, id=WALLET_ID, balance=self.balances.get(user_id, 0))
 
-    async def notify(self, user_id, server_id, decision, balance_minor) -> None:
+    async def notify(self, user_id, server_id, decision, balance_minor, episode=None) -> None:
         self.notified.append((user_id, server_id, decision, balance_minor))
+        self.episodes.append(episode)
 
 
 def _service(fakes: Fakes) -> LowBalancePolicyService:
@@ -163,6 +165,7 @@ class TestServiceStateMachine:
         assert s.low_balance_since == T0
         assert len(fakes.saved) == 1
         assert fakes.notified == [(USER_ID, SERVER_ID, LowBalanceDecision.WARN, 400)]
+        assert fakes.episodes == [T0]  # the new watermark is the episode id
         assert s.state is ServerLifecycleState.RUNNING
 
     async def test_within_grace_is_silent(self) -> None:
@@ -183,6 +186,7 @@ class TestServiceStateMachine:
         assert report.auto_delete == 1
         assert s.state is ServerLifecycleState.DELETE_REQUESTED  # the saga takes over
         assert fakes.notified == [(USER_ID, SERVER_ID, LowBalanceDecision.AUTO_DELETE, 400)]
+        assert fakes.episodes == [T0]  # the existing watermark identifies the episode
         assert len(fakes.saved) == 1
 
     async def test_recovery_clears_watermark(self) -> None:
@@ -193,7 +197,10 @@ class TestServiceStateMachine:
         assert report.recovered == 1
         assert s.low_balance_since is None
         assert len(fakes.saved) == 1
-        assert fakes.notified == []
+        # M08-011: the recovery closes the episode and is notified with the
+        # cleared watermark as its episode id.
+        assert fakes.notified == [(USER_ID, SERVER_ID, LowBalanceDecision.RECOVERED, 5000)]
+        assert fakes.episodes == [T0]
         assert s.state is ServerLifecycleState.RUNNING
 
     async def test_no_wallet_counts_as_below_threshold(self) -> None:

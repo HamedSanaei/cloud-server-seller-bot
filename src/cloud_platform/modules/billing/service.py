@@ -751,10 +751,22 @@ def decide_low_balance(
 
 
 class BalanceNotifier(Protocol):
-    """Port for user notification of balance decisions (bot/API later)."""
+    """Port for user notification of balance decisions.
+
+    ``episode`` is the low-balance watermark for the decision: the new
+    watermark on WARN, the existing one on AUTO_DELETE, and the cleared one
+    on RECOVERED. Deduplicating implementations (M08-011's
+    :class:`~cloud_platform.modules.notifications.domain.LowBalanceNotifier`)
+    key notifications by (server, level, episode).
+    """
 
     async def notify(
-        self, user_id: UUID, server_id: UUID, decision: LowBalanceDecision, balance_minor: int
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        decision: LowBalanceDecision,
+        balance_minor: int,
+        episode: datetime | None = None,
     ) -> None:
         """Inform the user about ``decision`` for their server."""
         ...
@@ -764,14 +776,20 @@ class _LoggingNotifier:
     """Default notifier: structured log line (the bot integration replaces it)."""
 
     async def notify(
-        self, user_id: UUID, server_id: UUID, decision: LowBalanceDecision, balance_minor: int
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        decision: LowBalanceDecision,
+        balance_minor: int,
+        episode: datetime | None = None,
     ) -> None:
         logger.warning(
-            "low balance decision %s for server %s (user %s, balance %s)",
+            "low balance decision %s for server %s (user %s, balance %s, episode %s)",
             decision.value,
             server_id,
             user_id,
             balance_minor,
+            episode.isoformat() if episode is not None else "-",
         )
 
 
@@ -870,12 +888,25 @@ class LowBalancePolicyService:
 
         if decision is LowBalanceDecision.WARN:
             server.low_balance_since = now
-            await self._notifier.notify(server.user_id, server.id, decision, balance)
+            await self._notifier.notify(server.user_id, server.id, decision, balance, episode=now)
         elif decision is LowBalanceDecision.RECOVERED:
+            # The episode's watermark (cleared now) identifies the episode
+            # the recovery closes, so its notification deduplicates too.
+            episode = server.low_balance_since
             server.low_balance_since = None
+            if episode is not None:
+                await self._notifier.notify(
+                    server.user_id, server.id, decision, balance, episode=episode
+                )
         elif decision is LowBalanceDecision.AUTO_DELETE:
             server.transition_to(ServerLifecycleState.DELETE_REQUESTED)
-            await self._notifier.notify(server.user_id, server.id, decision, balance)
+            await self._notifier.notify(
+                server.user_id,
+                server.id,
+                decision,
+                balance,
+                episode=server.low_balance_since,
+            )
         # GRACE: silent - the user was already warned when the window opened;
         # the server keeps running until the window exhausts.
 

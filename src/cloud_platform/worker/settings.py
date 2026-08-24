@@ -73,21 +73,58 @@ async def evaluate_low_balance(ctx: dict[str, object]) -> None:
     """
     del ctx
     async with metrics.job("evaluate_low_balance"):
+        from datetime import datetime
+        from uuid import UUID
+
         from cloud_platform.core.config import get_settings
         from cloud_platform.db.session import SessionFactory
         from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
         from cloud_platform.modules.billing.service import (
+            LowBalanceDecision,
             LowBalancePolicyConfig,
             LowBalancePolicyService,
         )
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.notifications.domain import (
+            LowBalanceNotifier,
+            _LoggingLowBalanceNotifier,
+        )
+        from cloud_platform.modules.notifications.repository import (
+            SqlAlchemyLowBalanceNotificationLogRepository,
+        )
         from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 
         settings = get_settings()
+        currency = settings.default_currency
+        low_balance_notifier = LowBalanceNotifier(
+            notifier=_LoggingLowBalanceNotifier(),
+            log_repo=SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
+        )
+
+        class _LowBalanceNotifierAdapter:
+            """Adapts the deduplicating LowBalanceNotifier to the BalanceNotifier port."""
+
+            async def notify(
+                self,
+                user_id: UUID,
+                server_id: UUID,
+                decision: LowBalanceDecision,
+                balance_minor: int,
+                episode: datetime | None = None,
+            ) -> None:
+                if episode is None:
+                    # The policy always passes the watermark on notified
+                    # decisions; without an episode there is nothing to dedup by.
+                    return
+                await low_balance_notifier.notify(
+                    user_id, server_id, decision, balance_minor, currency, episode
+                )
+
         service = LowBalancePolicyService(
             server_repo=SqlAlchemyServerRepository(SessionFactory),
             wallet_repo=SqlAlchemyWalletRepository(SessionFactory),
             audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+            notifier=_LowBalanceNotifierAdapter(),
         )
         config = LowBalancePolicyConfig(
             threshold_minor=settings.low_balance_threshold_minor,

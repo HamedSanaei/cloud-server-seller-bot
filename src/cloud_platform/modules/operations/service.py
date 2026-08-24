@@ -28,8 +28,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, NoReturn, Protocol
-from uuid import UUID
+from typing import Any, ClassVar, NoReturn, Protocol
+from uuid import UUID, uuid4
 
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
@@ -40,6 +40,7 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.navigation.domain import Callback, encode_callback
 from cloud_platform.modules.notifications.domain import ProvisioningProgressService
 from cloud_platform.modules.operations.domain import (
     Operation,
@@ -1041,6 +1042,22 @@ def power_operation_key(action: PowerAction, server_id: UUID, idempotency_key: s
     return f"{action.value}:{server_id}:{idempotency_key}"
 
 
+def available_power_actions(
+    state: ServerLifecycleState, capabilities: set[Capability] | frozenset[Capability]
+) -> list[PowerAction]:
+    """The power actions valid for a local state and the provider's capabilities.
+
+    The single source of the capability/state gate: a command is only issued
+    for an action in this list, and the UI (M08-008) hides every action NOT
+    in this list, so the user never sees a button that would be rejected.
+    """
+    return [
+        action
+        for action in PowerAction
+        if state in _POWER_PRECONDITION[action] and Capability.POWER in capabilities
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class PowerCommandResult:
     server: CloudServer
@@ -1292,6 +1309,127 @@ class PowerCommandService:
             server=await self._servers.get(server_id) or server,
             replayed=False,
             requeued=result is PowerExecutionResult.REQUEUED,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Power controls UI (M08-008)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PowerActionOption:
+    """One power button the user may press for their server."""
+
+    action: PowerAction
+    label: str
+    callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class ServerPowerView:
+    """The servers.detail screen: the server's status + its power controls.
+
+    Acceptance: **capabilities/states hide invalid actions.** ``actions``
+    contains exactly the power actions that would be accepted by the power
+    command for this server right now (local state gate AND the provider's
+    POWER capability); every other action is hidden, not shown disabled, so
+    the user never sees a button that would be rejected. The buttons carry
+    signed callbacks (M08-001 scheme) that the bot dispatches into
+    :class:`PowerCommandService` with a fresh idempotency key per press.
+    """
+
+    server_id: UUID
+    provider_key: str
+    state: ServerLifecycleState
+    provider_server_id: str | None
+    actions: tuple[PowerActionOption, ...]
+    back_callback: str  # servers.list
+    cancel_callback: str  # main.menu
+
+    def render(self) -> str:
+        """ASCII rendering for logs and the review UI."""
+        lines = [
+            f"Server {self.server_id} [{self.state.value}] @ {self.provider_key}"
+            + (f" (provider {self.provider_server_id})" if self.provider_server_id else ""),
+        ]
+        if self.actions:
+            lines.append("  power: " + ", ".join(opt.label for opt in self.actions))
+        else:
+            lines.append("  power: (no actions available)")
+        return "\n".join(lines)
+
+
+class PowerControlsService:
+    """Builds the power controls of the server detail screen (M08-008).
+
+    Acceptance: **capabilities/states hide invalid actions.** The set of
+    actions is computed with the SAME gate the power command enforces
+    (:func:`available_power_actions`: local state precondition + the
+    provider's POWER capability), so the screen and the command can never
+    disagree. An unknown provider (not in the registry) exposes no power
+    actions at all. Ownership is enforced here as in MyServersService: a
+    missing or foreign server is indistinguishable (``None``).
+
+    No enforcement happens here: pressing a button calls
+    PowerCommandService, which re-checks ownership, state and capability at
+    execution time and is idempotent per command key.
+    """
+
+    _LABELS: ClassVar[dict[PowerAction, str]] = {
+        PowerAction.POWER_ON: "Power on",
+        PowerAction.POWER_OFF: "Power off",
+        PowerAction.REBOOT: "Reboot",
+    }
+
+    def __init__(
+        self,
+        server_repo: ServerRepository,
+        provider_registry: ProviderRegistry,
+        signing_key: str,
+    ) -> None:
+        if not signing_key:
+            raise ValueError("signing_key must not be empty")
+        self._servers = server_repo
+        self._registry = provider_registry
+        self._signing_key = signing_key
+
+    async def detail(self, user_id: UUID, server_id: UUID) -> ServerPowerView | None:
+        """The detail screen of one server the user owns, or None."""
+        server = await self._servers.get(server_id)
+        if server is None or server.user_id != user_id:
+            return None
+
+        try:
+            provider: CloudProvider = self._registry.get(server.provider_key)
+        except KeyError:
+            capabilities: set[Capability] = set()
+        else:
+            capabilities = set(provider.capabilities)
+
+        actions = tuple(
+            PowerActionOption(
+                action=action,
+                label=self._LABELS[action],
+                callback=encode_callback(
+                    Callback(flow="servers", screen=action.value, args=(str(server.id),)),
+                    self._signing_key,
+                ),
+            )
+            for action in available_power_actions(server.state, capabilities)
+        )
+        return ServerPowerView(
+            server_id=server.id,
+            provider_key=server.provider_key,
+            state=server.state,
+            provider_server_id=server.provider_server_id,
+            actions=actions,
+            back_callback=encode_callback(
+                Callback(flow="servers", screen="list"), self._signing_key
+            ),
+            cancel_callback=encode_callback(
+                Callback(flow="main", screen="menu"), self._signing_key
+            ),
         )
 
 
@@ -1579,6 +1717,137 @@ DELETE_PRECONDITION_STATES: frozenset[ServerLifecycleState] = frozenset(
         ServerLifecycleState.MANUAL_REVIEW,
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# Delete confirmation UI (M08-009)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteConfirmationView:
+    """The delete.confirm screen: the double-confirmation of a server deletion.
+
+    Acceptance: **double confirmation and idempotent callback.**
+
+    - Stage 1 (``stage=1``) shows what will happen (irreversible, final
+      charge at deletion). Pressing its ``confirm_callback`` advances to
+      stage 2, which carries the SAME idempotency key and a stronger
+      warning.
+    - Only the stage-2 ``execute_callback`` runs the delete. It embeds the
+      idempotency key the screen was built with, so a double-tap or a
+      re-sent callback replays the SAME DeleteCommandService command
+      (COMPLETED -> replayed, IN_FLIGHT -> rejected as in-progress) instead
+      of issuing a second deletion.
+    - The delete button is only shown when the delete command itself would
+      accept the state (``DELETE_PRECONDITION_STATES``); anything else
+      returns ``None`` and the detail screen hides the button.
+    """
+
+    server_id: UUID
+    provider_key: str
+    state: ServerLifecycleState
+    provider_server_id: str | None
+    stage: int  # 1 = warning, 2 = final confirmation
+    idempotency_key: str
+    warning: str
+    confirm_callback: str  # stage 1 -> stage 2 (re-render with the same key)
+    execute_callback: str  # stage 2 -> done -> DeleteCommandService.request
+    back_callback: str  # servers.detail:<server-id>
+    cancel_callback: str  # main.menu
+
+    def render(self) -> str:
+        """ASCII rendering for logs and the review UI."""
+        lines = [
+            f"Delete server {self.server_id} [{self.state.value}] @ {self.provider_key} "
+            f"(stage {self.stage}/2)",
+            f"  {self.warning}",
+        ]
+        return "\n".join(lines)
+
+
+class DeleteConfirmationService:
+    """Builds the delete confirmation screens (M08-009).
+
+    Acceptance: **double confirmation and idempotent callback.** Two
+    renders (stage 1 warning, stage 2 final confirmation) and one
+    execution, all keyed by a single idempotency key:
+
+    - ``screen(..., stage=1)`` - the warning; its confirm callback
+      re-renders stage 2 with the same key.
+    - ``screen(..., stage=2, idempotency_key=...)`` - the final
+      confirmation; its execute callback is what the bot dispatches into
+      ``DeleteCommandService.request(user_id, server_id, key)``.
+
+    The view NEVER executes anything: the command re-checks ownership and
+    state at request time, so a stale callback cannot delete a server that
+    changed in the meantime. Ownership follows MyServersService (missing or
+    foreign server -> uniform None).
+    """
+
+    _WARNING_1 = (
+        "This permanently deletes the server. The server is stopped, the "
+        "remaining usage is billed as a final charge, and nothing can be "
+        "recovered."
+    )
+    _WARNING_2 = "FINAL CONFIRMATION: the server will be deleted now. This cannot be undone."
+
+    def __init__(self, server_repo: ServerRepository, signing_key: str) -> None:
+        if not signing_key:
+            raise ValueError("signing_key must not be empty")
+        self._servers = server_repo
+        self._signing_key = signing_key
+
+    async def screen(
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        *,
+        stage: int = 1,
+        idempotency_key: str | None = None,
+    ) -> DeleteConfirmationView | None:
+        """One confirmation stage for a server the user owns, or None.
+
+        ``stage`` is 1 or 2; ``idempotency_key`` keeps the key stable across
+        the two stages and across re-sends (a fresh UUID is minted when
+        absent).
+        """
+        if stage not in (1, 2):
+            raise ValueError("stage must be 1 or 2")
+        server = await self._servers.get(server_id)
+        if server is None or server.user_id != user_id:
+            return None
+        if server.state not in DELETE_PRECONDITION_STATES:
+            # The delete command would reject this state: hide the button.
+            return None
+
+        key = idempotency_key if idempotency_key else uuid4().hex
+        if not key.strip():
+            key = uuid4().hex
+        args = (str(server.id), key)
+        return DeleteConfirmationView(
+            server_id=server.id,
+            provider_key=server.provider_key,
+            state=server.state,
+            provider_server_id=server.provider_server_id,
+            stage=stage,
+            idempotency_key=key,
+            warning=self._WARNING_1 if stage == 1 else self._WARNING_2,
+            confirm_callback=encode_callback(
+                Callback(flow="delete", screen="confirm", args=args), self._signing_key
+            ),
+            execute_callback=encode_callback(
+                Callback(flow="delete", screen="execute", args=args), self._signing_key
+            ),
+            back_callback=encode_callback(
+                Callback(flow="servers", screen="detail", args=(str(server.id),)),
+                self._signing_key,
+            ),
+            cancel_callback=encode_callback(
+                Callback(flow="main", screen="menu"), self._signing_key
+            ),
+        )
+
 
 # States the executor may find the server in when a claimed operation runs.
 _DELETE_IN_PROGRESS_STATES: frozenset[ServerLifecycleState] = frozenset(

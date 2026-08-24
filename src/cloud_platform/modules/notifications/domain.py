@@ -26,6 +26,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from cloud_platform.modules.billing.service import LowBalanceDecision
 from cloud_platform.modules.compute.domain import CloudServer
 
 logger = logging.getLogger(__name__)
@@ -156,4 +157,160 @@ class ProvisioningProgressService:
             return False
         event = self._event(server, kind, detail)
         await self._notifier.send(event)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Low-balance notifications (M08-011)
+# ---------------------------------------------------------------------------
+
+
+class LowBalanceNotificationKind(StrEnum):
+    """The warning levels the user is notified about.
+
+    One level per (server, episode) is delivered: a repeat of the SAME level
+    in the SAME episode is a no-op (the policy job may run twice, and a
+    re-sent delivery must not double-notify). A NEW episode (the watermark
+    was cleared and set again) may re-notify.
+    """
+
+    WARN = "warn"
+    AUTO_DELETE = "auto_delete"
+    RECOVERED = "recovered"
+
+
+@dataclass(frozen=True, slots=True)
+class LowBalanceNotificationEvent:
+    """One low-balance notification to the user."""
+
+    user_id: UUID
+    server_id: UUID
+    kind: LowBalanceNotificationKind
+    balance_minor: int
+    currency: str
+    episode: datetime
+    at: datetime | None = None
+
+    def render(self) -> str:
+        """ASCII rendering (integer-formatted money, no floats)."""
+        major, minor = divmod(abs(self.balance_minor), 100)
+        sign = "-" if self.balance_minor < 0 else ""
+        return (
+            f"low-balance {self.kind.value} for server {self.server_id}: "
+            f"balance {sign}{major}.{minor:02d} {self.currency} "
+            f"(episode {self.episode.isoformat()})"
+        )
+
+
+class LowBalanceNotifierPort(Protocol):
+    """Port for delivering low-balance notifications (bot/API later)."""
+
+    async def send(self, event: LowBalanceNotificationEvent) -> None:
+        """Deliver ``event`` to the user (best effort per event)."""
+        ...
+
+
+class _LoggingLowBalanceNotifier:
+    """Default notifier: structured log line (the bot integration replaces it)."""
+
+    async def send(self, event: LowBalanceNotificationEvent) -> None:
+        logger.warning("low-balance %s: %s", event.kind.value, event.render())
+
+
+class LowBalanceNotificationLogRepository(Protocol):
+    """Persistent dedup log for low-balance notifications.
+
+    Unique (server_id, kind, episode): the first delivery attempt of one
+    level in one episode inserts the row; repeats hit the constraint and
+    must not deliver again.
+    """
+
+    async def record(
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        kind: LowBalanceNotificationKind,
+        episode: datetime,
+        balance_minor: int,
+        currency: str,
+    ) -> bool:
+        """Atomically record one notification; True only for the first one."""
+        ...
+
+
+_DECISION_TO_KIND: dict[LowBalanceDecision, LowBalanceNotificationKind | None] = {
+    LowBalanceDecision.WARN: LowBalanceNotificationKind.WARN,
+    LowBalanceDecision.AUTO_DELETE: LowBalanceNotificationKind.AUTO_DELETE,
+    LowBalanceDecision.RECOVERED: LowBalanceNotificationKind.RECOVERED,
+    LowBalanceDecision.NONE: None,
+    LowBalanceDecision.GRACE: None,
+}
+
+
+def _decision_kind(decision: LowBalanceDecision) -> LowBalanceNotificationKind | None:
+    """Map a policy decision onto the user-notification kind (None = silent)."""
+    return _DECISION_TO_KIND.get(decision)
+
+
+class LowBalanceNotifier:
+    """User-facing low-balance notifications with per-level dedup (M08-011).
+
+    Acceptance: **deduplicated warning levels.** The policy (M06-007)
+    decides the level (WARN / GRACE / AUTO_DELETE / RECOVERED); this
+    notifier turns it into exactly-once user notifications:
+
+    - GRACE is silent by design (the user was warned when the episode
+      opened) and never touches the log.
+    - WARN / AUTO_DELETE / RECOVERED are recorded in the persistent log
+      keyed by (server, level, episode); only the first record delivers,
+      so a double-run of the policy job cannot notify twice, while a new
+      episode (new watermark) notifies again.
+    """
+
+    def __init__(
+        self,
+        notifier: LowBalanceNotifierPort,
+        log_repo: LowBalanceNotificationLogRepository,
+    ) -> None:
+        self._notifier = notifier
+        self._log = log_repo
+
+    async def notify(
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        decision: LowBalanceDecision,
+        balance_minor: int,
+        currency: str,
+        episode: datetime,
+    ) -> bool:
+        """Deliver one notification for ``decision``; True when delivered.
+
+        ``episode`` is the server's low-balance watermark (the instant the
+        episode opened): the policy passes the new watermark on WARN, the
+        existing one on AUTO_DELETE, and the cleared one on RECOVERED.
+        """
+        kind = _decision_kind(decision)
+        if kind is None:
+            return False  # NONE and GRACE are not user notifications
+        first = await self._log.record(user_id, server_id, kind, episode, balance_minor, currency)
+        if not first:
+            logger.info(
+                "low-balance %s for server %s episode %s already recorded; not re-notifying",
+                kind.value,
+                server_id,
+                episode.isoformat(),
+            )
+            return False
+        await self._notifier.send(
+            LowBalanceNotificationEvent(
+                user_id=user_id,
+                server_id=server_id,
+                kind=kind,
+                balance_minor=balance_minor,
+                currency=currency,
+                episode=episode,
+                at=datetime.now(UTC),
+            )
+        )
         return True

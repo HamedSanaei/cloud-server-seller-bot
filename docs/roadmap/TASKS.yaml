@@ -1554,48 +1554,141 @@ tasks:
   milestone: M08
   title: Implement power controls UI
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M08-007
   - M07-006
   acceptance:
   - Capabilities/states hide invalid actions.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the power controls UI (M08-008); acceptance ''Capabilities/states hide invalid actions'' holds.
+    The screen and the command share one gate: new public function available_power_actions(state, capabilities) in src/cloud_platform/modules/operations/service.py
+    (same file as the power command) returns exactly the PowerActions whose local-state precondition is met (_POWER_PRECONDITION)
+    AND whose provider advertises the POWER capability; the power command keeps enforcing it at execution time, so the UI
+    can never show a button that would be rejected. New views (in operations, next to PowerCommandService - power is that
+    module''s domain; a compute-module placement caused a circular import via the package __init__ chain and was rejected):
+    PowerActionOption (action, label, signed callback), ServerPowerView (server_id, provider_key, state, provider_server_id,
+    actions tuple, back/cancel callbacks, ASCII render) and PowerControlsService(server_repo, provider_registry, signing_key).detail(user_id,
+    server_id) -> ServerPowerView | None: ownership enforced in the application layer exactly as in MyServersService (missing
+    or foreign server both give a uniform None, never leaking existence), the provider is resolved from the registry and an
+    UNKNOWN provider (KeyError) exposes no power actions at all (no capability information, no actions), each available action
+    gets a signed callback (M08-001 scheme) servers:<action>:<server-id> (flow servers, screen power_on/power_off/reboot,
+    arg the server UUID) that the bot maps to the matching PowerCommandService call with a fresh idempotency key per press,
+    plus back (servers:list) and cancel (main:menu). No enforcement in the view: PowerCommandService re-checks ownership,
+    state and capability at execution and is idempotent per command key. Empty signing key rejected at construction. 15 tests:
+    the shared gate itself (RUNNING -> off+reboot, STOPPED -> on, no POWER capability -> nothing, all eight non-steady states
+    REQUESTED/PROVISIONING/ERROR/MANUAL_REVIEW/DELETE_REQUESTED/DELETING/DELETED -> nothing), the view hides invalid actions
+    (running shows off+reboot with labels, stopped shows only on, provisioning shows none with a render note, provider without
+    POWER shows none, unknown provider shows none, the view carries the server context), foreign and missing servers both
+    give None, action callbacks roundtrip to the right flow/screen/args, back and cancel callbacks roundtrip, a tampered action
+    callback is rejected by decode_callback, callbacks are deterministic/stable across two calls, and the constructor rejects
+    an empty signing key. Full suite 1128 passed.'
 - id: M08-009
   milestone: M08
   title: Implement delete confirmation UI
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M08-007
   - M07-007
   acceptance:
   - Double confirmation and idempotent callback.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the delete confirmation UI (M08-009); acceptance ''Double confirmation and idempotent callback''
+    holds. New in src/cloud_platform/modules/operations/service.py (next to DeleteCommandService): DeleteConfirmationView
+    (server_id, provider_key, state, provider_server_id, stage 1|2, idempotency_key, warning, confirm/execute/back/cancel
+    callbacks, ASCII render) and DeleteConfirmationService(server_repo, signing_key).screen(user_id, server_id, *, stage=1,
+    idempotency_key=None) -> DeleteConfirmationView | None. DOUBLE CONFIRMATION: stage 1 shows the consequence warning (irreversible,
+    final charge at deletion, nothing recoverable) and its confirm_callback delete:confirm:<server-id>:<key> re-renders stage
+    2 with the SAME key and a FINAL CONFIRMATION warning; only the stage-2 execute_callback delete:execute:<server-id>:<key>
+    is dispatched into DeleteCommandService.request(user_id, server_id, key). IDEMPOTENT CALLBACK: one key (minted as uuid4().hex
+    at stage 1, passed unchanged to stage 2 and both callbacks) rides the wire, so a double-tap or re-sent execute callback
+    replays the SAME command - COMPLETED replays with replayed=True, IN_FLIGHT is rejected as in-progress, and a different
+    key can never be smuggled in because the signature (M08-001 scheme) is bound to the key and tampered callbacks fail decode.
+    The screen is shown only when the delete command itself would accept the state (DELETE_PRECONDITION_STATES: RUNNING/STOPPED/ERROR/MANUAL_REVIEW);
+    every other state (REQUESTED, PROVISIONING, DELETE_REQUESTED, DELETING, DELETED) returns None so the detail screen hides
+    the button. Ownership as in MyServersService: missing or foreign server both give a uniform None. The view never executes
+    anything - the command re-checks ownership and state at request time. Back = servers:detail:<server-id>, cancel = main:menu.
+    Stage validation (1 or 2 only) and empty signing key rejected. 18 tests: RUNNING shows stage 1 with the warning, all three
+    other deletable states (STOPPED/ERROR/MANUAL_REVIEW, parametrized) show, all five non-deletable states (REQUESTED/PROVISIONING/DELETE_REQUESTED/DELETING/DELETED,
+    parametrized) hide, foreign and missing servers give None, stage 2 carries the final warning, stage 3 is rejected, the
+    idempotency key is stable across stages (stage-1 confirm, stage-2 confirm and execute all carry it), a re-sent execute
+    callback decodes to the exact same delete:execute:<server-id>:ik tuple, stage-1 confirm advances to delete:confirm with
+    the key, back goes to servers:detail and cancel to main:menu, a tampered execute callback (truncated signature and wrong
+    key) is rejected by decode_callback, callbacks are deterministic across two builds, and the constructor rejects an empty
+    signing key. Full suite 1148 passed.'
 - id: M08-010
   milestone: M08
   title: Implement wallet/ledger history UI
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M05-003
   acceptance:
   - Readable amounts/references/pagination.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the wallet/ledger history UI (M08-010); acceptance ''Readable amounts/references/pagination''
+    holds. Domain: LedgerEntry gained created_at (datetime | None = None - the DB column existed and the SQL mapper now fills
+    it; the history needs orderable timestamps) and LedgerRepository gained list_entries_paged(wallet_id, *, offset, limit)
+    -> (entries, total) with SqlAlchemyLedgerRepository implementing count + page ordered by created_at DESC NULLS LAST, id
+    DESC. New in src/cloud_platform/modules/wallet/service.py: WalletBalanceView (has_wallet, balance_minor, currency, formatted)
+    and WalletHistoryService(wallet_repo, ledger_repo).balance(user_id): the balance screen in INTEGER minor units rendered
+    with divmod (1234 -> ''12.34 EUR'', 7 -> ''0.07 EUR'', no wallet -> has_wallet=False and ''0.00 EUR''). history(user_id,
+    *, offset=0, limit=20): LedgerEntryView rows (entry_id, entry_type, signed amount_minor, currency, formatted with an explicit
+    +/- sign from integer divmod - ''+12.34 EUR'' / ''-1.50 EUR'' / one-cent ''-0.01 EUR'' never rounds, readable reference_label
+    built from reference_type + reference_id (''server <uuid>'', ''hold <uuid>'', ''payment'') falling back to the description,
+    the entry description, created_at) inside a LedgerHistoryPage (items, total, offset, limit, has_next, pages - the same
+    pagination contract as the server list: default 20, max 100, newest first, validated: negative offset / limit < 1 / limit
+    > 100 raise ValueError). Ownership-safe and read-only: it reads only the acting user''s own wallet (wallet_repo.get(user_id));
+    a user without a wallet gets an empty page, never an error and never another user''s data. Exports: HISTORY_DEFAULT_PAGE_SIZE,
+    HISTORY_MAX_PAGE_SIZE, WalletBalanceView, LedgerEntryView, LedgerHistoryPage, WalletHistoryService. 18 tests: the balance
+    screen formats 12.34 / 0.07 / 0.00 and the no-wallet case, credits render +12.34 and charges -1.50 with their ledger types,
+    one cent renders -0.01 without rounding, reference labels are type+id (''server <uuid>''), type-only (''payment''), and
+    fall back to the description (''admin refund''), pagination over 55 entries gives pages of 20/20/15 with has_next per
+    page, 3 pages total, the repo calls (offset, limit) as requested, an empty ledger is an empty page, a missing wallet is
+    an empty page (not an error), invalid pagination (negative offset, zero limit, limit > max) is rejected, an explicit limit
+    of 5 is passed through, and the SQL repository does count-then-page on one session, maps created_at into the domain entry,
+    preserves the repository''s newest-first order and returns an empty page with total 0. Full suite 1166 passed.'
 - id: M08-011
   milestone: M08
   title: Implement low-balance notifications
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M06-007
   acceptance:
   - Deduplicated warning levels.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented low-balance notifications (M08-011); acceptance ''Deduplicated warning levels'' holds. The policy
+    (M06-007) decides the level; this task turns it into user notifications where each warning level is delivered at most
+    once per (server, episode) and a new episode may re-notify. New in src/cloud_platform/modules/notifications: LowBalanceNotificationKind
+    (WARN / AUTO_DELETE / RECOVERED - the three notified levels; NONE and GRACE are silent), LowBalanceNotificationEvent (user,
+    server, kind, signed balance_minor, currency, episode, at + ASCII render with integer divmod money), LowBalanceNotifierPort
+    protocol with the established _LoggingLowBalanceNotifier default (bot integration replaces it), LowBalanceNotificationLogRepository
+    protocol and LowBalanceNotifier(notifier, log_repo).notify(user_id, server_id, decision, balance_minor, currency, episode)
+    -> bool: NONE/GRACE never notify and never touch the log; the other levels are recorded in the persistent log and only
+    the FIRST record of (server_id, kind, episode) delivers. Episode = the server''s low-balance watermark: the policy passes
+    the NEW watermark on WARN, the EXISTING one on AUTO_DELETE, and the CLEARED one on RECOVERED, so a double-run of the policy
+    job cannot notify twice, a level change in the same episode (warn -> auto_delete) notifies, and a recovered-then-later
+    re-warn is a new episode and notifies again. DB: new table low_balance_notifications (alembic 0019, model in db/base.py)
+    with the UniqueConstraint (server_id, kind, episode) as the dedup guard, storing the balance (minor units) + currency
+    at notification time; SqlAlchemyLowBalanceNotificationLogRepository.record inserts and treats IntegrityError as ''already
+    sent'' (rollback + False). The BalanceNotifier port gained an optional episode parameter (backwards compatible) and _LoggingNotifier
+    logs it; LowBalancePolicyService now passes the episode at all three notified branches and, new, also notifies RECOVERED
+    (with the cleared watermark) so the user learns the episode closed - the audit trail was already recording all decisions.
+    Worker wiring: the evaluate_low_balance job now builds LowBalanceNotifier(_LoggingLowBalanceNotifier, SqlAlchemyLowBalanceNotificationLogRepository)
+    behind a small adapter that maps the BalanceNotifier port (skipping silently when no episode is present) with the configured
+    default_currency. 11 new tests: same level + same episode notifies once across three attempts (the first delivery''s balance
+    is the one recorded), a new episode re-notifies the same level, warn and auto_delete in one episode are independent kinds
+    (each once), recovered closes the episode, different servers are independent, NONE and GRACE (parametrized) never notify
+    and never touch the log, the event render uses integer minor units (''-0.07 EUR''), the logging port logs (caplog), the
+    SQL repository''s first record wins with the mapped fields and a duplicate (IntegrityError) rolls back and returns False;
+    plus the M06-007 policy tests updated: WARN carries episode=new watermark, AUTO_DELETE carries episode=existing watermark,
+    and RECOVERED now notifies with the cleared watermark. Full suite 1177 passed.'
 - id: M09-001
   milestone: M09
   title: Finalize payment gateway port

@@ -165,6 +165,7 @@ def _ledger_entry_to_domain(row: _LEModel) -> LedgerEntry:
         reference_id=str(ref_id) if ref_id else "",
         description=_attr(row, "description") or "",
         idempotency_key=str(_attr(row, "idempotency_key")),
+        created_at=_attr(row, "created_at"),
     )
 
 
@@ -245,6 +246,25 @@ class SqlAlchemyLedgerRepository:
             stmt = select(_LEModel).where(_LEModel.wallet_id == wallet_id)
             result = await session.execute(stmt)
             return [_ledger_entry_to_domain(row) for row in result.scalars().all()]
+
+    async def list_entries_paged(
+        self, wallet_id: UUID, *, offset: int, limit: int
+    ) -> tuple[list[LedgerEntry], int]:
+        """One page of the wallet's ledger, newest first, plus the total."""
+        async with self._session_factory() as session:
+            count_result = await session.execute(
+                select(func.count()).select_from(_LEModel).where(_LEModel.wallet_id == wallet_id)
+            )
+            total = int(count_result.scalar() or 0)
+            stmt = (
+                select(_LEModel)
+                .where(_LEModel.wallet_id == wallet_id)
+                .order_by(_LEModel.created_at.desc().nulls_last(), _LEModel.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return ([_ledger_entry_to_domain(row) for row in result.scalars().all()], total)
 
 
 # ===================================================================

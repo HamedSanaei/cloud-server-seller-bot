@@ -29,6 +29,7 @@ class LedgerEntry:
     reference_id: str
     idempotency_key: str
     description: str = ""
+    created_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.amount.amount == 0:
@@ -294,4 +295,14 @@ class LedgerRepository(Protocol):
 
     async def list_entries(self, wallet_id: UUID) -> list[LedgerEntry]:
         """Every ledger entry of a wallet (reconciliation/reporting)."""
+        ...
+
+    async def list_entries_paged(
+        self, wallet_id: UUID, *, offset: int, limit: int
+    ) -> tuple[list[LedgerEntry], int]:
+        """One page of the wallet's ledger (newest first) plus the total.
+
+        ``offset`` and ``limit`` are validated by the caller (the history
+        service); the repository only enforces the SQL boundary.
+        """
         ...

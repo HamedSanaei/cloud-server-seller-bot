@@ -31,9 +31,20 @@ from cloud_platform.modules.wallet.repository import (
     SqlAlchemyLedgerRepository,
     SqlAlchemyWalletRepository,
 )
-from cloud_platform.modules.wallet.service import HoldAdminService, WalletAdminService
+from cloud_platform.modules.wallet.service import (
+    HISTORY_DEFAULT_PAGE_SIZE,
+    HISTORY_MAX_PAGE_SIZE,
+    HoldAdminService,
+    LedgerEntryView,
+    LedgerHistoryPage,
+    WalletAdminService,
+    WalletBalanceView,
+    WalletHistoryService,
+)
 
 __all__ = [
+    "HISTORY_DEFAULT_PAGE_SIZE",
+    "HISTORY_MAX_PAGE_SIZE",
     "DuplicateIdempotencyError",
     "FindingSeverity",
     "Hold",
@@ -48,6 +59,8 @@ __all__ = [
     "InsufficientHoldBalanceError",
     "LedgerEntry",
     "LedgerEntryType",
+    "LedgerEntryView",
+    "LedgerHistoryPage",
     "LedgerReconciliationService",
     "LedgerRepository",
     "ReconciliationFinding",
@@ -57,7 +70,9 @@ __all__ = [
     "SqlAlchemyWalletRepository",
     "Wallet",
     "WalletAdminService",
+    "WalletBalanceView",
     "WalletError",
+    "WalletHistoryService",
     "WalletRepository",
     "WalletStatus",
     "check_wallet",

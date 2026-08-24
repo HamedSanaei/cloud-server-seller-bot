@@ -251,6 +251,44 @@ class ProvisioningNotification(Base):
     sent_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", nullable=False)
 
 
+class LowBalanceNotification(Base):
+    """One low-balance notification, recorded once per (server, level, episode).
+
+    The unique (server_id, kind, episode) constraint is the dedup guarantee
+    for the warning levels (M08-011): a repeat of the same level in the same
+    episode is a no-op, a new episode may re-notify.
+
+    Attributes:
+        id: Primary key
+        user_id: The user to notify
+        server_id: The server the episode belongs to
+        kind: warn | auto_delete | recovered
+        episode: The low-balance watermark opening the episode
+        balance_minor: The balance at notification time (minor units)
+        currency: ISO 4217 currency code
+        sent_at: When the record was made
+    """
+
+    __tablename__ = "low_balance_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "server_id",
+            "kind",
+            "episode",
+            name="uq_low_balance_notifications_server_kind_episode",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
+    kind = Column(String, nullable=False)
+    episode = Column(DateTime(timezone=True), nullable=False)
+    balance_minor = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False)
+    sent_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", nullable=False)
+
+
 class Server(Base):
     """Represents a cloud server instance with lifecycle states.
 
