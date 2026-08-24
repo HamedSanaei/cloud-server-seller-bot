@@ -35,6 +35,42 @@ class RateLimitSnapshot:
     reset_at_unix: int | None
 
 
+class HetznerSshKeyApi:
+    """SSH-key management against the Hetzner Cloud API (M13-001).
+
+    ``GET /ssh_keys`` / ``POST /ssh_keys`` / ``DELETE /ssh_keys/{id}``.
+    Uploads are idempotent-by-caller: the sync layer reuses an existing
+    same-name/same-fingerprint key and never re-uploads it.
+    """
+
+    def __init__(self, provider: HetznerCloudProvider) -> None:
+        self._provider = provider
+
+    async def list_ssh_keys(self) -> list[tuple[str, str, str]]:
+        payload = await self._provider._request("GET", "/ssh_keys")
+        return [
+            (
+                str(item["id"]),
+                str(item["name"]),
+                str(item.get("fingerprint", "")),
+            )
+            for item in payload.get("ssh_keys", [])
+        ]
+
+    async def upload_ssh_key(self, name: str, public_key: str) -> str:
+        payload = await self._provider._request(
+            "POST", "/ssh_keys", json={"name": name, "public_key": public_key}
+        )
+        return str(payload["ssh_key"]["id"])
+
+    async def delete_ssh_key(self, provider_key_id: str) -> None:
+        try:
+            await self._provider._request("DELETE", f"/ssh_keys/{provider_key_id}")
+        except ProviderNotFound:
+            # already gone at the provider - deletion is idempotent
+            return
+
+
 class HetznerCloudProvider:
     key = "hetzner"
     capabilities = frozenset(
@@ -75,6 +111,8 @@ class HetznerCloudProvider:
         self._credential_source = credential_source
         self.last_rate_limit = RateLimitSnapshot(None, None, None)
         self._backoff = RateLimitBackoff(rate_limit_policy or RateLimitPolicy())
+        # M13-001: capability-probed SSH-key port (provider.ssh_keys)
+        self.ssh_keys = HetznerSshKeyApi(self)
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}

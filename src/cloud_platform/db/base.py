@@ -794,3 +794,26 @@ class AccrualPeriod(Base):
     currency = Column(String(3), nullable=False)
     idempotency_key = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+
+class SshKeyRow(Base):
+    """A user-owned public SSH key (M13-001).
+
+    Ownership-scoped: ``user_id`` is on every row and every query; names
+    and fingerprints are unique PER USER. ``public_key`` holds PUBLIC
+    material only (OpenSSH one-line format); ``fingerprint`` is the
+    OpenSSH-style SHA256 of the key blob.
+    """
+
+    __tablename__ = "ssh_keys"
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_ssh_keys_user_name"),
+        UniqueConstraint("user_id", "fingerprint", name="uq_ssh_keys_user_fingerprint"),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(64), nullable=False)
+    public_key = Column(Text, nullable=False)
+    fingerprint = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")

@@ -2590,18 +2590,41 @@ tasks:
   milestone: M13
   title: Implement SSH key CRUD/sync
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M07-005
   acceptance:
   - User keys are ownership-scoped.
-  evidence: []
+  evidence:
+  - '2026-08-24: SSH key CRUD/sync (M13-001); acceptance ''User keys are ownership-scoped'' holds. NEW modules/sshkeys: domain.py
+    validates OpenSSH public keys (supported types ssh-ed25519, ssh-rsa, ecdsa-nistp256/384/521; strict ''<type> <base64>
+    [comment]'' parse with base64 validation and 64 KiB blob cap) and computes OpenSSH-style SHA256 fingerprints from PUBLIC
+    material only (known-answer vector pinned in tests); SshKey entity normalizes name/key on construction. service.py SshKeyService
+    enforces ownership IN THE APPLICATION LAYER on every operation: register/list/delete all take actor_user_id vs owner_user_id
+    - registering for another user is refused; another user''s key by id reads as NOT FOUND (no existence leak) and cannot
+    be deleted; listing another user''s keys is denied. Registration dedupes per user (same name AND same fingerprint both
+    rejected via DuplicateSshKeyError), caps quota (20 default, injectable), and audits through the AuditTrail chokepoint
+    (ActorType.USER + actor_id, actions sshkey.registered / sshkey.deleted). repository.py SqlAlchemySshKeyRepository maps
+    to a new ssh_keys table (migration 0022: user FK CASCADE, unique (user_id,name) + unique (user_id,fingerprint), ix_ssh_keys_user_id;
+    downgrade drops them) so scoping is structural at the schema level too. SYNC: capability-probed provider port (ssh_key_port_of
+    checks provider.ssh_keys.list_ssh_keys/upload_ssh_key); HetznerCloudProvider gains HetznerSshKeyApi over GET/POST/DELETE
+    /ssh_keys with 404-on-delete mapped to idempotent success; ArvanCloud simply has no port (probe returns None). sync_keys_to_provider
+    is idempotent by construction: deterministic provider-side names platform-{user8}-{safe-name} are user-scoped so accounts
+    never collide; existing remote key with same name+same fingerprint is REUSED (no re-upload - asserted uploads==1 across
+    two syncs); remote same-name/different-material raises instead of silently overwriting. Container wires SshKeyService(request-scoped
+    factory). TESTS tests/unit/test_ssh_keys.py (25): known fingerprint vector, parse/type/base64/comment cases, entity normalization,
+    register happy path + audit fields, cross-user register refusal, duplicate name/material, quota, list/get/delete scoping
+    incl. no-existence-leak, delete audited, missing-key not-found, sync upload-then-reuse idempotency, deterministic user-scoped
+    provider names, foreign-material conflict, capability probe (with/without port), Hetzner API mapping through a fake transport
+    (list/upload/delete incl. 404-as-success), ids_for_provider single-scope. Migration gate passed (22 revisions, 0 unsafe);
+    head now 0022 (post-deploy smoke expectation updated). Full gates: ruff format/check clean, mypy clean (110 files), 1567
+    passed 11 skipped, provider-branching gate 64 modules 0 violations.'
 - id: M13-002
   milestone: M13
   title: Implement rebuild flow
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M13-001
@@ -2612,7 +2635,7 @@ tasks:
   milestone: M13
   title: Implement rescue mode
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M13-001

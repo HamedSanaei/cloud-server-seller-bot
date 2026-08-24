@@ -16,11 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from cloud_platform.core.config import get_settings
 from cloud_platform.db.session import SessionFactory, get_session
 from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
+from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.credentials.domain import (
     CredentialHolderLike,
 )
 from cloud_platform.modules.credentials.service import CredentialRotationService
 from cloud_platform.modules.payments.service import PaymentWebhookService
+from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
+from cloud_platform.modules.sshkeys.service import SshKeyService
 from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeAllocator
 from cloud_platform.providers.arvancloud.client import ArvanCloudProvider
 from cloud_platform.providers.arvancloud.sync import ArvanCloudCatalogSyncer
@@ -67,6 +70,13 @@ class Container:
     arvancloud_syncers: tuple[ArvanCloudCatalogSyncer, ...]
     credential_holders: _CredentialHolderRegistry | None = None
     credential_rotation_service: CredentialRotationService | None = None
+
+    def ssh_key_service(self) -> SshKeyService:
+        """Ownership-scoped SSH-key service (M13-001), request-scoped."""
+        return SshKeyService(
+            SqlAlchemySshKeyRepository(self.session_factory),
+            AuditTrail(_audit_repository(self.session_factory)),
+        )
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
