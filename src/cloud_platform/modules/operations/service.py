@@ -34,6 +34,7 @@ from uuid import UUID
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.billing.service import FinalChargeService, MissingSnapshotError
 from cloud_platform.modules.compute.domain import (
     CloudServer,
     ServerLifecycleState,
@@ -54,6 +55,7 @@ from cloud_platform.modules.wallet.domain import (
     HoldStatus,
     WalletRepository,
 )
+from cloud_platform.modules.wallet.repository import HoldService
 from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
     Capability,
@@ -62,7 +64,7 @@ from cloud_platform.providers.base import (
     ProviderImage,
     ProviderServer,
 )
-from cloud_platform.providers.errors import ProviderError
+from cloud_platform.providers.errors import ProviderError, ProviderNotFound
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
 from cloud_platform.providers.waiter import (
@@ -1499,3 +1501,647 @@ class MissingResourceDetector:
         if state is ServerLifecycleState.STOPPED:
             return await self._servers.list_stopped()
         return []
+
+
+# ---------------------------------------------------------------------------
+# Delete-server saga (M07-007)
+# ---------------------------------------------------------------------------
+#
+# Acceptance: delete request -> provider absent -> billing final -> deleted.
+#
+# The saga is one durable operation (key ``server-delete:{server_id}:{ik}``,
+# the same key sent to the provider as its IdempotencyKey) executed as:
+#
+#   1. request: the command service (ownership + state gates) creates the
+#      operation and moves the server to DELETE_REQUESTED;
+#   2. provider absence: the executor transitions DELETE_REQUESTED -> DELETING,
+#      calls provider.delete_server once per operation, treats 404
+#      (ProviderNotFound) as success, and waits (bounded) until the provider
+#      no longer returns the server; a timeout re-queues the SAME operation
+#      so a later attempt re-verifies instead of double-acting;
+#   3. billing final: once absence is confirmed the server gets its deletion
+#      timestamp and transitions DELETING -> DELETED, and the final usage
+#      segment is settled by FinalChargeService (M06-006; idempotent under
+#      its own ledger keys, so a crash-replay settles nothing twice). A
+#      server that never had a provider resource (failed before
+#      provisioning) has no usage: any still-reserved creation hold is
+#      released back to the wallet and no charge is made;
+#   4. deleted: the operation completes with the correlation (deletion time,
+#      charge amount) and the server row is DELETED (freeing quota).
+#
+# Every step is individually replay-safe, so a crash anywhere in the middle
+# leaves a consistent, retryable state.
+
+
+class DeleteCommandError(Exception):
+    """Base error for the delete command path."""
+
+
+class DeleteNotOwnerError(DeleteCommandError):
+    """The acting user does not own the server (indistinguishable from absent)."""
+
+
+class DeleteActionNotAllowedError(DeleteCommandError):
+    """The server's state does not allow a delete request."""
+
+
+class DeleteOperationInProgressError(DeleteCommandError):
+    """A delete operation for this server is already running."""
+
+
+class DeleteOperationFailedError(DeleteCommandError):
+    """The delete operation permanently failed (error recorded in the ledger)."""
+
+
+#: Local states from which a delete may be requested.
+DELETE_PRECONDITION_STATES: frozenset[ServerLifecycleState] = frozenset(
+    {
+        ServerLifecycleState.RUNNING,
+        ServerLifecycleState.STOPPED,
+        ServerLifecycleState.ERROR,
+        ServerLifecycleState.MANUAL_REVIEW,
+    }
+)
+
+# States the executor may find the server in when a claimed operation runs.
+_DELETE_IN_PROGRESS_STATES: frozenset[ServerLifecycleState] = frozenset(
+    {
+        ServerLifecycleState.DELETE_REQUESTED,
+        ServerLifecycleState.DELETING,
+        ServerLifecycleState.DELETED,
+    }
+)
+
+
+def delete_operation_key(server_id: UUID, idempotency_key: str) -> str:
+    """Deterministic ledger key for one delete intent (unique per command key)."""
+    return f"server-delete:{server_id}:{idempotency_key}"
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteCommandResult:
+    server: CloudServer
+    replayed: bool  # True when a prior attempt with the same key already completed
+    requeued: bool = False  # True when the attempt hit a retryable provider error
+
+
+class DeleteExecutionResult(StrEnum):
+    EXECUTED = "executed"
+    REQUEUED = "requeued"
+
+
+class DeleteOperationExecutor:
+    """Executes a *claimed* SERVER_DELETE operation (the saga proper).
+
+    Shared by the interactive command path (actor = the issuing user) and the
+    worker path (actor = system, retrying re-queued operations). The operation
+    key is the IdempotencyKey sent to the provider, so a re-send after an
+    unresolved failure can never trigger a second physical deletion.
+    """
+
+    def __init__(
+        self,
+        *,
+        operation_repo: OperationRepository,
+        server_repo: ServerRepository,
+        provider_registry: ProviderRegistry,
+        final_charge: FinalChargeService,
+        hold_repo: HoldRepository,
+        hold_service: HoldService,
+        wallet_repo: WalletRepository,
+        audit_repo: AuditRepository,
+        waiter: ActionWaiter | None = None,
+    ) -> None:
+        self._ops = operation_repo
+        self._servers = server_repo
+        self._registry = provider_registry
+        self._final_charge = final_charge
+        self._hold_repo = hold_repo
+        self._holds = hold_service
+        self._wallets = wallet_repo
+        self._audit = AuditTrail(audit_repo)
+        self._waiter = waiter or ActionWaiter()
+
+    async def execute(
+        self,
+        operation: Operation,
+        *,
+        actor_type: ActorType,
+        actor_id: UUID | None = None,
+    ) -> DeleteExecutionResult:
+        """Run one claimed (IN_FLIGHT) delete operation; raises on permanent failure."""
+        server = await self._servers.get(operation.resource_id)
+        if server is None:
+            await self._fail(operation, actor_type, actor_id, "server row missing")
+        if server.state not in _DELETE_IN_PROGRESS_STATES:
+            # The state moved since the intent was created (containment was
+            # reversed to a live state, drift). Never delete against a
+            # mismatched state.
+            await self._fail(
+                operation,
+                actor_type,
+                actor_id,
+                f"server left the deletion states ({server.state.value}) before "
+                "the provider deletion ran",
+            )
+
+        provider: CloudProvider | None = None
+        if server.provider_server_id:
+            try:
+                provider = self._registry.get(server.provider_key)
+            except KeyError:
+                await self._fail(
+                    operation,
+                    actor_type,
+                    actor_id,
+                    f"unknown provider {server.provider_key!r}",
+                )
+
+        # Step 2: provider absence.
+        if server.provider_server_id and provider is not None:
+            if server.state is ServerLifecycleState.DELETE_REQUESTED:
+                server.transition_to(ServerLifecycleState.DELETING)
+                await self._servers.save(server)
+            deleted = await self._ensure_provider_absent(
+                operation, server, provider, actor_type, actor_id
+            )
+            if deleted is DeleteExecutionResult.REQUEUED:
+                return DeleteExecutionResult.REQUEUED
+        elif server.provider_server_id is None and server.state in (
+            ServerLifecycleState.DELETE_REQUESTED,
+            ServerLifecycleState.DELETING,
+        ):
+            # No provider resource was ever created (failed before
+            # provisioning): nothing to delete and no usage to bill. Return
+            # any still-reserved creation hold to the wallet.
+            await self._release_reservation(server)
+
+        # Step 3: billing final + DELETED.
+        deleted_at = server.deleted_at or datetime.now(UTC)
+        if server.state in (
+            ServerLifecycleState.DELETE_REQUESTED,
+            ServerLifecycleState.DELETING,
+        ):
+            server.transition_to(ServerLifecycleState.DELETED)
+            server.deleted_at = deleted_at
+            await self._servers.save(server)
+
+        charged_minor = 0
+        charge_capped = False
+        if server.provider_server_id:
+            # A server that had a provider resource carries its final usage
+            # segment (idempotent: a crash-replay settles nothing twice). A
+            # server that never had one (failed before provisioning) has no
+            # usage and its reservation was already returned above.
+            try:
+                result = await self._final_charge.charge_final(server, deleted_at)
+                charged_minor = result.charged_minor
+                charge_capped = result.capped
+            except MissingSnapshotError as exc:
+                # The resource is gone; the billing gap goes to the review
+                # queue (M05 operations tooling) for manual reconciliation
+                # instead of blocking the deletion fact.
+                await self._audit.record_mutation(
+                    actor_type=ActorType.SYSTEM,
+                    actor_id=None,
+                    action="billing.final_charge_failed",
+                    resource_type="server",
+                    resource_id=str(server.id),
+                    reason=str(exc),
+                    metadata={"deleted_at": deleted_at.isoformat()},
+                )
+                operation.fail(f"final charge failed: {exc}")
+                await self._ops.save(operation)
+                await self._audit.record_mutation(
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    action="server.delete_failed",
+                    resource_type=RESOURCE_TYPE_SERVER,
+                    resource_id=str(server.id),
+                    reason=f"final charge: no price snapshot ({exc})",
+                    metadata={"operation_id": str(operation.id)},
+                )
+                raise DeleteOperationFailedError("final charge: no price snapshot") from exc
+
+        # Step 4: deleted.
+        operation.complete(
+            {
+                "provider_server_id": server.provider_server_id,
+                "deleted_at": deleted_at.isoformat(),
+                "charged_minor": charged_minor,
+                "charge_capped": charge_capped,
+            }
+        )
+        await self._ops.save(operation)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="server.deleted",
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(server.id),
+            reason="deletion confirmed at the provider; final usage settled",
+            metadata={
+                "operation_id": str(operation.id),
+                "provider_server_id": server.provider_server_id or "",
+                "deleted_at": deleted_at.isoformat(),
+                "charged_minor": str(charged_minor),
+                "charge_capped": str(charge_capped).lower(),
+            },
+        )
+        return DeleteExecutionResult.EXECUTED
+
+    async def _ensure_provider_absent(
+        self,
+        operation: Operation,
+        server: CloudServer,
+        provider: CloudProvider,
+        actor_type: ActorType,
+        actor_id: UUID | None,
+    ) -> DeleteExecutionResult | None:
+        """Delete at the provider (once per operation key) and verify absence.
+
+        Returns REQUEUED when the run must be retried (retryable error or the
+        provider still shows the server at the wait deadline); None when
+        absence is confirmed.
+        """
+        assert server.provider_server_id is not None
+        try:
+            await provider.delete_server(
+                server.provider_server_id, IdempotencyKey(operation.operation_key)
+            )
+        except ProviderNotFound:
+            pass  # 404 on delete: the resource is already absent - success
+        except ProviderError as exc:
+            if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                operation.requeue(str(exc))
+                await self._ops.save(operation)
+                await self._audit.record_mutation(
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    action="server.delete_requeued",
+                    resource_type=RESOURCE_TYPE_SERVER,
+                    resource_id=str(server.id),
+                    reason=str(exc),
+                    metadata={"operation_id": str(operation.id)},
+                )
+                return DeleteExecutionResult.REQUEUED
+            await self._fail(operation, actor_type, actor_id, str(exc))
+
+        async def probe() -> WaitProbe:
+            remote = await provider.get_server(server.provider_server_id or "")
+            if remote is None:
+                return WaitProbe(WaitState.COMPLETED, "provider reports no such server")
+            return WaitProbe(
+                WaitState.PENDING,
+                f"provider still reports the server (status={remote.status or 'unknown'})",
+            )
+
+        wait = await self._waiter.wait_for(probe)
+        if wait.outcome is WaitOutcome.TIMEOUT:
+            # Ambiguity by deadline: the deletion may still finish. The SAME
+            # operation re-runs later and re-verifies (404 is success), so
+            # nothing can double-act.
+            operation.requeue(
+                f"provider still shows the server {wait.polls} polls after delete; "
+                "re-verifying on the next attempt"
+            )
+            await self._ops.save(operation)
+            await self._audit.record_mutation(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="server.delete_requeued",
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=str(server.id),
+                reason=wait.detail or "absence wait timed out",
+                metadata={
+                    "operation_id": str(operation.id),
+                    "polls": str(wait.polls),
+                },
+            )
+            return DeleteExecutionResult.REQUEUED
+        if wait.outcome is WaitOutcome.FAILED:
+            await self._fail(
+                operation, actor_type, actor_id, wait.detail or "provider deletion failed"
+            )
+        return None
+
+    async def _release_reservation(self, server: CloudServer) -> None:
+        """Return a still-reserved creation hold for a server without a resource."""
+        if not server.idempotency_key:
+            return
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id is None:
+            return
+        hold = await self._hold_repo.get_by_idempotency(
+            wallet.id, f"server-create:{server.idempotency_key}"
+        )
+        if hold is not None and hold.status is HoldStatus.CREATED:
+            assert hold.id is not None
+            await self._holds.release_hold(
+                wallet.id, hold.id, f"server-create:{server.idempotency_key}"
+            )
+            logger.info(
+                "server %s: released reserved hold (no provider resource existed)", server.id
+            )
+
+    async def _fail(
+        self,
+        operation: Operation,
+        actor_type: ActorType,
+        actor_id: UUID | None,
+        reason: str,
+    ) -> NoReturn:
+        operation.fail(reason)
+        await self._ops.save(operation)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="server.delete_failed",
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(operation.resource_id),
+            reason=reason,
+            metadata={"operation_id": str(operation.id)},
+        )
+        raise DeleteOperationFailedError(reason)
+
+
+class DeleteCommandService:
+    """User-facing delete command: request the deletion saga.
+
+    Authorization is enforced here (the application layer), not the UI:
+    - **Ownership** — the server must belong to the acting user; a server
+      belonging to someone else (or not found) is indistinguishable.
+    - **Capability** — the local state must allow a deletion.
+    - **Idempotency** — one ledger operation per (server, command key); the
+      operation key is the IdempotencyKey sent to the provider, so a retry
+      of the same command can never double-act. A completed command is
+      replayed without a provider call; an in-flight one is rejected; a
+      failed one surfaces its recorded error.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_repo: ServerRepository,
+        operation_repo: OperationRepository,
+        provider_registry: ProviderRegistry,
+        final_charge: FinalChargeService,
+        hold_repo: HoldRepository,
+        hold_service: HoldService,
+        wallet_repo: WalletRepository,
+        audit_repo: AuditRepository,
+        executor: DeleteOperationExecutor | None = None,
+    ) -> None:
+        self._servers = server_repo
+        self._ops = operation_repo
+        self._audit = AuditTrail(audit_repo)
+        self._executor = executor or DeleteOperationExecutor(
+            operation_repo=operation_repo,
+            server_repo=server_repo,
+            provider_registry=provider_registry,
+            final_charge=final_charge,
+            hold_repo=hold_repo,
+            hold_service=hold_service,
+            wallet_repo=wallet_repo,
+            audit_repo=audit_repo,
+        )
+
+    async def request(
+        self, user_id: UUID, server_id: UUID, idempotency_key: str
+    ) -> DeleteCommandResult:
+        if not idempotency_key or not idempotency_key.strip():
+            raise DeleteCommandError("idempotency_key is required")
+        key = delete_operation_key(server_id, idempotency_key.strip())
+        if len(key) > 128:
+            raise DeleteCommandError("idempotency_key too long")
+
+        server = await self._servers.get(server_id)
+        if server is None or server.user_id != user_id:
+            raise DeleteNotOwnerError("server not found")
+
+        # Replays of an existing intent are resolved from the ledger BEFORE any
+        # state gate: a completed deletion must stay idempotent even after
+        # the server is DELETED.
+        op = await self._ops.get_by_key(key)
+        state_valid = server.state in DELETE_PRECONDITION_STATES
+        if op is not None:
+            if op.status is OperationStatus.COMPLETED:
+                return DeleteCommandResult(
+                    server=await self._servers.get(server_id) or server, replayed=True
+                )
+            if op.status is OperationStatus.FAILED:
+                raise DeleteOperationFailedError(op.error or "delete operation failed")
+            if op.status is OperationStatus.IN_FLIGHT:
+                raise DeleteOperationInProgressError("delete operation is in progress")
+            if not state_valid and op.attempts == 0:
+                raise DeleteActionNotAllowedError(
+                    f"delete not allowed in state {server.state.value}"
+                )
+        else:
+            if not state_valid:
+                raise DeleteActionNotAllowedError(
+                    f"delete not allowed in state {server.state.value}"
+                )
+            server.transition_to(ServerLifecycleState.DELETE_REQUESTED)
+            await self._servers.save(server)
+            op = await self._ops.get_or_create(
+                operation_key=key,
+                operation_type=OperationType.SERVER_DELETE,
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=server_id,
+                provider_key=server.provider_key,
+            )
+            await self._audit.record_mutation(
+                actor_type=ActorType.USER,
+                actor_id=user_id,
+                action="server.delete_requested",
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=str(server_id),
+                reason=f"delete requested (key={idempotency_key.strip()})",
+                metadata={"operation_id": str(op.id)},
+            )
+
+        claimed = await self._ops.claim(op.id)
+        if claimed is None:
+            raise DeleteOperationInProgressError("delete operation is in progress")
+
+        result = await self._executor.execute(claimed, actor_type=ActorType.USER, actor_id=user_id)
+        return DeleteCommandResult(
+            server=await self._servers.get(server_id) or server,
+            replayed=False,
+            requeued=result is DeleteExecutionResult.REQUEUED,
+        )
+
+
+class DeleteWorker:
+    """Processes PENDING delete operations (crash recovery + retryable errors).
+
+    The command path executes the saga inline; this worker picks up anything
+    that was re-queued (retryable provider error, absence-wait timeout) or
+    left PENDING by a crashed run, using the same executor and therefore the
+    same operation keys.
+    """
+
+    def __init__(
+        self,
+        *,
+        operation_repo: OperationRepository,
+        executor: DeleteOperationExecutor,
+    ) -> None:
+        self._ops = operation_repo
+        self._executor = executor
+
+    async def process_pending_deletes(self, limit: int = 10) -> dict[str, int]:
+        """Claim and execute PENDING delete operations.
+
+        Returns counts keyed by ``executed`` / ``requeued`` / ``failed`` /
+        ``contended`` (lost the claim race).
+        """
+        counts = {"executed": 0, "requeued": 0, "failed": 0, "contended": 0}
+        if limit <= 0:
+            return counts
+        for op in (await self._ops.list_pending([OperationType.SERVER_DELETE]))[:limit]:
+            claimed = await self._ops.claim(op.id)
+            if claimed is None:
+                counts["contended"] += 1
+                continue
+            try:
+                result = await self._executor.execute(
+                    claimed, actor_type=ActorType.SYSTEM, actor_id=None
+                )
+            except DeleteOperationFailedError:
+                counts["failed"] += 1
+                continue
+            counts["executed" if result is DeleteExecutionResult.EXECUTED else "requeued"] += 1
+        return counts
+
+
+class DeleteReconciliationOutcome(StrEnum):
+    SKIPPED = "skipped"
+    REQUEUED_IN_FLIGHT = "requeued_in_flight"
+    RECREATED_OPERATION = "recreated_operation"
+    FAILED = "failed"  # the server row is gone; the intent can never complete
+
+
+def reconciled_delete_key(server_id: UUID) -> str:
+    """Deterministic operation key for a deletion whose intent row was lost."""
+    return f"server-delete:{server_id}:reconciled"
+
+
+class DeleteTimeoutReconciler:
+    """Reconciles deletion ambiguity: crashes anywhere in the saga (M07-008).
+
+    The acceptance property: *404 is success; timeout ambiguity reconciles.*
+    A deletion can be left ambiguous by a crash in any of its windows:
+
+    - the operation was IN_FLIGHT (the worker died between the claim and the
+      completion) - the provider may or may not have deleted the resource;
+    - the command moved the server to DELETE_REQUESTED but died before the
+      operation row was created.
+
+    Both are resolved by re-entering the SAME saga with the SAME operation
+    key, which is safe because:
+
+    - ``provider.delete_server`` is re-sent with the original idempotency
+      key, and a 404 (ProviderNotFound) on delete - the resource is already
+      gone - is treated as success;
+    - the absence check re-verifies against the provider's current state;
+    - the final charge is idempotent under its own ledger keys, so the final
+      usage segment is posted exactly once across all attempts.
+
+    Re-queueing IN_FLIGHT operations to PENDING is the ledger's own
+    retryable transition (``requeue``); nothing else mutates state here.
+    """
+
+    def __init__(
+        self,
+        *,
+        operation_repo: OperationRepository,
+        server_repo: ServerRepository,
+        audit_repo: AuditRepository,
+        in_flight_timeout: timedelta = timedelta(minutes=15),
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if in_flight_timeout <= timedelta(0):
+            raise ValueError("in_flight_timeout must be positive")
+        self._ops = operation_repo
+        self._servers = server_repo
+        self._audit = AuditTrail(audit_repo)
+        self._in_flight_timeout = in_flight_timeout
+        self._now = clock or (lambda: datetime.now(UTC))
+
+    async def reconcile(self) -> dict[DeleteReconciliationOutcome, int]:
+        """Scan for ambiguous deletions and resolve each safely."""
+        counts: dict[DeleteReconciliationOutcome, int] = {}
+
+        def bump(outcome: DeleteReconciliationOutcome) -> None:
+            counts[outcome] = counts.get(outcome, 0) + 1
+
+        # 1) IN_FLIGHT delete operations past the timeout (ambiguous window).
+        for op in await self._ops.list_in_flight(OperationType.SERVER_DELETE):
+            server = await self._servers.get(op.resource_id)
+            if server is None:
+                op.fail("server row missing during delete-timeout reconciliation")
+                await self._ops.save(op)
+                bump(DeleteReconciliationOutcome.FAILED)
+                continue
+            age = None if op.updated_at is None else self._now() - op.updated_at
+            if age is not None and age < self._in_flight_timeout:
+                bump(DeleteReconciliationOutcome.SKIPPED)
+                continue
+            op.requeue(
+                "in-flight timeout: re-entering the deletion saga with the "
+                "same operation key (404 on delete is success)"
+            )
+            await self._ops.save(op)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                actor_id=None,
+                action="server.delete_reconciled",
+                resource_type="server",
+                resource_id=str(server.id),
+                reason=f"IN_FLIGHT delete operation {op.operation_key} re-queued (age {age})",
+                metadata={
+                    "operation_id": str(op.id),
+                    "attempts": str(op.attempts),
+                },
+            )
+            bump(DeleteReconciliationOutcome.REQUEUED_IN_FLIGHT)
+
+        # 2) Servers stuck in DELETE_REQUESTED without an operation row (crash
+        # between the command's state save and the op create). Recreating the
+        # operation is safe: a PENDING operation has never called the
+        # provider, and the deletion re-runs the same saga. A server that
+        # already has ANY delete operation (PENDING / IN_FLIGHT / FAILED) is
+        # left to the worker / the manual-retry tooling - a second
+        # operation would only double-run a replay-safe saga.
+        delete_ops = (
+            await self._ops.list_pending([OperationType.SERVER_DELETE])
+            + await self._ops.list_in_flight(OperationType.SERVER_DELETE)
+            + await self._ops.list_failed(operation_types=[OperationType.SERVER_DELETE])
+        )
+        for server in await self._servers.list_deletion_in_progress():
+            if server.state is not ServerLifecycleState.DELETE_REQUESTED:
+                continue  # DELETING implies the operation exists (handled in 1)
+            if any(op.resource_id == server.id for op in delete_ops):
+                continue
+            await self._ops.get_or_create(
+                operation_key=reconciled_delete_key(server.id),
+                operation_type=OperationType.SERVER_DELETE,
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=server.id,
+                provider_key=server.provider_key,
+            )
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                actor_id=None,
+                action="server.delete_reconciled",
+                resource_type="server",
+                resource_id=str(server.id),
+                reason="DELETE_REQUESTED server had no delete operation; "
+                "recreated with the reconciled key",
+                metadata={},
+            )
+            bump(DeleteReconciliationOutcome.RECREATED_OPERATION)
+
+        return counts

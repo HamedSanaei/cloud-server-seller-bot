@@ -1178,25 +1178,77 @@ tasks:
   milestone: M07
   title: Implement delete-server saga
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M07-005
   - M06-006
   acceptance:
   - Delete request -> provider absent -> billing final -> deleted.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the delete-server saga (M07-007) following the acceptance order: delete request -> provider absent
+    -> billing final -> deleted. New in src/cloud_platform/modules/operations/service.py: (1) DeleteCommandService.request(user_id,
+    server_id, idempotency_key) - application-layer authorization (ownership: foreign or unknown servers are indistinguishable
+    via DeleteNotOwnerError; capability: only RUNNING/STOPPED/ERROR/MANUAL_REVIEW may be deleted), ledger-first idempotency
+    (a completed intent replays with no provider call, an in-flight one is rejected, a failed one surfaces its recorded error),
+    creates the operation (key server-delete:{server_id}:{ik}) and moves the server to DELETE_REQUESTED with a server.delete_requested
+    audit event. (2) DeleteOperationExecutor.execute - the saga: transitions DELETE_REQUESTED -> DELETING, calls provider.delete_server
+    once per operation with the operation key as the provider IdempotencyKey (a re-send can never double-delete), treats ProviderNotFound
+    (404 on delete) as success, re-queues retryable provider errors with the SAME key, then waits for confirmed absence with
+    the bounded ActionWaiter (get_server until None) - a timeout re-queues the same operation for re-verification instead
+    of failing (404-on-retry resolves the ambiguity, so nothing can double-act). A server that never had a provider resource
+    (failed before provisioning) skips the provider step entirely and gets its still-reserved creation hold RELEASED back
+    to the wallet (no usage, no charge). Once absence is confirmed the server gets its deletion timestamp and transitions
+    to DELETED (freeing quota), and FinalChargeService.charge_final (M06-006) settles the final usage segment - idempotent
+    under its own ledger keys so a crash-replay settles nothing twice; a missing price snapshot does not undo the deletion:
+    the server stays DELETED, the operation is FAILED with the billing gap audited (billing.final_charge_failed) for the manual
+    review queue. The operation completes with the correlation (provider_server_id, deleted_at, charged_minor, charge_capped)
+    and a server.deleted audit event. Every saga step is individually replay-safe. (3) DeleteWorker.process_pending_deletes
+    - the worker path that claims and executes PENDING delete operations (crash recovery + retryable re-queues) with the same
+    executor and keys; registered as the arq job process_deletes in worker/settings.py (registry built from settings like
+    the container). OperationType.SERVER_DELETE added to the operation ledger domain. 17 tests: happy path (single provider
+    delete call, final charge with the deletion timestamp, completed correlation, audit trail), replay of a completed command
+    (no provider call, no second charge), not-owner and unknown-server indistinguishability, state gate (PROVISIONING rejected),
+    in-flight rejected, failed op surfaces its recorded error, empty idempotency key rejected, 404-on-delete success, retryable
+    error re-queues (state DELETING, op PENDING attempts=1, no billing, audited), permanent error (auth) fails the op and
+    leaves the server in DELETING for review, absence-wait timeout re-queues with re-verification semantics and no billing,
+    no-provider-resource server releases the hold and skips billing (correlation charged=0), missing snapshot fails the op
+    but the server stays DELETED with the billing audit, cap-capped charge correlation, and the worker executing a re-queued
+    delete after provider recovery (attempts=2, exactly one final charge) plus an empty queue. Full suite 1023 passed.'
 - id: M07-008
   milestone: M07
   title: Implement delete retry/reconcile
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M07-007
   acceptance:
   - 404 is success; timeout ambiguity reconciles.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented delete retry/reconcile (M07-008); acceptance ''404 is success; timeout ambiguity reconciles''
+    holds end-to-end. New in src/cloud_platform/modules/operations/service.py: DeleteTimeoutReconciler + DeleteReconciliationOutcome
+    (SKIPPED / REQUEUED_IN_FLIGHT / RECREATED_OPERATION / FAILED) + reconciled_delete_key(server_id) (deterministic key server-delete:{server_id}:reconciled
+    for a lost intent). Two ambiguity windows a crash can leave: (1) a SERVER_DELETE operation IN_FLIGHT past the injectable
+    in-flight timeout (default 15 minutes, injectable clock) - the provider may or may not have applied the deletion - is
+    re-queued to PENDING via the ledger''s own requeue transition (attempts preserved, audited server.delete_reconciled with
+    the operation id and age); the delete worker (M07-007) then re-enters the SAME saga with the SAME operation key, so the
+    provider delete is re-sent with the original idempotency key and a 404 (ProviderNotFound) on delete - the resource already
+    gone - is treated as success; the absence check re-verifies against the provider''s current state; the final charge is
+    idempotent under its own ledger keys so the final usage segment is posted exactly once across all attempts. (2) a server
+    stuck in DELETE_REQUESTED with no operation row at all (crash between the command''s state save and the operation create)
+    gets a deterministic reconciled operation created so the deletion completes instead of hanging; a server that already
+    has ANY delete operation (PENDING, IN_FLIGHT or FAILED) is left to the worker or the admin manual-retry tooling (operation.retry)
+    - the reconciler never creates a duplicate operation, and a FAILED op is owned by the review queue, not duplicated. An
+    IN_FLIGHT op whose server row is gone is FAILED with a review audit. A DELETING server without an op is impossible by
+    construction (the op exists before the transition) and is ignored. ServerRepository gained list_deletion_in_progress()
+    (DELETE_REQUESTED or DELETING) on the protocol and the SQL repository. The arq job reconcile_deletes was added to worker/settings.py
+    (periodic, builds the reconciler from SessionFactory). 9 tests: stale IN_FLIGHT re-queued to PENDING with attempts preserved
+    and audited, fresh IN_FLIGHT skipped (timeout respected), missing server row fails the op, the full end-to-end crash scenario
+    (reconcile re-queues -> worker re-enters -> provider 404 is success -> server DELETED, op COMPLETED, final segment posted
+    exactly once on the re-entry), lost operation recreated with the reconciled key and the deletion finished by the worker,
+    existing PENDING op prevents duplication, FAILED op prevents duplication (tooling owns it), DELETING server ignored, and
+    an empty scan returns no counts. Full suite 1032 passed.'
 - id: M07-009
   milestone: M07
   title: Implement orphan provider-resource detector
@@ -1392,7 +1444,7 @@ tasks:
   milestone: M08
   title: Implement delete confirmation UI
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M08-007
@@ -1853,7 +1905,7 @@ tasks:
   milestone: M11
   title: Add chaos tests for provider timeouts
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M07-003
@@ -2066,7 +2118,7 @@ tasks:
   milestone: M14
   title: Define customer REST API v1
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M07-007

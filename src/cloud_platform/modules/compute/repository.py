@@ -205,6 +205,22 @@ class SqlAlchemyServerRepository:
             ).all()
             return [_to_domain(server_row, str(name)) for server_row, name in rows]
 
+    async def list_deletion_in_progress(self) -> list[CloudServer]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    _server_stmt().where(
+                        _ServerModel.state.in_(
+                            [
+                                ServerLifecycleState.DELETE_REQUESTED.value,
+                                ServerLifecycleState.DELETING.value,
+                            ]
+                        )
+                    )
+                )
+            ).all()
+            return [_to_domain(server_row, str(name)) for server_row, name in rows]
+
     async def get_provisioning_spec(self, server_id: UUID) -> ProvisioningSpec | None:
         """Resolve the plan/location/currency the server's catalog offer maps to."""
         async with self._session_factory() as session:

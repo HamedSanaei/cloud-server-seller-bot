@@ -314,6 +314,10 @@ class ServerRepository(Protocol):
         """All servers in MANUAL_REVIEW state (the operator review queue)."""
         ...
 
+    async def list_deletion_in_progress(self) -> list[CloudServer]:
+        """All servers in DELETE_REQUESTED or DELETING (deletion reconciliation)."""
+        ...
+
     async def save(self, server: CloudServer) -> CloudServer:
         """Persist lifecycle/state changes to an existing server."""
         ...

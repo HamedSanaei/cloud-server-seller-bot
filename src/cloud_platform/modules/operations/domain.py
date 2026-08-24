@@ -42,6 +42,7 @@ class OperationType(StrEnum):
     POWER_ON = "power_on"
     POWER_OFF = "power_off"
     REBOOT = "reboot"
+    SERVER_DELETE = "server_delete"
 
 
 class OperationStatus(StrEnum):
