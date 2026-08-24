@@ -2846,14 +2846,40 @@ tasks:
   milestone: M15
   title: Run multi-provider billing parity tests
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M15-003
   - M06-006
   acceptance:
   - Different billing quantum/policy settles correctly.
-  evidence: []
+  evidence:
+  - '2026-08-24: Ran multi-provider billing parity tests (M15-006); acceptance ''Different billing quantum/policy settles
+    correctly'' holds. No product code changes were required - the parity suite proves the provider-neutral billing pipeline
+    (M06-006 engine + M15-003 catalog normalization) already settles Hetzner (EUR, hourly quantum) and ArvanCloud (IRR, hourly
+    or daily quantum) correctly through the same code path, which is the invariant M15-007 now enforces. NEW tests/unit/test_multi_provider_billing_parity.py
+    (12 tests, two parts). PART A - catalog normalization parity: a raw ArvanCloud Plan payload (float price_per_hour 2500.5
+    IRR, int price_per_month, memory_in_bytes/disk_in_bytes) maps via plan_pricing_from_arvancloud + PricingIngestionService.ingest_plan
+    to exactly 250050 minor IRR per quantum (exact float->str money path, pinned with a 0.1 float case); a monthly-only ArvanCloud
+    plan derives its hourly minor via monthly/720 exactly as the catalog domain prescribes; a Hetzner PlanPricing (15.87 EUR)
+    flows through the SAME ingest path to 1587 minor EUR; both providers'' normalized specs carry the identical offer shape
+    (per-quantum price + quantum + currency) with distinct currencies preserved end to end (IRR vs EUR, no silent conversion).
+    PART B - billing engine parity (ParityHarness: two users, EUR + IRR wallets, one Hetzner server 700/1000 EUR per hour
+    quantum, one ArvanCloud server 2000000/2500000 IRR per quantum, one shared settlement run): (1) same 2h30m window settles
+    2 complete quanta per provider - each wallet debited in its own currency (hold capture for period 1 + plain debit for
+    period 2), every ledger entry carries its wallet''s own currency, accrual business records carry correct per-provider
+    selling/cost minor and currency (margin consistent per provider), watermarks advance identically; (2) crash-replay (watermarks
+    reset, ledger kept) re-derives all 4 periods as replays with zero money movement for either currency; (3) one provider''s
+    failure never disturbs the other''s - an IRR wallet that cannot cover a period settles nothing (no debit, balance untouched)
+    while the Hetzner server settles both periods; (4) the trailing partial quantum is billed by nobody in the periodic run
+    for either provider. FINAL CHARGE PARITY: (5) both hourly providers: after one accrued period each, deletion at 2h30m
+    bills exactly one ceiling quantum per provider in its own currency under the deterministic final key, and a full replay
+    moves nothing (no new entries, balances unchanged); (6) DAILY QUANTUM POLICY: an ArvanCloud server with an 86400s quantum
+    in the same 2h30m life settles ZERO complete periods in the periodic run, then the final charge captures the daily creation
+    hold (exactly ONE daily quantum, 2500000 IRR, with the correct cost/selling margin record) while the hourly Hetzner parity
+    server bills THREE hourly quanta (3000 EUR) - both correct per their own policy; (7) daily-quantum final charge replay
+    is idempotent (charged 0, no new entries). Full gate: ruff format/check clean, mypy clean (101 files), 1463 passed 11
+    skipped.'
 - id: M15-007
   milestone: M15
   title: Prove zero core-domain provider branching
