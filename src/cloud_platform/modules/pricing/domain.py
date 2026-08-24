@@ -62,10 +62,15 @@ def _require_pattern(value: str, field: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class MarginRule:
-    """One margin rule: pattern + explicit margin.
+    """One margin rule: pattern + explicit margin + optional monthly cap.
 
     ``margin_factor`` multiplies the provider cost (e.g. Decimal("1.15") =
     +15%). ``fixed_minor`` is a flat per-quantum addition in minor units.
+    ``monthly_cap_minor`` is an optional per-user, per-calendar-month (UTC)
+    maximum for all charges under this rule; None means uncapped. The cap
+    must never be exceeded: when it is reached, further settlement of
+    periods for that user in that month is skipped (or, at deletion, the
+    reserved creation hold is released back to the wallet).
     """
 
     provider: str
@@ -73,6 +78,7 @@ class MarginRule:
     location: str
     margin_factor: Decimal
     fixed_minor: int = 0
+    monthly_cap_minor: int | None = None
 
     def __post_init__(self) -> None:
         _require_pattern(self.provider, "provider")
@@ -82,6 +88,8 @@ class MarginRule:
             raise ValueError("margin_factor must be > 0")
         if self.fixed_minor < 0:
             raise ValueError("fixed_minor must not be negative")
+        if self.monthly_cap_minor is not None and self.monthly_cap_minor < 0:
+            raise ValueError("monthly_cap_minor must be >= 0 when set")
 
     def specificity(self) -> int:
         """Number of concrete (non-wildcard) fields: 0..3."""
@@ -306,6 +314,7 @@ def rule_to_dict(rule: MarginRule) -> dict[str, object]:
         "location": rule.location,
         "margin_factor": str(rule.margin_factor),
         "fixed_minor": rule.fixed_minor,
+        "monthly_cap_minor": rule.monthly_cap_minor,
     }
 
 
@@ -313,10 +322,14 @@ def rule_from_dict(raw: dict[str, object]) -> MarginRule:
     fixed = raw["fixed_minor"]
     if not isinstance(fixed, int) or isinstance(fixed, bool):
         raise ValueError("fixed_minor must be an int")
+    cap = raw.get("monthly_cap_minor")  # absent in pre-cap rows: uncapped
+    if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool)):
+        raise ValueError("monthly_cap_minor must be an int or absent")
     return MarginRule(
         provider=str(raw["provider"]),
         plan=str(raw["plan"]),
         location=str(raw["location"]),
         margin_factor=Decimal(str(raw["margin_factor"])),
         fixed_minor=fixed,
+        monthly_cap_minor=cap,
     )

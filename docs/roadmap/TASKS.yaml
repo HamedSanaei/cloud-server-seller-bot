@@ -820,59 +820,173 @@ tasks:
   milestone: M06
   title: Implement periodic accrual job
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M05-002
   - M06-004
   acceptance:
   - No duplicate charges on retry.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the periodic usage accrual job (M06-005). New src/cloud_platform/modules/billing/service.py:
+    AccrualJob settles COMPLETE quantum-sized usage periods for RUNNING servers, anchored at the server''s creation instant
+    and tracked by a new accrual watermark (CloudServer.last_accrued_at, servers.last_accrued_at column, migration 0015).
+    The trailing partial quantum is deliberately never settled here - it is billed as the final segment at deletion (M06-006)
+    - so no usage slice is ever charged twice. Idempotency (acceptance: no duplicate charges on retry): every settlement moves
+    money under a deterministic idempotency key accrual:{server_id}:{period_start_epoch_utc} (UTC-normalized, offset-independent);
+    the first period is instead settled by CAPTURING the creation-time hold (ledger key capture-server-create:{idempotency_key})
+    because that hold reserved exactly the first quantum''s funds at creation - capturing consumes what was reserved with
+    no balance race, and if the hold was released by the failed-create path the period falls back to a plain debit. Before
+    moving money the job looks up BOTH candidate keys in the append-only ledger (key selection is history-independent), so
+    a replayed period is a no-op that only advances the watermark; the ledger''s unique idempotency-key constraint and a new
+    unique-keyed accrual_periods business-record table (migration 0015: period window, quanta, cost_minor from the pinned
+    price snapshot, selling_minor, currency) are durable backstops. New ports: AccrualPeriodRepository (get_by_key/add/list_between
+    for margin reporting) and JobLock; new SqlAlchemyAccrualPeriodRepository and PostgresAdvisoryAccrualLock (session-level
+    pg_try_advisory_lock, same pattern as the catalog sync) serialize runs across processes. Money is always integer minor
+    units from the immutable per-server price snapshot (MissingSnapshotError when absent); insufficient balance leaves the
+    period unsettled for the next run and is counted in the report (deterministic signal for the M06-007 low-balance policy);
+    per-server failures never break the run; one SYSTEM audit event per run (billing.accrual) with counters; AccrualRunReport.render()
+    is ASCII. Wiring: arq job accrue_usage in worker/settings.py builds the full job from the shared SessionFactory. 21 tests:
+    first period captures the creation hold (no fresh debit, business record + watermark correct), partial period not settled,
+    later periods are plain debits, multiple periods in one run, and the acceptance proof: crash-before-watermark-save replay
+    posts 0 charges with 1 replay, no second debit/capture, no duplicate ledger rows and the watermark restored; no-elapsed-time
+    noop; no duplicate accrual rows on replay; released-hold fallback to debit; already-captured hold replay moves nothing;
+    insufficient balance leaves the period unsettled with the report signal; one bad server (missing snapshot) does not break
+    the run; missing wallet counted as error; lock-not-acquired skips entirely, lock-acquired proceeds; charge key determinism
+    across timezones; created_at validation; AccrualPeriod validation; ASCII render; corrupted watermark rebase; per-run audit
+    event; typed MissingSnapshotError. Full suite 951 passed.'
 - id: M06-006
   milestone: M06
   title: Implement final deletion charge
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M06-005
   acceptance:
   - Final segment posted once after confirmed deletion.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the final deletion charge (M06-006) as FinalChargeService in src/cloud_platform/modules/billing/service.py.
+    When a server''s deletion is confirmed (state DELETED, deletion timestamp), the service settles the trailing PARTIAL quantum
+    that the periodic accrual job deliberately left unsettled (it only settles complete periods), so every usage slice of
+    a server''s life is charged exactly once across the whole lifecycle. Window = [last_accrued_at or created_at, deleted_at];
+    a zero-length window (deleted exactly on a grid boundary) charges nothing. Two deterministic legs: (1) if the creation
+    hold is still CREATED and the window covers the first quantum, it is CAPTURED (ledger key capture-server-create:{ik})
+    - the hold reserved exactly that quantum''s funds, no balance race; (2) any remaining window is billed flat as one debit
+    plus one CHARGE entry under the deterministic key final:{server_id}, a partial quantum billing as a full one per the billing
+    policy. Every leg is idempotent under its own key, so a full replay (crash before the watermark save) re-derives both
+    legs and moves nothing, and a partial replay (crash between legs) settles exactly the missing leg - the final segment
+    is posted once. A business record for the margin report covers the FULL final window (both legs) under a unique per-server
+    key, so a partial-replay run still records the complete amount; a SYSTEM audit event (billing.final_charge) is recorded
+    per settlement with charged amount, captured/replayed flags and the entry key; the server watermark advances to the deletion
+    instant. Validation: DELETED state required, deleted_at >= created_at, wallet and immutable price snapshot required (MissingSnapshotError).
+    CloudServer gained deleted_at (domain + repository mapping/save; the column already existed from the schema). 12 tests:
+    partial first quantum captures the hold (no fresh debit, record + watermark correct), full replay moves nothing (no second
+    capture/debit/entry), no-hold flat billing under final: key with replay, long window = 1 captured + 1 flat quantum with
+    the business record covering both (selling=2x, cost=2x) and full replay + crash replay (watermark lost) both settling
+    nothing, crash between legs settling only the missing leg with the record still covering the full window, grid-aligned
+    deletion charges nothing, zero-length window charges nothing, later accrued periods then a partial final quantum (balance
+    math across 3 quanta), and validation (non-DELETED state rejected, missing snapshot typed error, deleted-before-created
+    rejected, audit event contents). Full suite 963 passed.'
 - id: M06-007
   milestone: M06
   title: Implement low-balance policy
   priority: P0
-  status: blocked
+  status: done
   owner_hint: supervisor
   depends_on:
   - M05-003
   - M06-005
   acceptance:
   - Warn/grace/auto-delete decisions are deterministic.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the low-balance policy (M06-007) in src/cloud_platform/modules/billing/service.py. Pure deterministic
+    decision function decide_low_balance(balance, config, low_balance_since, now) -> LowBalanceDecision (NONE / WARN / GRACE
+    / AUTO_DELETE / RECOVERED): balance at/above threshold is healthy (RECOVERED only when a stale watermark exists), balance
+    below threshold with no watermark is WARN (starts the grace clock), below threshold within the grace window is GRACE (silent
+    - the user was already warned), at/older than the grace window is AUTO_DELETE. The decision depends only on (balance,
+    config, watermark, now) - the acceptance line - and is proven deterministic by a repeated-inputs test across balance/watermark
+    combinations. The grace clock is a new persisted per-server watermark servers.low_balance_since (migration 0016; CloudServer.low_balance_since
+    field + repository mapping/save): it starts when the server first falls below the threshold and is cleared on recovery,
+    so the decision state survives process restarts and is auditable. LowBalancePolicyService.evaluate(config, now) passes
+    over all RUNNING servers: WARN starts the watermark and notifies the user; GRACE changes nothing (no re-notification spam,
+    no state churn); AUTO_DELETE transitions the server to DELETE_REQUESTED through the domain lifecycle (RUNNING -> DELETE_REQUESTED
+    is an allowed transition) and notifies - the deletion saga (M07-007) owns the actual stop, provider deletion and final
+    charge, so the policy never stops or deletes resources and never moves money; RECOVERED clears the watermark. State changes
+    are persisted via the server repository and every decision is audited (billing.low_balance_<decision> SYSTEM events with
+    balance/threshold/grace metadata). User notification goes through a new BalanceNotifier port (the bot/API integration
+    implements it later; the default is a structured log line). Config: LowBalancePolicyConfig(threshold_minor, grace_hours)
+    with validation, wired from Settings fields low_balance_threshold_minor (default 5000) and low_balance_grace_hours (default
+    24); scheduled as arq job evaluate_low_balance in worker/settings.py. 18 tests: the pure decision function (healthy none,
+    exact-threshold boundary healthy, just-below warn, within-grace grace, exact-grace-boundary auto-delete, beyond-grace
+    auto-delete, recovery, determinism across repeated inputs, naive watermark treated as UTC, config validation) and the
+    service state machine (healthy untouched, falling server warns + starts clock + notifies once, within-grace silent with
+    no state churn, grace exhausted requests deletion (state DELETE_REQUESTED) + notifies, recovery clears watermark, missing
+    wallet treated as balance 0, mixed fleet in one pass (none/warn/grace/auto_delete with a 10h-into-window server correctly
+    in GRACE while the 30h-into-window one auto-deletes), audit action + metadata per decision). Full suite 981 passed.'
 - id: M06-008
   milestone: M06
   title: Implement provider-vs-customer margin report
   priority: P1
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M06-005
   acceptance:
   - Daily expected margin and anomalies visible.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the provider-vs-customer margin report (M06-008) as MarginReportService in src/cloud_platform/modules/billing/service.py.
+    Read-only service over the accrual_periods business records written by the accrual job (M06-005) and the final deletion
+    charge (M06-006) - each record carries the provider cost and the customer charge of its settled quanta from the pinned
+    price snapshot, so the report reflects what was actually billed, not a live recompute. report(start, end) aggregates [start,
+    end) per currency (the platform is multi-currency): total revenue, total cost, expected margin, quanta and period counts,
+    plus a per-server breakdown (ServerMargin with quanta/revenue/cost/margin). Anomalies make pricing problems visible instead
+    of averaging them out, per the acceptance line: NEGATIVE_MARGIN when a period''s provider cost met or exceeded the customer
+    charge (a misconfigured margin rule bleeds money every period - flagged per period, and the period still counts in the
+    totals so the loss is visible, not hidden), COST_UNKNOWN when a period was settled without a price snapshot (cost recorded
+    as 0), MIXED_CURRENCY when the window mixes currencies (per-currency totals remain usable). Anomaly ordering is deterministic
+    (period_start, reason) and repeated reports are byte-identical. report_for_day(day) gives the daily expected margin for
+    [day, day+1) UTC. render() emits an ASCII report (window header, per-currency revenue/cost/margin lines, per-server lines,
+    anomaly list or ''anomalies: none''). The service mutates nothing - it only reads the accrual repository. 12 tests: empty
+    window (zeros, clean, zero margin), daily totals + per-server breakdown (3 periods / 2 servers with exact revenue=4300
+    cost=3000 margin=1300 and per-server splits), window boundaries ([start, end) semantics: period at start in, at end out),
+    invalid window rejected, report_for_day uses the UTC day, negative margin flagged with amounts in the reason and the negative
+    total still visible (margin -100), zero-cost settled flagged COST_UNKNOWN, cost==revenue treated as negative margin (zero
+    margin), mixed currency flagged with per-currency totals intact, deterministic anomaly ordering across repeated reports,
+    and ASCII rendering completeness (counts, per-currency line, per-server lines, ''anomalies: none'' / anomaly list). Full
+    suite 993 passed.'
 - id: M06-009
   milestone: M06
   title: Add monthly-cap support per price policy
   priority: P2
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M06-004
   acceptance:
   - Optional cap cannot overcharge configured maximum.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added monthly-cap support per price policy (M06-009). The cap is configured on MarginRule.monthly_cap_minor
+    (optional per-user, per-UTC-calendar-month maximum in minor units; None = uncapped, validated >= 0) and rides the existing
+    margin_rule JSON column inside the immutable server price snapshot, so it requires no schema migration and pre-cap persisted
+    rows deserialize as uncapped (rule_from_dict uses .get; round-trip and backward-compat tested). Enforcement: (1) the accrual
+    job checks, before settling each period, the wallet''s billed total for the period''s usage month (new AccrualPeriodRepository.month_total
+    = SUM(selling_minor) where wallet and period_start >= month_start, plus SqlAlchemyAccrualPeriodRepository implementation)
+    - when billed + period charge would exceed the cap, the period is settled as CAPPED: no money moves, no ledger entry,
+    no business record, but the watermark advances past it (each period is evaluated exactly once, no audit spam, and a new
+    month starts a fresh cap), counted in AccrualRunReport.capped_periods (also in render() and the run audit metadata) and
+    audited as a billing.cap_reached SYSTEM event with cap/billed/skipped amounts and month start. (2) The final deletion
+    charge applies the same cap at the deletion instant: a leg that would pass the cap is skipped; if the capture leg is capped
+    the reserved creation hold is RELEASED (release-{ik} ledger entry) so reserved funds are returned to the user instead
+    of being stranded - the platform absorbs the difference; FinalChargeResult gained a capped flag and the final_charge audit
+    event carries it. The acceptance invariant - the cap cannot overcharge the configured maximum - is exact: billed + charge
+    > cap blocks, billed + charge == cap is allowed (boundary tested). 13 tests: rule round-trip with/without cap, old rows
+    without the cap key deserialize uncapped, negative cap rejected, month_start_utc boundaries (first-of-month, last instant,
+    rollover, naive-as-UTC), accrual cap (5 due periods with cap=2: exactly 2 posted + 3 capped, watermark advances past capped
+    periods, only 2 ledger entries and 2 business records; per-usage-month semantics: periods ending in the new month bill
+    under the fresh cap; exact-cap boundary allowed; capped periods audited with correct metadata), final charge cap (capped
+    final releases the hold and charges nothing with both legs audited; within-cap charges normally; flat leg capped; no-cap
+    behavior unchanged). Full suite 1006 passed.'
 - id: M07-001
   milestone: M07
   title: Implement create-server application command
@@ -1064,7 +1178,7 @@ tasks:
   milestone: M07
   title: Implement delete-server saga
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M07-005
@@ -1301,7 +1415,7 @@ tasks:
   milestone: M08
   title: Implement low-balance notifications
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M06-007
@@ -1483,7 +1597,7 @@ tasks:
   milestone: M10
   title: Implement cost circuit breakers
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M06-008

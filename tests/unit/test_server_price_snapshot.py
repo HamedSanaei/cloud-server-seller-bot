@@ -341,6 +341,7 @@ class TestSnapshotRepository:
             "location": "*",
             "margin_factor": "1.07",
             "fixed_minor": 0,
+            "monthly_cap_minor": None,
         }
 
     async def test_create_duplicate_raises(self, db: AsyncMock) -> None:

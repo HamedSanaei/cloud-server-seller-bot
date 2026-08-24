@@ -211,6 +211,8 @@ class Server(Base):
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
     deleted_at = Column(DateTime, nullable=True)
+    last_accrued_at = Column(DateTime(timezone=True), nullable=True)
+    low_balance_since = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     user = relationship("User", back_populates="servers")
@@ -599,4 +601,41 @@ class TermsVersion(Base):
     body = Column(Text, nullable=False)
     summary = Column(String, nullable=False, server_default="")
     effective_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+
+class AccrualPeriod(Base):
+    """One settled quantum of a server's usage (M06-005).
+
+    The business record behind each periodic accrual charge: the customer
+    charge (``selling_minor``) and the provider cost (``cost_minor``, from the
+    server's pinned price snapshot) for one quantum window. The margin report
+    (M06-008) aggregates these rows per day. The unique ``idempotency_key``
+    is a second backstop against duplicate charges beyond the wallet ledger.
+
+    Attributes:
+        id: Primary key
+        server_id: The server the quantum belongs to
+        wallet_id: The wallet that was charged
+        period_start / period_end: The quantum window (UTC, end exclusive)
+        quanta: Quanta settled in this row (1 for periodic accruals)
+        cost_minor: Provider cost in minor units (0 when no snapshot)
+        selling_minor: Customer charge in minor units
+        currency: ISO 4217 currency
+        idempotency_key: Unique charge key (the ledger entry key)
+        created_at: Record creation timestamp
+    """
+
+    __tablename__ = "accrual_periods"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
+    wallet_id = Column(PG_UUID, ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False)
+    period_start = Column(DateTime(timezone=True), nullable=False)
+    period_end = Column(DateTime(timezone=True), nullable=False)
+    quanta = Column(Integer, nullable=False, server_default="1")
+    cost_minor = Column(BigInteger, nullable=False, server_default="0")
+    selling_minor = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False)
+    idempotency_key = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")

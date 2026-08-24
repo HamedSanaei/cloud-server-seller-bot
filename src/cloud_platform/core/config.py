@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
     default_currency: str = "EUR"
     customer_billing_quantum_seconds: int = Field(default=3600, ge=60)
+    low_balance_threshold_minor: int = Field(default=5000, ge=0)
+    low_balance_grace_hours: int = Field(default=24, ge=0)
     backup_output_dir: str = "./backups"
     backup_retention_days: int = Field(default=14, ge=1)
     backup_encryption_key: str = ""

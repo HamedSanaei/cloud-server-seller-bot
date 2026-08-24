@@ -64,6 +64,10 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         contained_from=_state_or_none(_attr(row, "contained_from")),
         idempotency_key=_attr(row, "idempotency_key"),
         created_at=_aware_or_none(_attr(row, "created_at")),
+        last_accrued_at=_aware_or_none(_attr(row, "last_accrued_at")),
+        deleted_at=_aware_or_none(_attr(row, "deleted_at")),
+        low_balance_since=_aware_or_none(_attr(row, "low_balance_since")),
+        quantum_seconds=int(_attr(row, "quantum_seconds") or 3600),
     )
 
 
@@ -237,6 +241,9 @@ class SqlAlchemyServerRepository:
                 server.contained_from.value if server.contained_from is not None else None
             )
             cast_any.provider_server_id = server.provider_server_id
+            cast_any.last_accrued_at = server.last_accrued_at
+            cast_any.deleted_at = server.deleted_at
+            cast_any.low_balance_since = server.low_balance_since
             await session.commit()
             await session.refresh(server_row)
             return _to_domain(server_row, str(provider_name))

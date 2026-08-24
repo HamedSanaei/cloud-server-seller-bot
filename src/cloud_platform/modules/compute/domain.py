@@ -108,6 +108,10 @@ class CloudServer:
     contained_from: ServerLifecycleState | None = None
     idempotency_key: str | None = None
     created_at: datetime | None = None
+    last_accrued_at: datetime | None = None
+    deleted_at: datetime | None = None
+    low_balance_since: datetime | None = None
+    quantum_seconds: int = 3600
 
     def transition_to(self, target: ServerLifecycleState) -> None:
         if target not in _ALLOWED[self.state]:

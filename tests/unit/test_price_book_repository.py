@@ -92,6 +92,7 @@ class TestCreateVersion:
                 "location": "*",
                 "margin_factor": "1.15",
                 "fixed_minor": 5,
+                "monthly_cap_minor": None,
             }
         ]
 
