@@ -2315,14 +2315,36 @@ tasks:
   milestone: M12
   title: Add migration compatibility gate
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M01-001
   - M12-001
   acceptance:
   - Deploy blocks unsafe migration patterns.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added the migration compatibility gate (M12-003); acceptance ''Deploy blocks unsafe migration patterns''
+    holds. NEW scripts/check_migrations.py: a static (AST-based, no imports, no execution) analysis of every alembic revision''s
+    upgrade() body that BLOCKS the closed set of rolling-deploy-unsafe patterns - op.drop_column and op.drop_table (old code
+    still SELECT/INSERTs the column or queries the table), op.rename_table and op.alter_column(new_column_name=...) (old code
+    references the old name), op.add_column with NOT NULL on an existing table without a server_default (old code''s INSERTs
+    fail; the nullable=/server_default= detection looks at the sa.Column(...) argument where alembic migrations actually write
+    them), and op.alter_column(nullable=False) tightening without a server_default. Non-blocking WARNINGS: unique index/constraint
+    on existing rows (fails on duplicates), op.execute() raw SQL (not analysable), missing/empty downgrade() (operability).
+    Drops/renames in downgrade() are correctly NOT flagged - they are the expected reverse direction (this is why all 20 existing
+    revisions, whose drop_* calls all live in downgrade(), pass cleanly: ''checked 20 revision(s): 0 unsafe, 0 overridden,
+    7 warning(s) - migration gate passed''). A blocked pattern can be overridden in the revision file with ''# compat-override:
+    <reason>'' (a bare marker with no reason is rejected); the gate prints each override with its reason so the decision stays
+    auditable, and exit 0 means deploy may proceed. CLI: uv run python scripts/check_migrations.py [dir] [--strict] (strict
+    makes warnings fail too). DEPLOY BLOCK: wired into .github/workflows/ci.yml as a ''Migration compatibility gate'' step
+    in the test job (runs on every PR/push, fails the build, so a deploy of an unsafe migration is blocked at CI). TESTS:
+    tests/unit/test_migration_gate.py (23 tests) - each unsafe rule on synthetic revisions (drop_column, drop_table, rename_table,
+    column rename, NOT NULL add_column without default, tightening without default), each safe pattern (nullable add_column,
+    NOT NULL with server_default in both positions, create_table, drops in downgrade only), each warning (unique index, op.execute,
+    missing downgrade), the override mechanism (with reason claims the finding, without reason does not, and only claims findings
+    BELOW the marker), end-to-end runs over the REAL alembic/versions directory (must pass with zero unsafe) and via subprocess
+    CLI (exit 0 + ''migration gate passed''), and main() exit codes (unsafe -> 1, overridden -> 0, warnings pass without --strict
+    and fail with it). Full suite 1306 passed.'
 - id: M12-004
   milestone: M12
   title: Create staging compose/deployment

@@ -67,6 +67,11 @@ jobs:
           --cov-report=xml:coverage.xml
           --cov-report=term
           --cov-fail-under=88
+      # M12-003: the migration compatibility gate - rolling-deploy-unsafe
+      # schema changes (drops/renames/defaultless NOT NULL on the upgrade
+      # path) fail the build unless a reasoned '# compat-override:' is present.
+      - name: Migration compatibility gate
+        run: uv run python scripts/check_migrations.py
       - name: Validate task backlog
         if: always()
         run: uv run python scripts/validate_tasks.py
