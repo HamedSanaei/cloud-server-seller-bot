@@ -3234,18 +3234,35 @@ tasks:
   milestone: M16
   title: Create realistic load model
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M12-004
   acceptance:
   - User/order/job/provider assumptions documented.
-  evidence: []
+  evidence:
+  - '2026-08-24: Realistic load model (M16-001); acceptance ''User/order/job/provider assumptions documented'' holds. ASSUMPTIONS
+    LIVE TWICE, kept honest: prose in docs/ops/load_model.md (tables with a WHY for every number) and executable values in
+    NEW src/cloud_platform/planning/load_model.py - tests assert the two agree. USERS UserPopulation(registered=10000, daily_active=1500=15%
+    DAU-typical, peak_concurrent=120 evening burst): ordering invariant enforced (active<=registered, peak<=active). ORDERS
+    OrderMix: fractions of all user actions summing to EXACTLY 1 (validated, negatives rejected): reads dominate by design
+    (server_read .45 + catalog .20 + wallet .15 = .80), power .12 is the common mutation, create .02 / delete .015 / rebuild
+    .005 / snapshot .01 / ssh_key .03; read-dominance asserted by test. JOBS JobProfile: billing tick 60s (metering hourly
+    per quantum spread over ticks), reconcile sweep 300s, outbox flush 5s, worker poll 2s with derived runs/hour properties.
+    PROVIDERS ProviderCapacity: published limit x max_utilized_fraction -> rps_budget; HEADROOM_FACTOR=0.5 mandated (half
+    of any published rate limit stays free at modeled peak for incident sweeps + catalog sync bursts); fraction bounds validated
+    in __post_init__. DERIVATIONS checked against hand computation in tests: steady arrival = daily_active*40/86400 ~= 0.69
+    rps; burst arrival = peak_concurrent / PEAK_ACTION_SPREAD_SECONDS(60) = 2.0 rps; provider-bound write load at burst =
+    burst x mutating mix (.17) = 0.34 rps; Hetzner budget 3600/h x .5 / 3600s = 0.5 rps >= 0.34 required -> check_provider_headroom
+    passes for the documented model and RAISES LoadModelError for a scaled-up population violating budget (tested both ways);
+    docs quote the exact derived numbers and test_documented_numbers_match_code pins them (0.69 / 2.0 / 0.34). Pure integer/float
+    math over dataclasses - no I/O, no clocks. Full gates: ruff format/check clean, mypy clean (127 files), 1697 passed 11
+    skipped, provider-branching gate 73 modules clean.'
 - id: M16-002
   milestone: M16
   title: Load test API and worker queues
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M16-001
