@@ -14,6 +14,7 @@ from cloud_platform.providers.base import (
     ProviderLocation,
     ProviderPlan,
     ProviderServer,
+    ProviderSnapshot,
 )
 from cloud_platform.providers.credentials import CredentialSource
 from cloud_platform.providers.errors import (
@@ -308,6 +309,61 @@ class HetznerCloudProvider:
         )
         action = payload.get("action") or {}
         return str(action.get("status", "unknown"))
+
+    async def create_snapshot(
+        self,
+        provider_server_id: str,
+        description: str,
+        idempotency_key: IdempotencyKey | None = None,
+    ) -> str:
+        """Create a server snapshot (M13-004): ``POST /servers/{id}/actions/create_image``.
+
+        Returns the new image id, read from the action's resources.
+        """
+        del idempotency_key
+        payload = await self._request(
+            "POST",
+            f"/servers/{provider_server_id}/actions/create_image",
+            json={"type": "snapshot", "description": description},
+        )
+        action = payload.get("action") or {}
+        for resource in action.get("resources", []):
+            if resource.get("type") == "image":
+                return str(resource["id"])
+        raise ProviderError("create_image action returned no image resource")
+
+    async def list_snapshots(self, provider_server_id: str | None = None) -> list[ProviderSnapshot]:
+        """List available snapshots: ``GET /images?type=snapshot``.
+
+        With ``provider_server_id`` only that server's snapshots are listed
+        (``bound_to`` filter).
+        """
+        params: dict[str, Any] = {"type": "snapshot", "status": "available"}
+        if provider_server_id is not None:
+            params["bound_to"] = provider_server_id
+        payload = await self._request("GET", "/images", params=params)
+        result: list[ProviderSnapshot] = []
+        for item in payload.get("images", []):
+            created_from = item.get("created_from") or {}
+            result.append(
+                ProviderSnapshot(
+                    id=str(item["id"]),
+                    description=str(item.get("description") or ""),
+                    size_gb=item.get("image_size"),
+                    server_provider_id=(
+                        str(created_from["id"]) if created_from.get("id") else None
+                    ),
+                    created_at=item.get("created"),
+                )
+            )
+        return result
+
+    async def delete_snapshot(self, snapshot_id: str) -> None:
+        """Delete a snapshot: ``DELETE /images/{id}``; 404 means already gone."""
+        try:
+            await self._request("DELETE", f"/images/{snapshot_id}")
+        except ProviderNotFound:
+            return
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         operation = _operation_label(method, path)

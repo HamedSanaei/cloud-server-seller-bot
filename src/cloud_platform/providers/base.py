@@ -172,6 +172,32 @@ def rescue_support_of(provider: CloudProvider) -> Callable[..., Any] | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderSnapshot:
+    """One server snapshot (disk image) known to a provider (M13-004).
+
+    ``size_gb`` drives COST representation: snapshot storage is billed by
+    size-time through the explicit snapshot rate card (modules/pricing),
+    never by hardcoded provider prices.
+    """
+
+    id: str
+    description: str
+    size_gb: float | None
+    server_provider_id: str | None
+    created_at: str | None = None
+
+
+def snapshot_support_of(provider: CloudProvider) -> Callable[[str, str], Any] | None:
+    """The provider's ``create_snapshot`` method, or None (M13-004).
+
+    Snapshots are an OPTIONAL capability; its presence implies
+    ``list_snapshots`` and ``delete_snapshot``.
+    """
+    method = getattr(provider, "create_snapshot", None)
+    return method if callable(method) else None
+
+
 # ---------------------------------------------------------------------------
 # Payment gateway port: create / verify / refund capability model (M09-001)
 # ---------------------------------------------------------------------------

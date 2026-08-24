@@ -2694,13 +2694,33 @@ tasks:
   milestone: M13
   title: Implement snapshots
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M06-002
   acceptance:
   - Snapshot cost/capability represented.
-  evidence: []
+  evidence:
+  - '2026-08-24: Snapshots (M13-004); acceptance ''Snapshot cost/capability represented'' holds. CAPABILITY: new optional
+    port probe snapshot_support_of(provider) in providers/base.py (create implies list/delete; domain never branches per provider)
+    plus a ProviderSnapshot value type (id, description, size_gb, server_provider_id, created_at). HetznerCloudProvider gains
+    the real API mapping: create_snapshot -> POST /servers/{id}/actions/create_image with body {type: snapshot, description}
+    reading the new image id from action.resources (raises ProviderError when absent); list_snapshots -> GET /images?type=snapshot&status=available
+    (+ bound_to filter per server) mapping image_size/created_from/created; delete_snapshot -> DELETE /images/{id} with 404
+    mapped to idempotent success. COST: NEW modules/pricing/snapshots.py - SnapshotRateCard is an EXPLICIT OPERATOR INPUT
+    (currency + per_gb_month_minor in MINOR units; validated 3-letter currency, non-negative rate; rate 0 is a documented
+    deliberate free-snapshots decision, not a hardcoded provider price - honoring the ''never hard-code live provider prices''
+    invariant). snapshot_monthly_minor does exact integer math (rate x GB, negative size rejected); snapshot_hourly_quantum_minor
+    derives hourly via Decimal division by HOURS_PER_MONTH=720 (the SAME constant/convention as the catalog''s monthly->hourly
+    derivation) with ROUND_HALF_UP to whole minor units, then prorates to quantum_seconds with ROUND_HALF_UP again - deterministic
+    integer in/out, never float. Settings gained operator-configurable snapshot_rate_currency / snapshot_per_gb_month_minor
+    so environments declare their own rate card. TESTS tests/unit/test_snapshots.py (16): rate-card validation incl. zero-rate
+    validity and negative rejection, linear monthly math, catalog-convention hourly equivalence asserted against an independent
+    reference computation, half-up rounding case (10.5 -> 11), sub-quantum prorating (2.5 -> 3), invalid-quantum rejection,
+    capability probe present for Hetzner and absent for a plain object, and adapter endpoint/body/parsing coverage through
+    fake transports (create body+resource extraction, list filters and field mapping, delete 204 plus 404-as-success idempotency).
+    Full gates: ruff format/check clean, mypy clean (111 files), 1611 passed 11 skipped, provider-branching gate 65 modules
+    0 violations.'
 - id: M13-005
   milestone: M13
   title: Implement backups toggle

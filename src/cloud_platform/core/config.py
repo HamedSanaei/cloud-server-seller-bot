@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     # (e.g. http://otel-collector:4317); empty = in-process spans, no export.
     otel_exporter_endpoint: str = ""
     otel_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Snapshot storage rate card (M13-004): the OPERATOR-declared price of
+    # snapshot storage - minor units per GB per month. Never a hardcoded
+    # provider price; 0 means snapshots are free in this environment.
+    snapshot_rate_currency: str = ""
+    snapshot_per_gb_month_minor: int = Field(default=0, ge=0)
 
 
 @lru_cache(maxsize=1)
