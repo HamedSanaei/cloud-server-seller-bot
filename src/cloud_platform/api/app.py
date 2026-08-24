@@ -79,6 +79,13 @@ def create_app() -> FastAPI:
     app.middleware("http")(_observe_api)
     app.include_router(health_router)
     app.include_router(webhooks_router)
+    # M14-001: versioned customer REST surface with the stable
+    # error/idempotency envelope.
+    from cloud_platform.api.v1 import install_error_handlers
+    from cloud_platform.api.v1 import router as v1_router
+
+    install_error_handlers(app)
+    app.include_router(v1_router)
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics_endpoint() -> Response:

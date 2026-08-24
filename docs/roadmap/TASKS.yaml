@@ -2814,19 +2814,42 @@ tasks:
   milestone: M14
   title: Define customer REST API v1
   priority: P1
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M07-007
   - M05-003
   acceptance:
   - Stable resource/error/idempotency contract.
-  evidence: []
+  evidence:
+  - '2026-08-24: Customer REST API v1 (M14-001); acceptance ''Stable resource/error/idempotency contract'' holds. CONTRACT
+    FROZEN under /v1 and pinned by executable contract tests + docs/api/REST_API_V1.md. ERROR ENVELOPE: every failure returns
+    {error:{code,message,details}} with codes from the frozen ErrorCode enum (validation_error, invalid_ssh_key, unauthorized,
+    not_found, conflict, quota_exceeded, action_not_allowed, operation_in_progress, idempotency_required, rate_limited, not_implemented,
+    internal_error) each bound to its HTTP status; install_error_handlers registers handlers for ApiError raised in handlers,
+    a domain-error map (SshKeyNotFoundError/FirewallNotFoundError -> not_found so foreign resources are indistinguishable
+    from missing ones = no existence leak; DuplicateSshKeyError -> conflict; SshKeyLimitError -> quota_exceeded; InvalidPublicKeyError
+    -> invalid_ssh_key), RequestValidationError -> validation_error with details.errors, and framework HTTPException/404s
+    converted to the SAME envelope (starlette-level handler so unmatched routes are enveloped too). IDEMPOTENCY: require_idempotency_key
+    dependency enforces that EVERY mutating request carries an Idempotency-Key header (missing/blank -> 428 idempotency_required;
+    >128 chars -> 400 validation_error); reads never require it; keys join the ledger operation keys downstream so replays
+    cannot double-act. IDENTITY SEAM: get_current_user_id dependency (documented auth adapter seam) validates the identity
+    header as a UUID else 401 unauthorized envelope. RESOURCES wired to real platform services via container factories (new
+    Container.catalog_repository() and Container.power_command_service()): GET /v1/catalog/offers (enabled offers only), GET
+    /v1/wallet (integer minor units), GET /v1/servers paged owner-scoped list, GET /v1/servers/{id} (foreign id = 404 envelope),
+    POST /v1/servers/{id}/actions/{power-on|power-off|reboot} dispatched through PowerCommandService public methods with NotServerOwnerError->404,
+    action-not-allowed->409, in-progress->409 operation_in_progress, failed->409 conflict, returning 202 with replayed/requeued
+    flags; GET/POST/DELETE /v1/ssh-keys through SshKeyService (fingerprints only, never key material); DELETE /v1/servers/{id}
+    reserved as stable 501 not_implemented until the REST order/delete saga phase (documented). STABILITY TESTS tests/unit/test_api_v1_contract.py
+    (12): envelope shape asserted on unknown routes/401/validation/domain errors, mutation-requires-key matrix incl. oversized
+    key, reads key-free, catalog enabled-only filtering, ssh-key registration fingerprint, OpenAPI path pinning (exact /v1
+    path set must exist) and version-prefix check. Full gates: ruff format/check clean, mypy clean (119 files), 1646 passed
+    11 skipped, provider-branching gate 69 modules clean.'
 - id: M14-002
   milestone: M14
   title: Implement customer API tokens/scopes
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M14-001
@@ -2849,7 +2872,7 @@ tasks:
   milestone: M14
   title: Build customer web panel shell
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M14-001

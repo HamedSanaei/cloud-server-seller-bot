@@ -17,12 +17,14 @@ from cloud_platform.core.config import get_settings
 from cloud_platform.db.session import SessionFactory, get_session
 from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.catalog.repository import SqlAlchemyCatalogRepository
 from cloud_platform.modules.credentials.domain import (
     CredentialHolderLike,
 )
 from cloud_platform.modules.credentials.service import CredentialRotationService
 from cloud_platform.modules.firewalls.repository import SqlAlchemyFirewallRepository
 from cloud_platform.modules.firewalls.service import FirewallService
+from cloud_platform.modules.operations.service import PowerCommandService
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
 from cloud_platform.modules.sshkeys.service import SshKeyService
@@ -85,6 +87,22 @@ class Container:
         return FirewallService(
             SqlAlchemyFirewallRepository(self.session_factory),
             AuditTrail(_audit_repository(self.session_factory)),
+        )
+
+    def catalog_repository(self) -> SqlAlchemyCatalogRepository:
+        """Read-side catalog repository (REST v1 offers listing)."""
+        return SqlAlchemyCatalogRepository(self.session_factory)
+
+    def power_command_service(self) -> PowerCommandService:
+        """Idempotent power command service (REST v1 server actions)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+
+        return PowerCommandService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            provider_registry=self.provider_registry,
+            audit_repo=_audit_repository(self.session_factory),
         )
 
     @asynccontextmanager
