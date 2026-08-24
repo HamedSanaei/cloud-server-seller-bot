@@ -40,6 +40,7 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.notifications.domain import ProvisioningProgressService
 from cloud_platform.modules.operations.domain import (
     Operation,
     OperationRepository,
@@ -153,6 +154,7 @@ class ProvisioningWorker:
         power_executor: PowerOperationExecutor | None = None,
         concurrency_limit: int = 3,
         waiter: ActionWaiter | None = None,
+        progress: ProvisioningProgressService | None = None,
     ) -> None:
         if concurrency_limit < 1:
             raise ValueError("concurrency_limit must be at least 1")
@@ -165,6 +167,7 @@ class ProvisioningWorker:
         self._audit = AuditTrail(audit_repo)
         self._concurrency_limit = concurrency_limit
         self._waiter = waiter
+        self._progress = progress
         self._power = power_executor or PowerOperationExecutor(
             operation_repo=operation_repo,
             server_repo=server_repo,
@@ -272,6 +275,8 @@ class ProvisioningWorker:
             },
         )
         logger.info("provisioned server %s -> provider %s", server_id, created.id)
+        if self._progress is not None:
+            await self._progress.started(server, f"provider server {created.id}")
         await self._watch_creation(server, provider, created)
         return ProvisioningOutcome.PROVISIONED
 
@@ -326,6 +331,8 @@ class ProvisioningWorker:
                     "polls": str(result.polls),
                 },
             )
+            if self._progress is not None:
+                await self._progress.succeeded(server, f"provider server {created.id}")
             return
 
         outcome_action = (
@@ -464,6 +471,8 @@ class ProvisioningWorker:
             reason=reason,
             metadata={"operation_id": str(claimed.id)},
         )
+        if self._progress is not None:
+            await self._progress.failed(server, reason)
         return ProvisioningOutcome.FAILED
 
     async def _release_hold(self, server: CloudServer) -> None:
@@ -529,6 +538,7 @@ class CreateTimeoutReconciler:
         in_flight_timeout: timedelta = timedelta(minutes=15),
         provisioning_timeout: timedelta = timedelta(hours=1),
         clock: Callable[[], datetime] | None = None,
+        progress: ProvisioningProgressService | None = None,
     ) -> None:
         if in_flight_timeout <= timedelta(0) or provisioning_timeout <= timedelta(0):
             raise ValueError("timeouts must be positive")
@@ -542,6 +552,7 @@ class CreateTimeoutReconciler:
         self._in_flight_timeout = in_flight_timeout
         self._provisioning_timeout = provisioning_timeout
         self._now = clock or (lambda: datetime.now(UTC))
+        self._progress = progress
 
     async def reconcile(self) -> dict[ReconciliationOutcome, int]:
         """Scan for timed-out create intents and resolve each safely.
@@ -750,6 +761,10 @@ class CreateTimeoutReconciler:
                 reason=f"provider server {server.provider_server_id} not found on reconciliation",
                 metadata={"operation_id": str(op.id)},
             )
+            if self._progress is not None:
+                await self._progress.failed(
+                    server, "provider server not found during reconciliation"
+                )
             return ReconciliationOutcome.FAILED
 
         # The resource exists but did not finish in time: uncertain, so a human
@@ -784,6 +799,8 @@ class CreateTimeoutReconciler:
             reason=reason,
             metadata={"operation_id": str(op.id)},
         )
+        if self._progress is not None:
+            await self._progress.failed(server, reason)
         return ReconciliationOutcome.FAILED
 
     async def _contain(self, server: CloudServer, reason: str) -> None:

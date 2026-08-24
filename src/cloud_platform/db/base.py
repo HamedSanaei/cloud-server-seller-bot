@@ -220,6 +220,37 @@ class ProviderLocation(Base):
     provider = relationship("Provider", back_populates="locations")
 
 
+class ProvisioningNotification(Base):
+    """One FINAL provisioning notification, recorded exactly once (M08-006).
+
+    The unique (server_id, kind) constraint is the exactly-once guarantee:
+    the first delivery attempt inserts the row, every later attempt hits
+    the constraint and is a no-op, so the user sees the final
+    success/error at most once - and at least once, because the record is
+    written before the notifier is called.
+
+    Attributes:
+        id: Primary key
+        user_id: The user to notify
+        server_id: The server being provisioned
+        kind: "success" or "failed"
+        detail: Optional human-readable detail (provider id / failure reason)
+        sent_at: When the record was made
+    """
+
+    __tablename__ = "provisioning_notifications"
+    __table_args__ = (
+        UniqueConstraint("server_id", "kind", name="uq_provisioning_notifications_server_kind"),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
+    kind = Column(String, nullable=False)
+    detail = Column(Text, nullable=True)
+    sent_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", nullable=False)
+
+
 class Server(Base):
     """Represents a cloud server instance with lifecycle states.
 

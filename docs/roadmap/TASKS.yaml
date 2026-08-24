@@ -1496,13 +1496,37 @@ tasks:
   milestone: M08
   title: Implement provisioning progress notifications
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M07-002
   acceptance:
   - User receives final success/error once.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented provisioning progress notifications (M08-006); acceptance ''User receives final success/error
+    once'' holds. New domain module src/cloud_platform/modules/notifications (domain.py, repository.py, __init__.py): ProvisioningEventKind
+    (STARTED progress / SUCCESS / FAILED final, is_final property), ProvisioningEvent (user_id, server_id, kind, detail, at),
+    ProvisioningNotifier protocol port with the established _LoggingNotifier default (the Telegram bot integration replaces
+    it later, same pattern as BalanceNotifier), ProvisioningNotificationLogRepository protocol and ProvisioningProgressService(notifier,
+    log_repo) with started(server, detail) for non-deduplicated progress and succeeded(server, detail)/failed(server, reason)
+    for the final events: record_final(user_id, server_id, kind, detail) -> bool atomically inserts a row; only the FIRST
+    record (True) triggers notifier.send, so a crash, worker retry, or overlapping reconciler round can never make the user
+    see two finals - and the record is written before the notifier is called, so the outcome is never swallowed either. Dedup
+    is per (server_id, kind): a success does not suppress a later failure of the same server (different saga outcome) and
+    different servers are independent. New DB table provisioning_notifications (alembic 0018, model in db/base.py) with the
+    UniqueConstraint (server_id, kind) as the exactly-once guard; SqlAlchemyProvisioningNotificationLogRepository.record_final
+    inserts and treats IntegrityError as ''already sent'' (rollback + False), rejects non-final kinds. Wiring (optional dependency,
+    None = current behavior): ProvisioningWorker gained progress: ProvisioningProgressService | None and now emits started(server,
+    provider server id) after the provider create + correlation audit, succeeded(server) when the ActionWaiter wait completes
+    (state -> RUNNING) and failed(server, reason) in _fail_permanent (state -> ERROR, hold released); CreateTimeoutReconciler
+    gained the same optional progress and emits failed(server, reason) on the lost-provider-resource path and in _fail_intent.
+    14 tests: final kinds are final, success delivered exactly once across three attempts (event fields user/server/detail),
+    failure delivered exactly once, success and failure are separate dedup kinds, different servers independent, started never
+    touches the final log (progress may repeat), the logging notifier logs (caplog), repository first-record commits the row
+    with kind value ''success'', a duplicate insert (IntegrityError) rolls back and returns False, non-final kinds are rejected,
+    worker without a progress service is unchanged, happy path emits only started (no final yet - the waiter decides), a completed
+    wait emits started + success with exactly one log record and the server RUNNING, and a permanent provider error emits
+    exactly one failed with the reason, the hold released and the server ERROR. Full suite 1111 passed.'
 - id: M08-007
   milestone: M08
   title: Implement My Servers list/detail
