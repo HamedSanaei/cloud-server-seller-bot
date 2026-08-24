@@ -2280,13 +2280,37 @@ tasks:
   milestone: M12
   title: Build and publish OCI image
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M12-001
   acceptance:
   - Tagged immutable image produced.
-  evidence: []
+  evidence:
+  - '2026-08-24: Built and can publish the OCI image (M12-002); acceptance ''Tagged immutable image produced'' holds. Dockerfile
+    rewritten as a hardened two-stage build: builder (python:3.13-slim + uv only) does uv sync --frozen --no-dev in two layers
+    (dependencies first via --no-install-project for layer caching, then the project editable after src is copied) so the
+    lockfile is the single source of truth exactly like CI; runtime (python:3.13-slim) copies only the venv + src + entrypoint,
+    installs nothing, runs as the non-root system user app (USER app), sets PATH to the venv, EXPOSE 8000 and a stdlib urllib
+    HEALTHCHECK against /health/live (slim has no curl). NEW docker-entrypoint.sh gives one image several entry points: api
+    (uvicorn cloud_platform.api.app:create_app --factory, default), worker (arq cloud_platform.worker.settings.WorkerSettings),
+    backup (python -m cloud_platform.backup), migrate (alembic upgrade head), and anything else executes verbatim; configuration
+    stays environment-only. NEW .dockerignore keeps the build context small and secret-free (.git, .venv, tests, docs, .env*,
+    *.key, *.pem, caches). NEW scripts/release_oci_image.py implements the immutable release: it tags the image with the FULL
+    40-char git commit SHA (the same tag is never re-pushed; blobs addressable by content digest), refuses to build on a dirty
+    working tree (the tag must name what was built) unless --allow-dirty is used for local smoke tests, accepts extra tags
+    only via an explicit --tag flag with format validation (no mutable tag can appear in a plain run), builds with docker
+    build --pull, verifies the image exists and prints its content digest, and publishes only with --push; subprocess output
+    is captured as bytes and decoded utf-8/replace so docker''s UTF-8 progress output cannot crash the release under a cp1252
+    locale. ACTUAL BUILD PERFORMED: uv run python scripts/release_oci_image.py --allow-dirty produced cloud-server-platform:a1f7892e48dd661aa7349f58ea12cc68410a9bac
+    (digest sha256:313487503974716c83fe6fff513e1cb034e3d1131aa088865c6e8bd205658f96) and the running image was verified: docker
+    run api starts uvicorn, /health/live and /health/ready both return 200, /metrics serves cloud_platform_api_requests_total,
+    docker exec id reports uid=999(app) (non-root) and the image Config.User is app. TESTS: tests/unit/test_oci_release.py
+    (19 tests) covers the release planning (default plan has ONLY the immutable SHA tag, extra tags are opt-in, dirty-tree
+    refusal with and without --allow-dirty, push opt-in, invalid tag rejection) with every docker effect faked, and the image
+    structure (two stages, runtime non-root, runtime installs nothing, no broad COPY . ., healthcheck + EXPOSE 8000, entrypoint/default-api
+    wiring, lockfile-based dependencies, entrypoint covers all four entry points, .dockerignore excludes secrets/dev files).
+    Full suite 1283 passed.'
 - id: M12-003
   milestone: M12
   title: Add migration compatibility gate
@@ -2303,7 +2327,7 @@ tasks:
   milestone: M12
   title: Create staging compose/deployment
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M12-002
@@ -2702,7 +2726,7 @@ tasks:
   milestone: M16
   title: Run disaster/cost runaway game day
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M11-008

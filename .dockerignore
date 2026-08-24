@@ -1,0 +1,22 @@
+# Keep the image build context small and secret-free.
+.git
+.venv
+**/.venv
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+coverage.xml
+pytest-results.xml
+.env
+.env.*
+*.pem
+*.key
+dist
+build
+docs
+.github
+uv.lock.bak
