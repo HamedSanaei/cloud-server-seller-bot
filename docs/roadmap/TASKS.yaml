@@ -2732,13 +2732,38 @@ tasks:
   milestone: M15
   title: Implement Iranian catalog/pricing mapper
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M15-002
   acceptance:
   - Normalized offers require no core-domain change.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the Iranian catalog/pricing mapper (M15-003); acceptance ''Normalized offers require no core-domain
+    change'' holds: the mapper emits provider-neutral PlanPricing that the EXISTING PricingIngestionService ingests unchanged
+    - zero edits to the catalog domain, no new catalog tables, no new core types. NEW src/cloud_platform/providers/arvancloud/sync.py:
+    (1) plan_pricing_from_arvancloud(item, location_id=) maps one ArvanCloud Plan payload to PlanPricing exactly like Hetzner''s
+    _plan_pricing_from_hetzner - id/name/type-category/cpu_count/memory/disk, with per-region pricing (location_id = the region
+    the plan was fetched from, since ArvanCloud prices are per-region and the catalog row key is (provider, plan, location));
+    currency IRR (contract section 7, provider metadata not a price); (2) MONEY DISCIPLINE - price_per_hour/price_per_month
+    parsed into Decimal MAJOR units only (float values go through str first so no float money math ever occurs; non-numeric
+    and negative values are rejected as payload defects; string prices accepted); at least one of hourly/monthly required
+    (daily is carried in metadata but the catalog''s hourly-quantum model uses hourly-else-monthly-derived via the core hourly_minor());
+    integer specs from _in_bytes fields with Decimal division, GB-field fallback; (3) ArvanCloudCatalogSyncer mirrors HetznerCatalogSyncer
+    in shape (SyncResult, sync_all, build_catalog_sync_job wiring into the shared M04-006 CatalogSyncJob + lock) but without
+    pagination (the spec returns full lists per region) and uses the M15-002 ArvanCloudProvider for transport so auth/error-mapping/throttle
+    are shared with the operational path; per-plan error isolation (one bad payload logs and continues, never aborts the sync);
+    (4) container wiring (core/container.py): when arvancloud_api_key is set, create_container builds one ArvanCloudProvider
+    plus one ArvanCloudCatalogSyncer per configured region (arvancloud_region accepts a comma-separated list) and exposes
+    them as Container.arvancloud_syncers; the provider instance registered in the registry is the same one the syncers use.
+    TESTS: tests/unit/test_arvancloud_catalog.py (13 tests) - full field mapping; memory/disk byte- and field-based fallbacks;
+    monthly-only acceptance; missing hourly+monthly, missing id, missing location all raise; negative price rejection (domain
+    validation); non-numeric price falls through to the next field; string prices parse as exact Decimal (0.55 IRR -> 55 minor
+    via the CORE to_minor_units - proving no core change); and the ACCEPTANCE PIN: the mapper output is a PlanPricing whose
+    ProviderPriceEntry tuple is consumed as-is by the ingestion service (fake ingestion in the syncer test captures the exact
+    (provider_key=''arvancloud'', plan) pair). Syncer tests: per-region sync ingests every plan and reports fetched/upserted
+    counts; per-plan errors are isolated (2 plans, 1 bad -> 1 error entry, sync continues). Full gate: ruff format/check clean,
+    mypy clean (101 files), 1400 passed 11 skipped.'
 - id: M15-004
   milestone: M15
   title: Implement provider-specific reconciliation
@@ -2754,7 +2779,7 @@ tasks:
   milestone: M15
   title: Enable capability-driven Telegram UX
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M15-003
@@ -2766,7 +2791,7 @@ tasks:
   milestone: M15
   title: Run multi-provider billing parity tests
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M15-003

@@ -503,6 +503,7 @@ class TestRegistryAndSettings:
             provider_registry=ProviderRegistry(),
             provider_allocator=None,  # type: ignore[arg-type]
             hetzner_syncer=None,
+            arvancloud_syncers=(),
         )
         monkeypatch.setattr("cloud_platform.core.config.get_settings", lambda: settings)
         monkeypatch.setattr("cloud_platform.core.container.get_settings", lambda: settings)

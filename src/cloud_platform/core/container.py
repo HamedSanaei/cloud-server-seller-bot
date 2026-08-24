@@ -18,6 +18,7 @@ from cloud_platform.db.session import SessionFactory, get_session
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeAllocator
 from cloud_platform.providers.arvancloud.client import ArvanCloudProvider
+from cloud_platform.providers.arvancloud.sync import ArvanCloudCatalogSyncer
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
 from cloud_platform.providers.registry import ProviderRegistry
@@ -44,6 +45,7 @@ class Container:
     provider_registry: ProviderRegistry
     provider_allocator: BaseProviderAllocator
     hetzner_syncer: HetznerCatalogSyncer | None
+    arvancloud_syncers: tuple[ArvanCloudCatalogSyncer, ...]
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
@@ -116,14 +118,38 @@ def create_container() -> Container:
             base_url=settings.hetzner_api_base_url,
         )
 
+    # Create ArvanCloud syncer(s) if key available - one per configured region
+    arvancloud_syncers: list[ArvanCloudCatalogSyncer] = []
+    if settings.arvancloud_api_key:
+        arvancloud_provider = ArvanCloudProvider(
+            api_key=settings.arvancloud_api_key,
+            base_url=settings.arvancloud_api_base_url,
+            region=settings.arvancloud_region,
+        )
+        for region in _configured_regions(settings.arvancloud_region):
+            arvancloud_syncers.append(
+                ArvanCloudCatalogSyncer(
+                    session_factory=session_factory,
+                    provider=arvancloud_provider,
+                    region=region,
+                )
+            )
+
     container = Container(
         session_factory=session_factory,
         provider_registry=registry,
         provider_allocator=allocator,
         hetzner_syncer=hetzner_syncer,
+        arvancloud_syncers=tuple(arvancloud_syncers),
     )
 
     return container
+
+
+def _configured_regions(region_setting: str) -> list[str]:
+    """The ArvanCloud regions to sync (comma-separated setting)."""
+    regions = [r.strip() for r in (region_setting or "").split(",") if r.strip()]
+    return regions or []
 
 
 async def get_container() -> Container:
