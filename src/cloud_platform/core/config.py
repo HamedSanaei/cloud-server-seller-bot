@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     hetzner_api_token: str = ""
     hetzner_api_base_url: str = "https://api.hetzner.cloud/v1"
+    arvancloud_api_key: str = ""
+    arvancloud_api_base_url: str = "https://napi.arvancloud.ir/ecc/v1"
+    arvancloud_region: str = ""
     provider_credential_encryption_key: str = ""
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
     default_currency: str = "EUR"

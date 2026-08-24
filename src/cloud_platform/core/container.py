@@ -17,6 +17,7 @@ from cloud_platform.core.config import get_settings
 from cloud_platform.db.session import SessionFactory, get_session
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeAllocator
+from cloud_platform.providers.arvancloud.client import ArvanCloudProvider
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
 from cloud_platform.providers.registry import ProviderRegistry
@@ -67,6 +68,13 @@ class Container:
                 base_url=settings.hetzner_api_base_url,
             )
             self.provider_registry.register(hetzner)
+        if settings.arvancloud_api_key:
+            arvancloud = ArvanCloudProvider(
+                api_key=settings.arvancloud_api_key,
+                base_url=settings.arvancloud_api_base_url,
+                region=settings.arvancloud_region,
+            )
+            self.provider_registry.register(arvancloud)
 
     async def close(self) -> None:
         """Close all resources."""

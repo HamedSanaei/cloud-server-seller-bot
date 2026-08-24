@@ -2678,18 +2678,61 @@ tasks:
   milestone: M15
   title: Implement Iranian provider adapter
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M15-001
   acceptance:
   - Provider contract suite passes.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the first Iranian provider adapter (M15-002) per the M15-001 contract (docs/iranian/PROVIDER_CONTRACT.md);
+    acceptance ''Provider contract suite passes'' holds for the portable offline half: the full fake-HTTP contract suite for
+    every port method is green. NEW src/cloud_platform/providers/arvancloud/ package: client.py - ArvanCloudProvider (key=arvancloud,
+    phase-1 capabilities per contract section 3: compute/power/rebuild/rescue/snapshot/firewall/network/floating_ip/primary_ip/rdns;
+    BACKUP and VOLUME deliberately NOT advertised), transport + auth + error mapping + throttle: (1) AUTH per section 2 -
+    Authorization header carries the plain Machine-User key with NO Bearer prefix (asserted by test against the real httpx
+    client config), Accept/Content-Type application/json; (2) REGION MODEL - the API addresses every resource by (region,
+    id) and the platform stores only the id, so the adapter returns region-qualified server ids (region:id, qualify_server_id/parse_server_id
+    helpers) and create_server takes the region from request.location_id; region-scoped reads (list_plans/list_images/list_servers)
+    require a configured default region (arvancloud_region) and fail loudly without one; (3) CATALOG - list_plans maps Plan
+    to ProviderPlan passing price_per_hour/price_per_day/price_per_month through metadata VERBATIM (section 7 - never hard-coded,
+    no float money), list_images maps ImageList, list_locations maps the global regions endpoint with a 404 fallback to the
+    configured region (the captured iaas-1.0.json snapshot contains no /regions path - documented as an observation item);
+    (4) CREATE IDEMPOTENCY per section 6 (the spec documents NO Idempotency-Key header) - get-before-create correlation: the
+    adapter lists the region''s servers and matches the deterministic ledger-derived name before POSTing, returning the already-materialized
+    server as-is on a re-send (no second mutation), body maps plan_id->flavor_id, image_id->image_id, user_data->init_script,
+    ssh_key_ids[0]->key_name (single key by NAME, limitation documented); (5) DELETE - 404 treated as success (section 5);
+    power_on/power_off/reboot map to the section-3 endpoints; (6) ERROR MODEL per section 8 - exact mapping 401/403->ProviderAuthError,
+    404->ProviderNotFound, 409/423/''already''->ProviderConflict, 429->ProviderRateLimited(reset_at_unix from Retry-After),
+    5xx/network->ProviderUnavailable, else->ProviderError, parsing the ErrorResponse {message, errors} shape defensively (empty
+    bodies allowed); (7) RATE LIMITING per section 9 - conservative client-side Throttle (default 10 rps, injectable wait
+    for tests) + Retry-After/Retry-After handling on 429 with bounded retries (initial + max_retries, then ProviderRateLimited);
+    (8) STATUS NORMALIZATION - normalize_provider_status table (available/running/started/active->running, creating/build/building/pending->building,
+    deleting->deleting, stopped/off/powered-off->stopped, error/failed->error, unknown passes through lower-cased) - the exact
+    live vocabulary is a documented open item; (9) METRICS - every request goes through the M11-001 provider-call instrumentation
+    with a CLOSED endpoint-shape label set (numeric id and ir-* region segments shaped to {id}/{region}). Settings (core/config.py):
+    arvancloud_api_key (encrypted-secret discipline, default empty), arvancloud_api_base_url default https://napi.arvancloud.ir/ecc/v1,
+    arvancloud_region. Registration: core/container.py _register_providers constructs ArvanCloudProvider from settings when
+    the key is present (same pattern as Hetzner); closed with aclose. NEW docs/iranian/INTEGRATION_NOTES.md - live-account
+    observation file mirroring docs/hetzner/INTEGRATION_NOTES.md: all six contract open items (status vocabulary, create sync-vs-task
+    + poll interval, rate limits, IRR currency + prepaid packages, SSH key name-vs-id, idempotency header) plus the /regions
+    endpoint observation, each TBD with the adapter behavior that keeps working while TBD, and a live smoke checklist. TESTS:
+    tests/unit/test_arvancloud_adapter.py (46 tests) - auth header is the plain key without Bearer (real httpx config), key
+    never appears in any error text (all error paths swept for the raw key), region addressing in paths, missing-region failures,
+    unqualified-id default region, catalog mappings (regions list with broken-item skip, configured-region fallback, plan
+    price pass-through, ImageList), server lifecycle (qualified ids, status normalization, IP extraction, 404->None), create
+    idempotency (mapped body including key_name/init_script; already-materialized server returned with NO second POST; missing
+    region fails), delete 404-as-success + correct DELETE path, power-on/off/reboot paths, the exact section-8 error table
+    (401/403/404/409/500/503), errors[] fallback, empty-body defensiveness, network error -> unavailable, 429 retry-then-success
+    and 429 exhaustion -> ProviderRateLimited with reset_at_unix, the status table (9 cases), id helpers, container registration
+    when the key is set, and settings defaults. Full gate: ruff format/check clean, mypy clean (100 files), 1387 passed 11
+    skipped. Live-account contract tests run through ProviderContractTests when credentials are provisioned (contract section
+    10: no production key from tests).'
 - id: M15-003
   milestone: M15
   title: Implement Iranian catalog/pricing mapper
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M15-002
@@ -2700,7 +2743,7 @@ tasks:
   milestone: M15
   title: Implement provider-specific reconciliation
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M15-002
