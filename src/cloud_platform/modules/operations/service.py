@@ -65,7 +65,7 @@ from cloud_platform.providers.base import (
     CreateServerRequest,
     ProviderImage,
     ProviderServer,
-    supports_power_probe,
+    power_probe_of,
 )
 from cloud_platform.providers.errors import ProviderError, ProviderNotFound
 from cloud_platform.providers.registry import ProviderRegistry
@@ -1209,13 +1209,10 @@ class PowerOperationExecutor:
         # Ambiguous-mutation guard (M15-004): on a RE-SEND (an earlier attempt
         # exists) against a provider that can prove its power effects (no
         # native idempotency header, e.g. ArvanCloud), probe first so a
-        # timed-out mutation is never blindly re-applied.
-        if operation.attempts >= 2 and supports_power_probe(provider):
-            probe_method = provider.probe_power_effect
-            try:
-                probe = await probe_method(server.provider_server_id, action.value)
-            except ProviderError:
-                probe = None  # inconclusive: fall through to the safe default
+        # timed-out mutation is never blindly re-applied. Providers without a
+        # probe (Hetzner) skip straight to the plain re-send below.
+        if operation.attempts >= 2 and power_probe_of(provider) is not None:
+            probe = await self._probe_power_effect(provider, server, action)
             if probe is True:
                 return await self._complete_probe_applied(
                     operation, server, action, actor_type, actor_id
@@ -1243,8 +1240,40 @@ class PowerOperationExecutor:
                 )
                 return PowerExecutionResult.REQUEUED
 
+        if not await self._invoke_power(operation, provider, server, action, actor_type, actor_id):
+            return PowerExecutionResult.REQUEUED
+        return await self._finish_power(operation, server, action, actor_type, actor_id)
+
+    async def _probe_power_effect(
+        self, provider: CloudProvider, server: CloudServer, action: PowerAction
+    ) -> bool | None:
+        """Call the optional probe; None when the provider has no probe or the
+        probe itself fails (conservative default, never a re-send for reboot)."""
+        probe_method = power_probe_of(provider)
+        if probe_method is None:
+            return None
+        provider_server_id = server.provider_server_id
+        if provider_server_id is None:
+            return None
         try:
-            method = getattr(provider, action.value)
+            result = await probe_method(provider_server_id, action.value)
+            return result if result is None or isinstance(result, bool) else None
+        except ProviderError:
+            return None
+
+    async def _invoke_power(
+        self,
+        operation: Operation,
+        provider: CloudProvider,
+        server: CloudServer,
+        action: PowerAction,
+        actor_type: ActorType,
+        actor_id: UUID | None,
+    ) -> bool:
+        """Send the power mutation. Returns False when re-queued (retryable
+        error); raises on permanent failure."""
+        method = getattr(provider, action.value)
+        try:
             await method(server.provider_server_id, IdempotencyKey(operation.operation_key))
         except ProviderError as exc:
             if classify_provider_error(exc) is ErrorClass.RETRYABLE:
@@ -1259,9 +1288,19 @@ class PowerOperationExecutor:
                     reason=str(exc),
                     metadata={"operation_id": str(operation.id)},
                 )
-                return PowerExecutionResult.REQUEUED
+                return False
             await self._fail(operation, actor_type, actor_id, str(exc))
+        return True
 
+    async def _finish_power(
+        self,
+        operation: Operation,
+        server: CloudServer,
+        action: PowerAction,
+        actor_type: ActorType,
+        actor_id: UUID | None,
+    ) -> PowerExecutionResult:
+        """Record completion, apply the target state, and audit the action."""
         operation.complete({"action": action.value, "idempotency_key": operation.operation_key})
         await self._ops.save(operation)
         target = _POWER_TARGET[action]

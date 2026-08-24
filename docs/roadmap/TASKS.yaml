@@ -2858,13 +2858,32 @@ tasks:
   milestone: M15
   title: Prove zero core-domain provider branching
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M15-005
   acceptance:
   - No `if provider == ...` in domain modules.
-  evidence: []
+  evidence:
+  - '2026-08-24: Proved zero core-domain provider branching (M15-007); acceptance ''No if provider == ... in domain modules''
+    now a CI gate. CHANGES: (1) NEW scripts/check_domain_provider_branching.py - AST-based architectural gate that scans EVERY
+    .py under src/cloud_platform/modules/ (the core domain, 57 files) and fails on: any known provider key (hetzner/arvancloud)
+    used in a provider-branching context (a Compare node or a Call argument such as registry.get(''hetzner'')), and any import
+    of a concrete provider adapter package (providers.hetzner/arvancloud/...); provider-generic packages (providers.base ports,
+    errors, retry, registry, waiter, health, contract) are explicitly allowed; provider-key names used as settings attribute
+    names (settings.hetzner_api_token) are configuration plumbing, not branching, and are not flagged (pinned by test). (2)
+    Wired the gate into .github/workflows/ci.yml as the ''Provider-branching gate'' step next to the migration compatibility
+    gate - the invariant is now enforced on every PR. (3) TESTS: tests/unit/test_domain_provider_branching_gate.py (12 tests)
+    - the gate passes on the REAL codebase (acceptance itself); the domain root is the actual modules package with >40 files
+    scanned; the gate catches hetzner equality, arvancloud inequality, in-tuple membership, registry get-lookups, and adapter
+    imports (both providers flagged); port imports are allowed; attribute-name usage is allowed; main() exits 0 on a clean
+    tree and 1 on a violation (monkeypatched root). (4) COLLATERAL CLEANUP required by the stricter typing of the M15-004
+    probe path: providers/base.py gained power_probe_of(provider) -> typed optional probe accessor (the port-level escape
+    hatch, keeping the domain branch-free); PowerOperationExecutor.execute was refactored - probe guard now calls _probe_power_effect,
+    and the provider call + completion were extracted into _invoke_power (returns False when re-queued) and _finish_power
+    (complete + state transition + audit); behavior is byte-identical (all 24 M15-004 reconciliation tests + all power command
+    tests pass unchanged). Full gate: ruff format/check clean, mypy clean (101 files), 1451 passed 11 skipped, provider-branching
+    gate: 57 domain modules scanned, 0 provider-key branches, 0 adapter imports.'
 - id: M16-001
   milestone: M16
   title: Create realistic load model

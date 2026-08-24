@@ -26,7 +26,7 @@ from cloud_platform.modules.operations.service import (
     PowerOperationExecutor,
 )
 from cloud_platform.providers.arvancloud.client import ArvanCloudProvider, Throttle
-from cloud_platform.providers.base import Capability, supports_power_probe
+from cloud_platform.providers.base import Capability, power_probe_of, supports_power_probe
 from cloud_platform.providers.errors import ProviderError
 from cloud_platform.providers.registry import ProviderRegistry
 
@@ -162,6 +162,14 @@ class TestProbePowerEffect:
         provider = ArvanCloudProvider(api_key=KEY, base_url="https://x/v1", throttle=_no_sleep())
         assert supports_power_probe(provider) is True
         assert callable(getattr(provider, "probe_power_effect", None))
+        assert power_probe_of(provider) is not None
+
+    def test_power_probe_of_returns_none_for_providers_without_probe(self) -> None:
+        class NoProbe:
+            key = "hetzner"
+            capabilities = frozenset()
+
+        assert power_probe_of(NoProbe()) is None
 
     def test_read_only_probe_makes_no_mutating_calls(self) -> None:
         provider = _arvancloud_provider(_remote("running"))
@@ -311,7 +319,7 @@ class TestCreateAndDeleteAmbiguityAlreadySafe:
         provider._request = boom
         await provider.delete_server(f"{REGION}:gone", IdempotencyKey("delete-test-key"))
 
-    def test_executor_module_imports_the_probe_port(self) -> None:
+    def test_executor_module_uses_the_probe_port(self) -> None:
         import cloud_platform.modules.operations.service as svc
 
-        assert hasattr(svc, "supports_power_probe")
+        assert hasattr(svc, "power_probe_of")

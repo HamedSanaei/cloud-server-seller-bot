@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
@@ -134,6 +134,17 @@ class PowerEffectProbe(Protocol):
 def supports_power_probe(provider: CloudProvider) -> bool:
     """Whether the provider can prove a power effect before a re-send."""
     return callable(getattr(provider, "probe_power_effect", None))
+
+
+def power_probe_of(provider: CloudProvider) -> Callable[[str, str], Any] | None:
+    """The provider's probe method, or None when it does not implement one.
+
+    Typed escape hatch for the optional ``PowerEffectProbe`` capability:
+    the domain (which only knows the ``CloudProvider`` port) calls this to
+    obtain the method without a per-provider branch (M15-004/M15-007).
+    """
+    method = getattr(provider, "probe_power_effect", None)
+    return method if callable(method) else None
 
 
 # ---------------------------------------------------------------------------

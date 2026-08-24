@@ -72,6 +72,11 @@ jobs:
       # path) fail the build unless a reasoned '# compat-override:' is present.
       - name: Migration compatibility gate
         run: uv run python scripts/check_migrations.py
+      # M15-007: the provider-branching gate - no domain module may branch on
+      # a concrete provider key or import a provider adapter package; a new
+      # provider must be addable without touching src/cloud_platform/modules.
+      - name: Provider-branching gate
+        run: uv run python scripts/check_domain_provider_branching.py
       - name: Validate task backlog
         if: always()
         run: uv run python scripts/validate_tasks.py
