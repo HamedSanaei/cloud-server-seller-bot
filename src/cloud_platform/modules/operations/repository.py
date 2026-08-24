@@ -39,6 +39,7 @@ def _to_domain(row: _OperationModel) -> Operation:
         attempts=int(_attr(row, "attempts")),
         created_at=_attr(row, "created_at"),
         updated_at=_attr(row, "updated_at"),
+        traceparent=_attr(row, "traceparent"),
     )
 
 
@@ -74,6 +75,8 @@ class SqlAlchemyOperationRepository:
             )
             if row is not None:
                 return _to_domain(row)
+            from cloud_platform.observability.tracing import current_traceparent
+
             row = _OperationModel(
                 operation_key=operation_key,
                 operation_type=operation_type.value,
@@ -82,6 +85,11 @@ class SqlAlchemyOperationRepository:
                 provider_key=provider_key,
                 status=OperationStatus.PENDING.value,
                 attempts=0,
+                # M11-002: capture the trace context of the request that
+                # enqueued this operation (None outside a span, e.g. manual
+                # tooling) so the worker's execution span joins the same
+                # trace as the API call.
+                traceparent=current_traceparent(),
             )
             session.add(row)
             try:

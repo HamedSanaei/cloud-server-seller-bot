@@ -25,6 +25,11 @@ from prometheus_client import (
     generate_latest,
 )
 
+from cloud_platform.observability.tracing import (
+    job_span,
+    provider_span,
+    set_span_status_error,
+)
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderConflict,
@@ -159,35 +164,52 @@ class PlatformMetrics:
 
     @asynccontextmanager
     async def job(self, name: str) -> AsyncIterator[None]:
-        """Time one background job run; status ok|error."""
+        """Time one background job run; status ok|error.
+
+        Also opens the job SPAN (M11-002); operation spans started inside a
+        job that carry a persisted traceparent join the ORIGINAL request
+        trace, while the job span itself records the periodic run.
+        """
         started = time.perf_counter()
         status = "ok"
-        try:
-            yield
-        except Exception:
-            status = "error"
-            raise
-        finally:
-            self.job_runs_total.labels(job=name, status=status).inc()
-            self.job_duration_seconds.labels(job=name).observe(time.perf_counter() - started)
+        with job_span(name) as span:
+            try:
+                yield
+            except Exception as exc:
+                status = "error"
+                set_span_status_error(span, exc)
+                raise
+            finally:
+                self.job_runs_total.labels(job=name, status=status).inc()
+                self.job_duration_seconds.labels(job=name).observe(time.perf_counter() - started)
 
     @asynccontextmanager
     async def provider_call(self, provider: str, operation: str) -> AsyncIterator[None]:
-        """Time one provider API call; outcome success|<closed error code>."""
+        """Time one provider API call; outcome success|<closed error code>.
+
+        Also opens the provider SPAN (M11-002) as a child of the current
+        context - the API request span or the worker operation span - so a
+        single trace correlates request -> operation -> provider call.
+        """
         started = time.perf_counter()
         outcome = "success"
-        try:
-            yield
-        except Exception as exc:
-            outcome = provider_outcome(exc)
-            raise
-        finally:
-            self.provider_calls_total.labels(
-                provider=provider, operation=operation, outcome=outcome
-            ).inc()
-            self.provider_call_duration_seconds.labels(
-                provider=provider, operation=operation
-            ).observe(time.perf_counter() - started)
+        with provider_span(provider, operation) as span:
+            try:
+                yield
+            except Exception as exc:
+                outcome = provider_outcome(exc)
+                span.set_attribute("cloud.provider.outcome", outcome)
+                set_span_status_error(span, exc)
+                raise
+            else:
+                span.set_attribute("cloud.provider.outcome", outcome)
+            finally:
+                self.provider_calls_total.labels(
+                    provider=provider, operation=operation, outcome=outcome
+                ).inc()
+                self.provider_call_duration_seconds.labels(
+                    provider=provider, operation=operation
+                ).observe(time.perf_counter() - started)
 
     def record_billing_event(self, event: str, result: str) -> None:
         """Count one billing fund event (e.g. hold_created / hold_captured)."""

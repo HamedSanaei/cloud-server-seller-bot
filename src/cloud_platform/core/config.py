@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     backup_output_dir: str = "./backups"
     backup_retention_days: int = Field(default=14, ge=1)
     backup_encryption_key: str = ""
+    # OpenTelemetry (M11-002): OTLP/GRPC collector endpoint
+    # (e.g. http://otel-collector:4317); empty = in-process spans, no export.
+    otel_exporter_endpoint: str = ""
+    otel_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 @lru_cache(maxsize=1)

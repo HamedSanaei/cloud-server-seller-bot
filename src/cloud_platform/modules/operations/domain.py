@@ -80,6 +80,10 @@ class Operation:
     attempts: int = 0
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: W3C traceparent of the request that enqueued this operation (M11-002);
+    #: the worker starts its execution span as a child of it, so one trace
+    #: correlates API -> job -> provider.
+    traceparent: str | None = None
 
     def __post_init__(self) -> None:
         if not self.operation_key or not self.operation_key.strip():

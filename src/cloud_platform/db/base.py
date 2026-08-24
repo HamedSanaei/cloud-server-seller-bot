@@ -696,6 +696,8 @@ class Operation(Base):
     attempts = Column(Integer, nullable=False, server_default="0")
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    # W3C traceparent of the request that enqueued the operation (M11-002)
+    traceparent = Column(String, nullable=True)
 
 
 # ---------------------------------------------------------------------------

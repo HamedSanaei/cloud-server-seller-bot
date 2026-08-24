@@ -182,7 +182,33 @@ class ProvisioningWorker:
         return server_operation_key(server_id)
 
     async def process_server(self, server_id: UUID) -> ProvisioningOutcome:
-        """Process one server's create intent. See module docstring for semantics."""
+        """Process one server's create intent. See module docstring for semantics.
+
+        M11-002: runs inside a span; when the create operation carries the
+        traceparent of the enqueuing request, the span joins that trace so
+        one trace shows API -> job -> provider.
+        """
+        from cloud_platform.observability.tracing import operation_span
+
+        async with operation_span(
+            "provision server",
+            traceparent=await self._create_traceparent(server_id),
+            attributes={"cloud.resource.id": str(server_id)},
+        ):
+            return await self._process_server_in_span(server_id)
+
+    async def _create_traceparent(self, server_id: UUID) -> str | None:
+        """The persisted traceparent of an existing create op, else None.
+
+        Best-effort: test doubles without ``get_by_key`` simply get no parent.
+        """
+        get_by_key = getattr(self._ops, "get_by_key", None)
+        if get_by_key is None:
+            return None
+        existing = await get_by_key(self._operation_key(server_id))
+        return existing.traceparent if existing is not None else None
+
+    async def _process_server_in_span(self, server_id: UUID) -> ProvisioningOutcome:
         server = await self._servers.get(server_id)
         if server is None:
             return ProvisioningOutcome.SKIPPED_STATE
@@ -1174,7 +1200,34 @@ class PowerOperationExecutor:
         actor_type: ActorType,
         actor_id: UUID | None = None,
     ) -> PowerExecutionResult:
-        """Run one claimed (IN_FLIGHT) power operation; raises on permanent failure."""
+        """Run one claimed (IN_FLIGHT) power operation; raises on permanent failure.
+
+        M11-002: the whole execution runs inside a span that joins the trace
+        of the request that enqueued the operation (via the persisted
+        traceparent), so one trace shows API -> job -> provider.
+        """
+        from cloud_platform.observability.tracing import operation_span
+
+        async with operation_span(
+            "power operation",
+            traceparent=operation.traceparent,
+            attributes={
+                "cloud.operation.id": str(operation.id),
+                "cloud.operation.type": operation.operation_type.value,
+                "cloud.operation.attempts": operation.attempts,
+                "cloud.provider": operation.provider_key,
+            },
+        ):
+            return await self._execute_in_span(operation, actor_type=actor_type, actor_id=actor_id)
+
+    async def _execute_in_span(
+        self,
+        operation: Operation,
+        *,
+        actor_type: ActorType,
+        actor_id: UUID | None = None,
+    ) -> PowerExecutionResult:
+        """The original execution body (runs inside the operation span)."""
         action = _OP_TYPE_TO_ACTION.get(operation.operation_type)
         if action is None:
             raise PowerCommandError(f"operation {operation.id} is not a power operation")
@@ -2121,7 +2174,32 @@ class DeleteOperationExecutor:
         actor_type: ActorType,
         actor_id: UUID | None = None,
     ) -> DeleteExecutionResult:
-        """Run one claimed (IN_FLIGHT) delete operation; raises on permanent failure."""
+        """Run one claimed (IN_FLIGHT) delete operation; raises on permanent failure.
+
+        M11-002: runs inside a span joined to the enqueuing request's trace.
+        """
+        from cloud_platform.observability.tracing import operation_span
+
+        async with operation_span(
+            "delete operation",
+            traceparent=operation.traceparent,
+            attributes={
+                "cloud.operation.id": str(operation.id),
+                "cloud.operation.type": operation.operation_type.value,
+                "cloud.operation.attempts": operation.attempts,
+                "cloud.provider": operation.provider_key,
+            },
+        ):
+            return await self._execute_in_span(operation, actor_type=actor_type, actor_id=actor_id)
+
+    async def _execute_in_span(
+        self,
+        operation: Operation,
+        *,
+        actor_type: ActorType,
+        actor_id: UUID | None = None,
+    ) -> DeleteExecutionResult:
+        """The original execution body (runs inside the operation span)."""
         server = await self._servers.get(operation.resource_id)
         if server is None:
             await self._fail(operation, actor_type, actor_id, "server row missing")

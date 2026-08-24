@@ -9,6 +9,17 @@ from cloud_platform.observability.metrics import metrics
 
 async def startup(ctx: dict[str, object]) -> None:
     ctx["service"] = "cloud-platform-worker"
+    # M11-002: install tracing for the worker process (no-op when a provider
+    # is already installed; in-process spans without OTLP when no endpoint).
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.observability.tracing import setup_tracing
+
+    settings = get_settings()
+    setup_tracing(
+        "cloud-platform-worker",
+        otlp_endpoint=settings.otel_exporter_endpoint,
+        sample_ratio=settings.otel_sample_ratio,
+    )
 
 
 async def shutdown(ctx: dict[str, object]) -> None:

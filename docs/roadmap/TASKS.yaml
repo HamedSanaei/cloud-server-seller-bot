@@ -2101,13 +2101,43 @@ tasks:
   milestone: M11
   title: Add OpenTelemetry tracing
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M11-001
   acceptance:
   - Trace spans correlate API->job->provider.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented OpenTelemetry tracing (M11-002); acceptance ''Trace spans correlate API->job->provider'' holds
+    end to end. DESIGN: 1) NEW observability/tracing.py: parse_traceparent (strict W3C validation, malformed values never
+    break execution), current_traceparent (W3C string of the current span or None), remote_parent_context (builds a remote
+    SpanContext so a new span becomes a child of a persisted parent across process boundaries), setup_tracing (installs TracerProvider
+    with service.name resource + TraceIdRatioBased sampler; OTLP/GRPC BatchSpanProcessor only when otel_exporter_endpoint
+    is set, otherwise in-process spans with no export; first-install-wins per the OTel override ban so app factories and tests
+    coexist), get_tracer (no-op safe when no provider), context managers provider_span/job_span/operation_span (operation_span
+    joins the persisted traceparent and records the error status on raise), api_span_attributes (bounded cardinality: method,
+    status_code, route template). 2) DEPENDENCIES: opentelemetry-api + opentelemetry-sdk + opentelemetry-exporter-otlp-proto-grpc
+    added to pyproject. 3) API SPAN: api/app.py middleware now wraps every request in an ''API request'' span (joins an inbound
+    traceparent header), records http.method/http.status_code/http.route on the span and still emits the M11-001 Prometheus
+    metrics; create_app installs tracing (config-driven, no endpoint = no exporter). 4) API->JOB CORRELATION (the cross-process
+    link): migration 0021 adds a nullable operations.traceparent column (rolling-deploy safe ADD COLUMN; downgrade drops it);
+    the Operation domain + ORM model gained traceparent; the repository captures current_traceparent() at operation CREATION
+    time, so the API request span''s trace id is persisted with every durable operation (create/power/delete) - no call-site
+    signature changes. Worker executors (PowerOperationExecutor, DeleteOperationExecutor, ProvisioningWorker.process_server)
+    now run inside operation_span(...), which joins the persisted traceparent, so the execution span lands in the SAME trace
+    as the enqueuing API request, with the remote-parent flag set. 5) JOB SPANS: PlatformMetrics.job now also opens a ''job
+    <name>'' span (covers all 8 job sites: accrue, reconcile, deletes, provisioning, catalog sync, backup). 6) PROVIDER SPANS:
+    PlatformMetrics.provider_call now opens a ''provider call <operation>'' span as a child of the executing context with
+    cloud.provider/outcome attributes and error status on failure - both adapters covered via the shared metrics choke point.
+    7) CONFIG: Settings gained otel_exporter_endpoint + otel_sample_ratio; worker startup installs tracing. TESTS: tests/unit/test_otel_tracing.py
+    (22 tests) - traceparent parse/validate (7 malformed shapes rejected, zero ids rejected, wrong version rejected), current_traceparent
+    inside/outside a span, remote parent roundtrip (child keeps parent trace id, new span id), API middleware: one span per
+    request with method/status/route attributes, inbound traceparent joins the caller trace (asserted trace id), the acceptance
+    chain: API span -> persisted traceparent -> worker operation span in the SAME trace (asserted trace id equality + parent
+    span id + is_remote=True) with a provider span nested under the operation (is_remote=False), operation without/with-malformed
+    traceparent stays safe, error status recorded on span, provider_call nesting + error outcome attribute, job span, setup
+    idempotence (first install wins). Existing test doubles without get_by_key tolerated (best-effort parent lookup). M15-007
+    gate still clean (60 modules). Full gate: ruff format/check clean, mypy clean (106 files), 1510 passed 11 skipped.'
 - id: M11-003
   milestone: M11
   title: Implement provider retry/backoff policy
