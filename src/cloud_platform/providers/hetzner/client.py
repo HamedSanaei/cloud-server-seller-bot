@@ -273,6 +273,42 @@ class HetznerCloudProvider:
         action = payload.get("action") or {}
         return str(action.get("status", "unknown"))
 
+    async def enable_rescue(
+        self,
+        provider_server_id: str,
+        *,
+        ssh_key_ids: tuple[str, ...] | list[str] = (),
+        rescue_type: str = "linux64",
+    ) -> dict[str, Any]:
+        """Boot into the rescue system (M13-003).
+
+        With ``ssh_key_ids`` the provider issues NO password (key-only
+        access - the protected path). Without them Hetzner generates a
+        temporary root password, returned here ONCE in ``root_password``;
+        the service layer wraps it as a one-time secret that never reaches
+        logs, audit events or persistence.
+        """
+        body: dict[str, Any] = {"type": rescue_type}
+        if ssh_key_ids:
+            body["ssh_keys"] = list(ssh_key_ids)
+        payload = await self._request(
+            "POST", f"/servers/{provider_server_id}/actions/enable_rescue", json=body
+        )
+        action = payload.get("action") or {}
+        return {
+            "status": str(action.get("status", "unknown")),
+            # absent/None when ssh_keys were supplied (password-free rescue)
+            "root_password": payload.get("root_password"),
+        }
+
+    async def disable_rescue(self, provider_server_id: str) -> str:
+        """Leave the rescue system: ``POST /servers/{id}/actions/disable_rescue``."""
+        payload = await self._request(
+            "POST", f"/servers/{provider_server_id}/actions/disable_rescue"
+        )
+        action = payload.get("action") or {}
+        return str(action.get("status", "unknown"))
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         operation = _operation_label(method, path)
         async with metrics.provider_call(self.key, operation):

@@ -2661,13 +2661,35 @@ tasks:
   milestone: M13
   title: Implement rescue mode
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M13-001
   acceptance:
   - Temporary credentials protected.
-  evidence: []
+  evidence:
+  - '2026-08-24: Rescue mode (M13-003); acceptance ''Temporary credentials protected'' holds. DESIGN - key-first: RescueCommandService.enable(user_id,
+    server_id, key, *, ssh_key_ids) forwards the user''s REGISTERED SSH key ids (M13-001) to the provider, so NO temporary
+    password is ever generated (result.password_free=True, credential=None) - the strongest protection is not issuing a secret
+    at all. When no keys are supplied and Hetzner issues a temporary root password anyway, it is wrapped in OneTimeSecret
+    at a single credential-protection boundary inside RescueOperationExecutor: str()/repr() render only ''OneTimeSecret(***REDACTED***)''
+    so logs and error paths cannot leak it; reveal() consumes the plaintext exactly once (second read returns None); the value
+    is NEVER written to the operation row, the audit log, or any store - operation.provider_response records only password_issued
+    bool + ssh_key_count, audit metadata records only a password_free flag. FLOW: enable/disable follow platform command conventions
+    - ownership enforced in the application layer (foreign server = ''server not found'', zero side effects), state gate RUNNING/STOPPED
+    shared with rebuild preconditions, one ledger operation per (action, server, key) via rescue_operation_key with distinct
+    enable/disable key spaces; completed commands replay without provider calls, IN_FLIGHT rejected, FAILED surfaces recorded
+    errors, retryable ProviderUnavailable requeues same key while permanent ProviderConflict fails permanently. NEW OperationType.RESCUE_ENABLE
+    / RESCUE_DISABLE. PROVIDER: optional capability probe rescue_support_of(provider) in providers/base.py (enable implies
+    disable; no per-provider branch in domain); HetznerCloudProvider gains enable_rescue (POST /servers/{id}/actions/enable_rescue
+    with type + optional ssh_keys; root_password absent when keys supplied - mirrored in fake transports) and disable_rescue
+    (POST .../disable_rescue). TESTS tests/unit/test_rescue_mode.py (13): password-free arming with forwarded key ids, issued-password
+    wrapping incl. repr/redaction and single-use reveal, plaintext absence across audit events AND operation payloads (scanned),
+    OneTimeSecret unit behavior, foreign-server refusal for both actions, non-steady-state refusals, missing/oversized key
+    rejection, completed replay without provider call, retryable requeue, permanent failure surfacing on replay, disable flow
+    + separate key spaces, IN_FLIGHT rejection, adapter endpoint mapping through fake transport (key-only vs password path).
+    Full gates: ruff format/check clean, mypy clean (110 files), 1595 passed 11 skipped, provider-branching gate 64 modules
+    0 violations.'
 - id: M13-004
   milestone: M13
   title: Implement snapshots

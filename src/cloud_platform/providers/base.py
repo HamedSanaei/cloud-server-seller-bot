@@ -158,6 +158,20 @@ def rebuild_support_of(provider: CloudProvider) -> Callable[[str, str], Any] | N
     return method if callable(method) else None
 
 
+def rescue_support_of(provider: CloudProvider) -> Callable[..., Any] | None:
+    """The provider's ``enable_rescue`` method, or None (M13-003).
+
+    Rescue mode is an OPTIONAL capability; the presence of ``enable_rescue``
+    implies ``disable_rescue``. The domain probes for it instead of
+    branching per provider.
+    """
+    enable = getattr(provider, "enable_rescue", None)
+    disable = getattr(provider, "disable_rescue", None)
+    if callable(enable) and callable(disable):
+        return enable  # type: ignore[no-any-return]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Payment gateway port: create / verify / refund capability model (M09-001)
 # ---------------------------------------------------------------------------

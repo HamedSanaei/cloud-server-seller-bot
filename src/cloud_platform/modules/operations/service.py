@@ -24,7 +24,7 @@ no funds stay reserved for a server that will never be provisioned.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -67,6 +67,7 @@ from cloud_platform.providers.base import (
     ProviderServer,
     power_probe_of,
     rebuild_support_of,
+    rescue_support_of,
 )
 from cloud_platform.providers.errors import ProviderError, ProviderNotFound
 from cloud_platform.providers.registry import ProviderRegistry
@@ -3079,3 +3080,413 @@ class RebuildWorker:
             result = await self._executor.execute(claimed, actor_type=ActorType.SYSTEM)
             counts["executed" if result is RebuildExecutionResult.EXECUTED else "requeued"] += 1
         return counts
+
+
+# ---------------------------------------------------------------------------
+# Rescue mode (M13-003)
+# ---------------------------------------------------------------------------
+
+
+class OneTimeSecret:
+    """Wraps a provider-issued temporary credential (M13-003).
+
+    ``str()``/``repr()`` NEVER reveal the value - logs, audit events and
+    error messages can only ever show the redaction placeholder. The
+    plaintext exists exactly once, behind :meth:`reveal`, which consumes
+    it: a second read returns None. Nothing in the platform persists or
+    transmits rescue credentials except this single deliberate hand-off
+    to the owner.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value: str | None = value
+
+    def reveal(self) -> str | None:
+        """Return the plaintext ONCE; afterwards always None."""
+        value, self._value = self._value, None
+        return value
+
+    def __bool__(self) -> bool:
+        return True  # an issued secret exists even after consumption
+
+    def __repr__(self) -> str:
+        return "OneTimeSecret(***REDACTED***)"
+
+    def __str__(self) -> str:
+        return "***REDACTED***"
+
+
+class RescueCommandError(Exception):
+    """Base class for rescue command errors."""
+
+
+class RescueNotOwnerError(RescueCommandError):
+    """The acting user does not own the server (indistinguishable from missing)."""
+
+
+class RescueActionNotAllowedError(RescueCommandError):
+    """The server's current state does not allow this rescue action."""
+
+
+class RescueOperationInProgressError(RescueCommandError):
+    """A rescue operation with this key is already in flight."""
+
+
+class RescueOperationFailedError(RescueCommandError):
+    """A prior attempt with the same key failed permanently."""
+
+
+def rescue_operation_key(action: str, server_id: UUID, idempotency_key: str) -> str:
+    """Deterministic ledger key for one rescue intent."""
+    return f"server-rescue-{action}:{server_id}:{idempotency_key}"
+
+
+@dataclass(frozen=True, slots=True)
+class RescueEnableResult:
+    server: CloudServer
+    replayed: bool = False
+    requeued: bool = False
+    #: The temporary rescue password - ISSUED ONLY WHEN NO SSH KEYS were
+    #: supplied (key-only rescue has no password at all). One-time secret:
+    #: repr-safe, consumed on first read, never persisted.
+    credential: OneTimeSecret | None = None
+    password_free: bool = False  # True when rescue was armed with SSH keys
+
+
+@dataclass(frozen=True, slots=True)
+class RescueDisableResult:
+    server: CloudServer
+    replayed: bool = False
+    requeued: bool = False
+
+
+class RescueExecutionResult(StrEnum):
+    EXECUTED = "executed"
+    REQUEUED = "requeued"
+
+
+class RescueOperationExecutor:
+    """Executes claimed RESCUE_ENABLE / RESCUE_DISABLE operations.
+
+    Credential protection lives here: the provider's temporary root
+    password (when one is issued at all) is wrapped into a
+    :class:`OneTimeSecret` and attached to the in-memory result - it is
+    never written to the operation row, the audit log or any store. The
+    audit metadata records only the KEY COUNT used to arm rescue.
+    """
+
+    def __init__(
+        self,
+        *,
+        operation_repo: OperationRepository,
+        server_repo: ServerRepository,
+        provider_registry: ProviderRegistry,
+        audit_repo: AuditRepository,
+    ) -> None:
+        self._ops = operation_repo
+        self._servers = server_repo
+        self._registry = provider_registry
+        self._audit = AuditTrail(audit_repo)
+
+    async def run(
+        self,
+        operation: Operation,
+        *,
+        actor_type: ActorType,
+        actor_id: UUID | None = None,
+        ssh_key_ids: Sequence[str] | None = None,
+    ) -> tuple[RescueExecutionResult, OneTimeSecret | None, bool]:
+        from cloud_platform.observability.tracing import operation_span
+
+        async with operation_span(
+            "rescue operation",
+            traceparent=operation.traceparent,
+            attributes={
+                "cloud.operation.id": str(operation.id),
+                "cloud.operation.type": operation.operation_type.value,
+                "cloud.operation.attempts": operation.attempts,
+                "cloud.provider": operation.provider_key,
+            },
+        ):
+            return await self._run_in_span(
+                operation, actor_type=actor_type, actor_id=actor_id, ssh_key_ids=ssh_key_ids
+            )
+
+    async def _run_in_span(
+        self,
+        operation: Operation,
+        *,
+        actor_type: ActorType,
+        actor_id: UUID | None = None,
+        ssh_key_ids: Sequence[str] | None = None,
+    ) -> tuple[RescueExecutionResult, OneTimeSecret | None, bool]:
+        server = await self._servers.get(operation.resource_id)
+        if server is None:
+            await self._fail(operation, actor_type, actor_id, "server row missing")
+        if not server.provider_server_id:
+            await self._fail(operation, actor_type, actor_id, "server has no provider resource id")
+        if server.state not in REBUILD_PRECONDITION_STATES:
+            await self._fail(
+                operation,
+                actor_type,
+                actor_id,
+                f"server left the expected state ({server.state.value}) before "
+                "the rescue action was executed",
+            )
+        try:
+            provider: CloudProvider = self._registry.get(server.provider_key)
+        except KeyError:
+            await self._fail(
+                operation, actor_type, actor_id, f"unknown provider {server.provider_key!r}"
+            )
+        enable_rescue = rescue_support_of(provider)
+        if enable_rescue is None:
+            await self._fail(operation, actor_type, actor_id, "provider lacks rescue support")
+        # the probe guarantees disable_rescue exists whenever enable does
+        disable_rescue: Any = getattr(provider, "disable_rescue", None)
+
+        keys = list(ssh_key_ids or [])
+        try:
+            if operation.operation_type is OperationType.RESCUE_ENABLE:
+                payload = await enable_rescue(server.provider_server_id, ssh_key_ids=tuple(keys))
+                status = str(payload.get("status", "unknown"))
+                raw_password = payload.get("root_password")
+            elif operation.operation_type is OperationType.RESCUE_DISABLE:
+                status = str(await disable_rescue(server.provider_server_id))
+                raw_password = None
+            else:
+                await self._fail(operation, actor_type, actor_id, "not a rescue operation")
+        except ProviderError as exc:
+            if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                operation.requeue(str(exc))
+                await self._ops.save(operation)
+                await self._audit.record_mutation(
+                    actor_type=actor_type,
+                    action="server.rescue_requeued",
+                    resource_type=RESOURCE_TYPE_SERVER,
+                    resource_id=str(server.id),
+                    actor_id=actor_id,
+                    reason=str(exc),
+                    metadata={"operation_id": str(operation.id)},
+                )
+                return RescueExecutionResult.REQUEUED, None, False
+            await self._fail(operation, actor_type, actor_id, str(exc))
+
+        # Credential protection boundary: wrap ONCE, persist NOTHING.
+        credential = OneTimeSecret(str(raw_password)) if raw_password else None
+        operation.complete(
+            {
+                "action": operation.operation_type.value,
+                "provider_status": status,
+                # NEVER the password itself - only whether one was issued.
+                "password_issued": bool(raw_password),
+                "ssh_key_count": len(keys),
+            }
+        )
+        await self._ops.save(operation)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            action="server.rescue_enabled"
+            if operation.operation_type is OperationType.RESCUE_ENABLE
+            else "server.rescue_disabled",
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(server.id),
+            actor_id=actor_id,
+            reason=(
+                f"rescue armed with {len(keys)} platform ssh key(s)"
+                if keys and operation.operation_type is OperationType.RESCUE_ENABLE
+                else f"rescue {operation.operation_type.value} executed"
+            ),
+            metadata={
+                "operation_id": str(operation.id),
+                "password_free": "true" if keys else "false",
+            },
+        )
+        return (
+            RescueExecutionResult.EXECUTED,
+            credential,
+            bool(keys) and operation.operation_type is OperationType.RESCUE_ENABLE,
+        )
+
+    async def _fail(
+        self,
+        operation: Operation,
+        actor_type: ActorType,
+        actor_id: UUID | None,
+        reason: str,
+    ) -> NoReturn:
+        operation.fail(reason)
+        await self._ops.save(operation)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            action="server.rescue_failed",
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(operation.resource_id),
+            actor_id=actor_id,
+            reason=reason,
+            metadata={"operation_id": str(operation.id)},
+        )
+        raise RescueOperationFailedError(reason)
+
+
+class RescueCommandService:
+    """User-facing rescue mode commands (enable / disable).
+
+    Acceptance: **temporary credentials protected.**
+
+    - Ownership enforced here; foreign servers are "not found".
+    - Key-first design: the caller passes the user's REGISTERED SSH key ids
+      (M13-001); with keys armed, the provider issues NO password at all -
+      the strongest form of credential protection.
+    - When no keys are supplied and the provider issues a temporary root
+      password anyway, it is wrapped in a :class:`OneTimeSecret`: repr/str
+      redacted, consumable exactly once, never persisted, never audited -
+      the audit trail stores only the key count and a password_free flag.
+    - Idempotency mirrors power/rebuild: one ledger operation per
+      (action, server, key); completed replays never call the provider.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_repo: ServerRepository,
+        operation_repo: OperationRepository,
+        provider_registry: ProviderRegistry,
+        audit_repo: AuditRepository,
+        executor: RescueOperationExecutor | None = None,
+    ) -> None:
+        self._servers = server_repo
+        self._ops = operation_repo
+        self._audit = AuditTrail(audit_repo)
+        self._executor = executor or RescueOperationExecutor(
+            operation_repo=operation_repo,
+            server_repo=server_repo,
+            provider_registry=provider_registry,
+            audit_repo=audit_repo,
+        )
+
+    async def enable(
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        idempotency_key: str,
+        *,
+        ssh_key_ids: Sequence[str] = (),
+    ) -> RescueEnableResult:
+        stripped = self._validated_key(idempotency_key)
+        server = await self._owned(user_id, server_id)
+
+        op = await self._ops.get_by_key(rescue_operation_key("enable", server_id, stripped))
+        state_valid = server.state in REBUILD_PRECONDITION_STATES
+        result, credential, password_free = await self._drive(
+            op,
+            OperationType.RESCUE_ENABLE,
+            server,
+            user_id,
+            stripped,
+            state_valid,
+            ssh_key_ids=list(ssh_key_ids),
+        )
+        return RescueEnableResult(
+            server=await self._servers.get(server_id) or server,
+            replayed=result.replayed,
+            requeued=result.requeued,
+            credential=credential,
+            password_free=password_free,
+        )
+
+    async def disable(
+        self, user_id: UUID, server_id: UUID, idempotency_key: str
+    ) -> RescueDisableResult:
+        stripped = self._validated_key(idempotency_key)
+        server = await self._owned(user_id, server_id)
+
+        op = await self._ops.get_by_key(rescue_operation_key("disable", server_id, stripped))
+        state_valid = server.state in REBUILD_PRECONDITION_STATES
+        result, _credential, _pf = await self._drive(
+            op, OperationType.RESCUE_DISABLE, server, user_id, stripped, state_valid
+        )
+        return RescueDisableResult(
+            server=await self._servers.get(server_id) or server,
+            replayed=result.replayed,
+            requeued=result.requeued,
+        )
+
+    # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _validated_key(idempotency_key: str) -> str:
+        if not idempotency_key or not idempotency_key.strip():
+            raise RescueCommandError("idempotency_key is required")
+        stripped = idempotency_key.strip()
+        if len(stripped) > 128:
+            raise RescueCommandError("idempotency_key too long")
+        return stripped
+
+    async def _owned(self, user_id: UUID, server_id: UUID) -> CloudServer:
+        server = await self._servers.get(server_id)
+        if server is None or server.user_id != user_id:
+            raise RescueNotOwnerError("server not found")
+        return server
+
+    async def _drive(
+        self,
+        existing_op: Any,
+        op_type: OperationType,
+        server: CloudServer,
+        user_id: UUID,
+        key: str,
+        state_valid: bool,
+        *,
+        ssh_key_ids: list[str] | None = None,
+    ) -> tuple[RebuildCommandResult, OneTimeSecret | None, bool]:
+        op_type_name = "enable" if op_type is OperationType.RESCUE_ENABLE else "disable"
+        if existing_op is not None:
+            if existing_op.status is OperationStatus.COMPLETED:
+                return RebuildCommandResult(server=server, replayed=True), None, False
+            if existing_op.status is OperationStatus.FAILED:
+                raise RescueOperationFailedError(existing_op.error or "rescue operation failed")
+            if existing_op.status is OperationStatus.IN_FLIGHT:
+                raise RescueOperationInProgressError("rescue operation is in progress")
+            if not state_valid and existing_op.attempts == 0:
+                raise RescueActionNotAllowedError(
+                    f"rescue not allowed in state {server.state.value}"
+                )
+        else:
+            if not state_valid:
+                raise RescueActionNotAllowedError(
+                    f"rescue not allowed in state {server.state.value}"
+                )
+            existing_op = await self._ops.get_or_create(
+                operation_key=rescue_operation_key(op_type_name, server.id, key),
+                operation_type=op_type,
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=server.id,
+                provider_key=server.provider_key,
+            )
+            await self._audit.record_mutation(
+                actor_type=ActorType.USER,
+                actor_id=user_id,
+                action=f"server.rescue_{op_type_name}_requested",
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=str(server.id),
+                reason=f"rescue {op_type_name} requested (key={key})",
+                metadata={"operation_id": str(existing_op.id)},
+            )
+
+        claimed = await self._ops.claim(existing_op.id)
+        if claimed is None:
+            raise RescueOperationInProgressError("rescue operation is in progress")
+
+        outcome, credential, password_free = await self._executor.run(
+            claimed, actor_type=ActorType.USER, actor_id=user_id, ssh_key_ids=ssh_key_ids
+        )
+        return (
+            RebuildCommandResult(
+                server=server, replayed=False, requeued=outcome is RescueExecutionResult.REQUEUED
+            ),
+            credential,
+            password_free,
+        )
