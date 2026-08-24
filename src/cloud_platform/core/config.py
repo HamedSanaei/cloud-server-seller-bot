@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # provider price; 0 means snapshots are free in this environment.
     snapshot_rate_currency: str = ""
     snapshot_per_gb_month_minor: int = Field(default=0, ge=0)
+    # Backups surcharge (M13-005): the OPERATOR-declared percentage of a
+    # server's monthly price that backups cost, in basis points (2000 bp
+    # = 20%). Never a hardcoded provider default; 0 means free.
+    backup_surcharge_bps: int = Field(default=0, ge=0, le=10_000)
     # REST v1 identity (M14-001/M14-002): the x-platform-user header is a
     # DEV/TEST fallback and MUST stay disabled in production, where requests
     # authenticate with revocable hashed bearer tokens.

@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -17,6 +18,8 @@ from cloud_platform.core.config import get_settings
 from cloud_platform.db.session import SessionFactory, get_session
 from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.backups.repository import SqlAlchemyBackupSettingsRepository
+from cloud_platform.modules.backups.service import BackupsToggleService
 from cloud_platform.modules.catalog.repository import SqlAlchemyCatalogRepository
 from cloud_platform.modules.credentials.domain import (
     CredentialHolderLike,
@@ -96,6 +99,27 @@ class Container:
         return TokenService(
             SqlAlchemyApiTokenRepository(self.session_factory),
             AuditTrail(_audit_repository(self.session_factory)),
+        )
+
+    def backups_toggle_service(self, *, settings: Any = None) -> BackupsToggleService:
+        """Two-phase backups toggle with confirmed price impact (M13-005)."""
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.modules.backups.domain import BackupRateCard
+        from cloud_platform.modules.pricing.repository import (
+            SqlAlchemyServerPriceSnapshotRepository,
+        )
+        from cloud_platform.modules.pricing.service import ServerPriceSnapshotService
+
+        cfg = settings or get_settings()
+        card_provider = lambda: BackupRateCard(surcharge_bps=cfg.backup_surcharge_bps)  # noqa: E731
+        return BackupsToggleService(
+            settings_repo=SqlAlchemyBackupSettingsRepository(self.session_factory),
+            price_snapshots=ServerPriceSnapshotService(
+                SqlAlchemyServerPriceSnapshotRepository(self.session_factory),
+                _audit_repository(self.session_factory),
+            ),
+            audit_repo=_audit_repository(self.session_factory),
+            rate_card_provider=card_provider,
         )
 
     def catalog_repository(self) -> SqlAlchemyCatalogRepository:

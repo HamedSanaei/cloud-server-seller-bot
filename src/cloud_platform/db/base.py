@@ -863,3 +863,25 @@ class ApiTokenRow(Base):
     created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     last_used_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ServerBackupSettingsRow(Base):
+    """Per-server backups toggle (M13-005).
+
+    ``server_id`` IS the primary key: exactly one settings row per server.
+    ``surcharge_bps_at_change`` records which operator rate was in effect
+    when the user confirmed, so historical bills stay explainable even if
+    the rate card moves later.
+    """
+
+    __tablename__ = "server_backup_settings"
+
+    server_id = Column(
+        PG_UUID,
+        ForeignKey("servers.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    enabled = Column(Boolean, nullable=False, server_default="false")
+    surcharge_bps_at_change = Column(Integer, nullable=False, server_default="0")
+    updated_by = Column(PG_UUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")

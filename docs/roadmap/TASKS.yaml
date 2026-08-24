@@ -2725,13 +2725,27 @@ tasks:
   milestone: M13
   title: Implement backups toggle
   priority: P2
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M06-002
   acceptance:
   - Price impact confirmed before mutation.
-  evidence: []
+  evidence:
+  - '2026-08-24: Backups toggle (M13-005); acceptance ''Price impact confirmed before mutation'' holds. TWO-PHASE FLOW in
+    NEW modules/backups/: preview() computes BackupPriceImpact from the server''s IMMUTABLE M06-002 price snapshot (base,
+    surcharge, total, signed delta) and set_enabled() mutates ONLY when the caller re-presents the confirmed_delta_minor the
+    user accepted - recomputed impact mismatch raises StaleConfirmationError so a price move between preview and confirm REFUSES
+    the mutation instead of billing an unseen amount (tested both for wrong confirmation and for snapshot changed mid-flight).
+    SURCHARGE IS AN OPERATOR INPUT: BackupRateCard(surcharge_bps 0..10000, from_percent helper) sourced from NEW settings.backup_surcharge_bps
+    - no hardcoded provider percentage; math is exact Decimal ROUND_HALF_UP to minor units (parametrized hand computations
+    incl. 20% of 499 = 100). STATE: ServerBackupSettings one row per server with surcharge_bps_at_change stamped at each confirmed
+    change so historical bills stay explainable; persisted via SqlAlchemyBackupSettingsRepository + ORM row + migration 0025_add_server_backup_settings
+    (server_id PK, FK->servers CASCADE; smoke head expectation bumped to 0025, migration gate passed). Every confirmed toggle
+    is audited (backups.enabled/disabled, USER actor, delta + bps + idempotency key in metadata); missing idempotency key
+    rejected before any lookup. Container factory backups_toggle_service wires pricing snapshot service + audit + settings.
+    Full gates: ruff format/check clean, mypy clean (131 files), 1717 passed 11 skipped, migration gate passed, provider-branching
+    gate 77 modules clean.'
 - id: M13-006
   milestone: M13
   title: Implement firewall management
