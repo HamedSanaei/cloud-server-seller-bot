@@ -339,6 +339,19 @@ class HetznerCloudProvider:
         del idempotency_key
         await self._request("POST", f"/servers/{provider_server_id}/actions/reboot")
 
+    async def set_reverse_dns(self, provider_server_id: str, ip: str, ptr: str | None) -> None:
+        """Set/reset the reverse DNS (PTR) of one server IP (M13-007).
+
+        ``POST /servers/{id}/actions/change_dns_ptr`` with ``dns_ptr``
+        (``None`` resets the automatic assignment). Naturally idempotent:
+        re-setting an identical PTR is a no-op on the provider side.
+        """
+        await self._request(
+            "POST",
+            f"/servers/{provider_server_id}/actions/change_dns_ptr",
+            json={"ip": ip, "dns_ptr": ptr},
+        )
+
     async def rebuild_server(
         self, provider_server_id: str, image_id: str, idempotency_key: IdempotencyKey | None = None
     ) -> str:

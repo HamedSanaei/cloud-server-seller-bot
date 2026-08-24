@@ -2784,13 +2784,26 @@ tasks:
   milestone: M13
   title: Implement rDNS
   priority: P2
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M07-005
   acceptance:
   - IP ownership and validation.
-  evidence: []
+  evidence:
+  - '2026-08-24: Reverse DNS (M13-007); acceptance ''IP ownership and validation'' holds. VALIDATION FIRST in NEW modules/networking/domain.py:
+    validate_ip parses strictly via ipaddress (canonical form, rejects garbage/overflow), validate_ptr enforces RFC-1035 hostnames
+    (label regex 1-63 chars no leading/trailing hyphen, >=2 labels, <=253 total, trailing root dot accepted then stripped,
+    lowercased); ReverseDnsRecord freezes both through __post_init__ normalization. OWNERSHIP PROVEN TWICE in RdnsService.set_ptr:
+    (1) application-layer platform ownership - foreign server reads as not found; (2) IP MEMBERSHIP - the service fetches
+    the server from the provider and refuses any IP not among THAT server''s assigned ipv4/ipv6 addresses (RdnsIpNotAssignedError)
+    so a user can never PTR an arbitrary internet host; tested for wrong owner, unassigned valid IP, address-less provider,
+    and IPv6 membership acceptance. CAPABILITY PATTERN: rdns_support_of probe on providers/base.py returns the optional set_reverse_dns
+    method; unsupported providers raise RdnsUnsupportedError with zero provider calls - no per-provider branch (gate now scans
+    80 modules clean). Hetzner adapter implements set_reverse_dns -> POST /servers/{id}/actions/change_dns_ptr {ip,dns_ptr}
+    (endpoint mapping test with fake transport); naturally idempotent re-set. Every successful set/reset is audited (rdns.set
+    / rdns.reset, USER actor, ip+ptr metadata). Full gates: ruff format/check clean, mypy clean (134 files), 1741 passed 11
+    skipped, provider-branching gate 80 modules clean.'
 - id: M13-008
   milestone: M13
   title: Implement Primary/Floating IP features

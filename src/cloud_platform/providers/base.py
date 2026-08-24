@@ -198,6 +198,18 @@ def snapshot_support_of(provider: CloudProvider) -> Callable[[str, str], Any] | 
     return method if callable(method) else None
 
 
+def rdns_support_of(provider: CloudProvider) -> Callable[..., Any] | None:
+    """The provider's ``set_reverse_dns`` method, or None (M13-007).
+
+    Reverse DNS is an OPTIONAL capability:
+    ``set_reverse_dns(provider_server_id, ip, ptr)`` sets (or, with
+    ``ptr=None``, resets) the PTR record for one of the server's IPs. The
+    domain probes for it instead of branching per provider.
+    """
+    method = getattr(provider, "set_reverse_dns", None)
+    return method if callable(method) else None
+
+
 # ---------------------------------------------------------------------------
 # Payment gateway port: create / verify / refund capability model (M09-001)
 # ---------------------------------------------------------------------------
