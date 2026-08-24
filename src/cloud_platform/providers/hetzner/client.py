@@ -255,6 +255,24 @@ class HetznerCloudProvider:
         del idempotency_key
         await self._request("POST", f"/servers/{provider_server_id}/actions/reboot")
 
+    async def rebuild_server(
+        self, provider_server_id: str, image_id: str, idempotency_key: IdempotencyKey | None = None
+    ) -> str:
+        """Re-image the server (M13-002): ``POST /servers/{id}/actions/rebuild``.
+
+        Destructive by definition (the disk is wiped); the platform gates it
+        behind explicit confirmation + a ledger operation key. Only an image
+        REFERENCE is ever sent - no credential material.
+        """
+        del idempotency_key
+        payload = await self._request(
+            "POST",
+            f"/servers/{provider_server_id}/actions/rebuild",
+            json={"image": image_id},
+        )
+        action = payload.get("action") or {}
+        return str(action.get("status", "unknown"))
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         operation = _operation_label(method, path)
         async with metrics.provider_call(self.key, operation):

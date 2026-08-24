@@ -43,6 +43,7 @@ class OperationType(StrEnum):
     POWER_OFF = "power_off"
     REBOOT = "reboot"
     SERVER_DELETE = "server_delete"
+    SERVER_REBUILD = "server_rebuild"
 
 
 class OperationStatus(StrEnum):

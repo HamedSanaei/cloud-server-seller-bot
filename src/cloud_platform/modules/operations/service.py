@@ -66,6 +66,7 @@ from cloud_platform.providers.base import (
     ProviderImage,
     ProviderServer,
     power_probe_of,
+    rebuild_support_of,
 )
 from cloud_platform.providers.errors import ProviderError, ProviderNotFound
 from cloud_platform.providers.registry import ProviderRegistry
@@ -2716,4 +2717,365 @@ class DeleteTimeoutReconciler:
             )
             bump(DeleteReconciliationOutcome.RECREATED_OPERATION)
 
+        return counts
+
+
+# ---------------------------------------------------------------------------
+# Rebuild flow (M13-002)
+# ---------------------------------------------------------------------------
+
+#: Rebuild (re-image) is allowed from steady states only: the disk is wiped,
+#: so a server mid-transition must not be re-imaged on top of a saga.
+REBUILD_PRECONDITION_STATES: frozenset[ServerLifecycleState] = frozenset(
+    {ServerLifecycleState.RUNNING, ServerLifecycleState.STOPPED}
+)
+
+
+class RebuildCommandError(Exception):
+    """Base class for rebuild command errors."""
+
+
+class RebuildConfirmationRequiredError(RebuildCommandError):
+    """Rebuild is destructive and was requested without explicit confirmation."""
+
+
+class RebuildNotOwnerError(RebuildCommandError):
+    """The acting user does not own the server (indistinguishable from missing)."""
+
+
+class RebuildActionNotAllowedError(RebuildCommandError):
+    """The server's current state does not allow a rebuild."""
+
+
+class RebuildOperationInProgressError(RebuildCommandError):
+    """A rebuild with this key is already in flight."""
+
+
+class RebuildOperationFailedError(RebuildCommandError):
+    """A prior attempt with the same key failed permanently."""
+
+
+def rebuild_operation_key(server_id: UUID, idempotency_key: str) -> str:
+    """Deterministic ledger key for one rebuild intent (unique per command key)."""
+    return f"server-rebuild:{server_id}:{idempotency_key}"
+
+
+@dataclass(frozen=True, slots=True)
+class RebuildCommandResult:
+    server: CloudServer
+    replayed: bool  # True when a prior attempt with the same key already completed
+    requeued: bool = False  # True when the attempt hit a retryable provider error
+
+
+class RebuildExecutionResult(StrEnum):
+    EXECUTED = "executed"
+    REQUEUED = "requeued"
+
+
+class RebuildOperationExecutor:
+    """Executes a *claimed* SERVER_REBUILD operation against the provider.
+
+    Credential handling is safe by construction: the ONLY thing ever sent
+    to the provider is an image REFERENCE. No password material exists in
+    this flow; access after the wipe is re-established through the user's
+    registered SSH keys (M13-001), which are audited BY COUNT ONLY - never
+    by material.
+
+    The target image is resolved per attempt through ``image_lookup`` so
+    every retry of the same operation uses the same deterministic target.
+    """
+
+    def __init__(
+        self,
+        *,
+        operation_repo: OperationRepository,
+        server_repo: ServerRepository,
+        provider_registry: ProviderRegistry,
+        audit_repo: AuditRepository,
+        image_lookup: Callable[[UUID], Any] | None = None,
+    ) -> None:
+        self._ops = operation_repo
+        self._servers = server_repo
+        self._registry = provider_registry
+        self._audit = AuditTrail(audit_repo)
+        self._image_lookup = image_lookup
+
+    async def execute(
+        self,
+        operation: Operation,
+        *,
+        actor_type: ActorType,
+        actor_id: UUID | None = None,
+        image_id: str | None = None,
+    ) -> RebuildExecutionResult:
+        """Run one claimed (IN_FLIGHT) rebuild; raises on permanent failure."""
+        from cloud_platform.observability.tracing import operation_span
+
+        async with operation_span(
+            "rebuild operation",
+            traceparent=operation.traceparent,
+            attributes={
+                "cloud.operation.id": str(operation.id),
+                "cloud.operation.type": operation.operation_type.value,
+                "cloud.operation.attempts": operation.attempts,
+                "cloud.provider": operation.provider_key,
+            },
+        ):
+            return await self._execute_in_span(
+                operation, actor_type=actor_type, actor_id=actor_id, image_id=image_id
+            )
+
+    async def _execute_in_span(
+        self,
+        operation: Operation,
+        *,
+        actor_type: ActorType,
+        actor_id: UUID | None = None,
+        image_id: str | None = None,
+    ) -> RebuildExecutionResult:
+        if operation.operation_type is not OperationType.SERVER_REBUILD:
+            await self._fail(operation, actor_type, actor_id, "not a rebuild operation")
+        server = await self._servers.get(operation.resource_id)
+        if server is None:
+            await self._fail(operation, actor_type, actor_id, "server row missing")
+        if not server.provider_server_id:
+            await self._fail(operation, actor_type, actor_id, "server has no provider resource id")
+        if server.state not in REBUILD_PRECONDITION_STATES:
+            # The state moved since the intent was created. Never re-image a
+            # server that is mid-delete / mid-provision.
+            await self._fail(
+                operation,
+                actor_type,
+                actor_id,
+                f"server left the expected state ({server.state.value}) before "
+                "the rebuild was executed",
+            )
+        try:
+            provider: CloudProvider = self._registry.get(server.provider_key)
+        except KeyError:
+            await self._fail(
+                operation, actor_type, actor_id, f"unknown provider {server.provider_key!r}"
+            )
+        rebuild = rebuild_support_of(provider)
+        if rebuild is None:
+            await self._fail(operation, actor_type, actor_id, "provider lacks rebuild support")
+
+        target_image = image_id
+        if target_image is None and self._image_lookup is not None:
+            resolved = self._image_lookup(server.id)
+            target_image = await resolved if hasattr(resolved, "__await__") else resolved
+        if not target_image or not str(target_image).strip():
+            await self._fail(operation, actor_type, actor_id, "no target image for rebuild")
+
+        try:
+            status = await rebuild(server.provider_server_id, str(target_image))
+        except ProviderError as exc:
+            if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                operation.requeue(str(exc))
+                await self._ops.save(operation)
+                await self._audit.record_mutation(
+                    actor_type=actor_type,
+                    action="server.rebuild_requeued",
+                    resource_type=RESOURCE_TYPE_SERVER,
+                    resource_id=str(server.id),
+                    actor_id=actor_id,
+                    reason=str(exc),
+                    metadata={"operation_id": str(operation.id)},
+                )
+                return RebuildExecutionResult.REQUEUED
+            await self._fail(operation, actor_type, actor_id, str(exc))
+
+        operation.complete(
+            {"action": "rebuild", "image": str(target_image), "provider_status": str(status)}
+        )
+        await self._ops.save(operation)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            action="server.rebuilt",
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(server.id),
+            actor_id=actor_id,
+            reason=f"user-confirmed rebuild with image {target_image}",
+            metadata={
+                "operation_id": str(operation.id),
+                "image_id": str(target_image),
+                "provider_status": str(status),
+            },
+        )
+        return RebuildExecutionResult.EXECUTED
+
+    async def _fail(
+        self,
+        operation: Operation,
+        actor_type: ActorType,
+        actor_id: UUID | None,
+        reason: str,
+    ) -> NoReturn:
+        operation.fail(reason)
+        await self._ops.save(operation)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            action="server.rebuild_failed",
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(operation.resource_id),
+            actor_id=actor_id,
+            reason=reason,
+            metadata={"operation_id": str(operation.id)},
+        )
+        raise RebuildOperationFailedError(reason)
+
+
+class RebuildCommandService:
+    """User-facing rebuild command: request a confirmed re-image.
+
+    Acceptance: **confirmation and credential handling safe.**
+
+    - **Confirmation** - rebuild wipes the server's disk; the request MUST
+      carry ``confirmed=True`` (the UI's final-confirmation step). An
+      unconfirmed call is rejected before ANY lookup happens.
+    - **Credential safety** - the command surface accepts an image reference
+      only. There is no password parameter anywhere in the flow; post-rebuild
+      access goes through the user's registered SSH keys, which are audited
+      by count only. The audit trail records who rebuilt what, when, with
+      which image, and under which ledger key.
+    - **Ownership** - enforced here: another user's server is "not found".
+    - **Idempotency** - one ledger operation per (server, command key); the
+      operation key is sent to the provider, retries reuse it, completed
+      commands replay without a provider call.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_repo: ServerRepository,
+        operation_repo: OperationRepository,
+        provider_registry: ProviderRegistry,
+        audit_repo: AuditRepository,
+        executor: RebuildOperationExecutor | None = None,
+    ) -> None:
+        self._servers = server_repo
+        self._ops = operation_repo
+        self._audit = AuditTrail(audit_repo)
+        self._executor = executor or RebuildOperationExecutor(
+            operation_repo=operation_repo,
+            server_repo=server_repo,
+            provider_registry=provider_registry,
+            audit_repo=audit_repo,
+        )
+
+    async def request(
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        image_id: str,
+        idempotency_key: str,
+        *,
+        confirmed: bool,
+    ) -> RebuildCommandResult:
+        if not confirmed:
+            # Gate BEFORE any data access: confirmation is part of the
+            # command's contract, not a UI nicety.
+            raise RebuildConfirmationRequiredError(
+                "rebuild wipes the server; pass confirmed=True (final UI step)"
+            )
+        if not idempotency_key or not idempotency_key.strip():
+            raise RebuildCommandError("idempotency_key is required")
+        stripped_key = idempotency_key.strip()
+        if len(stripped_key) > 128:
+            raise RebuildCommandError("idempotency_key too long")
+        image = (image_id or "").strip()
+        if not image or len(image) > 128:
+            raise RebuildCommandError("a non-empty image reference (max 128 chars) is required")
+
+        server = await self._servers.get(server_id)
+        if server is None or server.user_id != user_id:
+            raise RebuildNotOwnerError("server not found")
+
+        # Replay resolution BEFORE state gates (same convention as delete).
+        op = await self._ops.get_by_key(rebuild_operation_key(server_id, stripped_key))
+        state_valid = server.state in REBUILD_PRECONDITION_STATES
+        if op is not None:
+            if op.status is OperationStatus.COMPLETED:
+                return RebuildCommandResult(
+                    server=await self._servers.get(server_id) or server, replayed=True
+                )
+            if op.status is OperationStatus.FAILED:
+                raise RebuildOperationFailedError(op.error or "rebuild operation failed")
+            if op.status is OperationStatus.IN_FLIGHT:
+                raise RebuildOperationInProgressError("rebuild operation is in progress")
+            if not state_valid and op.attempts == 0:
+                raise RebuildActionNotAllowedError(
+                    f"rebuild not allowed in state {server.state.value}"
+                )
+        else:
+            if not state_valid:
+                raise RebuildActionNotAllowedError(
+                    f"rebuild not allowed in state {server.state.value}"
+                )
+            op = await self._ops.get_or_create(
+                operation_key=rebuild_operation_key(server_id, stripped_key),
+                operation_type=OperationType.SERVER_REBUILD,
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=server_id,
+                provider_key=server.provider_key,
+            )
+            await self._audit.record_mutation(
+                actor_type=ActorType.USER,
+                actor_id=user_id,
+                action="server.rebuild_requested",
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=str(server_id),
+                reason=f"confirmed rebuild requested (key={stripped_key})",
+                metadata={"operation_id": str(op.id), "image_id": image},
+            )
+
+        claimed = await self._ops.claim(op.id)
+        if claimed is None:
+            raise RebuildOperationInProgressError("rebuild operation is in progress")
+
+        result = await self._executor.execute(
+            claimed, actor_type=ActorType.USER, actor_id=user_id, image_id=image
+        )
+        return RebuildCommandResult(
+            server=await self._servers.get(server_id) or server,
+            replayed=False,
+            requeued=result is RebuildExecutionResult.REQUEUED,
+        )
+
+
+class RebuildWorker:
+    """Processes PENDING rebuild operations (crash recovery + retries).
+
+    Uses the SAME executor and therefore the same operation keys as the
+    interactive command path; the target image comes from the injected
+    ``image_lookup`` so every attempt of one intent resolves identically.
+    """
+
+    def __init__(
+        self,
+        *,
+        operation_repo: OperationRepository,
+        server_repo: ServerRepository,
+        provider_registry: ProviderRegistry,
+        audit_repo: AuditRepository,
+        image_lookup: Callable[[UUID], Any],
+    ) -> None:
+        self._ops = operation_repo
+        self._executor = RebuildOperationExecutor(
+            operation_repo=operation_repo,
+            server_repo=server_repo,
+            provider_registry=provider_registry,
+            audit_repo=audit_repo,
+            image_lookup=image_lookup,
+        )
+
+    async def process_pending(self) -> dict[str, int]:
+        """Run every PENDING rebuild once; returns outcome counts."""
+        counts = {"executed": 0, "requeued": 0}
+        for op in await self._ops.list_pending([OperationType.SERVER_REBUILD]):
+            claimed = await self._ops.claim(op.id)
+            if claimed is None:
+                continue
+            result = await self._executor.execute(claimed, actor_type=ActorType.SYSTEM)
+            counts["executed" if result is RebuildExecutionResult.EXECUTED else "requeued"] += 1
         return counts

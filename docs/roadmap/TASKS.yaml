@@ -2624,13 +2624,39 @@ tasks:
   milestone: M13
   title: Implement rebuild flow
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M13-001
   acceptance:
   - Confirmation and credential handling safe.
-  evidence: []
+  evidence:
+  - '2026-08-24: Rebuild flow (M13-002); acceptance ''Confirmation and credential handling safe'' holds. FLOW: RebuildCommandService.request(user_id,
+    server_id, image_id, idempotency_key, *, confirmed) - (1) CONFIRMATION: rebuild wipes the disk, so confirmed=False raises
+    RebuildConfirmationRequiredError BEFORE any data access or audit write (asserted: zero audit events, zero operations,
+    zero provider calls); the gate is part of the command contract, not a UI nicety. (2) CREDENTIAL SAFETY BY CONSTRUCTION:
+    the command surface accepts an image REFERENCE only - there is no password/secret parameter anywhere in the flow; the
+    executor sends only {image: <ref>} to the provider; post-rebuild access goes through the user''s registered SSH keys (M13-001
+    sync), and the audit trail records actor id, image reference and operation key only (tests assert no password/bearer material
+    appears in any audit event or operation payload). (3) OWNERSHIP in the application layer: a foreign user''s server reads
+    as ''server not found'' with zero side effects. (4) STATE GATE: rebuild only from steady states RUNNING/STOPPED (REBUILD_PRECONDITION_STATES);
+    non-steady states refused before intent creation; the executor re-checks at execution time so state drift between intent
+    and claim fails permanently instead of re-imaging mid-delete/mid-provision. (5) IDEMPOTENCY: one ledger operation per
+    (server, command key) via rebuild_operation_key; completed commands REPLAY without a provider call; IN_FLIGHT rejected;
+    FAILED surfaces its recorded error on replay; retryable provider errors (ProviderUnavailable) requeue with attempts=1
+    and the SAME key. NEW OperationType.SERVER_REBUILD; RebuildOperationExecutor mirrors the power/delete executors: operation_span
+    tracing joins the persisted traceparent, retryable->requeue+audit server.rebuild_requeued, permanent->fail+audit server.rebuild_failed,
+    success->complete({action,image,provider_status})+audit server.rebuilt with reason noting user confirmation. Target image
+    resolves per attempt via injected image_lookup so every retry of one intent uses the same deterministic target (worker
+    path covered). PROVIDER: optional capability probe rebuild_support_of(provider) in providers/base.py (no per-provider
+    branch in domain; ArvanCloud without the method is refused as ''lacks rebuild support''); HetznerCloudProvider.rebuild_server
+    maps POST /servers/{id}/actions/rebuild -> action status (tested through a fake transport asserting exact path and body).
+    WORKER: RebuildWorker.process_pending claims PENDING rebuilds with the same executor/keys. TESTS tests/unit/test_rebuild_flow.py
+    (15): confirmation gate incl. pre-access refusal, missing key/image validation, credential-material absence in audit+operations,
+    ownership, both non-steady-state refusals, completed-replay-no-provider-call, retryable requeue same key, worker retry
+    with lookup + identical image across attempts, permanent failure surfaces on replay without new call, provider-without-support
+    failure, state-drift failure, adapter endpoint mapping. Full gates: ruff format/check clean, mypy clean (110 files), 1582
+    passed 11 skipped, provider-branching gate 64 modules 0 violations.'
 - id: M13-003
   milestone: M13
   title: Implement rescue mode

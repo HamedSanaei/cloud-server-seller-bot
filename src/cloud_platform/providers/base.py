@@ -147,6 +147,17 @@ def power_probe_of(provider: CloudProvider) -> Callable[[str, str], Any] | None:
     return method if callable(method) else None
 
 
+def rebuild_support_of(provider: CloudProvider) -> Callable[[str, str], Any] | None:
+    """The provider's ``rebuild_server`` method, or None (M13-002).
+
+    Rebuild is an OPTIONAL capability: adapters that support re-imaging a
+    server implement ``rebuild_server(provider_server_id, image_id)``;
+    the domain probes for it instead of branching per provider.
+    """
+    method = getattr(provider, "rebuild_server", None)
+    return method if callable(method) else None
+
+
 # ---------------------------------------------------------------------------
 # Payment gateway port: create / verify / refund capability model (M09-001)
 # ---------------------------------------------------------------------------
