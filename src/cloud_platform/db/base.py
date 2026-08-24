@@ -908,3 +908,28 @@ class IpAddressRow(Base):
     location_id = Column(String(32), nullable=True)
     server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+
+
+class VolumeRow(Base):
+    """A user-owned block-storage volume (M13-009).
+
+    ``server_id`` is the CURRENT attachment and is reconciled against the
+    provider (attach/detach/delete); ``size_gb`` drives size-time billing
+    through the operator's volume rate card.
+    """
+
+    __tablename__ = "volumes"
+    __table_args__ = (
+        UniqueConstraint("provider_key", "provider_volume_id", name="uq_volumes_provider"),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    provider_account_id = Column(PG_UUID, nullable=False)
+    provider_key = Column(String(32), nullable=False)
+    provider_volume_id = Column(String(64), nullable=False)
+    name = Column(String(64), nullable=False)
+    size_gb = Column(Integer, nullable=False)
+    location_id = Column(String(32), nullable=True)
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")

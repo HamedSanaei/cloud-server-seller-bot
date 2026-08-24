@@ -2835,13 +2835,28 @@ tasks:
   milestone: M13
   title: Implement volumes
   priority: P2
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M07-005
   acceptance:
   - Attach/detach/delete reconciliation.
-  evidence: []
+  evidence:
+  - '2026-08-24: Volumes (M13-009); acceptance ''Attach/detach/delete reconciliation'' holds. LIFECYCLE in NEW modules/networking/volumes.py
+    + volume_service.py: Volume validates size 10..10240 GB and provider id; VolumeService is ownership-scoped (foreign reads
+    as missing, self-service enforced) with quota max_volumes_per_user. RECONCILIATION PROVEN BY TESTS: ATTACH is idempotent
+    - re-attaching to the same server succeeds with ZERO extra provider calls; DETACH of an unattached volume is a no-op with
+    no provider call; DELETE always drops the local row and is 404-idempotent at the provider (second delete reads as missing);
+    reconcile() repairs DRIFT - volumes vanished at the provider are purged locally (purged counter) and volumes detached
+    remotely but still bound locally are unbound (unbound counter), consistent rows are left untouched (zero counters, no
+    audit noise), and any applied repair is audited as SYSTEM actor event volume.reconciled with counters in metadata. CAPABILITY
+    PATTERN: volume_port_of probe requires all five methods on optional provider.volumes attribute (half-ported adapters rejected)
+    - no per-provider branch (gate scans 88 modules clean). HetznerVolumeApi maps GET/POST /volumes, actions/attach {server,automount:false}
+    + detach, DELETE 404-idempotent, list mapping server binding (attach endpoint test with fake transport). COST: modules/pricing/volumes.py
+    VolumeRateCard per_gb_month_minor operator input with exact Decimal/720 ROUND_HALF_UP math (100 GB x 44 minor -> 4400/month
+    -> 6/hour pinned). PERSISTENCE: VolumeRow + migration 0027_add_volumes (unique provider_key+provider_volume_id; smoke
+    head bumped to 0027, migration gate passed). Container volume_service() wired. Full gates: ruff format/check clean, mypy
+    clean (142 files), 1765 passed 11 skipped.'
 - id: M13-010
   milestone: M13
   title: Implement private networks

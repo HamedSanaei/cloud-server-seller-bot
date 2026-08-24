@@ -28,6 +28,7 @@ from cloud_platform.modules.credentials.service import CredentialRotationService
 from cloud_platform.modules.firewalls.repository import SqlAlchemyFirewallRepository
 from cloud_platform.modules.firewalls.service import FirewallService
 from cloud_platform.modules.networking.ip_service import IpService
+from cloud_platform.modules.networking.volume_service import VolumeService
 from cloud_platform.modules.operations.service import PowerCommandService
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
@@ -136,6 +137,19 @@ class Container:
 
         return IpService(
             repo=SqlAlchemyIpAddressRepository(self.session_factory),
+            audit_repo=_audit_repository(self.session_factory),
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+        )
+
+    def volume_service(self) -> VolumeService:
+        """Ownership-scoped volume lifecycle with reconciliation (M13-009)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.networking.volume_repository import (
+            SqlAlchemyVolumeRepository,
+        )
+
+        return VolumeService(
+            repo=SqlAlchemyVolumeRepository(self.session_factory),
             audit_repo=_audit_repository(self.session_factory),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
         )

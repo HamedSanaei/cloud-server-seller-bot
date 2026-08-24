@@ -158,6 +158,50 @@ class HetznerFloatingIpApi:
             return  # already gone - deletion is idempotent
 
 
+class HetznerVolumeApi:
+    """Block-storage volume lifecycle against the Hetzner Cloud API (M13-009).
+
+    ``GET/POST /volumes``, ``POST /volumes/{id}/actions/attach`` and
+    ``.../detach``, ``DELETE /volumes/{id}`` (404-idempotent).
+    """
+
+    def __init__(self, provider: HetznerCloudProvider) -> None:
+        self._provider = provider
+
+    async def create_volume(self, name: str, size_gb: int, location_id: str) -> tuple[str, str]:
+        payload = await self._provider._request(
+            "POST",
+            "/volumes",
+            json={"name": name, "size": int(size_gb), "location": location_id},
+        )
+        created = payload["volume"]
+        return str(created["id"]), str(created["name"])
+
+    async def attach_volume(self, provider_volume_id: str, provider_server_id: str) -> None:
+        await self._provider._request(
+            "POST",
+            f"/volumes/{provider_volume_id}/actions/attach",
+            json={"server": int(provider_server_id), "automount": False},
+        )
+
+    async def detach_volume(self, provider_volume_id: str) -> None:
+        await self._provider._request("POST", f"/volumes/{provider_volume_id}/actions/detach")
+
+    async def delete_volume(self, provider_volume_id: str) -> None:
+        try:
+            await self._provider._request("DELETE", f"/volumes/{provider_volume_id}")
+        except ProviderNotFound:
+            return  # already gone - deletion is idempotent
+
+    async def list_volumes(self) -> list[tuple[str, str | None]]:
+        payload = await self._provider._request("GET", "/volumes")
+        out: list[tuple[str, str | None]] = []
+        for item in payload.get("volumes", []):
+            server = item.get("server")
+            out.append((str(item["id"]), None if server is None else str(server)))
+        return out
+
+
 class HetznerSshKeyApi:
     """SSH-key management against the Hetzner Cloud API (M13-001).
 
@@ -238,6 +282,7 @@ class HetznerCloudProvider:
         self.ssh_keys = HetznerSshKeyApi(self)
         self.firewalls = HetznerFirewallApi(self)
         self.floating_ips = HetznerFloatingIpApi(self)
+        self.volumes = HetznerVolumeApi(self)
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}

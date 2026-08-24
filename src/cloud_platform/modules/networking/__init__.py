@@ -1,4 +1,4 @@
-"""Networking module (M13-007/M13-008): reverse DNS and IP resources."""
+"""Networking module (M13-007..M13-009): reverse DNS, IPs, volumes."""
 
 from .domain import (
     RdnsError,
@@ -21,6 +21,15 @@ from .ips import (
     IpNotFoundError,
 )
 from .service import RdnsService
+from .volume_repository import SqlAlchemyVolumeRepository
+from .volume_service import VolumeService, volume_port_of
+from .volumes import (
+    Volume,
+    VolumeError,
+    VolumeLimitError,
+    VolumeNotFoundError,
+    VolumeSizeError,
+)
 
 __all__ = [
     "IpAddress",
@@ -38,7 +47,15 @@ __all__ = [
     "RdnsValidationError",
     "ReverseDnsRecord",
     "SqlAlchemyIpAddressRepository",
+    "SqlAlchemyVolumeRepository",
+    "Volume",
+    "VolumeError",
+    "VolumeLimitError",
+    "VolumeNotFoundError",
+    "VolumeService",
+    "VolumeSizeError",
     "floating_port_of",
     "validate_ip",
     "validate_ptr",
+    "volume_port_of",
 ]
