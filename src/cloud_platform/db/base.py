@@ -7,7 +7,17 @@ the core domain entities: Users, Wallets, Providers, ProviderAccounts, Catalog, 
 from __future__ import annotations
 
 import sqlalchemy as sa
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -96,6 +106,7 @@ class Provider(Base):
     # Relationships
     accounts = relationship("ProviderAccount", back_populates="provider")
     catalog_entries = relationship("Catalog", back_populates="provider")
+    locations = relationship("ProviderLocation", back_populates="provider")
     servers = relationship("Server", back_populates="provider")
 
 
@@ -170,6 +181,43 @@ class Catalog(Base):
     # Relationships
     provider = relationship("Provider", back_populates="catalog_entries")
     servers = relationship("Server", back_populates="catalog_entry")
+
+
+class ProviderLocation(Base):
+    """One synced provider location (M08-002).
+
+    Country/city come from the provider's own location API — the
+    platform never assumes geography. Feeds the customer-facing
+    country/location catalog view.
+
+    Attributes:
+        id: Primary key
+        provider_id: Foreign key to Provider
+        location_id: Provider's internal location id (e.g. "fsn1")
+        name: Provider's location name
+        country_code: ISO 3166-1 alpha-2 country code (e.g. "DE"), if known
+        city: City name, if known
+        network_zone: Provider network zone, if known
+    """
+
+    __tablename__ = "provider_locations"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_id", "location_id", name="uq_provider_locations_provider_location"
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_id = Column(PG_UUID, ForeignKey("providers.id", ondelete="CASCADE"), nullable=False)
+    location_id = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    country_code = Column(String(2), nullable=True)
+    city = Column(String, nullable=True)
+    network_zone = Column(String, nullable=True)
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+
+    # Relationships
+    provider = relationship("Provider", back_populates="locations")
 
 
 class Server(Base):

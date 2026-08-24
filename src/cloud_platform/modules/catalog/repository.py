@@ -19,7 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import Catalog as _CatalogModel
 from cloud_platform.db.base import Provider as _ProviderModel
-from cloud_platform.modules.catalog.domain import CatalogEntrySpec, OfferRef, OfferState
+from cloud_platform.db.base import ProviderLocation as _ProviderLocationModel
+from cloud_platform.modules.catalog.domain import (
+    CatalogEntrySpec,
+    CatalogOffer,
+    LocationRecord,
+    OfferRef,
+    OfferState,
+)
 
 #: Namespace for deriving stable provider UUIDs from provider keys.
 _PROVIDER_UUID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:provider")
@@ -39,6 +46,26 @@ def provider_key_to_uuid(provider_key: str) -> uuid.UUID:
 def _attr(row: Any, name: str) -> Any:
     """Read a legacy-style Column attribute; typed as Any at the boundary."""
     return getattr(row, name)
+
+
+def _offer_from_row(catalog_row: Any, provider_name: Any) -> CatalogOffer:
+    """Map one (catalog row, provider name) query result to the domain offer."""
+    return CatalogOffer(
+        id=_attr(catalog_row, "id"),
+        provider_key=str(provider_name),
+        plan_id=str(_attr(catalog_row, "provider_plan_id")),
+        location_id=str(_attr(catalog_row, "provider_location_id")),
+        name=str(_attr(catalog_row, "name")),
+        architecture=str(_attr(catalog_row, "architecture")),
+        vcpu=int(_attr(catalog_row, "vcpu")),
+        memory_mb=int(_attr(catalog_row, "memory_mb")),
+        disk_gb=int(_attr(catalog_row, "disk_gb")),
+        currency=str(_attr(catalog_row, "currency")),
+        price_per_quantum=int(_attr(catalog_row, "price_per_quantum")),
+        quantum_seconds=int(_attr(catalog_row, "quantum_seconds")),
+        enabled=bool(_attr(catalog_row, "enabled")),
+        description=_attr(catalog_row, "description"),
+    )
 
 
 class SqlAlchemyCatalogRepository:
@@ -170,6 +197,148 @@ class SqlAlchemyCatalogRepository:
 
             await session.commit()
             return created
+
+    async def list_offers(self) -> list[CatalogOffer]:
+        """Every catalog row (offer), enabled or not, all providers.
+
+        Rows are joined to their provider so the provider key (name) is
+        resolved in one query.
+        """
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(_CatalogModel, _ProviderModel.name)
+                    .join(_ProviderModel, _CatalogModel.provider_id == _ProviderModel.id)
+                    .order_by(
+                        _ProviderModel.name,
+                        _CatalogModel.provider_plan_id,
+                        _CatalogModel.provider_location_id,
+                    )
+                )
+            ).all()
+            return [
+                _offer_from_row(catalog_row, provider_name) for catalog_row, provider_name in rows
+            ]
+
+    async def get_by_id(self, offer_id: uuid.UUID) -> CatalogOffer | None:
+        """One catalog row by its primary key, or None."""
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(_CatalogModel, _ProviderModel.name)
+                    .join(_ProviderModel, _CatalogModel.provider_id == _ProviderModel.id)
+                    .where(_CatalogModel.id == offer_id)
+                )
+            ).all()
+            if not rows:
+                return None
+            catalog_row, provider_name = rows[0]
+            return _offer_from_row(catalog_row, provider_name)
+
+
+class SqlAlchemyLocationRepository:
+    """Persists the synced provider-location table (M08-002).
+
+    Upserts are idempotent under the (provider_id, location_id) unique
+    constraint; provider keys resolve to the same deterministic UUIDs as
+    the catalog repository.
+    """
+
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+    ) -> None:
+        self._session_factory = session_factory
+
+    async def _provider_id(self, session: AsyncSession, provider_key: str) -> uuid.UUID:
+        provider_id = provider_key_to_uuid(provider_key)
+        existing = (
+            (
+                await session.execute(
+                    select(_ProviderModel.id).where(_ProviderModel.name == provider_key)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            return existing
+        session.add(_ProviderModel(id=provider_id, name=provider_key))
+        await session.flush()
+        return provider_id
+
+    async def upsert(self, record: LocationRecord) -> bool:
+        async with self._session_factory() as session:
+            provider_id = await self._provider_id(session, record.provider_key)
+            row = (
+                (
+                    await session.execute(
+                        select(_ProviderLocationModel).where(
+                            _ProviderLocationModel.provider_id == provider_id,
+                            _ProviderLocationModel.location_id == record.location_id,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                row = _ProviderLocationModel(
+                    provider_id=provider_id,
+                    location_id=record.location_id,
+                    name=record.name,
+                    country_code=record.country_code,
+                    city=record.city,
+                    network_zone=record.network_zone,
+                )
+                session.add(row)
+                created = True
+            else:
+                cast_any: Any = row
+                cast_any.name = record.name
+                cast_any.country_code = record.country_code
+                cast_any.city = record.city
+                cast_any.network_zone = record.network_zone
+                created = False
+            await session.commit()
+            return created
+
+    async def list_for_provider(self, provider_key: str) -> list[LocationRecord]:
+        async with self._session_factory() as session:
+            provider_id = provider_key_to_uuid(provider_key)
+            existing = (
+                (
+                    await session.execute(
+                        select(_ProviderModel.id).where(_ProviderModel.name == provider_key)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if existing is not None:
+                provider_id = existing
+            rows = (
+                (
+                    await session.execute(
+                        select(_ProviderLocationModel)
+                        .where(_ProviderLocationModel.provider_id == provider_id)
+                        .order_by(_ProviderLocationModel.name)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                LocationRecord(
+                    provider_key=provider_key,
+                    location_id=str(_attr(row, "location_id")),
+                    name=str(_attr(row, "name")),
+                    country_code=_attr(row, "country_code"),
+                    city=_attr(row, "city"),
+                    network_zone=_attr(row, "network_zone"),
+                )
+                for row in rows
+            ]
 
 
 class PostgresAdvisoryCatalogSyncLock:

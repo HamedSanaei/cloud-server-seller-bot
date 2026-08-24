@@ -12,13 +12,16 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
+from uuid import UUID
 
 import httpx
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.core.config import get_settings
 from cloud_platform.db.base import (
-    Catalog,
     Provider,
+    ProviderLocation,
 )
 from cloud_platform.modules.catalog.domain import (
     CatalogSyncJob,
@@ -28,7 +31,10 @@ from cloud_platform.modules.catalog.domain import (
     PlanPricing,
     ProviderPriceEntry,
 )
-from cloud_platform.modules.catalog.repository import SqlAlchemyCatalogRepository
+from cloud_platform.modules.catalog.repository import (
+    SqlAlchemyCatalogRepository,
+    provider_key_to_uuid,
+)
 from cloud_platform.modules.catalog.service import PricingIngestionService
 from cloud_platform.providers.errors import (
     ProviderAuthError,
@@ -175,7 +181,11 @@ class HetznerCatalogSyncer:
         )
 
     async def _upsert_locations(self, locations_data: list[dict[str, Any]]) -> tuple[int, int]:
-        """Upsert locations to database. Returns (upserted, skipped)."""
+        """Upsert locations to the provider_locations table. Returns (upserted, skipped).
+
+        Country/city/network-zone come from the provider payload (M08-002);
+        the row is keyed by (provider, location_id) so the sync is idempotent.
+        """
         if not locations_data:
             return 0, 0
 
@@ -183,76 +193,53 @@ class HetznerCatalogSyncer:
         skipped = 0
 
         async with self._session_factory() as session:
-            # Get or create Hetzner provider
-            provider = await session.get(Provider, "hetzner")
-            if not provider:
-                provider = Provider(
-                    id="hetzner",
-                    name="Hetzner",
-                    region="global",
-                )
-                session.add(provider)
-                await session.flush()
+            provider_id = await self._resolve_provider_id(session)
 
             for item in locations_data:
                 loc_id = str(item["id"])
-
-                # Check if location exists in catalog
-                from sqlalchemy import select
-
-                stmt = select(Catalog).where(
-                    Catalog.provider_id == provider.id,
-                    Catalog.provider_location_id == loc_id,
+                stmt = select(ProviderLocation).where(
+                    ProviderLocation.provider_id == provider_id,
+                    ProviderLocation.location_id == loc_id,
                 )
                 result = await session.execute(stmt)
-                existing = result.scalar_one_or_none()
+                existing = result.scalars().first()
 
                 if existing:
-                    # Update existing
-                    existing.name = item["name"]
-                    existing.provider_location_id = loc_id
-                    existing.architecture = "x86"  # Locations don't have architecture
-                    existing.vcpu = 0
-                    existing.memory_mb = 0
-                    existing.disk_gb = 0
-                    existing.price_per_quantum = 0
-                    existing.currency = "EUR"
-                    existing.quantum_seconds = 3600
-                    existing.enabled = True
-                    existing.metadata = {
-                        "description": item.get("description"),
-                        "city": item.get("city"),
-                        "network_zone": item.get("network_zone"),
-                    }
+                    existing.name = str(item["name"])
+                    existing.country_code = item.get("country")
+                    existing.city = item.get("city")
+                    existing.network_zone = item.get("network_zone")
                     skipped += 1
                 else:
-                    # Create new catalog entry for location
-                    catalog_entry = Catalog(
-                        name=item["name"],
-                        description=item.get("description"),
-                        provider_id=provider.id,
-                        provider_plan_id="location",
-                        provider_location_id=loc_id,
-                        architecture="x86",
-                        vcpu=0,
-                        memory_mb=0,
-                        disk_gb=0,
-                        price_per_quantum=0,
-                        currency="EUR",
-                        quantum_seconds=3600,
-                        enabled=True,
-                        metadata={
-                            "description": item.get("description"),
-                            "city": item.get("city"),
-                            "network_zone": item.get("network_zone"),
-                        },
+                    session.add(
+                        ProviderLocation(
+                            provider_id=provider_id,
+                            location_id=loc_id,
+                            name=str(item["name"]),
+                            country_code=item.get("country"),
+                            city=item.get("city"),
+                            network_zone=item.get("network_zone"),
+                        )
                     )
-                    session.add(catalog_entry)
                     upserted += 1
 
             await session.commit()
 
         return upserted, skipped
+
+    async def _resolve_provider_id(self, session: AsyncSession) -> UUID:
+        """Resolve (or deterministically create) the Hetzner provider row."""
+        existing = (
+            (await session.execute(select(Provider.id).where(Provider.name == PROVIDER_KEY)))
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            return existing
+        provider_id = provider_key_to_uuid(PROVIDER_KEY)
+        session.add(Provider(id=provider_id, name=PROVIDER_KEY, region="global"))
+        await session.flush()
+        return provider_id
 
     # --- Server Type (Plan) Sync ---
 

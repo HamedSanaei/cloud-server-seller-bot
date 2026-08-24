@@ -1353,47 +1353,145 @@ tasks:
   milestone: M08
   title: Implement catalog country/location view
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M08-001
   acceptance:
   - Only enabled offers shown.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the catalog country/location view (M08-002); acceptance ''Only enabled offers shown'' holds.
+    New in src/cloud_platform/modules/catalog/domain.py: CatalogOffer (full persisted offer row: id, provider key, plan, location,
+    specs, price in integer minor units, quantum, enabled flag), LocationRecord (provider-neutral location: provider_key/location_id/name
+    + country_code/city/network_zone from the provider''s own payload, validated non-empty keys), the LocationRepository protocol
+    (upsert, list_for_provider), the CatalogRepository port extended with list_offers(), and the view models CatalogOfferView
+    (spec_label property), CatalogLocationView (city, offers), CatalogCountryView (label, offer_count, ASCII render() using
+    integer-only price formatting - no float for money). New in service.py: CatalogViewService.list_by_country() - reads all
+    catalog rows, filters to SELLABLE offers only (the M04-007 enabled flag AND a vcpu>0 sanity filter that excludes synthetic
+    non-offer rows such as bare location markers), resolves each provider''s synced locations (each provider queried exactly
+    once, sorted), groups offers by country code (offers whose location has no synced record yet fall into the None/''Other''
+    bucket so a sync gap never silently hides a sellable offer), sorts countries by code with Other last, locations by name,
+    offers by plan name. New table provider_locations (migration 0017): provider_id FK CASCADE + location_id unique per provider,
+    name, country_code (ISO alpha-2, nullable), city, network_zone, updated_at; ProviderLocation model + Provider.locations
+    relationship in db/base.py. New SqlAlchemyLocationRepository (catalog/repository.py): idempotent upserts under the unique
+    constraint, deterministic provider UUIDs (provider_key_to_uuid) shared with the catalog repository, list_for_provider.
+    SqlAlchemyCatalogRepository.list_offers() joins providers in one query to resolve provider keys. Hetzner sync fixed and
+    re-targeted: _upsert_locations now persists to provider_locations (country/city/network_zone from the API payload) instead
+    of the previous legacy writes of fake catalog rows with a nonexistent ''metadata'' column and a string provider id - the
+    country data the view needs is now actually persisted; provider resolution uses the deterministic UUID helper. The sync
+    job''s locations step keeps its SyncResult semantics (upserted/skipped per row). 20 tests: view grouping by country then
+    location with sorted output, country sort with the Other bucket last, empty catalog, disabled offers hidden, disabled-only
+    locations drop the whole country, vcpu-0 synthetic rows excluded, per-provider location queries exactly once and sorted,
+    offer view carries specs/price/quantum, ASCII render with integer-formatted prices, LocationRecord validation (empty fields
+    rejected, optional country), location repository upsert create/update/deterministic-provider paths, list_for_provider
+    mapping and unknown-provider empty, list_offers row mapping with provider names and the empty case, and the updated Hetzner
+    locations sync test asserting rows land in ProviderLocation with country/city from the payload (DE/Falkenstein, FI/Helsinki).
+    Full suite 1052 passed.'
 - id: M08-003
   milestone: M08
   title: Implement plan selection view
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M08-002
   acceptance:
   - Price/spec visible and callback tamper-resistant.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the plan selection view (M08-003); acceptance ''Price/spec visible and callback tamper-resistant''
+    holds. New in src/cloud_platform/modules/catalog/service.py: BuyFlowViewService(catalog_repo, location_repo, signing_key)
+    - the data side of the M08-001 buy flow. (1) plans_screen(provider_key, location_id) -> PlanSelectionView: the enabled
+    plans sold at one location (same sellable filter as the country view: the M04-007 enabled flag AND vcpu>0 so synthetic
+    rows never appear), sorted by plan name, each with its specs (name, architecture, vcpu/memory/disk via spec_label) and
+    its price in integer minor units per quantum; raises PlanSelectionError for a location with no sellable offers (cannot
+    be reached via the locations screen, which only lists locations that have offers). (2) locations_screen() -> list[CountrySelectionView]:
+    enabled offers grouped by country (Other last), one LocationOption per (provider, location) so two providers sharing a
+    location id stay separate, each with its select_callback. Callbacks use the M08-001 scheme (v1|flow:screen:arg...|hmac-sha256-16,
+    deterministic): per-plan callback = buy:plans:<provider>:<location>:<offer-id> (the button that advances the state machine
+    plans --select--> os with the exact chosen offer), location select = buy:locations:<provider>:<location>, back = buy:locations:<provider>:<location>,
+    cancel = main:menu. PlanSelectionView carries parallel plans/plan_callbacks plus back/cancel callbacks and an ASCII render()
+    with integer-formatted prices (no float money). PlanSelectionError, LocationOption, CountrySelectionView, PlanSelectionView
+    added to the catalog package exports. 15 tests: price and spec visible (sorted plans, spec_label, minor-unit prices, location
+    name/city, parallel callbacks, render), only enabled offers of the requested location (disabled + other-location excluded),
+    unknown location raises, missing location record still renders (id as name, no city), callback stability (same inputs
+    -> same strings for plan/back/cancel across two builds), plan callback roundtrips to flow=buy screen=plans args=(provider,
+    location, offer-id), the second callback selects the second plan, tampered provider field rejected, tampered signature
+    rejected, wrong signing key rejected, back and cancel callbacks decode to the correct screens, locations screen groups
+    by country with decodable select callbacks and per-location offer counts, disabled-only catalog yields no options, multi-provider
+    same-location ids stay separate options, and an empty signing key is rejected. Full suite 1067 passed.'
 - id: M08-004
   milestone: M08
   title: Implement OS selection view
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M08-003
   acceptance:
   - Architecture compatibility enforced server-side.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the OS selection view (M08-004); acceptance ''Architecture compatibility enforced server-side''
+    holds. New in src/cloud_platform/modules/catalog/domain.py: OsOption (image_id/name/os_family/architecture + select_callback)
+    and OsSelectionView (offer context + compatible options + back/cancel callbacks + ASCII render). New in service.py: (1)
+    the pure server-side gate compatible_os_options(images, architecture) - returns only the provider images whose architecture
+    matches the offer''s architecture (case-insensitive comparison of two provider-reported values; empty/whitespace architectures
+    rejected), sorted by name; an incompatible image never reaches the UI so it can never be selected. (2) OsSelectionService(catalog_repo,
+    provider_registry, signing_key).os_screen(provider_key, location_id, offer_id) -> OsSelectionView: fetches the exact offer
+    by primary key and re-validates it server-side (the offer must exist AND match the requested provider+location AND be
+    sellable - enabled flag and vcpu>0, same filter as the other buy screens), resolves the provider from the registry (unknown
+    provider -> OsSelectionError), lists the provider''s images, applies the architecture gate (no compatible image -> OsSelectionError),
+    and builds one stable signed callback per image (M08-001 scheme: buy:os:<provider>:<location>:<offer-id>:<image-id> -
+    the button that advances os --select--> confirm with the exact image); image ids that cannot ride the callback wire (invalid
+    field characters) are skipped with a warning, and if none remain the screen is an error. Back = buy:plans:<provider>:<location>:<offer-id>,
+    cancel = main:menu. Empty signing key rejected at construction. Supporting: CatalogRepository port gained get_by_id(offer_id)
+    and SqlAlchemyCatalogRepository implements it (row mapping factored into _offer_from_row, shared with list_offers). OsSelectionError,
+    OsOption, OsSelectionView, OsSelectionService, compatible_os_options exported from the catalog package. 15 tests: only
+    the matching architecture is listed (arm image excluded for an x86 offer, sorted by name), an arm offer gets only arm
+    images, case-insensitive match, no-compatible-images raises, the pure gate filters/sorts and rejects empty architecture,
+    unknown offer id raises, an offer asked at the wrong location is rejected server-side (location mismatch), a disabled
+    offer is not selectable, an unknown provider raises, empty signing key rejected, option callback roundtrips to buy/os
+    with (provider, location, offer-id, image-id), a tampered image id in the callback is rejected, back/cancel callbacks
+    decode to the correct screens, callback stability across two builds, and the offer context (plan, architecture, price)
+    plus the render output. Full suite 1082 passed.'
 - id: M08-005
   milestone: M08
   title: Implement purchase confirmation view
   priority: P0
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M08-004
   - M07-001
   acceptance:
   - Shows exact price policy and wallet impact.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the purchase confirmation view (M08-005); acceptance ''Shows exact price policy and wallet impact''
+    holds. New in src/cloud_platform/modules/catalog/service.py: PurchasePolicy (the EXACT price policy: selling_minor_per_quantum,
+    currency, quantum_seconds, margin_factor, book_name, book_version, monthly_cap_minor when the rule caps usage, hold_minor
+    = the first quantum which is exactly what the create command holds), WalletImpact (has_wallet, available balance in minor
+    units, the hold, balance after the hold - shown even when negative - and sufficient, which is what the create command
+    will enforce), PurchaseConfirmationView (offer context + optional OS image + policy + wallet impact + confirm/back/cancel
+    callbacks + ASCII render with integer-formatted money) and PurchaseConfirmationService(catalog_repo, price_book_service,
+    wallet_repo, signing_key, book_name).confirmation(user_id, provider_key, location_id, offer_id, image_id=None). The selling
+    price is derived from the SAME versioned price book the create command and the immutable server price snapshot use (OfferCost
+    built from the exact catalog row: provider/plan/location/cost/currency, priced at now), so the confirmation can never
+    show a price different from the one that would be charged; book_name is an explicit constructor parameter (no hardcoded
+    default - the create command''s book is instance config). Pricing failures (no active version, no matching margin rule)
+    propagate: without a price there is nothing to confirm and the order would fail anyway. The wallet impact is read from
+    the user''s real wallet and only DISPLAYED - all enforcement (balance, quota, terms, maintenance, provider account) stays
+    in the create command. The offer is re-validated server-side (exists, matches provider+location, sellable) like the other
+    buy screens. Callbacks (M08-001 scheme): confirm = buy:confirm:<provider>:<location>:<offer-id>:<image-id-or-none> (advances
+    confirm --confirm--> done, then the bot fires the create command), back = buy:os with the same args, cancel = main:menu.
+    Empty signing key / empty book name rejected at construction. Exports: PurchaseConfirmationError/Service/View, PurchasePolicy,
+    WalletImpact. 15 tests: the book-derived price is shown exactly (cost 700, margin 1.43 -> 1001 minor/60min, book version
+    and margin visible, hold == first quantum, render), the monthly cap appears in the view when the rule has one (500.00
+    EUR), price-book errors (no active version) propagate instead of showing a stale price, the OfferCost is built from the
+    catalog row with the configured book name, a sufficient wallet shows balance -> balance-after-hold (10.00 -> 8.99) and
+    (ok), an insufficient wallet is flagged (insufficient!) with the negative after-hold shown but NOT enforced, an exact
+    balance is sufficient (after = 0), a missing wallet is shown as ''wallet: none'', an offer asked at the wrong location
+    is rejected, an unknown offer is rejected, a disabled offer is rejected, the OS image plus confirm/back/cancel callbacks
+    roundtrip with the right args, a missing image uses the ''none'' placeholder in the callback, and the constructor validation
+    (empty signing key, empty book name). Full suite 1097 passed.'
 - id: M08-006
   milestone: M08
   title: Implement provisioning progress notifications

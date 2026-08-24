@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -68,10 +69,20 @@ class TestHetznerCatalogSyncer:
         mock_session.commit = AsyncMock()
         mock_session.flush = AsyncMock()
         mock_session.add = MagicMock()
+        # provider lookup per page (found: deterministic uuid), then one location
+        # lookup per location (all missing -> created).
+        # Page 1: 2 locations, page 2: 1 location -> 1+2 + 1+1 executions.
+        provider_result = MagicMock(scalars=lambda: MagicMock(first=lambda: uuid4()))
+        missing_result = MagicMock(scalars=lambda: MagicMock(first=lambda: None))
         mock_session.execute = AsyncMock(
-            return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+            side_effect=[
+                provider_result,
+                missing_result,
+                missing_result,
+                provider_result,
+                missing_result,
+            ]
         )
-        mock_session.get = AsyncMock(return_value=None)  # No existing provider
 
         syncer._session_factory = lambda: mock_session
 
@@ -80,6 +91,17 @@ class TestHetznerCatalogSyncer:
         assert isinstance(result, SyncResult)
         assert result.total_fetched == 3
         assert result.errors == []
+        assert result.total_upserted == 3
+        assert result.total_skipped == 0
+        # locations land in provider_locations (M08-002), with country/city
+        added = [c.args[0] for c in mock_session.add.call_args_list]
+        locations = [a for a in added if a.__class__.__name__ == "ProviderLocation"]
+        assert len(locations) == 3
+        by_id = {loc.location_id: loc for loc in locations}
+        assert by_id["1"].country_code == "DE"
+        assert by_id["1"].city == "Falkenstein"
+        assert by_id["3"].country_code == "FI"
+        assert by_id["3"].city == "Helsinki"
 
     @pytest.mark.asyncio
     async def test_sync_plans_success(self, syncer):

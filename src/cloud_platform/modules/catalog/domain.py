@@ -218,6 +218,195 @@ class CatalogRepository(Protocol):
         """
         ...
 
+    async def list_offers(self) -> list[CatalogOffer]:
+        """Every catalog row (offer), enabled or not, all providers."""
+        ...
+
+    async def get_by_id(self, offer_id: UUID) -> CatalogOffer | None:
+        """One catalog row by its primary key, or None."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogOffer:
+    """One persisted catalog row: a sellable offer with its specs.
+
+    ``enabled`` is the visibility flag (M04-007); views that show what a
+    customer can buy filter on it. Synthetic rows that are not sellable
+    offers (e.g. bare location markers with no specs/price) are excluded by
+    the view layer, not the repository.
+    """
+
+    id: UUID
+    provider_key: str
+    plan_id: str
+    location_id: str
+    name: str
+    architecture: str
+    vcpu: int
+    memory_mb: int
+    disk_gb: int
+    currency: str
+    price_per_quantum: int
+    quantum_seconds: int
+    enabled: bool
+    description: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Provider locations (M08-002)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LocationRecord:
+    """One provider location as synced from the provider's own API.
+
+    Provider-neutral: the country code and city come from the provider
+    payload (``ProviderLocation``), never from platform assumptions.
+    """
+
+    provider_key: str
+    location_id: str
+    name: str
+    country_code: str | None = None
+    city: str | None = None
+    network_zone: str | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("provider_key", self.provider_key),
+            ("location_id", self.location_id),
+            ("name", self.name),
+        ):
+            if not value or not value.strip():
+                raise ValueError(f"{name} must not be empty")
+
+
+class LocationRepository(Protocol):
+    """Port for the synced provider-location table."""
+
+    async def upsert(self, record: LocationRecord) -> bool:
+        """Create or update the row for (provider, location_id).
+
+        Returns True if created, False if updated.
+        """
+        ...
+
+    async def list_for_provider(self, provider_key: str) -> list[LocationRecord]:
+        """All synced locations of one provider."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Country/location view (M08-002)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogOfferView:
+    """One enabled offer as the customer sees it (specs + price)."""
+
+    offer_id: UUID
+    provider_key: str
+    plan_id: str
+    location_id: str
+    name: str
+    architecture: str
+    vcpu: int
+    memory_mb: int
+    disk_gb: int
+    currency: str
+    price_per_quantum: int  # integer minor units per quantum
+    quantum_seconds: int
+
+    @property
+    def spec_label(self) -> str:
+        """Compact, unit-safe spec line (e.g. "2 vCPU / 4 GB / 40 GB")."""
+        return f"{self.vcpu} vCPU / {self.memory_mb // 1024} GB / {self.disk_gb} GB"
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogLocationView:
+    """One location with the enabled offers sold there."""
+
+    location_id: str
+    name: str
+    city: str | None
+    offers: tuple[CatalogOfferView, ...]
+
+    @property
+    def offer_count(self) -> int:
+        return len(self.offers)
+
+
+@dataclass(frozen=True, slots=True)
+class OsOption:
+    """One selectable OS image on the buy.os screen (already architecture-
+    compatible with the chosen offer)."""
+
+    image_id: str
+    name: str
+    os_family: str
+    architecture: str
+    select_callback: str  # buy.os --select--> buy.confirm for this image
+
+
+@dataclass(frozen=True, slots=True)
+class OsSelectionView:
+    """The buy.os screen: the OS images for one chosen offer.
+
+    Architecture compatibility is enforced SERVER-SIDE: only images whose
+    architecture matches the offer's architecture are included, so the UI
+    can neither see nor select an incompatible image.
+    """
+
+    provider_key: str
+    location_id: str
+    offer: CatalogOfferView
+    options: tuple[OsOption, ...]
+    back_callback: str
+    cancel_callback: str
+
+    def render(self) -> str:
+        """ASCII rendering for logs and the review UI."""
+        lines = [f"OS for {self.offer.name} ({self.offer.architecture}): {len(self.options)}"]
+        for option in self.options:
+            lines.append(f"  - {option.name} [{option.os_family}] {option.image_id}")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogCountryView:
+    """One country grouping; ``country_code`` is None for the "Other"
+    bucket (offers whose location has no synced country yet)."""
+
+    country_code: str | None
+    locations: tuple[CatalogLocationView, ...]
+
+    @property
+    def label(self) -> str:
+        return self.country_code or "Other"
+
+    @property
+    def offer_count(self) -> int:
+        return sum(loc.offer_count for loc in self.locations)
+
+    def render(self) -> str:
+        """ASCII rendering for logs and the review UI (no money in majors)."""
+        lines = [f"[{self.label}] {self.offer_count} offer(s)"]
+        for loc in self.locations:
+            place = loc.city or loc.name
+            lines.append(f"  {loc.name} ({place}): {loc.offer_count} offer(s)")
+            for offer in loc.offers:
+                major, minor = divmod(offer.price_per_quantum, 100)
+                price = f"{major}.{minor:02d}"  # display formatting only
+                lines.append(
+                    f"    - {offer.name} [{offer.spec_label}] "
+                    f"{price} {offer.currency}/{offer.quantum_seconds // 60}min"
+                )
+        return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Catalog sync job with lock (M04-006)
