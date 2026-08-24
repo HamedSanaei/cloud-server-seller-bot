@@ -173,6 +173,32 @@ uv run python scripts/post_deploy_smoke.py \
 new provisioning / the provider account / the offer - a controlled stop
 with clear status beats an ambiguous retry.
 
+## Deploy strategies (M12-006)
+
+The deploy driver encodes the consumer-safety rules as a validated plan
+(`scripts/deploy.py`): migrations always run first and once; the stateless
+api rolls behind health checks; the EXCLUSIVE consumers (worker = arq
+jobs, bot = Telegram long-polling) are **fully drained - verified against
+real `compose ps` output - before any new generation starts**, in both
+strategies. A plan that would double-consume is refused before anything
+executes.
+
+```bash
+# preview + validate (no changes)
+uv run python scripts/deploy.py --image $PLATFORM_IMAGE --strategy rolling --dry-run
+# rolling: health-gated api recreation, then drain->start per exclusive service
+uv run python scripts/deploy.py --image $PLATFORM_IMAGE --strategy rolling
+# blue-green: green sibling project takes traffic; blue drains first
+uv run python scripts/deploy.py --image $PLATFORM_IMAGE --strategy blue-green
+```
+
+Blue-green detail: migrate runs ONCE against the shared DB; the green api
+starts and must pass its health gate; only then are ALL blue worker/bot
+generations stopped and verified gone, the green ones start, traffic cuts
+over, and the blue api container is retired. Rollback = re-run the driver
+with the previous image ref (migrations are forward-only compatible per
+the M12-003 gate).
+
 ## Deploy checklist (copy per release)
 
 - [ ] CI green incl. migration gate; release commit SHA noted

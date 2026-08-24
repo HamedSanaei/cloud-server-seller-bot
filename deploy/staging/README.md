@@ -26,6 +26,16 @@ cd deploy/staging
 docker compose up -d
 ```
 
+Or use the deploy driver (M12-006), which validates the consumer-safety
+plan before executing (exclusive consumers - worker/bot - are fully
+drained, verified against `compose ps`, before any new generation starts):
+
+```bash
+uv run python scripts/deploy.py --image "$PLATFORM_IMAGE" --strategy rolling \
+    --dry-run    # preview the plan
+uv run python scripts/deploy.py --image "$PLATFORM_IMAGE" --strategy rolling
+```
+
 ## Verify
 
 ```bash

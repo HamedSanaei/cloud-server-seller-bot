@@ -2524,13 +2524,39 @@ tasks:
   milestone: M12
   title: Add rolling/blue-green strategy
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M12-005
   acceptance:
   - API/bot/worker deploy without double consumers.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added rolling/blue-green strategy (M12-006); acceptance ''API/bot/worker deploy without double consumers''
+    holds. NEW scripts/deploy.py - a deploy driver that makes consumer safety DATA, not convention: (1) EXCLUSIVE_CONSUMERS
+    = worker (arq jobs) + bot (Telegram long polling) are the services that must never have two live generations; api is replaceable
+    and rolls health-gated. (2) build_plan(strategy, ...) emits an explicit ordered Step list for ''rolling'' (preflight compose
+    config -> migrations up --wait FIRST and ONCE -> api up --no-deps --wait -> per exclusive service: stop --timeout 30 (SIGTERM
+    drain), ps --status running verification, then up with the new image) or ''blue-green'' (shared migrate once; green sibling
+    project (-p <project>-green) starts its api behind the health gate; ALL blue worker/bot generations stopped AND verified
+    gone; then green worker/bot start; traffic cutover stops blue api; blue api container retired). (3) assert_no_double_consumers
+    proves the invariant on any plan: for each exclusive service a completed drain VERIFICATION must precede its first start
+    step including across projects - a plan starting a second generation while the first may still consume raises DoubleConsumerError
+    BEFORE anything executes. (4) The guarantee is also enforced at EXECUTION time: Deployer reads the real compose ps output
+    of every drain-verification and refuses (''still has running containers - refusing to start a second generation'') when
+    an old generation is not gone; failed steps raise DeployError naming the step. (5) Runner is injectable so the whole driver
+    runs in tests without Docker; CLI supports --dry-run (validate + render only), --strategy rolling|blue-green, --compose-file,
+    --project-name. DOCS: PRODUCTION_RUNBOOK.md gained the deploy-strategies section (driver usage, blue-green sequence, rollback
+    = re-run with previous image ref, forward-only migration compatibility per M12-003); deploy/staging/README.md points the
+    repeatable staging deploy at the driver with a dry-run preview. TESTS: tests/unit/test_deploy_strategy.py (17 tests):
+    rolling plan shape (migrations first+once, api health-gated, per-service stop->verify->start ordering for worker AND bot),
+    unknown service/strategy rejected; blue-green plan: green api may roll early but NO green exclusive generation starts
+    before ALL blue drain verifications (asserted max(blue verify index) < min(green start index)), teardown step present,
+    invariant passes on both strategies; invariant refusal: hand-built bad plan raises DoubleConsumerError, Deployer refuses
+    to execute it (zero commands run), plan without worker trivially safe; execution semantics via FakeRunner: exact command
+    order (config, migrate wait, api wait, worker stop<verify<up), still-running ps output ABORTS the deploy before any new
+    worker starts, failing migrate names itself in DeployError, dry-run executes nothing yet validates and renders; CLI dry-run
+    main returns 0 with the plan on stdout. Full gate: ruff format/check clean, mypy clean (106 files), 1542 passed 11 skipped,
+    provider-branching gate 60 modules 0 violations.'
 - id: M12-007
   milestone: M12
   title: Add post-deploy smoke tests
