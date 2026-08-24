@@ -2988,24 +2988,46 @@ tasks:
   milestone: M14
   title: Build customer web panel shell
   priority: P2
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M14-001
   acceptance:
   - Login/session and server/wallet views.
-  evidence: []
+  evidence:
+  - '2026-08-24: Customer web panel shell (M14-004); acceptance ''Login/session and server/wallet views'' holds. NO NEW CREDENTIAL
+    KIND: NEW api/web/common.py + customer.py render an escaped-HTML shell (stdlib html.escape only, no template engine dependency)
+    whose LOGIN accepts one of the customer''s OWN API tokens cpt_... validated through the SAME hashed-token authenticator
+    as REST bearer auth (dependency-overridable _authenticator); on success an HttpOnly SameSite=Lax SESSION COOKIE carries
+    that token (set_session_cookie max-age 12h); bad tokens re-render the form with an error and set no cookie; LOGOUT clears
+    it; because authentication re-runs per request, REVOKING the token kills the web session immediately (tested: panel 200
+    then revoke then 303 redirect). SERVER VIEW lists the ownership-scoped server page (id/provider/state) via MyServersService;
+    WALLET VIEW shows balance minor units verbatim plus a major-unit hint (12345 minor = 123.45 EUR pinned). Anonymous /web/panel
+    redirects to login. Views are dependency ports (_servers_view/_wallet_view/_authenticator) overridable without a database;
+    11 TestClient tests in tests/unit/test_web_panels.py cover the full session lifecycle. python-multipart added for form
+    parsing. Full gates: ruff format/check clean, mypy clean (149 files), 1787 passed 11 skipped.'
 - id: M14-005
   milestone: M14
   title: Build admin web panel shell
   priority: P2
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M14-003
   acceptance:
   - Provider/users/operations dashboards.
-  evidence: []
+  evidence:
+  - '2026-08-24: Admin web panel shell (M14-005); acceptance ''Provider/users/operations dashboards'' holds. NEW api/web/admin.py
+    on the SAME API-token cookie session as the customer panel, but every request RE-CHECKS platform RBAC: session user must
+    exist, be ACTIVE and hold ADMIN_MANAGE_SETTINGS (frozen/banned admins lose access instantly; anonymous and non-admin sessions
+    redirect to /web/login IDENTICALLY - no existence leak). USERS DASHBOARD: search box + username/email/role/status table
+    (reuses M14-003 SqlAlchemyUserRepository.search). OPERATIONS DASHBOARD: newest audit events via NEW AuditRepository.list_recent(limit,
+    offset) added to the Protocol AND SqlAlchemyAuditRepository (occurred_at DESC, id DESC, limit clamped 1..100) - append-only
+    log untouched. PROVIDERS DASHBOARD: registered adapters from the live ProviderRegistry with their advertised capabilities;
+    a broken adapter renders ''unavailable'' instead of killing the view. All data sources are overridable dependency ports
+    (_user_repo/_user_search/_audit_feed/_providers_view). Container gained a public audit_repository() accessor. Tests: 4
+    TestClient tests pin anonymous==non-admin redirects and all three dashboards rendering. Full gates: ruff format/check
+    clean, mypy clean (149 files), 1787 passed 11 skipped.'
 - id: M14-006
   milestone: M14
   title: Add API rate limits

@@ -74,3 +74,7 @@ class AuditRepository(Protocol):
     async def get_by_actor(self, actor_id: UUID) -> list[AuditEvent]:
         """Return all events triggered by an actor, oldest first."""
         ...
+
+    async def list_recent(self, limit: int = 20, offset: int = 0) -> list[AuditEvent]:
+        """Return the newest events first (operations feed, M14-005)."""
+        ...

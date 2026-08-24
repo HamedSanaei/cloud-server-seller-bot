@@ -19,6 +19,7 @@ dependencies = [
   "pydantic>=2.11,<3",
   "pydantic-settings>=2.10,<3",
   "python-json-logger>=3.3,<4",
+  "python-multipart>=0.0.20,<1",
   "redis>=5,<6",
   "sqlalchemy[asyncio]>=2.0.40,<3",
   "structlog>=25,<26",

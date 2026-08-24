@@ -89,3 +89,15 @@ class SqlAlchemyAuditRepository:
             )
             result = await session.execute(stmt)
             return [_to_domain(row) for row in result.scalars().all()]
+
+    async def list_recent(self, limit: int = 20, offset: int = 0) -> list[AuditEvent]:
+        """Return the newest events first (operations feed, M14-005)."""
+        async with self._session_factory() as session:
+            stmt = (
+                select(_AuditModel)
+                .order_by(_AuditModel.occurred_at.desc(), _AuditModel.id.desc())
+                .limit(max(1, min(int(limit), 100)))
+                .offset(max(0, int(offset)))
+            )
+            result = await session.execute(stmt)
+            return [_to_domain(row) for row in result.scalars().all()]

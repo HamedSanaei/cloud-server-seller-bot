@@ -129,6 +129,10 @@ class Container:
         """Read-side catalog repository (REST v1 offers listing)."""
         return SqlAlchemyCatalogRepository(self.session_factory)
 
+    def audit_repository(self) -> Any:
+        """Request-scoped audit log repository (web panel feeds)."""
+        return _audit_repository(self.session_factory)
+
     def ip_service(self) -> IpService:
         """Ownership-scoped floating-IP lifecycle service (M13-008)."""
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository

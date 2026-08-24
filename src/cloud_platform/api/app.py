@@ -92,6 +92,12 @@ def create_app() -> FastAPI:
 
     app.include_router(admin_router)
 
+    # M14-004/M14-005: server-rendered web panel shells (customer + admin).
+    from cloud_platform.api.web import admin_web_router, customer_web_router
+
+    app.include_router(customer_web_router)
+    app.include_router(admin_web_router)
+
     # M14-002: bind the revocable-token authenticator for bearer auth.
     from cloud_platform.core.config import get_settings
     from cloud_platform.core.container import get_container
