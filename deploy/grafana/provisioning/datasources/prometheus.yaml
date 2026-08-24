@@ -1,0 +1,19 @@
+# Grafana datasource provisioning (M11-005).
+#
+# Point the volume-mounted provisioning dir at Grafana:
+#   /etc/grafana/provisioning/datasources  <- this directory
+#
+# The Prometheus URL must match wherever it scrapes the platform's
+# /metrics endpoints (see deploy/grafana/README.md).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 30s

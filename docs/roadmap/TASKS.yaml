@@ -2189,13 +2189,20 @@ tasks:
   milestone: M11
   title: Create Grafana dashboard definitions
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M11-001
   acceptance:
   - Golden signals visible.
-  evidence: []
+  evidence:
+  - '2026-08-24: Grafana golden-signals dashboard (deploy/grafana/dashboards/cloud-platform-golden-signals.json, 4 rows LATENCY/TRAFFIC/ERRORS/SATURATION,
+    15 panels over M11-001 cloud_platform_* families: API p50/p95/p99, provider p95 by provider, job p95, request/call/job/billing
+    rates, 5xx + provider-error-by-outcome + job-error + provisioning-failure-by-stage + reconciliation panels, queue-age
+    + daily-cost + 429-rate saturation panels) plus datasource/dashboard provisioning YAMLs and README. tests/unit/test_grafana_dashboards.py
+    (10 tests) validates the JSON shape and cross-checks every PromQL metric name against the families actually constructed
+    in observability/metrics.py (AST, _bucket/_sum/_count normalized) so a renamed metric breaks the gate. Gates: ruff clean,
+    mypy clean 106 files, 1520 passed 11 skipped.'
 - id: M11-006
   milestone: M11
   title: Create alert rules

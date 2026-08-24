@@ -1,0 +1,12 @@
+# Grafana dashboard provisioning (M11-005): loads every JSON under
+# /var/lib/grafana/dashboards on start. Mount the dashboard directory:
+#   /var/lib/grafana/dashboards <- deploy/grafana/dashboards
+apiVersion: 1
+
+providers:
+  - name: cloud-platform
+    folder: ""
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
