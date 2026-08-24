@@ -36,6 +36,88 @@ class RateLimitSnapshot:
     reset_at_unix: int | None
 
 
+class HetznerFirewallApi:
+    """Firewall management against the Hetzner Cloud API (M13-006).
+
+    A platform firewall rulebook maps 1:1 to a Hetzner firewall with the
+    SAME name; syncs are idempotent by name (update-in-place, never
+    duplicate). Rules use the Hetzner JSON shape:
+    ``{"direction", "protocol", "port"?, "source_ips" | "destination_ips"}``.
+    """
+
+    def __init__(self, provider: HetznerCloudProvider) -> None:
+        self._provider = provider
+
+    @staticmethod
+    def _rule_to_hetzner(rule: dict[str, Any]) -> dict[str, object]:
+        direction = str(rule.get("direction"))
+        out: dict[str, object] = {
+            "direction": "in" if direction == "in" else "out",
+            "protocol": str(rule.get("protocol")),
+        }
+        if rule.get("port"):
+            out["port"] = str(rule["port"])
+        cidrs = [str(c) for c in (rule.get("cidrs") or [])]
+        if direction == "in":
+            out["source_ips"] = cidrs
+        else:
+            out["destination_ips"] = cidrs
+        return out
+
+    async def list_firewalls(self) -> list[tuple[str, str]]:
+        payload = await self._provider._request("GET", "/firewalls")
+        return [(str(item["id"]), str(item["name"])) for item in payload.get("firewalls", [])]
+
+    async def create_firewall(self, name: str, rules: list[dict[str, object]]) -> str:
+        payload = await self._provider._request(
+            "POST",
+            "/firewalls",
+            json={"name": name, "rules": [self._rule_to_hetzner(r) for r in rules]},
+        )
+        return str(payload["firewall"]["id"])
+
+    async def update_firewall_rules(
+        self, provider_firewall_id: str, rules: list[dict[str, object]]
+    ) -> None:
+        await self._provider._request(
+            "PUT",
+            f"/firewalls/{provider_firewall_id}",
+            json={"rules": [self._rule_to_hetzner(r) for r in rules]},
+        )
+
+    async def delete_firewall(self, provider_firewall_id: str) -> None:
+        try:
+            await self._provider._request("DELETE", f"/firewalls/{provider_firewall_id}")
+        except ProviderNotFound:
+            return  # already gone - deletion is idempotent
+
+    async def apply_to_servers(
+        self, provider_firewall_id: str, provider_server_ids: list[str]
+    ) -> None:
+        await self._provider._request(
+            "POST",
+            f"/firewalls/{provider_firewall_id}/actions/apply_to_resources",
+            json={
+                "apply_to": [
+                    {"type": "server", "server": {"id": int(sid)}} for sid in provider_server_ids
+                ]
+            },
+        )
+
+    async def remove_from_servers(
+        self, provider_firewall_id: str, provider_server_ids: list[str]
+    ) -> None:
+        await self._provider._request(
+            "POST",
+            f"/firewalls/{provider_firewall_id}/actions/remove_from_resources",
+            json={
+                "remove_from": [
+                    {"type": "server", "server": {"id": int(sid)}} for sid in provider_server_ids
+                ]
+            },
+        )
+
+
 class HetznerSshKeyApi:
     """SSH-key management against the Hetzner Cloud API (M13-001).
 
@@ -112,8 +194,9 @@ class HetznerCloudProvider:
         self._credential_source = credential_source
         self.last_rate_limit = RateLimitSnapshot(None, None, None)
         self._backoff = RateLimitBackoff(rate_limit_policy or RateLimitPolicy())
-        # M13-001: capability-probed SSH-key port (provider.ssh_keys)
+        # M13-001/M13-006: capability-probed management ports
         self.ssh_keys = HetznerSshKeyApi(self)
+        self.firewalls = HetznerFirewallApi(self)
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}

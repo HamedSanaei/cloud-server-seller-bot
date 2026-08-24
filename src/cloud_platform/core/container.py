@@ -21,6 +21,8 @@ from cloud_platform.modules.credentials.domain import (
     CredentialHolderLike,
 )
 from cloud_platform.modules.credentials.service import CredentialRotationService
+from cloud_platform.modules.firewalls.repository import SqlAlchemyFirewallRepository
+from cloud_platform.modules.firewalls.service import FirewallService
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
 from cloud_platform.modules.sshkeys.service import SshKeyService
@@ -75,6 +77,13 @@ class Container:
         """Ownership-scoped SSH-key service (M13-001), request-scoped."""
         return SshKeyService(
             SqlAlchemySshKeyRepository(self.session_factory),
+            AuditTrail(_audit_repository(self.session_factory)),
+        )
+
+    def firewall_service(self) -> FirewallService:
+        """Ownership-scoped reusable-firewall service (M13-006)."""
+        return FirewallService(
+            SqlAlchemyFirewallRepository(self.session_factory),
             AuditTrail(_audit_repository(self.session_factory)),
         )
 

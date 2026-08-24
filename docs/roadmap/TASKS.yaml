@@ -2736,13 +2736,36 @@ tasks:
   milestone: M13
   title: Implement firewall management
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M07-005
   acceptance:
   - Reusable rules and ownership.
-  evidence: []
+  evidence:
+  - '2026-08-24: Firewall management (M13-006); acceptance ''Reusable rules and ownership'' holds. DOMAIN modules/firewalls/domain.py:
+    FirewallRule is a validated first-class value - direction in/out, protocol tcp/udp/icmp/gre/esp, optional port (single
+    1-65535 or ordered range like 8000-8100; None = any), and required CIDRs validated with ipaddress.ip_network(strict=False);
+    frozen dataclass with to_dict/from_dict round-trip; a bare host CIDR is accepted via strict=False normalization (tested).
+    Firewall is one user-owned NAMED rulebook (max 50 rules enforced, name length capped, unique names PER USER) whose rules
+    can be replaced as a whole while keeping the provider linkage - the reusable artifact applied to any number of servers.
+    SERVICE service.py FirewallService: ownership enforced in the application layer on every operation (create-for-another-user
+    refused; foreign get/list/delete read as FirewallNotFoundError with zero side effects, untouched rows asserted), per-user
+    quota (default 10, injectable), duplicate-name rejection per user (same name across DIFFERENT users is fine), full CRUD
+    audited through AuditTrail (firewall.created / rules_replaced / deleted with rule_count metadata). REUSABLE SYNC: ensure_remote_firewall
+    is idempotent BY NAME - it lists provider firewalls, UPDATES the existing same-name firewall''s rules and reuses its id
+    instead of ever duplicating (asserted: creates stays 1 across resyncs, updates increments, changed rules land on the SAME
+    remote object); capability probe firewall_port_of mirrors the ssh-keys pattern. PERSISTENCE: firewalls table migration
+    0023 (user FK CASCADE, JSONB rules column, unique (user_id,name), ix_firewalls_user_id, downgrade drops) + SqlAlchemyFirewallRepository
+    mapping validated dicts through domain from_dict/to_dict with IntegrityError mapped to DuplicateFirewallError; container
+    wires firewall_service(). PROVIDER: HetznerCloudProvider.firewalls = HetznerFirewallApi mapping GET/POST/PUT /firewalls,
+    DELETE /firewalls/{id} (404 -> idempotent success), apply_to_resources/remove_from_resources with server-id resources;
+    platform rule dicts serialize to Hetzner shape (direction, protocol, port?, source_ips for in / destination_ips for out
+    - both directions asserted). TESTS tests/unit/test_firewalls.py (23): rule validation matrix incl. inverted ranges and
+    bad CIDRs, dict round-trip, ownership scoping suite, duplicate/quota, replace-rules audit trail, sync idempotency-by-name
+    with update-in-place assertions, capability probe presence/absence, Hetzner endpoint+rule-shape mapping via fake transport.
+    Migration gate passed (23 revisions head 0023; smoke expectation updated). Full gates: ruff format/check clean, mypy clean
+    (115 files), 1634 passed 11 skipped, provider-branching gate 69 modules 0 violations.'
 - id: M13-007
   milestone: M13
   title: Implement rDNS

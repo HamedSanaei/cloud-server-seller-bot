@@ -817,3 +817,26 @@ class SshKeyRow(Base):
     public_key = Column(Text, nullable=False)
     fingerprint = Column(String(64), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+
+
+class FirewallRow(Base):
+    """A user-owned reusable firewall rulebook (M13-006).
+
+    One named rulebook may be applied to any number of the owner's servers;
+    names are unique PER USER. ``rules`` holds validated rule dicts (JSONB);
+    ``provider_firewall_id`` links the materialized provider-side object so
+    syncs UPDATE it instead of duplicating.
+    """
+
+    __tablename__ = "firewalls"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_firewalls_user_name"),)
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(64), nullable=False)
+    rules = Column(JSONB, nullable=False, server_default="[]")
+    provider_firewall_id = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP"
+    )
