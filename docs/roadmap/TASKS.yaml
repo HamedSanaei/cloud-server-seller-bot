@@ -2320,14 +2320,33 @@ tasks:
   milestone: M11
   title: Add chaos tests for provider timeouts
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M07-003
   - M07-008
   acceptance:
   - No double create/charge after injected timeout.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added chaos tests for provider timeouts (M11-009); acceptance ''No double create/charge after injected timeout''
+    holds. NEW tests/unit/test_provider_timeout_chaos.py (5 tests) injects timeouts at the HTTP layer of the REAL HetznerCloudProvider
+    over a chaos fake transport (ChaosHetznerAPI) that models a participating provider: it deduplicates POST /servers on the
+    platform-operation label (same operation key returns the SAME resource) and supports three chaos knobs - timeout AFTER
+    the mutation landed (the ambiguous lost-response window), timeout BEFORE anything landed (clean retry), and delete-then-timeout.
+    SCENARIOS: (1) crash during create: the worker dies with the op IN_FLIGHT after the provider applied the create; CreateTimeoutReconciler
+    re-resolves with the SAME idempotency key, the provider deduplicates, and assertions pin exactly one physical server despite
+    two POSTs, op COMPLETED with correlation to that server, and the server row pointing at it - no duplicate create. (2)
+    requeued timeout then retry: first attempt times out before landing -> REQUEUED with attempts=1 and nothing at the provider;
+    second run creates exactly ONE server, op COMPLETED, attempts=2. (3) same-key guarantee: both attempts carry the identical
+    platform-operation label (OP_KEY[:63]) so provider-side dedup is possible - no new key is ever minted. (4) delete ambiguity:
+    DELETE applied then timed out; the saga''s resend hits 404 which the adapter maps to success - no double-delete error,
+    resource stays gone. (5) charge: FinalChargeService with an in-memory ledger whose post_entry raises TimeoutError AFTER
+    committing (lost ack); the crash-replay finds the deterministic final:{server_id} entry by key and moves nothing - debits==1,
+    entries==1, wallet debited exactly once (asserted balance), replay detected. Also exercised incidentally: httpx.ReadTimeout
+    -> ProviderUnavailable mapping through the real adapter, image selection through GET /images (os_flavor mapping), and
+    the wallet-ledger duplicate-key rejection. No product code changes required - the existing idempotency machinery held
+    under all injected failures. Full gate: ruff format/check clean, mypy clean (106 files), 1525 passed 11 skipped, provider-branching
+    gate clean.'
 - id: M12-001
   milestone: M12
   title: Harden GitHub Actions quality pipeline
