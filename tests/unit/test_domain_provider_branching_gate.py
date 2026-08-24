@@ -96,6 +96,7 @@ class TestGateCatchesViolations:
             "from cloud_platform.providers.registry import ProviderRegistry\n"
             "from cloud_platform.providers.errors import ProviderError\n"
             "from cloud_platform.providers.retry import RetryExecutor\n"
+            "from cloud_platform.providers.credentials import CredentialHolder\n"
             "\n"
             "def x(provider: CloudProvider) -> Capability:\n"
             "    return Capability.COMPUTE\n",

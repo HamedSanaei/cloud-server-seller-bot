@@ -1981,13 +1981,52 @@ tasks:
   milestone: M10
   title: Implement secret rotation workflow
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M03-002
   acceptance:
   - Provider credential can rotate without downtime.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented secret rotation workflow (M10-008); acceptance ''Provider credential can rotate without downtime''
+    holds. WORKFLOW (verify-first, atomic, audited): (1) NEW providers/credentials.py (port-level, provider-generic): Credential
+    (value + key_hint, redacted repr/str), credential_key_hint (sha256 truncated to 12 hex - stable, non-reversible, safe
+    for audit), credential_from_value, CredentialSource port (async get -> Credential), CredentialHolder (atomic single-slot
+    holder under an asyncio lock: get/swap; swap returns the previous credential; a reader never observes a half-swapped state),
+    credential_verifier_of (optional port capability, same pattern as the power-effect probe). (2) Adapters now resolve the
+    credential at REQUEST time: HetznerCloudProvider and ArvanCloudProvider accept an optional credential_source; when set,
+    the Authorization header (Bearer for Hetzner, PLAIN key for ArvanCloud per contract) is set per request from the source
+    and the static client header is dropped; static construction is unchanged (backward compatible, all existing tests pass
+    untouched). Both adapters gained verify_credential(candidate): a one-shot READ-ONLY call with the candidate sent only
+    for that request (Hetzner GET /datacenters; ArvanCloud GET /regions/{r}/servers) that raises ProviderAuthError on 401/403
+    and maps other failures to the existing error taxonomy. (3) NEW domain module modules/credentials: domain.py (CredentialRotationError
+    + CredentialVerifyError + ProviderCredentialNotFoundError + CredentialNotVerifiableError, RotationResult/CredentialStatus
+    fingerprint-only records, holder registry ports) and service.py CredentialRotationService(holders, provider_registry,
+    audit_repo): rotate() resolves the provider (KeyError -> ProviderCredentialNotFoundError) and its live holder (missing
+    -> refused, never blind), REFUSES providers whose adapter cannot verify a candidate (CredentialNotVerifiableError - an
+    unverified swap would take the live credential offline), verifies the candidate BEFORE touching anything (any ProviderError
+    -> CredentialVerifyError, live credential keeps serving, no audit noise), then atomically swaps the holder and audits
+    credential.rotate with metadata carrying ONLY key fingerprints (previous_key_hint/new_key_hint) - the credential value
+    never appears in the event, reason, or error text; status() returns the current fingerprint without the value; admin actor
+    without id or empty reason refused. (4) Container wiring: create_container builds one CredentialHolder per configured
+    provider seeded from config, passes it as the adapter''s credential_source, registers it in a _CredentialHolderRegistry,
+    and exposes credential_rotation_service (FastAPI dependency get_credential_rotation_service); hand-built containers (tests)
+    still register adapters and are simply without a rotation surface. (5) docs/operations/PRODUCTION_RUNBOOK.md gained section
+    1a: the operator procedure (obtain, verify-first rotate, watch for 401/403, revoke the old key only after the overlap
+    window is healthy) plus the per-process scope note (worker picks up the new credential at its next start; the provider-side
+    overlap window keeps in-flight worker work valid; the at-rest master-key re-encryption via EnvelopeService.rotate remains
+    a separate offline operation). (6) M15-007 gate extended: providers/credentials added to the allowed provider-generic
+    packages (it is port-level, no provider-specific code) and the gate test pins that import. TESTS: tests/unit/test_credential_rotation.py
+    (25 tests) - key hint stable/non-reversible; credential repr redacted; empty values rejected; holder get/swap atomic (500x500
+    concurrent reader/writer race observes only whole credentials); verifier capability detection; Hetzner + ArvanCloud adapters:
+    request carries the CURRENT credential, a swap changes the very next request with NO restart, ArvanCloud keeps its plain
+    (non-Bearer) header, verify_credential sends only the candidate and rejects 401s, static construction unchanged; rotation
+    service: happy path verifies-then-swaps-and-audits with fingerprints only (asserted the values are absent from the rendered
+    event), failed verification changes nothing (live value intact, no audit), unknown provider / missing holder / unverifiable
+    provider refused, status fingerprint-only, empty reason and admin-without-id refused; end-to-end on the REAL Hetzner adapter:
+    a bad candidate is rejected without touching the live credential, a good one is verified, swapped, and the next API call
+    uses it. Full gate: ruff format/check clean, mypy clean (105 files), 1488 passed 11 skipped, provider-branching gate 60
+    modules 0 violations.'
 - id: M10-009
   milestone: M10
   title: Add security regression tests

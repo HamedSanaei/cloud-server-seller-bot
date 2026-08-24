@@ -39,6 +39,7 @@ from cloud_platform.providers.base import (
     ProviderPlan,
     ProviderServer,
 )
+from cloud_platform.providers.credentials import CredentialSource
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderConflict,
@@ -177,21 +178,29 @@ class ArvanCloudProvider:
         region: str = "",
         throttle: Throttle | None = None,
         max_retries: int = 3,
+        credential_source: CredentialSource | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
-        self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
+        if credential_source is not None:
+            # Runtime-rotatable (M10-008): the Authorization header is set per
+            # request from the source; api_key is only the initial value.
+            default_headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        else:
             # Contract §2: plain key in the Authorization header - NO Bearer prefix.
-            headers={
+            default_headers = {
                 "Authorization": api_key,
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-            },
+            }
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers=default_headers,
             timeout=httpx.Timeout(30.0),
         )
+        self._credential_source = credential_source
         self._region = region
         self._throttle = throttle or Throttle()
         self._max_retries = max_retries
@@ -327,6 +336,20 @@ class ArvanCloudProvider:
         items = payload if isinstance(payload, list) else payload.get("servers", [])
         return [self._map_server(region, item) for item in items or [] if isinstance(item, dict)]
 
+    async def verify_credential(self, candidate: str) -> None:
+        """Verify a CANDIDATE key with a read-only call (M10-008).
+
+        The candidate is sent only for this one request; the live key (if
+        any) is untouched. Raises ``ProviderAuthError`` when the candidate
+        is rejected (401/403), other ``ProviderError`` subclasses on other
+        failures.
+        """
+        region = self._require_region("verify_credential")
+        response = await self._client.request(
+            "GET", f"/regions/{region}/servers", headers={"Authorization": candidate}
+        )
+        self._raise_for_status(response)
+
     async def create_server(
         self, request: CreateServerRequest, idempotency_key: IdempotencyKey
     ) -> ProviderServer:
@@ -459,6 +482,9 @@ class ArvanCloudProvider:
             return await self._perform_request(method, path, **kwargs)
 
     async def _perform_request(self, method: str, path: str, **kwargs: Any) -> Any:
+        if self._credential_source is not None and "headers" not in kwargs:
+            credential = await self._credential_source.get()
+            kwargs["headers"] = {"Authorization": credential.value}
         attempt = 0
         while True:
             await self._throttle.acquire()

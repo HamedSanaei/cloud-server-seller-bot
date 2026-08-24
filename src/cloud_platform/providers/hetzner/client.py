@@ -15,6 +15,7 @@ from cloud_platform.providers.base import (
     ProviderPlan,
     ProviderServer,
 )
+from cloud_platform.providers.credentials import CredentialSource
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderConflict,
@@ -58,14 +59,25 @@ class HetznerCloudProvider:
         token: str,
         base_url: str = "https://api.hetzner.cloud/v1",
         rate_limit_policy: RateLimitPolicy | None = None,
+        credential_source: CredentialSource | None = None,
     ) -> None:
+        if credential_source is not None:
+            # Runtime-rotatable (M10-008): the Authorization header is set per
+            # request from the source; ``token`` is only the initial value.
+            headers: dict[str, str] = {}
+        else:
+            headers = {"Authorization": f"Bearer {token}"}
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
             timeout=httpx.Timeout(30.0),
         )
+        self._credential_source = credential_source
         self.last_rate_limit = RateLimitSnapshot(None, None, None)
         self._backoff = RateLimitBackoff(rate_limit_policy or RateLimitPolicy())
+
+    def _auth_headers(self, token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -84,6 +96,26 @@ class HetznerCloudProvider:
             return AccountHealth.HEALTHY
         except Exception:
             return AccountHealth.UNHEALTHY
+
+    async def verify_credential(self, candidate: str) -> None:
+        """Verify a CANDIDATE token with a read-only call (M10-008).
+
+        The candidate is sent only for this one request; the live
+        credential (if any) is untouched. Raises ``ProviderAuthError`` when
+        the candidate is rejected (401/403), other ``ProviderError``
+        subclasses on other failures.
+        """
+        response = await self._client.request(
+            "GET", "/datacenters", headers=self._auth_headers(candidate)
+        )
+        if response.status_code == 401 or response.status_code == 403:
+            raise ProviderAuthError(_error_message(response))
+        if response.status_code == 429:
+            raise ProviderRateLimited(_error_message(response))
+        if response.status_code >= 500:
+            raise ProviderUnavailable(_error_message(response))
+        if response.is_error:
+            raise ProviderError(_error_message(response))
 
     async def list_locations(self) -> list[ProviderLocation]:
         payload = await self._request("GET", "/locations")
@@ -192,6 +224,9 @@ class HetznerCloudProvider:
 
     async def _perform_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         max_retries = self._backoff.policy.max_retries
+        if self._credential_source is not None and "headers" not in kwargs:
+            credential = await self._credential_source.get()
+            kwargs["headers"] = self._auth_headers(credential.value)
         attempt = 0
         response: httpx.Response | None = None
         while True:

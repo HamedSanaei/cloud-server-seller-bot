@@ -9,16 +9,22 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from cloud_platform.core.config import get_settings
 from cloud_platform.db.session import SessionFactory, get_session
+from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
+from cloud_platform.modules.credentials.domain import (
+    CredentialHolderLike,
+)
+from cloud_platform.modules.credentials.service import CredentialRotationService
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeAllocator
 from cloud_platform.providers.arvancloud.client import ArvanCloudProvider
 from cloud_platform.providers.arvancloud.sync import ArvanCloudCatalogSyncer
+from cloud_platform.providers.credentials import CredentialHolder
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
 from cloud_platform.providers.registry import ProviderRegistry
@@ -31,6 +37,19 @@ __all__ = [
     "get_container",
     "get_session",
 ]
+
+
+@dataclass(frozen=True)
+class _CredentialHolderRegistry:
+    """Per-process credential holders, keyed by provider key (M10-008)."""
+
+    _holders: dict[str, CredentialHolder] = field(default_factory=dict, init=False, repr=False)
+
+    def register(self, provider_key: str, holder: CredentialHolder) -> None:
+        self._holders[provider_key] = holder
+
+    def get_holder(self, provider_key: str) -> CredentialHolderLike | None:
+        return self._holders.get(provider_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +65,8 @@ class Container:
     provider_allocator: BaseProviderAllocator
     hetzner_syncer: HetznerCatalogSyncer | None
     arvancloud_syncers: tuple[ArvanCloudCatalogSyncer, ...]
+    credential_holders: _CredentialHolderRegistry | None = None
+    credential_rotation_service: CredentialRotationService | None = None
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
@@ -60,21 +81,38 @@ class Container:
         self._register_providers()
 
     def _register_providers(self) -> None:
-        """Register provider adapters."""
+        """Register provider adapters.
+
+        Each configured provider's credential lives in a runtime
+        :class:`CredentialHolder` (M10-008): the adapter resolves it at
+        request time, so ``CredentialRotationService.rotate`` can swap it
+        without downtime. Containers hand-built without a holder registry
+        (tests) still register the adapters; they simply have nothing to
+        rotate.
+        """
         from cloud_platform.core.config import get_settings
 
         settings = get_settings()
+        holders = self.credential_holders
         if settings.hetzner_api_token:
+            hetzner_holder = CredentialHolder(settings.hetzner_api_token)
+            if holders is not None:
+                holders.register("hetzner", hetzner_holder)
             hetzner = HetznerCloudProvider(
                 token=settings.hetzner_api_token,
                 base_url=settings.hetzner_api_base_url,
+                credential_source=hetzner_holder,
             )
             self.provider_registry.register(hetzner)
         if settings.arvancloud_api_key:
+            arvancloud_holder = CredentialHolder(settings.arvancloud_api_key)
+            if holders is not None:
+                holders.register("arvancloud", arvancloud_holder)
             arvancloud = ArvanCloudProvider(
                 api_key=settings.arvancloud_api_key,
                 base_url=settings.arvancloud_api_base_url,
                 region=settings.arvancloud_region,
+                credential_source=arvancloud_holder,
             )
             self.provider_registry.register(arvancloud)
 
@@ -135,15 +173,30 @@ def create_container() -> Container:
                 )
             )
 
+    # M10-008: runtime-rotatable provider credentials - one holder per
+    # configured provider, plus the verify-then-swap rotation service.
+    holders = _CredentialHolderRegistry()
     container = Container(
         session_factory=session_factory,
         provider_registry=registry,
         provider_allocator=allocator,
         hetzner_syncer=hetzner_syncer,
         arvancloud_syncers=tuple(arvancloud_syncers),
+        credential_holders=holders,
+        credential_rotation_service=CredentialRotationService(
+            holders,
+            registry,
+            _audit_repository(session_factory),
+        ),
     )
 
     return container
+
+
+def _audit_repository(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> SqlAlchemyAuditRepository:
+    return SqlAlchemyAuditRepository(session_factory)
 
 
 def _configured_regions(region_setting: str) -> list[str]:
@@ -193,6 +246,13 @@ async def get_provider_allocator() -> CompositeAllocator:
     allocator = container.provider_allocator
     assert isinstance(allocator, CompositeAllocator)
     return allocator
+
+
+async def get_credential_rotation_service() -> CredentialRotationService:
+    """FastAPI dependency for the provider-credential rotation service."""
+    container = await get_container()
+    assert container.credential_rotation_service is not None
+    return container.credential_rotation_service
 
 
 async def get_payment_webhook_service() -> PaymentWebhookService:

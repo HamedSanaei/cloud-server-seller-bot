@@ -46,6 +46,42 @@ Rules:
   then, rotation = add new key env var, deploy, run the re-encryption
   job, then remove the old key on the next deploy.
 
+### 1a. Rotate a provider credential (M10-008) — no downtime
+
+The live provider credential (Hetzner token / ArvanCloud key) is held at
+runtime in a per-process `CredentialHolder`; adapters read it at REQUEST
+time. Rotation is **verify-first, atomic, audited** — a failed rotation
+changes nothing, so it can never take the live credential offline.
+
+Procedure (operator):
+
+1. Obtain the new credential from the provider (the provider-side overlap
+   window keeps the old one valid until step 5).
+2. Call the rotation endpoint / service
+   (`CredentialRotationService.rotate(provider_key, new_credential_value,
+   reason, actor)` — admin-gated, lands with the admin API, M14-003).
+   The service:
+   - verifies the candidate against the provider with a read-only call
+     (`GET /datacenters` for Hetzner; `GET /regions/{r}/servers` for
+     ArvanCloud). Any rejection aborts — the live credential keeps
+     serving, zero impact.
+   - atomically swaps the holder: in-flight requests finish on the old
+     value, the next request uses the new one. No restart, no downtime.
+   - writes an audited `credential.rotate` event carrying only key
+     FINGERPRINTS (`key_hint`, sha256-truncated) — never the values.
+3. Watch: provider-call metrics for `401/403` (an auth error after a
+   successful rotate means the swap raced a provider-side revoke).
+4. Only after the overlap window is confirmed healthy, revoke the old
+   credential on the provider side.
+5. The audit trail shows `previous_key_hint` / `new_key_hint`; the old
+   value itself was never persisted or logged.
+
+Scope note: the holder is per API process. The worker process picks up a
+newly rotated credential at its next (re)start; during the overlap window
+both credentials are valid at the provider, so in-flight worker work is
+unaffected. The master-key (at-rest encryption) re-encryption path
+(`EnvelopeService.rotate`) is a separate, offline operation.
+
 ## 2. Migrations
 
 The deploy runs `migrate` (alembic upgrade head) **before** the api and
