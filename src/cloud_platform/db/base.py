@@ -40,6 +40,7 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     status = Column(String, nullable=False, server_default="active")
     role = Column(String, nullable=False, server_default="user")
+    terms_version = Column(Integer, nullable=True)
     terms_accepted_at = Column(DateTime, nullable=True)
     telegram_user_id = Column(BigInteger, nullable=True, unique=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
@@ -576,3 +577,26 @@ class MaintenanceBlock(Base):
     __table_args__ = (
         sa.UniqueConstraint("provider_key", "location_id", name="uq_maintenance_blocks_scope"),
     )
+
+
+class TermsVersion(Base):
+    """One immutable, strictly increasing version of the platform terms (M02-004).
+
+    The highest ``version`` row is always the current terms. Rows are never
+    updated or deleted once published.
+
+    Attributes:
+        version: Primary key, strictly increasing integer
+        body: Full terms text
+        summary: Short human summary of the changes
+        effective_at: When this version became current
+        created_at: Record creation timestamp
+    """
+
+    __tablename__ = "terms_versions"
+
+    version = Column(Integer, primary_key=True)
+    body = Column(Text, nullable=False)
+    summary = Column(String, nullable=False, server_default="")
+    effective_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")

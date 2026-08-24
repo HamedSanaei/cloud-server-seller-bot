@@ -240,13 +240,33 @@ tasks:
   milestone: M02
   title: Implement terms acceptance versioning
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M02-001
   acceptance:
   - Provisioning can require latest terms.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented terms acceptance versioning (M02-004). New immutable TermsVersion aggregate (version int strictly
+    increasing, body, summary, effective_at; highest published version = current) with TermsVersionRepository port (get/get_latest/list_all/publish)
+    and SqlAlchemyTermsVersionRepository; new terms_versions table (version PK) plus users.terms_version column in migration
+    0014 (alembic heads verified: 0014 head). User aggregate gained terms_version and a needs_terms_acceptance(latest) predicate;
+    accept_terms now records the accepted version and timestamp (two legacy tests updated). New TermsService (users/terms.py):
+    publish (admin-gated admin:manage_settings, system actor allowed, version = latest+1, body stripped, audited terms.publish),
+    accept (idempotent: no-op when already current or nothing published; persists via new UserRepository.update_terms; audited
+    terms.accept; unknown user raises LookupError), user_requires_acceptance, and require_latest - the provisioning gate that
+    raises TermsAcceptanceRequiredError for never-accepted/stale users and passes through when no terms are published (nothing
+    to accept). CreateServerService gained an optional TermsGate port (require_latest(user) protocol defined in compute/service.py
+    so the compute module depends on a port, not the users service) wired as step 1.5: after the user-active check and BEFORE
+    any catalog work, so stale terms block provisioning with a distinct TermsAcceptanceRequiredError; without a wired gate
+    the legacy behavior is unchanged. 20 new tests: 6 acceptance-predicate cases (nothing published, never accepted, stale,
+    current, future version does not block), publish (first version is 1 with stripped body + audit, versions increment 1,2
+    -> 3, non-admin rejected with no audit/no publish), accept (records current version + persists + audit, idempotent when
+    current with no write, no-op without published terms, unknown user LookupError), require_latest (raises for never-accepted
+    with ''never'' message, raises for stale with ''accepted terms 1'', passes when current, passes when nothing published),
+    and 3 provisioning-gate integration tests (stale terms raise TermsAcceptanceRequiredError and the catalog is never consulted
+    - gate precedes all other checks; current terms proceed past the gate to the catalog; no wired gate never blocks). Full
+    suite 900 passed.'
 - id: M02-005
   milestone: M02
   title: Implement user status freeze/ban
@@ -281,13 +301,29 @@ tasks:
   milestone: M02
   title: Add locale/message catalog abstraction
   priority: P2
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M02-003
   acceptance:
   - Persian default; strings not scattered in handlers.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added the locale/message catalog abstraction (M02-007) in new module src/cloud_platform/core/i18n.py. Locale
+    StrEnum (FA Persian = platform default via DEFAULT_LOCALE, EN English); MessageCatalog - immutable per-locale message
+    table (MappingProxyType-backed, render() with str.format placeholders, raises UnknownMessageKey for missing keys instead
+    of silent fallback so handlers cannot drift back to literals); get_catalog(locale=None) returns the built-in catalog;
+    Translator(locale=None, catalog=None) is the locale-bound handler-facing object with t(key, **params) (also callable as
+    t(...)). Initial 18-key catalog in both locales covers the platform''s user-facing surfaces: greeting.start/help, terms.required/accepted,
+    user.frozen/banned/not_found, wallet.insufficient_balance/deposited, quota.exceeded, maintenance.blocked, offer.unavailable/show/hide,
+    server.created/destroyed, operation.failed, error.unknown. The Telegram start handler (bot/main.py) now renders greeting.start
+    from the catalog instead of a scattered English literal - the platform default output is Persian. Domain modules keep
+    their English exception messages by design (log/operator text); only user-facing handler output routes through this module.
+    13 tests: Persian default (DEFAULT_LOCALE, get_catalog(), Translator() all fa; default greeting is Persian, no ''Welcome''),
+    English locale available, parameter substitution in both locales, call alias, missing parameter raises KeyError, unknown
+    key raises UnknownMessageKey in every locale, catalog table immutable, completeness (fa/en key sets identical; all documented
+    keys present; placeholder parity between locales parsed via string.Formatter so a handler can pass one param set to either
+    locale), the bot start handler renders the Persian catalog greeting and the old scattered literal is gone, and an injected
+    custom catalog wins over the built-ins. Full suite 930 passed.'
 - id: M03-001
   milestone: M03
   title: Persist Provider and ProviderAccount
@@ -506,13 +542,34 @@ tasks:
   milestone: M04
   title: Cache customer catalog safely
   priority: P2
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M04-007
   acceptance:
   - Cache invalidates on offer/price change.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added the safe customer catalog cache (M04-008) as new module src/cloud_platform/modules/catalog/cache.py.
+    CatalogCache decorates any CatalogRepository and implements the same port (get_offer / upsert_entry / set_offer_enabled),
+    so it swaps in at the wiring point and every in-process catalog reader and writer shares one instance. Safety properties:
+    (1) epoch invalidation - every mutation (price ingestion upsert, offer visibility change) bumps an internal epoch after
+    the write commits, and cached entries tagged with an older epoch are treated as misses, which directly satisfies ''cache
+    invalidates on offer/price change''; (2) TTL safety net - entries expire after ttl_seconds (default 60, injectable monotonic
+    clock; ttl=0 disables caching) so a writer that bypasses the cache (direct DB write from another process) cannot keep
+    stale data past the TTL; (3) negative caching - unknown offers are cached like any result so repeated missing-offer lookups
+    do not hammer the store; (4) no stale write-through - if an invalidation occurs while a fetch is in flight, the fetched
+    value is returned for that call but not cached, so a racing admin write is never shadowed (epoch snapshot before fetch,
+    compared after). Manual invalidate(ref|None) evicts one entry or the whole cache and returns the eviction count; a conservative
+    epoch bump on per-ref eviction also ages out other entries (correctness over hit ratio - catalogs are small), documented.
+    CacheStats (hits/misses/invalidations/entries) exposes counters for logging. Exported CacheStats/CatalogCache from the
+    catalog package. 17 tests: reads (hit served from cache with inner hit exactly once, distinct refs independent, negative
+    cache, ttl=0 never caches, negative ttl rejected), invalidation on changes (price upsert invalidates - old price 1000
+    then 1500 re-fetched, visibility hide invalidates, LookupError from set_offer_enabled still propagates, upsert created/updated
+    return values pass through, racing invalidation during fetch is returned but not cached and the next read re-fetches),
+    TTL and manual invalidation (entry expires at 30.1s with fake clock, invalidate-all evicts 2, per-ref invalidation evicts
+    1 and both refs re-fetch under the conservative epoch semantics, invalidate of missing ref returns 0), port compatibility
+    (mypy-verified: CatalogCache assigned to a CatalogRepository variable and used for all three port methods), stats accounting,
+    and catalog row id preservation. Full suite 917 passed.'
 - id: M04-009
   milestone: M04
   title: Handle rate-limit headers and 429 backoff
@@ -641,13 +698,34 @@ tasks:
   milestone: M05
   title: Add ledger reconciliation report
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M05-003
   acceptance:
   - Detects impossible/corrupt balance states.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added the ledger reconciliation report (M05-008) in a new read-only module src/cloud_platform/modules/wallet/reconciliation.py.
+    Pure per-wallet checker check_wallet(wallet, holds, entries) detects impossible/corrupt balance states with stable finding
+    codes: NEGATIVE_BALANCE (error), OVERRESERVED (active holds exceed balance), CLOSED_NONZERO_BALANCE, CURRENCY_MISMATCH_HOLD,
+    CURRENCY_MISMATCH_ENTRY, ZERO_AMOUNT_ENTRY, DUPLICATE_IDEMPOTENCY_KEY, CAPTURED_HOLD_MISSING_CHARGE (captured hold without
+    its CHARGE entry), RELEASED_HOLD_MISSING_RELEASE, CHARGE_WITHOUT_HOLD (charge referencing a missing or non-captured hold),
+    RELEASE_WITHOUT_HOLD, HOLD_WITHOUT_ENTRY (warning), and BALANCE_LEDGER_MISMATCH which re-derives the balance from the
+    unambiguous ledger net (deposits + refunds - charges; HOLD/RELEASE entries move no cash) and compares it to the stored
+    balance, treating the unsigned admin-adjustment total as the explainable slack: residual within the adjustment total is
+    a WARNING, an unexplained residual is an ERROR with the residual and expected values in details. Findings carry wallet
+    id, code, severity (ERROR/WARNING), message and details; ReconciliationReport aggregates them with errors/warnings properties,
+    is_clean (no errors), and an ASCII-only render() for logs. LedgerReconciliationService.generate_report() iterates every
+    wallet and fetches its holds and entries. Repository ports gained read-only listing methods (WalletRepository.list_all,
+    HoldRepository.list_by_wallet, LedgerRepository.list_entries) with SQLAlchemy implementations. The pass is strictly read-only
+    (verified by test: no mutation of wallet/hold/entry state). 25 tests: 6 clean-state proofs (fresh wallet, deposit-only,
+    hold created, captured+charge pairing, released+release pairing, adjustment-explained residual is warning-only) and 14
+    corrupt-state detections (negative balance, overreserved, closed non-zero, hold/entry currency mismatch, zero-amount corrupt
+    row, duplicate idempotency key, captured hold missing charge, released hold missing release, charge without hold, charge
+    referencing a still-created hold, release without hold, hold without entry warning, unexplained residual error with residual=-500
+    detail) plus report rendering, clean report, cross-wallet aggregation (bad wallet -5 with empty ledger correctly yields
+    NEGATIVE_BALANCE + OVERRESERVED + BALANCE_LEDGER_MISMATCH, all attributed to the right wallet, per-wallet fetch counts),
+    no-wallets, and read-only verification. Full suite 880 passed.'
 - id: M06-001
   milestone: M06
   title: Implement price books and margin rules
@@ -891,14 +969,36 @@ tasks:
   milestone: M07
   title: Implement provider action waiter strategy
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M07-002
   - M04-009
   acceptance:
   - Polls with bounded backoff and rate-limit awareness.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented the provider action waiter strategy (M07-004) in a new framework-agnostic module src/cloud_platform/providers/waiter.py.
+    ActionWaiter.wait_for(probe) polls a provider action until terminal with: (1) bounded backoff - polls start at base_delay_seconds
+    (default 2s) and multiply by multiplier (default 2) per pending observation, clamped at max_delay_seconds (default 30s),
+    with the whole wait bounded by max_wait_seconds (default 600s); (2) rate-limit awareness - every individual poll runs
+    through a RetryExecutor (M04-009) so a 429 carrying a reset epoch waits out the reset window (clamped to the delay cap)
+    and 5xx/unavailability is retried with bounded exponential backoff WITHIN the poll, so transient provider hiccups do not
+    burn the poll budget; (3) timeout is not failure - exceeding the deadline returns WaitResult(TIMEOUT) so the caller keeps
+    watching via the normal reconciliation path instead of failing a resource that may still complete; (4) permanent errors
+    (bad credentials, unknown resource) propagate so the caller can contain them. WaitPolicy validates all bounds. Sleep,
+    clock, and the per-poll retry executor are injectable (deterministic tests, no real waiting). Wired into ProvisioningWorker
+    as an optional waiter: after create_server succeeds the worker now watches the new provider server (probe normalizes provider
+    status via normalize_provider_status: RUNNING -> completed, NOT_FOUND/DELETING -> failed, CREATING/STOPPED/UNKNOWN ->
+    pending); a completed watch fast-forwards the server PROVISIONING -> RUNNING and audits server.provisioning_wait_completed;
+    a timeout/failure leaves the server in PROVISIONING with server.provisioning_wait_timeout/failed audited so the state
+    reconciler (M07-005) keeps ownership; provider errors during the watch are logged, never raised (non-fatal). Without a
+    waiter the legacy behavior is unchanged (no extra provider calls). 18 tests: policy validation (4 invalid combos), immediate
+    completion (1 poll, 0s), completion after pending polls with exact backoff elapsed, failed probe with detail, deadline
+    timeout with exact poll count and elapsed <= max_wait, backoff sequence clamped ([2,4,5,5] with cap 5 and all <= cap),
+    transient 502 absorbed within one poll, 429 reset epoch slept out (clock advanced to reset), retry-budget exhaustion propagates,
+    permanent 401 propagates immediately, and 4 integration tests (fast-forward to RUNNING with 2 polls + audit, timeout keeps
+    PROVISIONING + audit, provider error during watch contained, no-waiter legacy path makes zero get_server calls). Full
+    suite 855 passed.'
 - id: M07-005
   milestone: M07
   title: Implement server state reconciliation

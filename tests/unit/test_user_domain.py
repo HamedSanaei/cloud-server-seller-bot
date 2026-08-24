@@ -72,17 +72,19 @@ class TestTransitions:
 
 
 class TestTermsAcceptance:
-    def test_accept_terms_records_timestamp(self) -> None:
+    def test_accept_terms_records_version_and_timestamp(self) -> None:
         user = _make_user()
         at = datetime(2026, 8, 22, tzinfo=UTC)
-        user.accept_terms(at)
+        user.accept_terms(3, at)
+        assert user.terms_version == 3
         assert user.terms_accepted_at == at
 
     def test_accept_terms_defaults_to_now(self) -> None:
         user = _make_user()
         before = datetime.now(UTC)
-        user.accept_terms()
+        user.accept_terms(1)
         after = datetime.now(UTC)
+        assert user.terms_version == 1
         assert user.terms_accepted_at is not None
         assert before <= user.terms_accepted_at <= after
 

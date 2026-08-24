@@ -82,6 +82,51 @@ class UserNotFound(LookupError):
     """Raised when a User is not found in the repository."""
 
 
+class TermsAcceptanceRequiredError(RuntimeError):
+    """Raised when a user must accept the current terms before proceeding."""
+
+
+# ---------------------------------------------------------------------------
+# Terms versioning (M02-004)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TermsVersion:
+    """One immutable version of the platform terms.
+
+    Versions are strictly increasing integers; the highest published version
+    is always the current one.
+    """
+
+    version: int
+    body: str
+    effective_at: datetime
+    summary: str = ""
+
+    def __post_init__(self) -> None:
+        if self.version < 1:
+            raise ValueError("terms version must be >= 1")
+        if not self.body or not self.body.strip():
+            raise ValueError("terms body must not be empty")
+
+
+class TermsVersionRepository(Protocol):
+    """Port for publishing/reading terms versions (immutable once published)."""
+
+    async def get(self, version: int) -> TermsVersion | None: ...
+
+    async def get_latest(self) -> TermsVersion | None:
+        """The highest published version, or None when nothing is published."""
+        ...
+
+    async def list_all(self) -> list[TermsVersion]: ...
+
+    async def publish(self, terms: TermsVersion) -> TermsVersion:
+        """Insert a new version. Fails if the version already exists."""
+        ...
+
+
 # ---------------------------------------------------------------------------
 # UserStatus
 # ---------------------------------------------------------------------------
@@ -118,6 +163,7 @@ class User:
     email: str = ""
     status: UserStatus = UserStatus.ACTIVE
     role: Role = Role.USER
+    terms_version: int | None = None
     terms_accepted_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -147,9 +193,21 @@ class User:
         allowed: frozenset[Permission] = PERMISSIONS.get(self.role, frozenset())
         return permission in allowed
 
-    def accept_terms(self, at: datetime | None = None) -> None:
-        """Record acceptance of the latest terms; defaults to now (UTC)."""
+    def accept_terms(self, version: int, at: datetime | None = None) -> None:
+        """Record acceptance of terms ``version``; defaults to now (UTC)."""
+        if version < 1:
+            raise ValueError("terms version must be >= 1")
+        self.terms_version = version
         self.terms_accepted_at = at or datetime.now(UTC)
+
+    def needs_terms_acceptance(self, latest_version: int | None) -> bool:
+        """True when the user has not accepted the latest published terms.
+
+        With no published terms there is nothing to accept.
+        """
+        if latest_version is None:
+            return False
+        return self.terms_version is None or self.terms_version < latest_version
 
     def freeze(self) -> None:
         """Freeze the user. Only allowed from ACTIVE."""
@@ -238,3 +296,7 @@ class UserRepository(Protocol):
     async def get_by_telegram_user_id(self, telegram_user_id: int) -> User | None: ...
 
     async def update_status(self, user_id: uuid.UUID, status: UserStatus) -> User: ...
+
+    async def update_terms(self, user_id: uuid.UUID, terms_version: int) -> User:
+        """Persist the user's accepted terms version."""
+        ...

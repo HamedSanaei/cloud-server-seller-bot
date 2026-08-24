@@ -65,6 +65,12 @@ from cloud_platform.providers.base import (
 from cloud_platform.providers.errors import ProviderError
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
+from cloud_platform.providers.waiter import (
+    ActionWaiter,
+    WaitOutcome,
+    WaitProbe,
+    WaitState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +150,7 @@ class ProvisioningWorker:
         audit_repo: AuditRepository,
         power_executor: PowerOperationExecutor | None = None,
         concurrency_limit: int = 3,
+        waiter: ActionWaiter | None = None,
     ) -> None:
         if concurrency_limit < 1:
             raise ValueError("concurrency_limit must be at least 1")
@@ -155,6 +162,7 @@ class ProvisioningWorker:
         self._holds = hold_repo
         self._audit = AuditTrail(audit_repo)
         self._concurrency_limit = concurrency_limit
+        self._waiter = waiter
         self._power = power_executor or PowerOperationExecutor(
             operation_repo=operation_repo,
             server_repo=server_repo,
@@ -262,7 +270,84 @@ class ProvisioningWorker:
             },
         )
         logger.info("provisioned server %s -> provider %s", server_id, created.id)
+        await self._watch_creation(server, provider, created)
         return ProvisioningOutcome.PROVISIONED
+
+    async def _watch_creation(
+        self, server: CloudServer, provider: CloudProvider, created: ProviderServer
+    ) -> None:
+        """Wait for the provider to finish creating (M07-004 waiter strategy).
+
+        Optional and non-fatal: a completed wait fast-forwards the server to
+        RUNNING; a timeout/failure leaves the server in PROVISIONING so the
+        state reconciler (M07-005) keeps watching. Provider errors while
+        polling are logged, not raised — the reconciler contains them.
+        """
+        waiter = self._waiter
+        if waiter is None or not created.id:
+            return
+
+        async def probe() -> WaitProbe:
+            remote = await provider.get_server(created.id)
+            if remote is None:
+                return WaitProbe(WaitState.FAILED, "server vanished after create")
+            state = normalize_provider_status(remote.status)
+            if state is ProviderServerState.RUNNING:
+                return WaitProbe(WaitState.COMPLETED, remote.status)
+            if state in (ProviderServerState.NOT_FOUND, ProviderServerState.DELETING):
+                return WaitProbe(WaitState.FAILED, f"unexpected provider state: {state.value}")
+            return WaitProbe(WaitState.PENDING, remote.status)
+
+        try:
+            result = await waiter.wait_for(probe)
+        except ProviderError as exc:
+            logger.warning(
+                "creation watch for server %s interrupted by provider error; "
+                "leaving reconciliation to the state reconciler: %s",
+                server.id,
+                exc,
+            )
+            return
+
+        if result.outcome is WaitOutcome.COMPLETED:
+            if server.state is ServerLifecycleState.PROVISIONING:
+                server.transition_to(ServerLifecycleState.RUNNING)
+                await self._servers.save(server)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                action="server.provisioning_wait_completed",
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=str(server.id),
+                reason=f"provider finished creating in {result.polls} polls",
+                metadata={
+                    "provider_server_id": created.id,
+                    "polls": str(result.polls),
+                },
+            )
+            return
+
+        outcome_action = (
+            "server.provisioning_wait_failed"
+            if result.outcome is WaitOutcome.FAILED
+            else "server.provisioning_wait_timeout"
+        )
+        logger.info(
+            "creation watch for server %s ended %s after %d polls; state reconciler continues",
+            server.id,
+            result.outcome.value,
+            result.polls,
+        )
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            action=outcome_action,
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(server.id),
+            reason=result.detail or f"wait ended {result.outcome.value}",
+            metadata={
+                "provider_server_id": created.id,
+                "polls": str(result.polls),
+            },
+        )
 
     async def run_once(self, limit: int = 10) -> dict[ProvisioningOutcome, int]:
         """Process up to ``limit`` REQUESTED servers; returns outcome counts.

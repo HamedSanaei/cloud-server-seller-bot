@@ -5,13 +5,18 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message
 
 from cloud_platform.core.config import get_settings
+from cloud_platform.core.i18n import Translator
 
 dp = Dispatcher()
+
+# User-facing strings come from the message catalog (M02-007), never
+# scattered literals. The platform default locale is Persian.
+_t = Translator()
 
 
 @dp.message(CommandStart())
 async def start(message: Message) -> None:
-    await message.answer("Cloud Server Platform starter is running.")
+    await message.answer(_t.t("greeting.start"))
 
 
 async def main() -> None:

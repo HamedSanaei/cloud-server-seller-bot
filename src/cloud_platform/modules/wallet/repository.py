@@ -87,6 +87,11 @@ class SqlAlchemyWalletRepository:
             row = await session.get(SQLAlchemyWallet, user_id)
             return _wallet_to_domain(row) if row is not None else None
 
+    async def list_all(self) -> list[Wallet]:
+        async with self._session_factory() as session:
+            result = await session.execute(select(SQLAlchemyWallet))
+            return [_wallet_to_domain(row) for row in result.scalars().all()]
+
     async def get_or_create(self, user_id: UUID, currency: str = "EUR") -> Wallet:
         wallet = await self.get(user_id)
         if wallet is not None:
@@ -234,6 +239,12 @@ class SqlAlchemyLedgerRepository:
             if row is None:
                 return None
             return _ledger_entry_to_domain(row)
+
+    async def list_entries(self, wallet_id: UUID) -> list[LedgerEntry]:
+        async with self._session_factory() as session:
+            stmt = select(_LEModel).where(_LEModel.wallet_id == wallet_id)
+            result = await session.execute(stmt)
+            return [_ledger_entry_to_domain(row) for row in result.scalars().all()]
 
 
 # ===================================================================
@@ -447,6 +458,12 @@ class SqlAlchemyHoldRepository:
             result = await session.execute(stmt)
             amounts = [int(_attr(r, "amount") or 0) for r in result.all()]
             return sum(amounts)
+
+    async def list_by_wallet(self, wallet_id: UUID) -> list[Hold]:
+        async with self._session_factory() as session:
+            stmt = select(_HoldModel).where(_HoldModel.wallet_id == wallet_id)
+            result = await session.execute(stmt)
+            return [_hold_to_domain(row) for row in result.scalars().all()]
 
 
 # ===================================================================

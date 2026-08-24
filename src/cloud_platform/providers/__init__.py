@@ -57,12 +57,21 @@ from cloud_platform.providers.retry import (
     RetryPolicy,
     classify_provider_error,
 )
+from cloud_platform.providers.waiter import (
+    ActionWaiter,
+    WaitOutcome,
+    WaitPolicy,
+    WaitProbe,
+    WaitResult,
+    WaitState,
+)
 
 __all__ = [
     "PERMANENT_ERROR_TYPES",
     "RETRYABLE_ERROR_TYPES",
     "AccountHealth",
     "AccountStatus",
+    "ActionWaiter",
     "AllAccountsExhaustedError",
     "AllocationError",
     "AllocationPolicy",
@@ -96,6 +105,11 @@ __all__ = [
     "RetryExecutor",
     "RetryPolicy",
     "UnsupportedGatewayOperation",
+    "WaitOutcome",
+    "WaitPolicy",
+    "WaitProbe",
+    "WaitResult",
+    "WaitState",
     "can_transition",
     "classify_provider_error",
     "evaluate_account_health",

@@ -125,6 +125,10 @@ class WalletRepository(Protocol):
         """Return the wallet for a user, or None."""
         ...
 
+    async def list_all(self) -> list[Wallet]:
+        """Every wallet (reconciliation/reporting)."""
+        ...
+
     async def get_or_create(self, user_id: UUID, currency: str = "EUR") -> Wallet:
         """Return the wallet; create it if absent."""
         ...
@@ -244,6 +248,10 @@ class HoldRepository(Protocol):
         """Return sum of all active holds for a wallet."""
         ...
 
+    async def list_by_wallet(self, wallet_id: UUID) -> list[Hold]:
+        """Every hold of a wallet, in all states (reconciliation/reporting)."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Ledger posting — append-only with idempotency guarantee
@@ -282,4 +290,8 @@ class LedgerRepository(Protocol):
         idempotency_key: str,
     ) -> LedgerEntry | None:
         """Return an existing entry if it exists, else None."""
+        ...
+
+    async def list_entries(self, wallet_id: UUID) -> list[LedgerEntry]:
+        """Every ledger entry of a wallet (reconciliation/reporting)."""
         ...

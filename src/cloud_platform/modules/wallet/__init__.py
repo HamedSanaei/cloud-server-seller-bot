@@ -18,6 +18,13 @@ from cloud_platform.modules.wallet.domain import (
     WalletRepository,
     WalletStatus,
 )
+from cloud_platform.modules.wallet.reconciliation import (
+    FindingSeverity,
+    LedgerReconciliationService,
+    ReconciliationFinding,
+    ReconciliationReport,
+    check_wallet,
+)
 from cloud_platform.modules.wallet.repository import (
     HoldService,
     SqlAlchemyHoldRepository,
@@ -28,6 +35,7 @@ from cloud_platform.modules.wallet.service import HoldAdminService, WalletAdminS
 
 __all__ = [
     "DuplicateIdempotencyError",
+    "FindingSeverity",
     "Hold",
     "HoldAdminService",
     "HoldError",
@@ -40,7 +48,10 @@ __all__ = [
     "InsufficientHoldBalanceError",
     "LedgerEntry",
     "LedgerEntryType",
+    "LedgerReconciliationService",
     "LedgerRepository",
+    "ReconciliationFinding",
+    "ReconciliationReport",
     "SqlAlchemyHoldRepository",
     "SqlAlchemyLedgerRepository",
     "SqlAlchemyWalletRepository",
@@ -49,4 +60,5 @@ __all__ = [
     "WalletError",
     "WalletRepository",
     "WalletStatus",
+    "check_wallet",
 ]

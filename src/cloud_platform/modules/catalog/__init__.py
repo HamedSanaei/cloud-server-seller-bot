@@ -1,5 +1,6 @@
 """Catalog module: location-aware provider pricing + offer visibility."""
 
+from cloud_platform.modules.catalog.cache import CacheStats, CatalogCache
 from cloud_platform.modules.catalog.domain import (
     HOURS_PER_MONTH,
     CatalogEntrySpec,
@@ -33,6 +34,8 @@ from cloud_platform.modules.catalog.service import (
 
 __all__ = [
     "HOURS_PER_MONTH",
+    "CacheStats",
+    "CatalogCache",
     "CatalogEntrySpec",
     "CatalogError",
     "CatalogRepository",

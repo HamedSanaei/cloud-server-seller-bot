@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 from uuid import UUID, uuid4
 
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
@@ -93,6 +94,14 @@ class MaintenanceSwitchError(Exception):
     """Base error for the maintenance switch service."""
 
 
+class TermsGate(Protocol):
+    """Port for the terms-acceptance check (implemented by the users module)."""
+
+    async def require_latest(self, user: User) -> None:
+        """Raise TermsAcceptanceRequiredError when the user's terms are stale."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class CreateServerResult:
     """Outcome of the create-server command.
@@ -124,6 +133,7 @@ class CreateServerService:
         book_name: str,
         quota: QuotaPolicy | None = None,
         maintenance: MaintenanceSwitchService | None = None,
+        terms: TermsGate | None = None,
     ) -> None:
         if not book_name or not book_name.strip():
             raise ValueError("book_name must not be empty")
@@ -138,6 +148,7 @@ class CreateServerService:
         self._book_name = book_name
         self._quota = quota or QuotaPolicy()
         self._maintenance = maintenance
+        self._terms = terms
 
     @staticmethod
     def _hold_key(idempotency_key: str) -> str:
@@ -156,6 +167,8 @@ class CreateServerService:
 
         Steps:
         1. User must be ACTIVE (frozen/banned users are rejected).
+        1.5 The terms gate (M02-004), when wired, must see the user on the
+            latest published terms (TermsAcceptanceRequiredError otherwise).
         2. Offer must exist in the catalog and be enabled.
         2.5 The maintenance switch (M10-005), when wired, must not block
             new orders for the offer's provider/location.
@@ -178,6 +191,8 @@ class CreateServerService:
 
         Raises:
             UserNotActiveError: Frozen or banned user.
+            TermsAcceptanceRequiredError: User's accepted terms are not the
+                latest published version.
             OfferNotFoundError: Unknown offer (from the catalog port).
             OfferDisabledError: Offer hidden/disabled.
             MaintenanceBlockedError: A maintenance switch blocks the scope.
@@ -192,6 +207,10 @@ class CreateServerService:
             raise CreateServerCommandError("a persisted user id is required")
         if user.status is not UserStatus.ACTIVE:
             raise UserNotActiveError(f"user {user.id} is {user.status.value}")
+
+        # 1.5 Terms (M02-004), when wired: provisioning requires the latest terms.
+        if self._terms is not None:
+            await self._terms.require_latest(user)
 
         # 2. Offer.
         offer = await self._catalog.get_offer(offer_ref)

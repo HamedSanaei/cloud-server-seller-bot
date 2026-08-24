@@ -6,6 +6,9 @@ from cloud_platform.modules.users.domain import (
     PermissionChecker,
     PermissionDeniedError,
     Role,
+    TermsAcceptanceRequiredError,
+    TermsVersion,
+    TermsVersionRepository,
     User,
     UserNotFound,
     UserRepository,
@@ -16,7 +19,11 @@ from cloud_platform.modules.users.onboarding import (
     OnboardingError,
     handle_start,
 )
-from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+from cloud_platform.modules.users.repository import (
+    SqlAlchemyTermsVersionRepository,
+    SqlAlchemyUserRepository,
+)
+from cloud_platform.modules.users.terms import TermsService
 
 __all__ = [
     "InvalidUserTransition",
@@ -26,7 +33,12 @@ __all__ = [
     "PermissionChecker",
     "PermissionDeniedError",
     "Role",
+    "SqlAlchemyTermsVersionRepository",
     "SqlAlchemyUserRepository",
+    "TermsAcceptanceRequiredError",
+    "TermsService",
+    "TermsVersion",
+    "TermsVersionRepository",
     "User",
     "UserNotFound",
     "UserRepository",
