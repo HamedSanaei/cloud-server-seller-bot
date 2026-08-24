@@ -19,6 +19,8 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Protocol
 from uuid import UUID
 
+from cloud_platform.observability.metrics import metrics
+
 logger = logging.getLogger(__name__)
 
 # Billing-hours basis used to derive an hourly price from a monthly one.
@@ -290,17 +292,18 @@ class CatalogSyncJob:
 
     async def run(self) -> CatalogSyncRunReport:
         """Execute the sync, or skip it when another sync holds the lock."""
-        async with self._lock.guard() as acquired:
-            if not acquired:
-                return CatalogSyncRunReport(
-                    ran=False,
-                    reason="catalog sync lock is held by another sync",
-                )
-            reports: list[CatalogSyncStepReport] = []
-            for step in self._steps:
-                try:
-                    reports.append(await step.run())
-                except Exception as exc:
-                    logger.exception("catalog sync step %r failed", step.name)
-                    reports.append(CatalogSyncStepReport(name=step.name, error=str(exc)))
-            return CatalogSyncRunReport(ran=True, steps=tuple(reports))
+        async with metrics.job("catalog_sync"):
+            async with self._lock.guard() as acquired:
+                if not acquired:
+                    return CatalogSyncRunReport(
+                        ran=False,
+                        reason="catalog sync lock is held by another sync",
+                    )
+                reports: list[CatalogSyncStepReport] = []
+                for step in self._steps:
+                    try:
+                        reports.append(await step.run())
+                    except Exception as exc:
+                        logger.exception("catalog sync step %r failed", step.name)
+                        reports.append(CatalogSyncStepReport(name=step.name, error=str(exc)))
+                return CatalogSyncRunReport(ran=True, steps=tuple(reports))

@@ -3,6 +3,7 @@ from typing import ClassVar
 from arq.connections import RedisSettings
 
 from cloud_platform.core.config import get_settings
+from cloud_platform.observability.metrics import metrics
 
 
 async def startup(ctx: dict[str, object]) -> None:
@@ -16,6 +17,8 @@ async def shutdown(ctx: dict[str, object]) -> None:
 async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
     # M07 implements bounded reconciliation batches with provider rate-limit awareness.
     del ctx
+    async with metrics.job("reconcile_provider_resources"):
+        pass
 
 
 class WorkerSettings:

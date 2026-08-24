@@ -120,6 +120,20 @@ class Operation:
         self._transition_to(OperationStatus.FAILED)
         self.error = error
 
+    def reopen_for_retry(self) -> None:
+        """Manual tooling only: FAILED -> PENDING with the same operation key.
+
+        Deliberately NOT part of ``_ALLOWED``: no automated path may reopen a
+        failed operation. The replay is safe because the worker re-sends the
+        SAME operation key, so the provider deduplicates the mutation.
+        """
+        if self.status is not OperationStatus.FAILED:
+            raise InvalidOperationTransition(
+                f"operation {self.operation_key}: {self.status.value} -> retry "
+                "(only FAILED operations may be reopened)"
+            )
+        self.status = OperationStatus.PENDING
+
 
 # ---------------------------------------------------------------------------
 # Server state reconciliation (M07-005)
@@ -292,4 +306,13 @@ class OperationRepository(Protocol):
 
     async def save(self, operation: Operation) -> Operation:
         """Persist status/correlation changes of a claimed operation."""
+        ...
+
+    async def list_failed(
+        self,
+        *,
+        operation_types: Sequence[OperationType] | None = None,
+        limit: int = 50,
+    ) -> list[Operation]:
+        """FAILED operations, most recently updated first (inspection)."""
         ...

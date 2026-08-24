@@ -40,6 +40,7 @@ from cloud_platform.modules.wallet.domain import (
     WalletRepository,
     WalletStatus,
 )
+from cloud_platform.observability.metrics import metrics
 
 
 def _attr(row: Any, name: str) -> Any:
@@ -491,7 +492,11 @@ class HoldService:
         Returns the created Hold.
         Raises InsufficientHoldBalanceError if the wallet cannot cover it.
         """
-        hold = await self._hold_repo.create_hold(wallet_id, amount, currency, idempotency_key)
+        try:
+            hold = await self._hold_repo.create_hold(wallet_id, amount, currency, idempotency_key)
+        except InsufficientHoldBalanceError:
+            metrics.record_billing_event("hold_created", "insufficient_balance")
+            raise
         # Post hold ledger entry (idempotent)
         try:
             await self._ledger_repo.post_entry(
@@ -506,6 +511,7 @@ class HoldService:
             )
         except DuplicateIdempotencyError:
             pass  # ledger entry already posted by idempotent re-invocation
+        metrics.record_billing_event("hold_created", "ok")
         return hold
 
     async def release_hold(
@@ -521,8 +527,13 @@ class HoldService:
         Raises HoldStateConflictError when the hold is captured, and
         HoldNotFoundError when the hold does not exist.
         """
-        hold = await self._resolve_hold(wallet_id, hold_id, idempotency_key)
+        try:
+            hold = await self._resolve_hold(wallet_id, hold_id, idempotency_key)
+        except HoldNotFoundError:
+            metrics.record_billing_event("hold_released", "not_found")
+            raise
         if hold.status is HoldStatus.CAPTURED:
+            metrics.record_billing_event("hold_released", "conflict")
             raise HoldStateConflictError(f"hold {hold_id} is already captured; cannot release")
         assert hold.id is not None
         persisted_id: UUID = hold.id
@@ -543,6 +554,7 @@ class HoldService:
             )
         except DuplicateIdempotencyError:
             pass  # already posted by an earlier attempt
+        metrics.record_billing_event("hold_released", "ok")
         return hold
 
     async def capture_hold(
@@ -558,8 +570,13 @@ class HoldService:
         captured hold is a no-op and the ledger entry is re-posted safely.
         Raises HoldStateConflictError when the hold was released.
         """
-        hold = await self._resolve_hold(wallet_id, hold_id, idempotency_key)
+        try:
+            hold = await self._resolve_hold(wallet_id, hold_id, idempotency_key)
+        except HoldNotFoundError:
+            metrics.record_billing_event("hold_captured", "not_found")
+            raise
         if hold.status is HoldStatus.RELEASED:
+            metrics.record_billing_event("hold_captured", "conflict")
             raise HoldStateConflictError(f"hold {hold_id} is already released; cannot capture")
         assert hold.id is not None
         persisted_id: UUID = hold.id
@@ -584,6 +601,7 @@ class HoldService:
             )
         except DuplicateIdempotencyError:
             pass  # already posted by an earlier attempt
+        metrics.record_billing_event("hold_captured", "ok")
         return hold
 
     async def _resolve_hold(self, wallet_id: UUID, hold_id: UUID, idempotency_key: str) -> Hold:

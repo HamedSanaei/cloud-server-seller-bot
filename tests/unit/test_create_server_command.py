@@ -19,6 +19,9 @@ from cloud_platform.modules.catalog.domain import (
 )
 from cloud_platform.modules.compute.domain import (
     CloudServer,
+    MaintenanceBlock,
+    MaintenanceScope,
+    QuotaPolicy,
     ServerCreateError,
     ServerCreateIntent,
     ServerLifecycleState,
@@ -26,8 +29,11 @@ from cloud_platform.modules.compute.domain import (
 from cloud_platform.modules.compute.service import (
     CreateServerCommandError,
     CreateServerService,
+    MaintenanceBlockedError,
+    MaintenanceSwitchService,
     NoWalletError,
     OfferDisabledError,
+    QuotaExceededError,
     UserNotActiveError,
 )
 from cloud_platform.modules.pricing.domain import (
@@ -130,6 +136,8 @@ class _Deps:
         self.servers.get_by_idempotency_key = AsyncMock(return_value=None)
         self.servers.create = AsyncMock(side_effect=lambda s, i: s)
         self.servers.save = AsyncMock(side_effect=lambda s: s)
+        self.servers.count_active = AsyncMock(return_value=0)
+        self.servers.count_total = AsyncMock(return_value=0)
         self.accounts = AsyncMock()
         self.accounts.get_active = AsyncMock(return_value=_account())
         self.catalog = AsyncMock()
@@ -150,7 +158,11 @@ class _Deps:
         self.audit = AsyncMock()
         self.audit.append = AsyncMock(side_effect=lambda e: e)
 
-    def service(self) -> CreateServerService:
+    def service(
+        self,
+        quota: QuotaPolicy | None = None,
+        maintenance: MaintenanceSwitchService | None = None,
+    ) -> CreateServerService:
         return CreateServerService(
             server_repo=self.servers,  # type: ignore[arg-type]
             account_repo=self.accounts,  # type: ignore[arg-type]
@@ -161,6 +173,8 @@ class _Deps:
             hold_repo=self.holds,  # type: ignore[arg-type]
             audit_repo=self.audit,  # type: ignore[arg-type]
             book_name="retail-eur",
+            quota=quota,
+            maintenance=maintenance,
         )
 
     def run(self, **overrides: object):
@@ -171,7 +185,11 @@ class _Deps:
             "at": NOW,
         }
         kwargs.update(overrides)
-        return self.service().create_server(**kwargs)  # type: ignore[arg-type]
+        quota = kwargs.pop("quota", None)
+        maintenance = kwargs.pop("maintenance", None)
+        return (
+            self.service(quota=quota, maintenance=maintenance).create_server(**kwargs)  # type: ignore[arg-type]
+        )
 
 
 def _audit_events(deps: _Deps) -> list:
@@ -355,3 +373,134 @@ class TestCompensation:
         assert saved.state is ServerLifecycleState.ERROR
         deps.holds.release_hold.assert_awaited_once()
         deps.audit.append.assert_not_awaited()
+
+
+class TestQuota:
+    async def test_concurrent_quota_exceeded(self) -> None:
+        deps = _Deps()
+        deps.servers.count_active = AsyncMock(return_value=10)  # default max 10
+        with pytest.raises(QuotaExceededError, match="concurrent limit"):
+            await deps.run()
+        deps.holds.create_hold.assert_not_awaited()
+        deps.servers.create.assert_not_awaited()
+
+    async def test_lifetime_quota_exceeded(self) -> None:
+        deps = _Deps()
+        deps.servers.count_active = AsyncMock(return_value=0)
+        deps.servers.count_total = AsyncMock(return_value=50)  # default max 50
+        with pytest.raises(QuotaExceededError, match="lifetime limit"):
+            await deps.run()
+        deps.holds.create_hold.assert_not_awaited()
+
+    async def test_concurrent_quota_checked_first(self) -> None:
+        deps = _Deps()
+        deps.servers.count_active = AsyncMock(return_value=10)
+        deps.servers.count_total = AsyncMock(return_value=50)
+        with pytest.raises(QuotaExceededError, match="concurrent limit"):
+            await deps.run()
+
+    async def test_just_under_quota_succeeds(self) -> None:
+        deps = _Deps()
+        deps.servers.count_active = AsyncMock(return_value=9)
+        deps.servers.count_total = AsyncMock(return_value=49)
+
+        result = await deps.run()
+
+        assert result.replayed is False
+        deps.servers.create.assert_awaited_once()
+        deps.holds.create_hold.assert_awaited_once()
+
+    async def test_custom_quota(self) -> None:
+        deps = _Deps()
+        deps.servers.count_active = AsyncMock(return_value=1)
+        with pytest.raises(QuotaExceededError, match="concurrent limit 1"):
+            await deps.run(quota=QuotaPolicy(max_active=1, max_total=100))
+        deps.servers.count_active = AsyncMock(return_value=0)
+        result = await deps.run(quota=QuotaPolicy(max_active=1, max_total=100))
+        assert result.replayed is False
+
+    async def test_zero_quota_blocks_everything(self) -> None:
+        deps = _Deps()
+        deps.servers.count_active = AsyncMock(return_value=0)
+        with pytest.raises(QuotaExceededError, match="concurrent limit 0"):
+            await deps.run(quota=QuotaPolicy(max_active=0, max_total=0))
+
+    async def test_replay_is_not_blocked_by_quota(self) -> None:
+        deps = _Deps()
+        existing = _existing()
+        deps.servers.get_by_idempotency_key = AsyncMock(return_value=existing)
+        deps.servers.count_active = AsyncMock(return_value=10)  # would exceed
+
+        result = await deps.run()
+
+        assert result.replayed is True
+        assert result.server.id == existing.id
+        deps.servers.count_active.assert_not_awaited()
+
+    async def test_negative_quota_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_active"):
+            QuotaPolicy(max_active=-1)
+        with pytest.raises(ValueError, match="max_total"):
+            QuotaPolicy(max_total=-1)
+
+
+class _MiniSwitchRepo:
+    """Just enough of MaintenanceSwitchRepository for the create command."""
+
+    def __init__(self, blocked: list[MaintenanceScope]) -> None:
+        self._blocked = blocked
+
+    async def list_blocks(self) -> list[MaintenanceBlock]:
+        return [
+            MaintenanceBlock(scope=s, reason="x", created_by=None, created_at=NOW)
+            for s in self._blocked
+        ]
+
+    async def save_block(self, block: MaintenanceBlock) -> MaintenanceBlock:
+        raise AssertionError("create command must not write switches")
+
+    async def remove_block(self, scope: MaintenanceScope) -> bool:
+        raise AssertionError("create command must not write switches")
+
+
+def _maintenance(*blocked: MaintenanceScope) -> MaintenanceSwitchService:
+    return MaintenanceSwitchService(_MiniSwitchRepo(list(blocked)), AsyncMock())  # type: ignore[arg-type]
+
+
+class TestMaintenanceBlocked:
+    async def test_provider_block_stops_new_orders_before_account_or_hold(self) -> None:
+        deps = _Deps()
+        maintenance = _maintenance(MaintenanceScope(provider_key="hetzner"))
+
+        with pytest.raises(MaintenanceBlockedError, match="provider hetzner"):
+            await deps.run(maintenance=maintenance)
+
+        deps.accounts.get_active.assert_not_awaited()
+        deps.holds.create_hold.assert_not_awaited()
+        deps.servers.create.assert_not_awaited()
+
+    async def test_location_block_only_blocks_that_location(self) -> None:
+        deps = _Deps()
+        maintenance = _maintenance(
+            MaintenanceScope(provider_key="hetzner", location_id=REF.location_id)
+        )
+
+        with pytest.raises(MaintenanceBlockedError, match="location fsn1"):
+            await deps.run(maintenance=maintenance)
+
+        # A different location of the same provider still orders fine.
+        other_ref = OfferRef(provider_key="hetzner", plan_id="cx22", location_id="nbg1")
+        deps.catalog.get_offer = AsyncMock(side_effect=lambda ref: _offer())
+        result = await deps.run(maintenance=maintenance, offer_ref=other_ref)
+        assert result.replayed is False
+
+    async def test_unrelated_provider_block_does_not_interfere(self) -> None:
+        deps = _Deps()
+        maintenance = _maintenance(MaintenanceScope(provider_key="ovh"))
+        result = await deps.run(maintenance=maintenance)
+        assert result.replayed is False
+
+    async def test_no_maintenance_service_means_no_check(self) -> None:
+        deps = _Deps()
+        result = await deps.run()  # maintenance defaults to None
+        assert result.replayed is False

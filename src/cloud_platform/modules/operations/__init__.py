@@ -42,6 +42,12 @@ from cloud_platform.modules.operations.service import (
     power_operation_key,
     server_operation_key,
 )
+from cloud_platform.modules.operations.tooling import (
+    ManualReviewItem,
+    OperationNotRetryableError,
+    OperationToolingError,
+    OperationToolingService,
+)
 
 __all__ = [
     "PLATFORM_SERVER_ID_LABEL",
@@ -49,13 +55,17 @@ __all__ = [
     "FirstLinuxImageSelector",
     "ImageSelector",
     "InvalidOperationTransition",
+    "ManualReviewItem",
     "MissingResource",
     "MissingResourceDetector",
     "NotServerOwnerError",
     "Operation",
     "OperationError",
+    "OperationNotRetryableError",
     "OperationRepository",
     "OperationStatus",
+    "OperationToolingError",
+    "OperationToolingService",
     "OperationType",
     "OrphanDetector",
     "OrphanResource",

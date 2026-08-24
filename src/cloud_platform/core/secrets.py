@@ -141,6 +141,20 @@ class FernetSecretBox:
             raise SecretBoxError(f"malformed envelope: {type(exc).__name__}") from exc
         return plaintext.decode("utf-8")
 
+    def encrypt_bytes(self, plaintext: bytes) -> str:
+        """Encrypt arbitrary bytes (e.g. a database dump) into a Fernet token."""
+        try:
+            return self._fernet.encrypt(plaintext).decode("ascii")
+        except Exception as exc:  # pragma: no cover - defensive
+            raise SecretBoxError(f"encryption failed: {type(exc).__name__}") from exc
+
+    def decrypt_bytes(self, token: str) -> bytes:
+        """Decrypt a Fernet token back to bytes."""
+        try:
+            return self._fernet.decrypt(token.encode("ascii"))
+        except InvalidToken as exc:
+            raise SecretBoxError("decryption failed: invalid token or wrong key") from exc
+
 
 class EnvelopeService:
     """Convenience facade over two boxes for sealing and rotation."""

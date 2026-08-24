@@ -6,6 +6,7 @@ the core domain entities: Users, Wallets, Providers, ProviderAccounts, Catalog, 
 
 from __future__ import annotations
 
+import sqlalchemy as sa
 from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -539,3 +540,39 @@ class Operation(Base):
     attempts = Column(Integer, nullable=False, server_default="0")
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+
+# ---------------------------------------------------------------------------
+# Maintenance block model — provider/location order switches (M10-005)
+# ---------------------------------------------------------------------------
+
+
+class MaintenanceBlock(Base):
+    """Active maintenance switch for a provider or provider/location pair.
+
+    A provider-wide switch stores an empty ``location_id``; the unique
+    constraint on (provider_key, location_id) makes one switch per scope.
+    Blocking a scope only stops NEW orders: existing servers keep working.
+
+    Attributes:
+        id: Primary key
+        provider_key: Provider the switch applies to
+        location_id: Location the switch applies to, '' = whole provider
+        reason: Operator-provided reason (required)
+        created_by: The admin who set the switch (null = system)
+        created_at / updated_at: Timestamps
+    """
+
+    __tablename__ = "maintenance_blocks"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_key = Column(String, nullable=False)
+    location_id = Column(String, nullable=False, server_default="")
+    reason = Column(Text, nullable=False)
+    created_by = Column(PG_UUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+    __table_args__ = (
+        sa.UniqueConstraint("provider_key", "location_id", name="uq_maintenance_blocks_scope"),
+    )

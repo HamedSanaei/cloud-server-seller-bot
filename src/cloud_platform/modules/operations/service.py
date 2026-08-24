@@ -54,6 +54,7 @@ from cloud_platform.modules.wallet.domain import (
     HoldStatus,
     WalletRepository,
 )
+from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
     Capability,
     CloudProvider,
@@ -274,6 +275,10 @@ class ProvisioningWorker:
         run; the run itself processes servers sequentially (each op completes
         before the next starts), so at most one extra slot is in use.
         """
+        async with metrics.job("provisioning_worker"):
+            return await self._run_once(limit)
+
+    async def _run_once(self, limit: int) -> dict[ProvisioningOutcome, int]:
         if limit <= 0:
             return {}
         counts: dict[ProvisioningOutcome, int] = {}

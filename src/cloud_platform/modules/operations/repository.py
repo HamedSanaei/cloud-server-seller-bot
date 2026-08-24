@@ -219,3 +219,30 @@ class SqlAlchemyOperationRepository:
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)
+
+    async def list_failed(
+        self,
+        *,
+        operation_types: Sequence[OperationType] | None = None,
+        limit: int = 50,
+    ) -> list[Operation]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        async with self._session_factory() as session:
+            stmt = select(_OperationModel).where(
+                _OperationModel.status == OperationStatus.FAILED.value
+            )
+            if operation_types is not None:
+                stmt = stmt.where(
+                    _OperationModel.operation_type.in_([t.value for t in operation_types])
+                )
+            rows = (
+                (
+                    await session.execute(
+                        stmt.order_by(_OperationModel.updated_at.desc()).limit(limit)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [_to_domain(row) for row in rows]

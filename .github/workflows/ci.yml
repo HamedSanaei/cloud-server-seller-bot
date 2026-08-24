@@ -1,26 +1,88 @@
 name: ci
+
 on:
   pull_request:
   push:
     branches: [main]
 
+# One CI run per ref: newer pushes cancel superseded runs.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Avoid hardlink/permission flakiness of cached virtualenvs between runners.
+  UV_LINK_MODE: copy
+
 jobs:
-  quality:
+  static:
+    name: Lint & types
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
-      - run: uv sync --all-groups
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy src
-      - run: uv run pytest
-      - run: uv run python scripts/validate_tasks.py
-      - run: uv run pre-commit run --all-files
+          cache: "true"
+      # --frozen: the lockfile is the single source of truth; the build fails
+      # if pyproject.toml and uv.lock drift, keeping every run deterministic.
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Ruff (lint)
+        run: uv run ruff check .
+      - name: Ruff (format)
+        run: uv run ruff format --check .
+      - name: Mypy
+        run: uv run mypy src
+      - name: Pre-commit (secret scanning, etc.)
+        run: uv run pre-commit run --all-files
         env:
           GIT_AUTHOR_NAME: "ci"
           GIT_AUTHOR_EMAIL: "ci@ci.ci"
           GIT_COMMITTER_NAME: "ci"
           GIT_COMMITTER_EMAIL: "ci@ci.ci"
+
+  test:
+    name: Tests & coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          cache: "true"
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      # Deterministic suite: stable file order, JUnit results, and a coverage
+      # regression gate one point below the measured baseline (89%).
+      - name: Run test suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          uv run pytest
+          --junitxml=pytest-results.xml
+          --cov=src
+          --cov-report=xml:coverage.xml
+          --cov-report=term
+          --cov-fail-under=88
+      - name: Validate task backlog
+        if: always()
+        run: uv run python scripts/validate_tasks.py
+      - name: Upload JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14

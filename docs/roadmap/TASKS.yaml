@@ -1143,18 +1143,30 @@ tasks:
   milestone: M08
   title: Implement My Servers list/detail
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M07-005
   acceptance:
   - Pagination and ownership checks.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented the My Servers list/detail read service (M08-007) in modules/compute. MyServersService.list_servers(user_id,
+    offset, limit) returns a ServerPage (tuple of ServerSummary, total, offset, limit, has_next, pages) from the new ServerRepository.list_by_user_paged
+    port; validation rejects negative offset, limit below 1, and limit above MAX_PAGE_SIZE (100); default page size 20. MyServersService.get_server(user_id,
+    server_id) returns ServerDetail or a uniform None for a missing OR foreign server, so existence of other users'' servers
+    is never leaked (ownership enforced in the application layer, not the UI). The list query is filtered to the acting user
+    in SQL (WHERE user_id = :u). Deterministic pagination: ORDER BY created_at DESC NULLS LAST, id DESC plus a COUNT total,
+    so pages are stable. CloudServer gained created_at (mapped with naive-to-aware UTC normalization in the repository, same
+    convention as the other modules). 11 tests: only-own-servers returned with correct user id passed to the repo, empty page
+    for a user with no servers, page slicing across 3 pages of 25 with has_next per page, newest-first order preserved, default
+    page size, 3 invalid pagination rejections (parametrized), own-server detail fields, foreign server indistinguishable
+    from missing (both None), and a repository test proving count-then-page execution with two executes on one session and
+    naive-to-aware timestamp mapping. Full suite 768 passed.'
 - id: M08-008
   milestone: M08
   title: Implement power controls UI
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M08-007
@@ -1349,13 +1361,24 @@ tasks:
   milestone: M10
   title: Implement provisioning quotas per user
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M07-001
   acceptance:
   - Limits concurrent/total creation.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented per-user provisioning quotas (M10-003) in modules/compute. QuotaPolicy (max_active=10, max_total=50,
+    non-negative validated): max_active caps concurrent servers (every state except DELETED - a deleting server still occupies
+    provider capacity), max_total caps lifetime creations including DELETED rows; zero blocks all creation. Enforced in CreateServerService
+    at step 5.5 - AFTER the idempotency replay check (so a replay is never rejected by quota and stays a no-op) and BEFORE
+    the wallet hold (no funds reserved for a rejected command): count_active >= max_active raises QuotaExceededError (concurrent),
+    then count_total >= max_total raises QuotaExceededError (lifetime). New ServerRepository port methods count_active (state
+    != deleted) and count_total, implemented in SQL with COUNT. 8 new tests: concurrent limit hit (no hold, no row), lifetime
+    limit hit, concurrent checked first when both hit, just-under-quota succeeds with hold + row, custom quota (1 active)
+    enforced then passes at 0, zero quota blocks, replay returns the original server even at the limit (count_active never
+    awaited), and negative quota values rejected. Existing create-command tests now configure the count mocks. Full suite
+    776 passed.'
 - id: M10-004
   milestone: M10
   title: Implement cost circuit breakers
@@ -1371,13 +1394,31 @@ tasks:
   milestone: M10
   title: Implement provider/location maintenance switches
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M04-007
   acceptance:
   - New orders stop without breaking existing resources.
-  evidence: []
+  evidence:
+  - '2026-08-23: Implemented provider/location maintenance switches (M10-005) in modules/compute. MaintenanceScope (provider,
+    location or None = whole provider; empty values rejected) and MaintenanceBlock aggregate; pure is_order_blocked(blocks,
+    provider, location) matcher (provider block covers all locations, location block covers only its pair). MaintenanceSwitchRepository
+    port + SqlAlchemyMaintenanceSwitchRepository adapter: list_blocks (stable order), save_block (idempotent upsert keyed
+    by unique (provider_key, location_id) scope; provider-wide stores empty string location_id), remove_block (True when one
+    existed). maintenance_blocks table + migration 0013 (unique scope constraint, created_by FK set-null to users). MaintenanceSwitchService:
+    block_provider / block_location / unblock_provider / unblock_location, all admin-gated with PermissionChecker(actor).require(admin:manage_settings)
+    (system actor allowed), non-empty reason required, each mutation audited (maintenance.block / maintenance.unblock with
+    location metadata); active_blocks and blocking_scope/is_order_blocked read paths. Acceptance proof - new orders stop without
+    breaking existing resources: CreateServerService gained an optional maintenance dependency and a step-2.5 check (after
+    the offer lookup, before account/price/hold/quota) that raises MaintenanceBlockedError when the offer scope is blocked;
+    only the create command consults the switch, so power/deletion/billing on existing servers are untouched. 16 new tests:
+    scope matching matrix (none/provider/all-locations/location-only/other-provider), scope validation, non-admin rejected
+    without writes, system actor allowed, provider block persists + audits (actor id, action, resource), location block covers
+    only its location with metadata, empty reason rejected, re-block updates reason without duplicating, unblock removes +
+    audits + False when absent, blocking_scope returns the matching scope, and 4 create-command tests (provider block stops
+    before account/hold with no side effects, location block only blocks that location while another location orders fine,
+    unrelated provider block does not interfere, default no-check). Full suite 792 passed; alembic chain 0001-0013 verified.'
 - id: M10-006
   milestone: M10
   title: Implement abuse case model/workflow
@@ -1437,7 +1478,7 @@ tasks:
   milestone: M10
   title: Add security regression tests
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M10-002
@@ -1449,18 +1490,36 @@ tasks:
   milestone: M11
   title: Add Prometheus metrics
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M01-007
   acceptance:
   - API/jobs/provider/billing metrics emitted.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added Prometheus metrics (M11-001) in a new framework-free observability package. New dependency prometheus-client
+    (pinned >=0.21,<1). PlatformMetrics owns a dedicated CollectorRegistry (module-level metrics singleton for the process;
+    isolated registries for tests) with four instrumented families: API (cloud_platform_api_requests_total by method/route-template/status
+    + api_request_duration_seconds histogram), jobs (job_runs_total by job/status + job_duration_seconds histogram), provider
+    (provider_calls_total by provider/operation/outcome + provider_call_duration_seconds), and billing (billing_events_total
+    by event/result). Closed cardinality discipline: route templates instead of raw paths, job names, endpoint-shape operation
+    labels, short outcome codes; async context helpers job(name) and provider_call(provider, operation) plus record_billing_event.
+    Emission points wired: (1) API - create_app adds an HTTP middleware that times every request and a /metrics endpoint serving
+    the Prometheus text format; (2) jobs - CatalogSyncJob.run, ProvisioningWorker.run_once (thin wrapper over _run_once) and
+    the arq reconcile_provider_resources job each record a job run via metrics.job; (3) provider - HetznerCloudProvider._request
+    splits into a metrics.provider_call wrapper (outcome via provider_outcome mapping: success/auth_error/not_found/conflict/rate_limited/unavailable/provider_error/error)
+    and _perform_request, with _operation_label shaping numeric id segments to {id} so labels stay bounded; (4) billing -
+    HoldService create_hold/release_hold/capture_hold emit hold_created/hold_released/hold_captured with ok/insufficient_balance/conflict/not_found
+    results. 10 new tests: job ok/error statuses + duration histogram on an isolated registry, provider call success/rate_limited
+    outcomes, billing event + render() contains the family, provider_outcome mapping, API middleware counts /health/live under
+    its route template and /metrics returns text/plain exposition, delta-based proofs that catalog_sync/provisioning_worker/arq
+    reconcile jobs and hold creation each bump the singleton by exactly 1 (delta-based because other suite tests drive the
+    same singletons), and operation-label shaping. Full suite 802 passed.'
 - id: M11-002
   milestone: M11
   title: Add OpenTelemetry tracing
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M11-001
@@ -1491,18 +1550,34 @@ tasks:
   milestone: M11
   title: Implement dead-letter/manual-review tooling
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M07-005
   acceptance:
   - Failed operations can be inspected/replayed safely.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented dead-letter / manual-review tooling (M11-004) in modules/operations. Operation gained reopen_for_retry():
+    a manual-only FAILED -> PENDING transition deliberately kept OUT of the automated _ALLOWED table (no worker path can ever
+    reopen a failed op); it preserves the operation key and the attempts history. OperationRepository gained list_failed(operation_types,
+    limit) (SQL: status=failed, optional type filter, updated_at DESC, LIMIT). ServerRepository gained list_manual_review
+    (state=manual_review). New OperationToolingService (operations/tooling.py): list_failed (dead-letter inspection), get_operation
+    (by key), retry_failed (admin-gated admin:manage_settings, system actor allowed, non-empty reason required) and review_queue
+    (every MANUAL_REVIEW server joined with its failed operations). Safe-replay semantics: PENDING returns the operation as
+    an idempotent no-op (no save, no audit); COMPLETED is rejected with an explicit double-apply explanation (the provider
+    mutation already applied); IN_FLIGHT is rejected (a worker owns it); FAILED reopens to PENDING, is saved, and is audited
+    as operation.retry with the actor, reason and attempts-before metadata. The replay is safe because the worker re-sends
+    the SAME operation key, so the provider deduplicates the mutation. 17 tests: reopen only from FAILED (PENDING/IN_FLIGHT/COMPLETED
+    rejected) with attempts preserved, reopen-then-worker-claim works, non-admin rejected without writes, empty reason rejected,
+    unknown key LookupError, failed->pending with save + operation.retry audit (action/resource/reason/attempts_before), system
+    actor allowed, pending idempotent no-op, completed never replayed (double-apply), in-flight rejected, list_failed type
+    filter + limit, get_operation by key, review queue joins the server with its failed ops (excluding other servers'' ops)
+    and empty queue. Full suite 819 passed.'
 - id: M11-005
   milestone: M11
   title: Create Grafana dashboard definitions
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M11-001
@@ -1513,7 +1588,7 @@ tasks:
   milestone: M11
   title: Create alert rules
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M11-001
@@ -1524,18 +1599,36 @@ tasks:
   milestone: M11
   title: Automate PostgreSQL backups
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M01-001
   acceptance:
   - Encrypted backup job + retention.
-  evidence: []
+  evidence:
+  - '2026-08-24: Automated encrypted PostgreSQL backups with retention (M11-007) in a new backup package. PostgresBackupJob.run():
+    pg_dump (plain format, --no-password --no-owner --no-privileges) via an injectable async runner (default runs pg_dump
+    in a thread so the loop stays responsive) -> Fernet-encrypts the dump under the configured 32-byte MasterKey (reusing
+    core.secrets; FernetSecretBox gained encrypt_bytes/decrypt_bytes) -> writes cloud-backup-YYYYMMDD-HHMMSS.dump.enc into
+    the output directory -> prunes backups older than retention_days. Security: the DSN carries the DB password and never
+    reaches logs, exceptions or the CLI summary (redact_dsn masks the password, runner stderr is scrubbed of the DSN and raw
+    password before reporting, the argv is never logged); the plaintext dump exists only in memory; retention deletes ONLY
+    files matching the platform''s own backup name pattern whose embedded timestamp parses - foreign files and unparseable
+    names are never touched. Config: Settings gained backup_output_dir, backup_retention_days (>=1), backup_encryption_key
+    (env-provided 32-byte url-safe base64, never hardcoded; missing/invalid key -> BackupError); build_backup_config translates
+    the postgresql+asyncpg DSN to the postgres scheme pg_dump accepts. Run one backup with python -m cloud_platform.backup
+    (one-line log-safe summary). Each run is timed under the postgres_backup job metric. 18 tests: pg_dump command shape,
+    DSN redaction (masked, unchanged without password), stderr scrubbing, dump encrypted at rest (file != plaintext; round-trip
+    decrypts with the same key), runner receives the command, failed dump raises a redacted BackupError (password absent,
+    detail kept, no file written), empty dump rejected, runner exception reported without argv, retention prunes only expired
+    own backups (30d and 15d with a 14d window deleted; 1d, foreign file, and unparseable-name file kept), no deletions when
+    all fresh, config validation (empty dsn, retention 0), asyncpg DSN translation, missing/invalid/short key rejected, and
+    the job metric bump (delta-based). Full suite 837 passed.'
 - id: M11-008
   milestone: M11
   title: Document/test restore drill
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M11-007
@@ -1558,18 +1651,31 @@ tasks:
   milestone: M12
   title: Harden GitHub Actions quality pipeline
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M00-004
   acceptance:
   - Cache + deterministic gates + artifacts.
-  evidence: []
+  evidence:
+  - '2026-08-24: Hardened the GitHub Actions quality pipeline (M12-001): .github/workflows/ci.yml rewritten. (1) Cache: astral-sh/setup-uv@v6
+    with cache=true on both jobs (uv package cache + virtualenv keyed by the lockfile) and UV_LINK_MODE=copy for stable cached
+    venvs across runners. (2) Deterministic gates: both jobs install with uv sync --frozen --all-groups so the lockfile is
+    the single source of truth and any pyproject/uv.lock drift fails the build; jobs split into static (ruff check, ruff format
+    --check, mypy src, pre-commit run --all-files) and test (pytest with --junitxml, --cov=src xml+term reports, and a --cov-fail-under=88
+    coverage regression gate set one point below the measured 88.81% baseline) so a lint regression and a test regression
+    surface independently; PYTHONDONTWRITEBYTECODE=1 avoids bytecode churn; per-job timeout-minutes (20/30); concurrency group
+    cancels superseded runs per ref; backlog validation (scripts/validate_tasks.py) kept in CI. (3) Artifacts: JUnit results
+    (pytest-results.xml) and the coverage report (coverage.xml) uploaded with actions/upload-artifact@v4 (retention 14 days,
+    if-no-files-found ignore, if: always() so failed runs still ship their results). Verified locally: workflow YAML parses
+    (jobs: static, test), uv sync --frozen confirms a consistent lock (78 packages), and the exact CI pytest command runs
+    837 passed / 11 skipped with ''Required test coverage of 88% reached. Total coverage: 88.81%''. Full local gate: ruff
+    format check, ruff check, mypy (88 files), pytest 837 passed, validate_tasks OK.'
 - id: M12-002
   milestone: M12
   title: Build and publish OCI image
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M12-001
@@ -1580,7 +1686,7 @@ tasks:
   milestone: M12
   title: Add migration compatibility gate
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M01-001
@@ -1814,18 +1920,38 @@ tasks:
   milestone: M15
   title: Select first Iranian provider and document API contract
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M03-006
   acceptance:
   - Capabilities/gaps/error/rate/pricing model documented.
-  evidence: []
+  evidence:
+  - '2026-08-24: Selected ArvanCloud IaaS as the first Iranian provider and documented the full API contract in docs/iranian/PROVIDER_CONTRACT.md
+    with a machine-readable OpenAPI snapshot archived at docs/iranian/api/iaas-1.0.json (downloaded from https://www.arvancloud.ir/api-docs/iaas-1.0.json,
+    187KB, validated). Selection rationale with alternatives table (Liara, IDCloud/Unico). Documented: (1) transport/auth
+    - base URL https://napi.arvancloud.ir/ecc/v1, Machine User key in the Authorization header WITHOUT a Bearer prefix, JSON,
+    encrypted secret storage and redaction discipline; (2) capability mapping table for every platform Capability to concrete
+    ArvanCloud endpoints (compute/power/rebuild/rescue/snapshot/firewall/network/floating_ip/primary_ip/rdns mapped; BACKUP
+    and VOLUME deliberately not advertised in phase 1 with reasons); (3) verified request/response shapes from the spec (CreateServerRequest
+    field mapping flavor_id/image_id/key_name/init_script, Plan with price_per_hour/day/month, Region, Quota, ServerDetail);
+    (4) async model - mutations return tasks, completion tracked via GET /regions/{r}/servers/inquiry/{task_id}, timeouts
+    ambiguous until reconciled, 404-on-delete = success; (5) idempotency design - the provider documents NO Idempotency-Key
+    header, so idempotency is enforced platform-side (operation ledger operation_key + correlation-label get-before-create
+    + ledger state guard), with a path to adopt a header if one appears; (6) error model - ErrorResponse {message, errors}
+    shape mapped exactly to ProviderAuthError/ProviderNotFound/ProviderConflict/ProviderRateLimited/ProviderUnavailable/ProviderError
+    with the metric outcome labels, 401 Unauthenticated. documented; (7) rate limiting - no numeric limits documented (open
+    item), conservative configurable client-side throttle (default 10 rps) plus Retry-After handling, observed headers captured
+    into M11-001 provider metrics; (8) pricing model - provider prices pass through Plan metadata into catalog sync (never
+    hard-coded), billing prices owned by the explicit price book, IRR integer minor units, prepaid-package semantics flagged;
+    (9) non-negotiable security requirements; (10) M15-002 adapter delivery checklist; (11) six open items to verify with
+    live credentials. Sources: https://docs.arvancloud.ir/en/developer-tools/api/api-usage and https://www.arvancloud.ir/api/iaas/1.0.
+    Full gate after the doc change: ruff format check, ruff check, mypy (88 files), 837 passed.'
 - id: M15-002
   milestone: M15
   title: Implement Iranian provider adapter
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M15-001

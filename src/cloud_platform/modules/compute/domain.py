@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
@@ -105,6 +107,7 @@ class CloudServer:
     provider_server_id: str | None = None
     contained_from: ServerLifecycleState | None = None
     idempotency_key: str | None = None
+    created_at: datetime | None = None
 
     def transition_to(self, target: ServerLifecycleState) -> None:
         if target not in _ALLOWED[self.state]:
@@ -201,6 +204,67 @@ class ProvisioningSpec:
                 raise ValueError(f"{name} must not be empty")
 
 
+@dataclass(frozen=True, slots=True)
+class QuotaPolicy:
+    """Per-user provisioning quota (M10-003).
+
+    ``max_active`` caps the concurrent servers (every state except DELETED —
+    a deleting server still occupies provider capacity). ``max_total`` caps
+    lifetime creations (including DELETED rows). Zero means the user may not
+    create anything.
+    """
+
+    max_active: int = 10
+    max_total: int = 50
+
+    def __post_init__(self) -> None:
+        if self.max_active < 0:
+            raise ValueError("max_active must not be negative")
+        if self.max_total < 0:
+            raise ValueError("max_total must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceScope:
+    """A maintenance switch scope (M10-005).
+
+    ``location_id is None`` means the whole provider; otherwise only that
+    provider/location pair.
+    """
+
+    provider_key: str
+    location_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.provider_key or not self.provider_key.strip():
+            raise ValueError("provider_key must not be empty")
+        if self.location_id is not None and (not self.location_id or not self.location_id.strip()):
+            raise ValueError("location_id must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceBlock:
+    """An active maintenance switch: new orders for the scope are blocked."""
+
+    scope: MaintenanceScope
+    reason: str
+    created_by: UUID | None
+    created_at: datetime
+    updated_at: datetime | None = None
+
+
+def is_order_blocked(
+    blocks: Sequence[MaintenanceBlock], provider_key: str, location_id: str
+) -> bool:
+    """True when a block covers the provider or the provider/location pair."""
+    for block in blocks:
+        if block.scope.provider_key != provider_key:
+            continue
+        if block.scope.location_id is None or block.scope.location_id == location_id:
+            return True
+    return False
+
+
 class ServerRepository(Protocol):
     """Port for CloudServer persistence."""
 
@@ -210,6 +274,20 @@ class ServerRepository(Protocol):
 
     async def list_by_user(self, user_id: UUID) -> list[CloudServer]:
         """All servers owned by a user."""
+        ...
+
+    async def list_by_user_paged(
+        self, user_id: UUID, *, offset: int, limit: int
+    ) -> tuple[list[CloudServer], int]:
+        """One page of a user's servers, newest first, plus the total count."""
+        ...
+
+    async def count_active(self, user_id: UUID) -> int:
+        """The user's servers in every state except DELETED (quota: concurrent)."""
+        ...
+
+    async def count_total(self, user_id: UUID) -> int:
+        """The user's servers in every state, DELETED included (quota: lifetime)."""
         ...
 
     async def list_requested(self) -> list[CloudServer]:
@@ -226,6 +304,10 @@ class ServerRepository(Protocol):
 
     async def list_stopped(self) -> list[CloudServer]:
         """All servers in STOPPED state (state-reconciliation candidates)."""
+        ...
+
+    async def list_manual_review(self) -> list[CloudServer]:
+        """All servers in MANUAL_REVIEW state (the operator review queue)."""
         ...
 
     async def save(self, server: CloudServer) -> CloudServer:
@@ -248,4 +330,20 @@ class ServerRepository(Protocol):
 
     async def get_provisioning_spec(self, server_id: UUID) -> ProvisioningSpec | None:
         """The provider plan/location the server's pinned catalog offer maps to."""
+        ...
+
+
+class MaintenanceSwitchRepository(Protocol):
+    """Durable storage for provider/location maintenance switches (M10-005)."""
+
+    async def list_blocks(self) -> list[MaintenanceBlock]:
+        """All active switches."""
+        ...
+
+    async def save_block(self, block: MaintenanceBlock) -> MaintenanceBlock:
+        """Upsert a switch for its scope (idempotent: same scope updates)."""
+        ...
+
+    async def remove_block(self, scope: MaintenanceScope) -> bool:
+        """Remove a switch; True when one existed."""
         ...

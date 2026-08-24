@@ -9,18 +9,22 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import Catalog as _CatalogModel
+from cloud_platform.db.base import MaintenanceBlock as _MaintenanceBlockModel
 from cloud_platform.db.base import Provider as _ProviderModel
 from cloud_platform.db.base import Server as _ServerModel
 from cloud_platform.modules.compute.domain import (
     CloudServer,
+    MaintenanceBlock,
+    MaintenanceScope,
     ProvisioningSpec,
     ServerCreateError,
     ServerCreateIntent,
@@ -39,6 +43,16 @@ def _state_or_none(value: Any) -> ServerLifecycleState | None:
     return ServerLifecycleState(value)
 
 
+def _aware_or_none(value: Any) -> datetime | None:
+    """DB timestamps are naive UTC; normalize to aware."""
+    if value is None:
+        return None
+    dt: datetime = value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
 def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
     return CloudServer(
         id=_attr(row, "id"),
@@ -49,6 +63,7 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         provider_server_id=_attr(row, "provider_server_id"),
         contained_from=_state_or_none(_attr(row, "contained_from")),
         idempotency_key=_attr(row, "idempotency_key"),
+        created_at=_aware_or_none(_attr(row, "created_at")),
     )
 
 
@@ -85,6 +100,58 @@ class SqlAlchemyServerRepository:
             ).all()
             return [_to_domain(server_row, str(name)) for server_row, name in rows]
 
+    async def list_by_user_paged(
+        self, user_id: UUID, *, offset: int, limit: int
+    ) -> tuple[list[CloudServer], int]:
+        base = _server_stmt().where(_ServerModel.user_id == user_id)
+        async with self._session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(_ServerModel)
+                    .where(_ServerModel.user_id == user_id)
+                )
+            ).scalar_one()
+            rows = (
+                await session.execute(
+                    base.order_by(
+                        _ServerModel.created_at.desc().nulls_last(),
+                        _ServerModel.id.desc(),
+                    )
+                    .offset(offset)
+                    .limit(limit)
+                )
+            ).all()
+        return (
+            [_to_domain(server_row, str(name)) for server_row, name in rows],
+            int(count),
+        )
+
+    async def count_active(self, user_id: UUID) -> int:
+        async with self._session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(_ServerModel)
+                    .where(
+                        _ServerModel.user_id == user_id,
+                        _ServerModel.state != ServerLifecycleState.DELETED.value,
+                    )
+                )
+            ).scalar_one()
+            return int(count)
+
+    async def count_total(self, user_id: UUID) -> int:
+        async with self._session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(_ServerModel)
+                    .where(_ServerModel.user_id == user_id)
+                )
+            ).scalar_one()
+            return int(count)
+
     async def list_requested(self) -> list[CloudServer]:
         async with self._session_factory() as session:
             rows = (
@@ -119,6 +186,17 @@ class SqlAlchemyServerRepository:
             rows = (
                 await session.execute(
                     _server_stmt().where(_ServerModel.state == ServerLifecycleState.STOPPED.value)
+                )
+            ).all()
+            return [_to_domain(server_row, str(name)) for server_row, name in rows]
+
+    async def list_manual_review(self) -> list[CloudServer]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    _server_stmt().where(
+                        _ServerModel.state == ServerLifecycleState.MANUAL_REVIEW.value
+                    )
                 )
             ).all()
             return [_to_domain(server_row, str(name)) for server_row, name in rows]
@@ -218,3 +296,86 @@ class SqlAlchemyServerRepository:
                 return None
             server_row, provider_name = row
             return _to_domain(server_row, str(provider_name))
+
+
+class SqlAlchemyMaintenanceSwitchRepository:
+    """Durable storage for maintenance switches (M10-005).
+
+    A provider-wide switch stores an empty ``location_id`` so the unique
+    scope constraint works for both switch kinds.
+    """
+
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+    ) -> None:
+        self._session_factory = session_factory
+
+    @staticmethod
+    def _to_domain(row: _MaintenanceBlockModel) -> MaintenanceBlock:
+        location_id = str(row.location_id) if row.location_id else None
+        return MaintenanceBlock(
+            scope=MaintenanceScope(provider_key=str(row.provider_key), location_id=location_id),
+            reason=str(row.reason),
+            created_by=_attr(row, "created_by"),
+            created_at=_attr(row, "created_at"),
+            updated_at=_aware_or_none(_attr(row, "updated_at")),
+        )
+
+    async def list_blocks(self) -> list[MaintenanceBlock]:
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(_MaintenanceBlockModel).order_by(
+                            _MaintenanceBlockModel.created_at,
+                            _MaintenanceBlockModel.provider_key,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [self._to_domain(row) for row in rows]
+
+    async def save_block(self, block: MaintenanceBlock) -> MaintenanceBlock:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_MaintenanceBlockModel).where(
+                        _MaintenanceBlockModel.provider_key == block.scope.provider_key,
+                        _MaintenanceBlockModel.location_id == (block.scope.location_id or ""),
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = _MaintenanceBlockModel(
+                    provider_key=block.scope.provider_key,
+                    location_id=block.scope.location_id or "",
+                    reason=block.reason,
+                    created_by=block.created_by,
+                )
+                session.add(row)
+            else:
+                cast_any: Any = row
+                cast_any.reason = block.reason
+                cast_any.created_by = block.created_by
+            await session.commit()
+            await session.refresh(row)
+            return self._to_domain(row)
+
+    async def remove_block(self, scope: MaintenanceScope) -> bool:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_MaintenanceBlockModel).where(
+                        _MaintenanceBlockModel.provider_key == scope.provider_key,
+                        _MaintenanceBlockModel.location_id == (scope.location_id or ""),
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True

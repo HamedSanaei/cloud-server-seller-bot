@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
     Capability,
     CreateServerRequest,
@@ -185,6 +186,11 @@ class HetznerCloudProvider:
         await self._request("POST", f"/servers/{provider_server_id}/actions/reboot")
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        operation = _operation_label(method, path)
+        async with metrics.provider_call(self.key, operation):
+            return await self._perform_request(method, path, **kwargs)
+
+    async def _perform_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         max_retries = self._backoff.policy.max_retries
         attempt = 0
         response: httpx.Response | None = None
@@ -249,6 +255,14 @@ def _int_or_none(value: str | None) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def _operation_label(method: str, path: str) -> str:
+    """Bounded endpoint-shape label for metrics: numeric id segments become
+    ``{id}`` (e.g. ``GET /servers/123/poweron`` -> ``GET /servers/{id}/poweron``)."""
+    segments = path.split("?")[0].strip("/").split("/")
+    shaped = ["{id}" if segment.isdigit() else segment for segment in segments]
+    return f"{method} /{'/'.join(shaped)}"
 
 
 def _error_message(response: httpx.Response) -> str:
