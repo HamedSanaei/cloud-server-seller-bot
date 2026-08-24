@@ -396,6 +396,52 @@ class ArvanCloudProvider:
         await self._request("POST", f"/regions/{region}/servers/{raw_id}/reboot")
 
     # ------------------------------------------------------------------
+    # Ambiguous-mutation probe (M15-004)
+    # ------------------------------------------------------------------
+
+    async def probe_power_effect(self, provider_server_id: str, action: str) -> bool | None:
+        """Read-only probe for the platform's ambiguous power re-send guard.
+
+        Returns whether the requested power effect ALREADY holds in steady
+        state, so a timed-out mutation is never blindly re-sent:
+
+        - ``power_on``  : True when running, False when stopped.
+        - ``power_off`` : True when stopped, False when running.
+        - ``reboot``    : a reboot ends in the running state, so a running
+          server means the effect holds (or is indistinguishable from it);
+          completing instead of re-sending avoids a second physical reboot.
+          A stopped server means the reboot never applied (False).
+        - transient states (building/deleting/error) and a vanished server
+          are ``None`` - the platform re-queues rather than guessing.
+        """
+        try:
+            remote = await self.get_server(provider_server_id)
+        except ProviderError:
+            return None
+        if remote is None:
+            return None
+        status = remote.status
+        if action == "power_on":
+            if status == "running":
+                return True
+            if status == "stopped":
+                return False
+            return None
+        if action == "power_off":
+            if status == "stopped":
+                return True
+            if status == "running":
+                return False
+            return None
+        if action == "reboot":
+            if status == "running":
+                return True
+            if status == "stopped":
+                return False
+            return None
+        return None
+
+    # ------------------------------------------------------------------
     # Transport
     # ------------------------------------------------------------------
 

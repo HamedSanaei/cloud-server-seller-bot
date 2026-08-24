@@ -65,6 +65,7 @@ from cloud_platform.providers.base import (
     CreateServerRequest,
     ProviderImage,
     ProviderServer,
+    supports_power_probe,
 )
 from cloud_platform.providers.errors import ProviderError, ProviderNotFound
 from cloud_platform.providers.registry import ProviderRegistry
@@ -1141,6 +1142,43 @@ class PowerOperationExecutor:
         if Capability.POWER not in provider.capabilities:
             await self._fail(operation, actor_type, actor_id, "provider lacks POWER capability")
 
+        # Ambiguous-mutation guard (M15-004): on a RE-SEND (an earlier attempt
+        # exists) against a provider that can prove its power effects (no
+        # native idempotency header, e.g. ArvanCloud), probe first so a
+        # timed-out mutation is never blindly re-applied.
+        if operation.attempts >= 2 and supports_power_probe(provider):
+            probe_method = getattr(provider, "probe_power_effect")
+            try:
+                probe = await probe_method(server.provider_server_id, action.value)
+            except ProviderError:
+                probe = None  # inconclusive: fall through to the safe default
+            if probe is True:
+                return await self._complete_probe_applied(
+                    operation, server, action, actor_type, actor_id
+                )
+            if probe is None and action is PowerAction.REBOOT:
+                # Reboot is a transient action: steady state cannot prove it,
+                # and re-sending would reboot a second time. Wait for the
+                # next round; the state reconciler drives the row.
+                operation.requeue(
+                    f"{action.value} effect inconclusive after a timed-out attempt; "
+                    "not re-sending to avoid a second physical action"
+                )
+                await self._ops.save(operation)
+                await self._audit.record_mutation(
+                    actor_type=actor_type,
+                    action="server.power_probe_inconclusive",
+                    resource_type=RESOURCE_TYPE_SERVER,
+                    resource_id=str(server.id),
+                    actor_id=actor_id,
+                    reason="reboot effect inconclusive; re-queued instead of re-sent",
+                    metadata={
+                        "operation_id": str(operation.id),
+                        "provider_server_id": server.provider_server_id,
+                    },
+                )
+                return PowerExecutionResult.REQUEUED
+
         try:
             method = getattr(provider, action.value)
             await method(server.provider_server_id, IdempotencyKey(operation.operation_key))
@@ -1185,6 +1223,52 @@ class PowerOperationExecutor:
             metadata={
                 "operation_id": str(operation.id),
                 "provider_server_id": server.provider_server_id,
+            },
+        )
+        return PowerExecutionResult.EXECUTED
+
+    async def _complete_probe_applied(
+        self,
+        operation: Operation,
+        server: CloudServer,
+        action: PowerAction,
+        actor_type: ActorType,
+        actor_id: UUID | None,
+    ) -> PowerExecutionResult:
+        """Probe proved the effect already holds: complete WITHOUT calling the
+        provider (the ambiguous re-send never happens), then apply the same
+        state transition and audit as a normal success."""
+        operation.complete(
+            {
+                "action": action.value,
+                "idempotency_key": operation.operation_key,
+                "probe": "already-applied",
+            }
+        )
+        await self._ops.save(operation)
+        target = _POWER_TARGET[action]
+        if target is not None and server.state is not target:
+            if server.state in _POWER_PRECONDITION[action]:
+                try:
+                    server.transition_to(target)
+                    await self._servers.save(server)
+                except Exception:
+                    logger.exception(
+                        "state transition after probe-applied %s rejected for server %s",
+                        action.value,
+                        server.id,
+                    )
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            action=_POWER_AUDIT[action],
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(server.id),
+            actor_id=actor_id,
+            reason=f"{action.value} probe: effect already applied (no provider call)",
+            metadata={
+                "operation_id": str(operation.id),
+                "provider_server_id": server.provider_server_id,
+                "probe": "already-applied",
             },
         )
         return PowerExecutionResult.EXECUTED

@@ -110,6 +110,32 @@ def supports_any(provider: CloudProvider, capabilities: Iterable[Capability]) ->
     return not provider.capabilities.isdisjoint(capabilities)
 
 
+class PowerEffectProbe(Protocol):
+    """Optional capability: safely re-send an *ambiguous* power mutation.
+
+    Providers without a native idempotency header (ArvanCloud, M15-002)
+    cannot deduplicate a re-sent power call: re-sending a timed-out reboot
+    would reboot a second time. Such providers implement this protocol, and
+    the platform probes BEFORE re-sending a power mutation whose earlier
+    attempt may already have applied:
+
+    - ``True``  - the effect already holds; skip the provider call.
+    - ``False`` - it does not; the re-send is safe.
+    - ``None``  - inconclusive (still transient, or the action is not
+      observable in steady state); the platform applies its conservative
+      per-action default instead of guessing.
+
+    The probe must be a read-only operation; it must never mutate.
+    """
+
+    async def probe_power_effect(self, provider_server_id: str, action: str) -> bool | None: ...
+
+
+def supports_power_probe(provider: CloudProvider) -> bool:
+    """Whether the provider can prove a power effect before a re-send."""
+    return callable(getattr(provider, "probe_power_effect", None))
+
+
 # ---------------------------------------------------------------------------
 # Payment gateway port: create / verify / refund capability model (M09-001)
 # ---------------------------------------------------------------------------
