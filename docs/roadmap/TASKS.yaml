@@ -2920,13 +2920,31 @@ tasks:
   milestone: M14
   title: Add API rate limits
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M14-002
   acceptance:
   - Per-user/token limits with headers.
-  evidence: []
+  evidence:
+  - '2026-08-24: API rate limits (M14-006); acceptance ''Per-user/token limits with headers'' holds. LIMITER api/v1/ratelimit.py:
+    SlidingWindowRateLimiter is an in-memory sliding-window limiter keyed by the authenticated identity - the API token''s
+    OWN id, so distinct tokens of the SAME user get INDEPENDENT buckets (tested); injectable monotonic+wall clocks make window
+    behavior deterministically testable (advance 61s -> blocked identity recovers, remaining recomputed); bounded memory via
+    LRU eviction of tracked keys (white-box bound check at max_tracked_keys=3 over 10 keys); exact decision math unit-tested
+    (remaining 2/1/0 then denied with retry_after>=1; retry_after counts down precisely to expiry). WIRING: router-level dependency
+    rate_limit on every /v1 route resolves the request identity through the same token-auth dependency (cached per request)
+    and stamps X-RateLimit-Limit / X-RateLimit-Remaining / X-RateLimit-Reset on EVERY response; reset is an approximate unix
+    epoch second derived from wall clock. Exceeding raises 429 whose envelope handler preserves framework headers - so the
+    stable rate_limited envelope carries Retry-After AND the full X-RateLimit trio (Remaining pinned to 0 on denial). The
+    429 maps through the frozen envelope handler (429 -> ErrorCode.RATE_LIMITED added in M14-001''s status map), keeping the
+    one-error-shape contract. CONFIGURATION: settings.api_rate_limit_per_minute (default 240/min, ge=1) is operator-declared;
+    create_app attaches the limiter to app.state; absent limiter (tests/dev) disables limiting. CONTRACT DOC docs/api/REST_API_V1.md
+    gained a Rate limits section documenting headers, per-token bucketing and the 429 semantics. TESTS tests/unit/test_api_rate_limits.py
+    (8): success headers incl. remaining decrement and epoch reset sanity, exceed->429 envelope shape + code + Retry-After
+    range + Remaining=0, sliding recovery after clock advance, independent buckets for distinct tokens of one user, wall-clock
+    reset assertion, plus pure-unit decision math/LRU/retry-countdown cases without HTTP. Full gates: ruff format/check clean,
+    mypy clean (124 files), 1673 passed 11 skipped, provider-branching gate 73 modules clean.'
 - id: M15-001
   milestone: M15
   title: Select first Iranian provider and document API contract

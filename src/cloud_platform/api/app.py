@@ -88,6 +88,7 @@ def create_app() -> FastAPI:
     app.include_router(v1_router)
 
     # M14-002: bind the revocable-token authenticator for bearer auth.
+    from cloud_platform.core.config import get_settings
     from cloud_platform.core.container import get_container
 
     async def _authenticate_token(raw_token: str) -> object:
@@ -95,6 +96,11 @@ def create_app() -> FastAPI:
         return await container.token_service().authenticate(raw_token)
 
     app.state.authenticate_token = _authenticate_token
+
+    # M14-006: per-identity sliding-window rate limiter for /v1.
+    from cloud_platform.api.v1.ratelimit import SlidingWindowRateLimiter
+
+    app.state.rate_limiter = SlidingWindowRateLimiter(get_settings().api_rate_limit_per_minute)
 
     @app.get("/metrics", include_in_schema=False)
     async def metrics_endpoint() -> Response:

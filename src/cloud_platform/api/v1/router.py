@@ -22,10 +22,14 @@ from cloud_platform.modules.sshkeys import SshKeyService
 from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
 from cloud_platform.modules.tokens.service import TokenService
 
-from .dependencies import require_idempotency_key, require_scope
+from .dependencies import (
+    rate_limit,
+    require_idempotency_key,
+    require_scope,
+)
 from .errors import ApiError, ErrorCode
 
-router = APIRouter(prefix="/v1", tags=["v1"])
+router = APIRouter(prefix="/v1", tags=["v1"], dependencies=[Depends(rate_limit)])
 
 #: Per-resource-family authenticated identities (scope-enforced).
 CatalogAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.CATALOG_READ))]

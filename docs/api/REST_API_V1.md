@@ -66,6 +66,22 @@ header:
 
 Read endpoints (`GET`) never require a key.
 
+## Rate limits
+
+Every `/v1` request is rate-limited per identity (the API token's own id -
+distinct tokens of one user get independent buckets) with a sliding
+window configured by the operator (`api_rate_limit_per_minute`, default
+240/minute). Every response carries:
+
+| header                   | meaning |
+|--------------------------|---------|
+| `X-RateLimit-Limit`      | requests allowed per window |
+| `X-RateLimit-Remaining`  | hits left in the current window |
+| `X-RateLimit-Reset`      | approximate unix epoch second when the window frees |
+
+Exceeding the limit returns `429` + envelope code `rate_limited` with a
+`Retry-After` header (seconds to wait).
+
 ## Resources (v1)
 
 | method & path                              | status | notes |

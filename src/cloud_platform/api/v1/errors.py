@@ -136,4 +136,8 @@ def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
         code = CODE_BY_HTTP_STATUS.get(exc.status_code, ErrorCode.INTERNAL_ERROR)
-        return error_response(code, str(exc.detail))
+        response = error_response(code, str(exc.detail))
+        # preserve framework headers such as Retry-After from rate limits
+        for name, value in (exc.headers or {}).items():
+            response.headers[name] = value
+        return response

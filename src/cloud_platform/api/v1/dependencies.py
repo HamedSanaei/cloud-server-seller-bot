@@ -15,14 +15,17 @@ a token without the scope gets the stable ``403 forbidden`` envelope.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header, Request
+from fastapi import Depends, Header, HTTPException, Request, Response
 
 from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
 
 from .errors import ApiError, ErrorCode
+
+if TYPE_CHECKING:
+    from .ratelimit import SlidingWindowRateLimiter
 
 #: The dev/test identity header (never valid in production mode).
 USER_HEADER = "x-platform-user"
@@ -103,3 +106,35 @@ def require_scope(
         return auth
 
     return _checker
+
+
+async def rate_limit(
+    request: Request,
+    response: Response,
+    auth: Annotated[TokenAuthentication, Depends(get_token_authentication)],
+) -> None:
+    """Per-identity sliding-window limit (M14-006).
+
+    Keyed by the token's OWN id, so distinct tokens of one user get
+    independent buckets. Adds the standard ``X-RateLimit-*`` headers to
+    every response; over-limit requests raise 429 with ``Retry-After``
+    (the envelope handler preserves that header).
+    """
+    limiter: SlidingWindowRateLimiter | None = getattr(request.app.state, "rate_limiter", None)
+    if limiter is None:
+        return
+    decision = limiter.check(str(auth.token_id))
+    response.headers["X-RateLimit-Limit"] = str(limiter.limit)
+    response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
+    response.headers["X-RateLimit-Reset"] = str(decision.reset_epoch)
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit exceeded",
+            headers={
+                "Retry-After": str(decision.retry_after),
+                "X-RateLimit-Limit": str(limiter.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(decision.reset_epoch),
+            },
+        )

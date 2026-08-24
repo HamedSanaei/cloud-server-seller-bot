@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # DEV/TEST fallback and MUST stay disabled in production, where requests
     # authenticate with revocable hashed bearer tokens.
     api_allow_header_identity: bool = False
+    # REST v1 rate limiting (M14-006): per-identity sliding window; each
+    # API token (or dev identity) gets its own bucket per API process.
+    api_rate_limit_per_minute: int = Field(default=240, ge=1)
 
 
 @lru_cache(maxsize=1)
