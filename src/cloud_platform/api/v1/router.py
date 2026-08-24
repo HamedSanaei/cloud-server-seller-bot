@@ -1,9 +1,11 @@
-"""The /v1 customer surface (M14-001).
+"""The /v1 customer surface (M14-001/M14-002).
 
 Read resources are fully wired to the platform services; mutating server
 endpoints require the idempotency key and are served by the same command
-services the Telegram bot uses. See ``docs/api/REST_API_V1.md`` for the
-frozen contract.
+services the Telegram bot uses. Requests authenticate with revocable,
+scoped bearer API tokens (``Authorization: Bearer cpt_...``); each
+resource family requires its scope. See ``docs/api/REST_API_V1.md`` for
+the frozen contract.
 """
 
 from __future__ import annotations
@@ -17,13 +19,22 @@ from cloud_platform.core.container import get_container
 from cloud_platform.modules.catalog.domain import CatalogRepository
 from cloud_platform.modules.compute.service import MyServersService
 from cloud_platform.modules.sshkeys import SshKeyService
+from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
+from cloud_platform.modules.tokens.service import TokenService
 
-from .dependencies import get_current_user_id, require_idempotency_key
+from .dependencies import require_idempotency_key, require_scope
 from .errors import ApiError, ErrorCode
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
-UserId = Annotated[UUID, Depends(get_current_user_id)]
+#: Per-resource-family authenticated identities (scope-enforced).
+CatalogAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.CATALOG_READ))]
+WalletAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.WALLET_READ))]
+ServersReadAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.SERVERS_READ))]
+ServersWriteAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.SERVERS_WRITE))]
+SshKeysReadAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.SSH_KEYS_READ))]
+SshKeysWriteAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.SSH_KEYS_WRITE))]
+TokensManageAuth = Annotated[TokenAuthentication, Depends(require_scope(TokenScope.TOKENS_MANAGE))]
 
 
 async def _catalog_repo() -> CatalogRepository:
@@ -36,11 +47,83 @@ async def _ssh_key_service() -> SshKeyService:
     return container.ssh_key_service()
 
 
+async def _token_service() -> TokenService:
+    container = await get_container()
+    return container.token_service()
+
+
 async def _my_servers() -> MyServersService:
     from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
 
     container = await get_container()
     return MyServersService(SqlAlchemyServerRepository(container.session_factory))
+
+
+# ---------------------------------------------------------------------------
+# API tokens (M14-002): create once / list / revoke
+# ---------------------------------------------------------------------------
+
+
+@router.get("/auth/tokens")
+async def list_tokens(
+    auth: TokensManageAuth,
+    service: Annotated[TokenService, Depends(_token_service)],
+) -> dict[str, Any]:
+    tokens = await service.list_tokens(actor_user_id=auth.user_id, owner_user_id=auth.user_id)
+    return {
+        "tokens": [
+            {
+                "id": str(t.id),
+                "name": t.name,
+                "prefix": t.prefix,
+                "scopes": sorted(s.value for s in t.scopes),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "revoked_at": t.revoked_at.isoformat() if t.revoked_at else None,
+                "last_used_at": t.last_used_at.isoformat() if t.last_used_at else None,
+            }
+            for t in tokens
+        ]
+    }
+
+
+@router.post("/auth/tokens", status_code=201)
+async def create_token(
+    auth: TokensManageAuth,
+    body: dict[str, Any],
+    service: Annotated[TokenService, Depends(_token_service)],
+    _key: Annotated[str, Depends(require_idempotency_key)],
+) -> dict[str, Any]:
+    """Returns the plaintext token EXACTLY ONCE; only a hash is stored."""
+    name = body.get("name")
+    scopes_raw = body.get("scopes")
+    if not isinstance(name, str) or not isinstance(scopes_raw, list):
+        raise ApiError(ErrorCode.VALIDATION_ERROR, "body must be {name: string, scopes: [string]}")
+    try:
+        scopes = frozenset(TokenScope(s) for s in scopes_raw)
+    except ValueError as exc:
+        raise ApiError(ErrorCode.VALIDATION_ERROR, f"unknown scope: {exc}") from exc
+    token, plaintext = await service.create(
+        actor_user_id=auth.user_id, owner_user_id=auth.user_id, name=name, scopes=scopes
+    )
+    return {
+        "token": {
+            "id": str(token.id),
+            "name": token.name,
+            "scopes": sorted(s.value for s in token.scopes),
+        },
+        # shown exactly once - never persisted, never audited
+        "plaintext": plaintext,
+    }
+
+
+@router.delete("/auth/tokens/{token_id}", status_code=204)
+async def revoke_token(
+    auth: TokensManageAuth,
+    token_id: UUID,
+    service: Annotated[TokenService, Depends(_token_service)],
+    _key: Annotated[str, Depends(require_idempotency_key)],
+) -> None:
+    await service.revoke(actor_user_id=auth.user_id, token_id=token_id)
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +133,7 @@ async def _my_servers() -> MyServersService:
 
 @router.get("/catalog/offers")
 async def list_offers(
-    _user: UserId,
+    _auth: CatalogAuth,
     repo: Annotated[CatalogRepository, Depends(_catalog_repo)],
 ) -> dict[str, Any]:
     offers = [
@@ -81,12 +164,12 @@ async def list_offers(
 
 
 @router.get("/wallet")
-async def get_wallet(user: UserId) -> dict[str, Any]:
+async def get_wallet(auth: WalletAuth) -> dict[str, Any]:
     from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 
     container = await get_container()
     wallets = SqlAlchemyWalletRepository(container.session_factory)
-    wallet = await wallets.get(user)
+    wallet = await wallets.get(auth.user_id)
     if wallet is None or wallet.id is None:
         raise ApiError(ErrorCode.NOT_FOUND, "no wallet for this user")
     return {
@@ -105,10 +188,10 @@ async def get_wallet(user: UserId) -> dict[str, Any]:
 
 @router.get("/servers")
 async def list_servers(
-    user: UserId,
+    auth: ServersReadAuth,
     servers: Annotated[MyServersService, Depends(_my_servers)],
 ) -> dict[str, Any]:
-    page = await servers.list_servers(user)
+    page = await servers.list_servers(auth.user_id)
     return {
         "servers": [
             {
@@ -127,11 +210,11 @@ async def list_servers(
 
 @router.get("/servers/{server_id}")
 async def get_server(
-    user: UserId,
+    auth: ServersReadAuth,
     server_id: UUID,
     servers: Annotated[MyServersService, Depends(_my_servers)],
 ) -> dict[str, Any]:
-    detail = await servers.get_server(user, server_id)
+    detail = await servers.get_server(auth.user_id, server_id)
     if detail is None:
         # ownership-scoped: a foreign server is indistinguishable from missing
         raise ApiError(ErrorCode.NOT_FOUND, f"server {server_id} not found")
@@ -148,7 +231,7 @@ async def get_server(
 
 @router.post("/servers/{server_id}/actions/{action}", status_code=202)
 async def server_action(
-    user: UserId,
+    auth: ServersWriteAuth,
     server_id: UUID,
     action: str,
     idempotency_key: Annotated[str, Depends(require_idempotency_key)],
@@ -172,7 +255,7 @@ async def server_action(
     if handler is None:
         raise ApiError(ErrorCode.NOT_FOUND, f"unknown action {action!r}")
     try:
-        outcome = await handler(user, server_id, idempotency_key)
+        outcome = await handler(auth.user_id, server_id, idempotency_key)
     except NotServerOwnerError:
         raise ApiError(ErrorCode.NOT_FOUND, f"server {server_id} not found") from None
     except PowerActionNotAllowedError as exc:
@@ -192,7 +275,7 @@ async def server_action(
 
 @router.delete("/servers/{server_id}")
 async def delete_server(
-    user: UserId,
+    auth: ServersWriteAuth,
     server_id: UUID,
     _key: Annotated[str, Depends(require_idempotency_key)],
 ) -> dict[str, Any]:
@@ -209,10 +292,10 @@ async def delete_server(
 
 @router.get("/ssh-keys")
 async def list_ssh_keys(
-    user: UserId,
+    auth: SshKeysReadAuth,
     service: Annotated[SshKeyService, Depends(_ssh_key_service)],
 ) -> dict[str, Any]:
-    keys = await service.list_keys(actor_user_id=user, owner_user_id=user)
+    keys = await service.list_keys(actor_user_id=auth.user_id, owner_user_id=auth.user_id)
     return {
         "keys": [
             {
@@ -228,7 +311,7 @@ async def list_ssh_keys(
 
 @router.post("/ssh-keys", status_code=201)
 async def register_ssh_key(
-    user: UserId,
+    auth: SshKeysWriteAuth,
     body: dict[str, Any],
     service: Annotated[SshKeyService, Depends(_ssh_key_service)],
     _key: Annotated[str, Depends(require_idempotency_key)],
@@ -240,7 +323,7 @@ async def register_ssh_key(
             ErrorCode.VALIDATION_ERROR, "body must be {name: string, public_key: string}"
         )
     created = await service.register(
-        actor_user_id=user, owner_user_id=user, name=name, public_key=public_key
+        actor_user_id=auth.user_id, owner_user_id=auth.user_id, name=name, public_key=public_key
     )
     return {
         "key": {
@@ -253,9 +336,9 @@ async def register_ssh_key(
 
 @router.delete("/ssh-keys/{key_id}", status_code=204)
 async def delete_ssh_key(
-    user: UserId,
+    auth: SshKeysWriteAuth,
     key_id: UUID,
     service: Annotated[SshKeyService, Depends(_ssh_key_service)],
     _key: Annotated[str, Depends(require_idempotency_key)],
 ) -> None:
-    await service.delete(actor_user_id=user, key_id=key_id)
+    await service.delete(actor_user_id=auth.user_id, key_id=key_id)

@@ -2849,14 +2849,40 @@ tasks:
   milestone: M14
   title: Implement customer API tokens/scopes
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M14-001
   - M02-006
   acceptance:
   - Revocable hashed tokens and scopes.
-  evidence: []
+  evidence:
+  - '2026-08-24: Customer API tokens/scopes (M14-002); acceptance ''Revocable hashed tokens and scopes'' holds. DOMAIN modules/tokens/domain.py:
+    ApiToken metadata entity (name unique per user, prefix display hint, scopes frozenset, revoked_at/last_used_at) NEVER
+    carries plaintext; generate_raw_token produces cpt_+24-byte-urlsafe tokens (uniqueness asserted over 50 draws); hash_token
+    is the ONLY stored form (SHA-256 hex, the unique lookup key); TokenScope stable enum (catalog:read, wallet:read, servers:read/write,
+    ssh_keys:read/write, tokens:manage); TokenAuthentication value (user_id, scopes, token_id) with conjunction has(). SERVICE:
+    create returns plaintext EXACTLY ONCE and audits only hash-derived metadata (test greps audit dump for plaintext - absent);
+    unknown/malformed/REVOKED tokens all fail identically (InvalidTokenError) so revocation is immediate and cannot be probed;
+    revoke is idempotent for the owner and permanent (re-authenticate after revoke raises); last_used_at stamped on successful
+    auth; ownership enforced app-layer on every op (create-for-other refused, foreign list/revoke = TokenNotFoundError with
+    rows untouched), per-user quota (10, injectable), duplicate-name rejection per user, unknown-scope validation; AuditTrail
+    records token.created/token.revoked as ActorType.USER. PERSISTENCE: migration 0024 api_tokens (sha256 hash UNIQUE as lookup
+    key, JSONB scopes, unique (user_id,name), CASCADE delete, downgrade drops; smoke head expectation updated) + SqlAlchemyApiTokenRepository
+    mapping scope strings through the enum. REST INTEGRATION: v1 authentication upgraded to bearer tokens - Authorization
+    Bearer cpt_... resolves via app.state.authenticate_token bound to container.token_service().authenticate in create_app;
+    dev x-platform-user header fallback now gated behind settings.api_allow_header_identity (default False, documented production-off);
+    declarative scope enforcement via require_scope dependency factory raising the NEW STABLE 403 forbidden envelope code
+    when a token lacks the endpoint''s scope; every resource family declares its scope (catalog:read offers, wallet:read wallet,
+    servers:read list/detail, servers:write actions+reserved delete, ssh_keys read/write, tokens:manage). TOKEN MANAGEMENT
+    SURFACE /v1/auth/tokens: POST returns {token, plaintext-shown-once} (201), GET lists metadata only, DELETE/{id} revokes
+    (204, idempotent) - all under tokens:manage + idempotency-key. TESTS: tests/unit/test_api_tokens.py (15) covering hash-only
+    storage, once-only plaintext incl. audit-dump grep, auth round-trip + last_used, identical rejection of bad tokens, immediate+final
+    revocation, idempotent revoke, scope subset validation, ownership/quota/duplicate matrix, audit actor types, scope enum
+    stability; tests/unit/test_api_v1_contract.py extended (16) with 403-forbidden scope contract (limited token: catalog
+    ok, wallet 403 naming the missing scope), write-scope gate on mutations, OpenAPI pins now include /v1/auth/tokens paths,
+    token-management surface wired to fake service. Full gates: ruff format/check clean, mypy clean (123 files), 1665 passed
+    11 skipped, migration gate passed (head 0024), provider-branching gate 73 modules clean.'
 - id: M14-003
   milestone: M14
   title: Implement admin API
@@ -2894,7 +2920,7 @@ tasks:
   milestone: M14
   title: Add API rate limits
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M14-002

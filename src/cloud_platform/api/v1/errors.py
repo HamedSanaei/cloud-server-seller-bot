@@ -41,6 +41,7 @@ class ErrorCode(StrEnum):
 
     VALIDATION_ERROR = "validation_error"
     UNAUTHORIZED = "unauthorized"
+    FORBIDDEN = "forbidden"
     NOT_FOUND = "not_found"
     CONFLICT = "conflict"
     QUOTA_EXCEEDED = "quota_exceeded"
@@ -56,6 +57,7 @@ class ErrorCode(StrEnum):
 STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.VALIDATION_ERROR: 400,
     ErrorCode.UNAUTHORIZED: 401,
+    ErrorCode.FORBIDDEN: 403,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.CONFLICT: 409,
     ErrorCode.QUOTA_EXCEEDED: 409,

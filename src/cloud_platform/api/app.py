@@ -87,6 +87,15 @@ def create_app() -> FastAPI:
     install_error_handlers(app)
     app.include_router(v1_router)
 
+    # M14-002: bind the revocable-token authenticator for bearer auth.
+    from cloud_platform.core.container import get_container
+
+    async def _authenticate_token(raw_token: str) -> object:
+        container = await get_container()
+        return await container.token_service().authenticate(raw_token)
+
+    app.state.authenticate_token = _authenticate_token
+
     @app.get("/metrics", include_in_schema=False)
     async def metrics_endpoint() -> Response:
         return Response(content=metrics.render(), media_type=CONTENT_TYPE_LATEST)

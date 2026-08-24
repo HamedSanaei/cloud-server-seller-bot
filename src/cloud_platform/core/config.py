@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # provider price; 0 means snapshots are free in this environment.
     snapshot_rate_currency: str = ""
     snapshot_per_gb_month_minor: int = Field(default=0, ge=0)
+    # REST v1 identity (M14-001/M14-002): the x-platform-user header is a
+    # DEV/TEST fallback and MUST stay disabled in production, where requests
+    # authenticate with revocable hashed bearer tokens.
+    api_allow_header_identity: bool = False
 
 
 @lru_cache(maxsize=1)

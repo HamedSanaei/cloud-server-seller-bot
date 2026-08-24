@@ -28,6 +28,8 @@ from cloud_platform.modules.operations.service import PowerCommandService
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
 from cloud_platform.modules.sshkeys.service import SshKeyService
+from cloud_platform.modules.tokens.repository import SqlAlchemyApiTokenRepository
+from cloud_platform.modules.tokens.service import TokenService
 from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeAllocator
 from cloud_platform.providers.arvancloud.client import ArvanCloudProvider
 from cloud_platform.providers.arvancloud.sync import ArvanCloudCatalogSyncer
@@ -86,6 +88,13 @@ class Container:
         """Ownership-scoped reusable-firewall service (M13-006)."""
         return FirewallService(
             SqlAlchemyFirewallRepository(self.session_factory),
+            AuditTrail(_audit_repository(self.session_factory)),
+        )
+
+    def token_service(self) -> TokenService:
+        """Revocable hashed API-token service (M14-002), request-scoped."""
+        return TokenService(
+            SqlAlchemyApiTokenRepository(self.session_factory),
             AuditTrail(_audit_repository(self.session_factory)),
         )
 

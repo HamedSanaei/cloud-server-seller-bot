@@ -8,9 +8,13 @@ idempotency rules below are pinned by
 
 - Base path: `/v1`. All resources are versioned; nothing unversioned is
   added to this surface.
-- Identity: every request carries the acting user via the identity header
-  (dependency seam: `api.v1.dependencies.get_current_user_id`). Requests
-  without a valid identity get `401` + envelope code `unauthorized`.
+- Authentication: requests authenticate with a **bearer API token**
+  (`Authorization: Bearer cpt_...`). Tokens are revocable, stored as
+  SHA-256 hashes only (the plaintext is shown exactly once at creation),
+  and carry a set of scopes; each resource family requires one scope and
+  a token without it gets `403` / `forbidden`. The `x-platform-user`
+  header is a dev/test fallback that stays disabled in production
+  (settings: `api_allow_header_identity`).
 - Ownership: application services enforce ownership. A foreign resource is
   indistinguishable from a missing one (`404` / `not_found`) — no
   existence leaks.
@@ -37,7 +41,8 @@ Stable codes (`api.v1.errors.ErrorCode`):
 |------------------------|------|---------|
 | `validation_error`     | 400  | malformed body/query/header |
 | `invalid_ssh_key`      | 400  | key material failed parsing |
-| `unauthorized`         | 401  | missing/invalid identity |
+| `unauthorized`         | 401  | missing/invalid credentials |
+| `forbidden`            | 403  | token lacks a required scope |
 | `not_found`            | 404  | unknown OR foreign resource |
 | `conflict`             | 409  | state conflict (e.g. failed op) |
 | `quota_exceeded`       | 409  | per-user limit reached |
@@ -72,9 +77,26 @@ Read endpoints (`GET`) never require a key.
 | `POST /v1/servers/{server_id}/actions/{action}` | live | `power-on` \| `power-off` \| `reboot`; 202 + replay/requeue flags |
 | `DELETE /v1/servers/{server_id}`           | 501    | reserved; saga wiring ships with the REST order/delete phase |
 | `POST /v1/servers`                         | -      | not exposed until order saga phase |
-| `GET  /v1/ssh-keys`                        | live   | fingerprints only, no material |
-| `POST /v1/ssh-keys`                        | live   | `{name, public_key}` -> fingerprint |
-| `DELETE /v1/ssh-keys/{key_id}`             | live   | 204 |
+| `GET  /v1/ssh-keys`                        | live   | `ssh_keys:read`; fingerprints only, no material |
+| `POST /v1/ssh-keys`                        | live   | `ssh_keys:write`; `{name, public_key}` -> fingerprint |
+| `DELETE /v1/ssh-keys/{key_id}`             | live   | `ssh_keys:write`; 204 |
+| `GET  /v1/auth/tokens`                     | live   | `tokens:manage`; token metadata, never material |
+| `POST /v1/auth/tokens`                     | live   | `tokens:manage`; returns plaintext EXACTLY ONCE |
+| `DELETE /v1/auth/tokens/{token_id}`        | live   | `tokens:manage`; revokes immediately (idempotent) |
+
+## Scopes
+
+Stable scope strings (`modules/tokens/domain.py::TokenScope`):
+
+| scope            | gates |
+|------------------|-------|
+| `catalog:read`   | catalog offers |
+| `wallet:read`    | wallet balance |
+| `servers:read`   | server list/detail |
+| `servers:write`  | power actions (+ reserved delete) |
+| `ssh_keys:read`  | ssh-key list |
+| `ssh_keys:write` | ssh-key register/delete |
+| `tokens:manage`  | token create/list/revoke |
 
 ## Stability policy
 

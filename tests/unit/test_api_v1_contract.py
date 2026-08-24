@@ -1,4 +1,4 @@
-"""Contract tests for REST API v1 (M14-001).
+"""Contract tests for REST API v1 (M14-001/M14-002).
 
 Acceptance: stable resource/error/idempotency contract.
 
@@ -8,6 +8,7 @@ These tests PIN the contract:
   ``{"error": {"code", "message", "details"}}`` with stable codes;
 - mutating endpoints REQUIRE an ``Idempotency-Key`` (428 otherwise);
 - identity is required (401 envelope);
+- bearer tokens authenticate with SCOPES (403 when a scope is lacking);
 - the /v1 resource paths exist and are versioned;
 - domain errors map to stable codes without leaking foreign resources.
 """
@@ -15,7 +16,7 @@ These tests PIN the contract:
 from __future__ import annotations
 
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -23,11 +24,17 @@ from fastapi.testclient import TestClient
 
 from cloud_platform.api.v1 import ErrorCode
 from cloud_platform.api.v1 import router as v1_router
-from cloud_platform.api.v1.dependencies import USER_HEADER, get_current_user_id
-from cloud_platform.api.v1.router import _catalog_repo, _ssh_key_service
+from cloud_platform.api.v1.dependencies import (
+    get_token_authentication,
+)
+from cloud_platform.api.v1.router import _catalog_repo, _ssh_key_service, _token_service
 from cloud_platform.modules.sshkeys.domain import SshKeyNotFoundError
+from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
 
 USER_ID = uuid4()
+ALL_SCOPES_AUTH = TokenAuthentication(
+    user_id=USER_ID, scopes=frozenset(TokenScope), token_id=uuid4()
+)
 
 
 class FakeCatalogRepo:
@@ -81,13 +88,14 @@ class FakeSshKeyService:
         raise SshKeyNotFoundError(f"ssh key {key_id} not found")
 
 
-def build_app() -> TestClient:
+def build_app(auth: TokenAuthentication | None = ALL_SCOPES_AUTH) -> TestClient:
     app = FastAPI()
     app.include_router(v1_router)
     from cloud_platform.api.v1.errors import install_error_handlers
 
     install_error_handlers(app)
-    app.dependency_overrides[get_current_user_id] = lambda: USER_ID
+    if auth is not None:
+        app.dependency_overrides[get_token_authentication] = lambda: auth
     app.dependency_overrides[_catalog_repo] = lambda: FakeCatalogRepo()
     app.dependency_overrides[_ssh_key_service] = lambda: FakeSshKeyService()
     return TestClient(app)
@@ -105,7 +113,7 @@ def assert_envelope(payload: dict[str, Any]) -> dict[str, Any]:
 class TestErrorEnvelope:
     def test_unknown_route_is_enveloped_404(self) -> None:
         with build_app() as client:
-            resp = client.get("/v1/does-not-exist", headers={USER_HEADER: str(USER_ID)})
+            resp = client.get("/v1/does-not-exist")
         assert resp.status_code == 404
         assert_envelope(resp.json())
 
@@ -115,7 +123,7 @@ class TestErrorEnvelope:
         from cloud_platform.api.v1.errors import install_error_handlers
 
         install_error_handlers(app)
-        app.dependency_overrides.pop(get_current_user_id, None)
+        app.dependency_overrides.pop(get_token_authentication, None)
         with TestClient(app) as client:
             resp = client.get("/v1/wallet")
         assert resp.status_code == 401
@@ -126,7 +134,7 @@ class TestErrorEnvelope:
         with build_app() as client:
             resp = client.post(
                 "/v1/ssh-keys",
-                headers={USER_HEADER: str(USER_ID), "Idempotency-Key": "k1"},
+                headers={"Idempotency-Key": "k1"},
                 json={"unexpected": 1},
             )
         # handler validates body itself -> validation_error envelope
@@ -138,11 +146,41 @@ class TestErrorEnvelope:
         with build_app() as client:
             resp = client.delete(
                 f"/v1/ssh-keys/{uuid4()}",
-                headers={USER_HEADER: str(USER_ID), "Idempotency-Key": "k2"},
+                headers={"Idempotency-Key": "k2"},
             )
         assert resp.status_code == 404
         error = assert_envelope(resp.json())
         assert error["code"] == ErrorCode.NOT_FOUND.value
+
+
+class TestScopeContract:
+    def test_token_without_scope_is_forbidden(self) -> None:
+        limited = TokenAuthentication(
+            user_id=USER_ID,
+            scopes=frozenset({TokenScope.CATALOG_READ}),
+            token_id=uuid4(),
+        )
+        with build_app(auth=limited) as client:
+            ok = client.get("/v1/catalog/offers")
+            forbidden = client.get("/v1/wallet")
+        assert ok.status_code == 200
+        assert forbidden.status_code == 403
+        error = assert_envelope(forbidden.json())
+        assert error["code"] == ErrorCode.FORBIDDEN.value
+        assert "wallet:read" in error["message"]
+
+    def test_write_scope_needed_for_mutations(self) -> None:
+        read_only = TokenAuthentication(
+            user_id=USER_ID,
+            scopes=frozenset({TokenScope.SERVERS_READ}),
+            token_id=uuid4(),
+        )
+        with build_app(auth=read_only) as client:
+            resp = client.post(
+                f"/v1/servers/{uuid4()}/actions/power-on", headers={"Idempotency-Key": "k"}
+            )
+        assert resp.status_code == 403
+        assert_envelope(resp.json())
 
 
 class TestIdempotencyContract:
@@ -151,21 +189,21 @@ class TestIdempotencyContract:
     )
     def test_mutations_require_the_header(self, method: str, path: str) -> None:
         with build_app() as client:
-            resp = getattr(client, method)(path, headers={USER_HEADER: str(USER_ID)})
+            resp = getattr(client, method)(path)
         assert resp.status_code == 428
         error = assert_envelope(resp.json())
         assert error["code"] == ErrorCode.IDEMPOTENCY_REQUIRED.value
 
     def test_reads_do_not_need_a_key(self) -> None:
         with build_app() as client:
-            resp = client.get("/v1/catalog/offers", headers={USER_HEADER: str(USER_ID)})
+            resp = client.get("/v1/catalog/offers")
         assert resp.status_code == 200
 
     def test_oversized_key_is_validation_error(self) -> None:
         with build_app() as client:
             resp = client.post(
                 "/v1/ssh-keys",
-                headers={USER_HEADER: str(USER_ID), "Idempotency-Key": "x" * 129},
+                headers={"Idempotency-Key": "x" * 129},
                 json={"name": "n", "public_key": "k"},
             )
         assert resp.status_code == 400
@@ -175,7 +213,7 @@ class TestIdempotencyContract:
 class TestResources:
     def test_catalog_offers_only_enabled(self) -> None:
         with build_app() as client:
-            resp = client.get("/v1/catalog/offers", headers={USER_HEADER: str(USER_ID)})
+            resp = client.get("/v1/catalog/offers")
         body = resp.json()
         assert len(body["offers"]) == 1
         offer = body["offers"][0]
@@ -186,7 +224,7 @@ class TestResources:
         with build_app() as client:
             resp = client.post(
                 "/v1/ssh-keys",
-                headers={USER_HEADER: str(USER_ID), "Idempotency-Key": "k3"},
+                headers={"Idempotency-Key": "k3"},
                 json={"name": "laptop", "public_key": "ssh-ed25519 AAA"},
             )
         assert resp.status_code == 201
@@ -206,6 +244,8 @@ class TestOpenApiStability:
             "/v1/servers/{server_id}/actions/{action}",
             "/v1/ssh-keys",
             "/v1/ssh-keys/{key_id}",
+            "/v1/auth/tokens",
+            "/v1/auth/tokens/{token_id}",
         }
         missing = expected - paths
         assert not missing, f"contract paths missing from OpenAPI: {missing}"
@@ -219,3 +259,48 @@ class TestOpenApiStability:
                 or path.startswith("/health")
                 or path.startswith("/webhooks")
             ), path
+
+
+class FakeTokenService:
+    """Token management surface behind /v1/auth/tokens."""
+
+    def __init__(self) -> None:
+        self.revoked: list[UUID] = []
+
+    async def create(
+        self, *, actor_user_id: UUID, owner_user_id: UUID, name: str, scopes: Any
+    ) -> tuple[Any, str]:
+        token = type(
+            "T",
+            (),
+            {"id": uuid4(), "name": name, "scopes": scopes},
+        )()
+        return token, "cpt_plaintext-shown-once"
+
+    async def revoke(self, *, actor_user_id: UUID, token_id: UUID) -> None:
+        self.revoked.append(token_id)
+
+
+class TestTokenManagementSurface:
+    def test_create_returns_plaintext_exactly_once(self) -> None:
+        service = FakeTokenService()
+        with build_app() as client:
+            client.app.dependency_overrides[_token_service] = lambda: service  # type: ignore[attr-defined]
+            resp = client.post(
+                "/v1/auth/tokens",
+                headers={"Idempotency-Key": "tk1"},
+                json={"name": "ci", "scopes": ["catalog:read"]},
+            )
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["plaintext"].startswith("cpt_")
+        assert body["token"]["name"] == "ci"
+
+    def test_revoke_is_wired(self) -> None:
+        service = FakeTokenService()
+        target = uuid4()
+        with build_app() as client:
+            client.app.dependency_overrides[_token_service] = lambda: service  # type: ignore[attr-defined]
+            resp = client.delete(f"/v1/auth/tokens/{target}", headers={"Idempotency-Key": "tk2"})
+        assert resp.status_code == 204
+        assert service.revoked == [target]

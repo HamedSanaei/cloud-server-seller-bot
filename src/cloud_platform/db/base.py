@@ -840,3 +840,26 @@ class FirewallRow(Base):
     updated_at = Column(
         DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP"
     )
+
+
+class ApiTokenRow(Base):
+    """A revocable customer API token (M14-002).
+
+    Only the SHA-256 HASH of the bearer token is stored (unique - it is
+    the lookup key); plaintext material never touches persistence. Scopes
+    bound what the token may do; ``revoked_at`` permanently invalidates.
+    """
+
+    __tablename__ = "api_tokens"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_api_tokens_user_name"),)
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(64), nullable=False)
+    #: sha256 hex digest of "cpt_..." - unique lookup key, never plaintext
+    token_hash = Column(String(64), nullable=False, unique=True)
+    prefix = Column(String(16), nullable=False, server_default="")
+    scopes = Column(JSONB, nullable=False, server_default="[]")
+    created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    last_used_at = Column(DateTime(timezone=True), nullable=True)
