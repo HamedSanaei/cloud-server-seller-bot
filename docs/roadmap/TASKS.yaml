@@ -2349,18 +2349,49 @@ tasks:
   milestone: M12
   title: Create staging compose/deployment
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M12-002
   acceptance:
   - Staging deploy repeatable.
-  evidence: []
+  evidence:
+  - '2026-08-24: Created the staging compose deployment (M12-004); acceptance ''Staging deploy repeatable'' holds - and was
+    proven by actually deploying twice. NEW deploy/staging/docker-compose.yml: the full service graph on the immutable M12-002
+    release image - postgres:17-alpine (pinned to the version the repo dev compose already uses; 18 changed the data layout)
+    with a pg_isready healthcheck and NO published ports, redis:8-alpine with AOF + healthcheck and no published ports, a
+    one-shot migrate job (alembic upgrade head, restart no) that api and worker both wait on with condition=service_completed_successfully
+    (migration-first ordering: the first deploy into an empty database and every later deploy run the identical sequence),
+    api (port configurable 8000), worker (arq), a profile-gated one-shot backup (M11-007, runs via docker compose --profile
+    backup run --rm backup, encrypted files kept on the backups volume for the M11-008 restore drill), and a root one-shot
+    volume-init that chowns the root-owned backups volume to the app user (uid 999) before any backup runs. All platform services
+    take their image from the required PLATFORM_IMAGE variable (registry/repo:FULL-SHA), all configuration arrives via .env
+    references - every secret in the file is a shell variable interpolation, nothing is hard-coded. NEW deploy/staging/.env.example
+    documents every required variable (PLATFORM_IMAGE, STAGING_DB_PASSWORD, STAGING_TELEGRAM_BOT_TOKEN, STAGING_HETZNER_API_TOKEN,
+    STAGING_PROVIDER_CREDENTIAL_KEY, STAGING_BACKUP_ENCRYPTION_KEY, optional port/currency/retention) with explicit change-me
+    placeholders; .env itself is never committed. NEW deploy/staging/README.md documents the repeatable loop: release the
+    immutable image, point PLATFORM_IMAGE at it, docker compose up -d, verify (health/live, health/ready, metrics, compose
+    ps, alembic current), backup/restore drill pointers, and down teardown. IMAGE FIXES the deploy forced: the image now carries
+    alembic.ini + the alembic revision tree (the migrate entry point), psycopg2-binary was added to the lockfile (migrations
+    run synchronously; env.py strips the asyncpg prefix), and the runtime stage installs the postgresql-client apt package
+    (pg_dump/psql for migrate/backup) - the only allowed runtime install, asserted by test. REAL DEPLOYMENT EXECUTED on this
+    machine: (1) docker compose up -d from an empty database - migrate applied all 20 revisions to 0020 head, api Up healthy
+    with /health/live and /health/ready returning ok and /metrics serving cloud_platform_api_requests_total, worker Up with
+    arq ''Starting worker for 5 functions''; (2) docker compose down then up -d again - the identical stack came back healthy
+    (repeatable); (3) docker compose --profile backup run --rm backup produced ''backup ok: cloud-backup-20260824-093658.dump.enc
+    (51940 bytes)'' from the real staged database. TESTS: tests/unit/test_staging_compose.py (17 tests) pins the artifact
+    - all seven services present, migrate is one-shot and api/worker wait on it completing successfully with postgres/redis
+    healthy, api/worker use the entrypoint commands, backup is profile-gated + one-shot + waits on volume-init, every platform
+    service uses the PLATFORM_IMAGE variable, infra images pinned, the database/redis ports are NOT published, state lives
+    in the three named volumes, healthchecks present, env wiring (APP_ENV=staging, DSN from STAGING_DB_PASSWORD), no literal
+    secrets in the compose file (every PASSWORD/TOKEN/KEY value is a variable interpolation), .env.example covers all required
+    variables, and the README documents the loop. test_oci_release.py gained the alembic-copy assertion and the postgresql-client-only
+    runtime-install rule. Full suite 1322 passed; the smoke stack was torn down and the local .env deleted afterwards.'
 - id: M12-005
   milestone: M12
   title: Create production deployment runbook
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M12-004
@@ -2382,7 +2413,7 @@ tasks:
   milestone: M12
   title: Add post-deploy smoke tests
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M12-004
@@ -2670,7 +2701,7 @@ tasks:
   milestone: M16
   title: Create realistic load model
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H1
   depends_on:
   - M12-004

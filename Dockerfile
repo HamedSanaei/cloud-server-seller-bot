@@ -44,12 +44,22 @@ ENV PYTHONUNBUFFERED=1 \
 RUN groupadd --system app \
     && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app
 
+# postgres client tools only: the `migrate` and `backup` entry points drive
+# psql/pg_dump over the network (the server never runs in this image).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # The editable project install in the venv points at /app/src, so the
 # sources must live at exactly that path.
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --chown=app:app src ./src
+# The `migrate` entry point (alembic upgrade head) needs the alembic config
+# and the revision scripts; env.py reads DATABASE_URL from the environment.
+COPY --chown=app:app alembic.ini ./alembic.ini
+COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh
 
 USER app

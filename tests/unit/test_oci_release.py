@@ -128,12 +128,26 @@ class TestDockerfileStructure:
         users = [line.strip() for line in stages["runtime"] if line.strip().startswith("USER")]
         assert users == ["USER app"]
 
-    def test_runtime_installs_nothing(self, dockerfile: str) -> None:
+    def test_runtime_installs_nothing_unexpected(self, dockerfile: str) -> None:
         stages = self._stages(dockerfile)
-        for line in stages["runtime"]:
+        runtime = stages["runtime"]
+        for line in runtime:
             stripped = line.strip()
             assert not stripped.startswith("RUN pip"), "runtime must not install packages"
-            assert not stripped.startswith("RUN apt"), "runtime must not install distro packages"
+        # the only allowed apt install is the postgres client tools (migrate/backup);
+        # continuation lines of the same RUN belong to it
+        apt_lines: list[str] = []
+        for i, line in enumerate(runtime):
+            if line.strip().startswith("RUN apt"):
+                chunk = [line]
+                for follow in runtime[i + 1 :]:
+                    if follow.strip().startswith("&&") or follow.strip().startswith("RUN"):
+                        if follow.strip().startswith("RUN"):
+                            break
+                        chunk.append(follow)
+                apt_lines.extend(chunk)
+        assert apt_lines, "the postgres client tools must be installed for migrate/backup"
+        assert "postgresql-client" in " ".join(apt_lines)
 
     def test_no_broad_copy(self, dockerfile: str) -> None:
         for line in dockerfile.splitlines():
@@ -170,6 +184,11 @@ class TestEntrypoint:
     def test_dockerfile_copies_the_entrypoint(self) -> None:
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
         assert "COPY --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh" in dockerfile
+
+    def test_dockerfile_copies_alembic_for_the_migrate_entrypoint(self) -> None:
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        assert "COPY --chown=app:app alembic.ini ./alembic.ini" in dockerfile
+        assert "COPY --chown=app:app alembic ./alembic" in dockerfile
 
 
 class TestDockerignore:

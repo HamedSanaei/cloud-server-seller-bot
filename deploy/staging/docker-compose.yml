@@ -1,0 +1,128 @@
+# Staging deployment for the cloud platform (M12-004).
+#
+# Repeatability is the point: everything is addressed by name, state lives in
+# named volumes, configuration comes from a .env file (never hard-coded),
+# and the image is the immutable, SHA-tagged release from M12-002.
+#
+#   cp .env.example .env          # fill in the secrets
+#   export PLATFORM_IMAGE=...     # the release image (registry/repo:<full-sha>)
+#   docker compose up -d          # postgres + redis + migrate + api + worker
+#   docker compose up -d backup   # one encrypted backup run, then it exits
+#   docker compose down           # repeatable teardown (state stays in volumes)
+#
+# The migrate job (alembic upgrade head) completes BEFORE api/worker start,
+# so the first deploy into an empty database and every later deploy run the
+# same sequence.
+
+name: cloud-platform-staging
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: cloud
+      POSTGRES_PASSWORD: ${STAGING_DB_PASSWORD:?set STAGING_DB_PASSWORD in .env}
+      POSTGRES_DB: cloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloud -d cloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    # no published ports: staging services are reachable only inside the network
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+    command: ["migrate"]
+    environment: &platform_env
+      APP_ENV: staging
+      DATABASE_URL: postgresql+asyncpg://cloud:${STAGING_DB_PASSWORD:?set STAGING_DB_PASSWORD in .env}@postgres:5432/cloud
+      REDIS_URL: redis://redis:6379/0
+      TELEGRAM_BOT_TOKEN: ${STAGING_TELEGRAM_BOT_TOKEN:-}
+      HETZNER_API_TOKEN: ${STAGING_HETZNER_API_TOKEN:-}
+      HETZNER_API_BASE_URL: ${STAGING_HETZNER_API_BASE_URL:-https://api.hetzner.cloud/v1}
+      PROVIDER_CREDENTIAL_ENCRYPTION_KEY: ${STAGING_PROVIDER_CREDENTIAL_KEY:?set STAGING_PROVIDER_CREDENTIAL_KEY in .env}
+      DEFAULT_CURRENCY: ${STAGING_DEFAULT_CURRENCY:-EUR}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+    command: ["api"]
+    ports:
+      - "${STAGING_API_PORT:-8000}:8000"
+    environment: *platform_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+    command: ["worker"]
+    environment: *platform_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # One encrypted pg_dump per run (M11-007); the encrypted file is kept on the
+  # volume for the restore drill (M11-008). Run explicitly:
+  #   docker compose --profile backup run --rm backup
+  # The named volume is root-owned until first use, so `volume-init` (root,
+  # one-shot) hands it to the app user before any backup runs.
+  volume-init:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+    user: root
+    command: ["/bin/sh", "-c", "chown -R 999:999 /backups"]
+    volumes:
+      - backups:/backups
+    restart: "no"
+
+  backup:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+    command: ["backup"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      volume-init:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: staging
+      DATABASE_URL: postgresql+asyncpg://cloud:${STAGING_DB_PASSWORD:?set STAGING_DB_PASSWORD in .env}@postgres:5432/cloud
+      BACKUP_OUTPUT_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${STAGING_BACKUP_RETENTION_DAYS:-14}
+      BACKUP_ENCRYPTION_KEY: ${STAGING_BACKUP_ENCRYPTION_KEY:?set STAGING_BACKUP_ENCRYPTION_KEY in .env}
+    volumes:
+      - backups:/backups
+    restart: "no"
+    profiles: ["backup"]
+
+volumes:
+  pgdata:
+  redisdata:
+  backups:

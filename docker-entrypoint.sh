@@ -27,6 +27,8 @@ case "${1:-api}" in
         ;;
     migrate)
         shift || true
+        # alembic/env.py reads DATABASE_URL and strips the asyncpg prefix
+        # (migrations run synchronously on psycopg2)
         exec alembic upgrade head "$@"
         ;;
     *)
