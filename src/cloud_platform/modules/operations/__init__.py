@@ -16,6 +16,7 @@ from cloud_platform.modules.operations.domain import (
 from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
 from cloud_platform.modules.operations.service import (
     PLATFORM_SERVER_ID_LABEL,
+    SERVER_CONTROLS,
     CreateTimeoutReconciler,
     DeleteActionNotAllowedError,
     DeleteCommandError,
@@ -52,10 +53,12 @@ from cloud_platform.modules.operations.service import (
     ProvisioningOutcome,
     ProvisioningWorker,
     ReconciliationOutcome,
+    ServerControl,
     ServerPowerView,
     ServerStateReconciler,
     StateReconciliationOutcome,
     available_power_actions,
+    available_server_controls,
     build_create_request,
     delete_operation_key,
     power_operation_key,
@@ -70,6 +73,7 @@ from cloud_platform.modules.operations.tooling import (
 
 __all__ = [
     "PLATFORM_SERVER_ID_LABEL",
+    "SERVER_CONTROLS",
     "CreateTimeoutReconciler",
     "DeleteActionNotAllowedError",
     "DeleteCommandError",
@@ -117,6 +121,7 @@ __all__ = [
     "ProvisioningOutcome",
     "ProvisioningWorker",
     "ReconciliationOutcome",
+    "ServerControl",
     "ServerPowerView",
     "ServerStateReconciler",
     "SqlAlchemyOperationRepository",
@@ -124,6 +129,7 @@ __all__ = [
     "StatePlan",
     "StateReconciliationOutcome",
     "available_power_actions",
+    "available_server_controls",
     "build_create_request",
     "delete_operation_key",
     "normalize_provider_status",

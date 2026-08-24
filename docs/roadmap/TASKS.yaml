@@ -2810,14 +2810,38 @@ tasks:
   milestone: M15
   title: Enable capability-driven Telegram UX
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M15-003
   - M08-008
   acceptance:
   - Unsupported controls hidden; shared flows reused.
-  evidence: []
+  evidence:
+  - '2026-08-24: Enabled capability-driven Telegram UX (M15-005); acceptance ''Unsupported controls hidden; shared flows reused''
+    holds. CHANGES in modules/operations/service.py: (1) NEW ServerControl dataclass + SERVER_CONTROLS table - the single
+    shared source of which controls the server detail screen offers, each row gated by (a) a provider Capability and (b) a
+    set of local lifecycle states; the three power controls reuse the M08-008 preconditions verbatim so existing behavior
+    is pinned byte-for-byte; (2) NEW available_server_controls(state, capabilities) - the capability AND state gate in table
+    order; (3) available_power_actions is unchanged in result (a test pins table-vs-legacy agreement for every state/capability
+    combination including the full ArvanCloud capability set); (4) PowerControlsService.detail now DERIVES its actions from
+    the shared table (labels come from the table rows, not a second label map) so the screen and the command gate can never
+    disagree - and the same code path serves any provider: the view is built from (server.state, provider.capabilities) only,
+    zero provider-specific branching. Why this is ''capability-driven'': when M13-004/005/006/007/008/009/010 ship their flows,
+    each adds ONE row to SERVER_CONTROLS (plus its nav transition) and every provider advertising that capability automatically
+    exposes the control - providers lacking it automatically hide it; today, capabilities with no implemented flow (ArvanCloud''s
+    SNAPSHOT/FIREWALL/RDNS/...) produce NO phantom buttons because the table has no rows for them (pinned by test). SHARED
+    FLOWS REUSED: the purchase flow (BuyFlowViewService) and the server detail flow are provider-neutral and now provably
+    so: TESTS: tests/unit/test_capability_driven_ux.py (14 tests) - the control table is fully capability+state gated; a running
+    server gets exactly [power_off, reboot], a stopped server exactly [power_on], no-POWER hides everything, provisioning
+    gets nothing; table-vs-legacy-gate agreement across states and capability sets (including the REAL ArvanCloud capability
+    frozenset from M15-002); the SAME detail screen serves a real ArvanCloudProvider (region-qualified server id) and a Hetzner-like
+    provider with identical action sets and labels (shared flow reuse, no per-provider UI code); a read-only (COMPUTE-only)
+    provider renders zero controls (hidden, not disabled); ArvanCloud''s full capability set adds no unknown controls (implemented
+    flows only); the shared buy flow serves offers from two providers (hetzner/FI + arvancloud/IR) in one locations screen
+    with correct (provider_key, location_id) selection options; a provider with only disabled offers is absent from the flow;
+    the plans screen for an arvancloud offer renders through the same flow with IRR currency pass-through. Full gate: ruff
+    format/check clean, mypy clean (101 files), 1438 passed 11 skipped.'
 - id: M15-006
   milestone: M15
   title: Run multi-provider billing parity tests
@@ -2834,7 +2858,7 @@ tasks:
   milestone: M15
   title: Prove zero core-domain provider branching
   priority: P0
-  status: blocked
+  status: ready
   owner_hint: supervisor
   depends_on:
   - M15-005

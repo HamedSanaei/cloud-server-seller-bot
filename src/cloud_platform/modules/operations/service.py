@@ -1068,6 +1068,70 @@ def available_power_actions(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Capability-driven server controls (M15-005)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ServerControl:
+    """One control the server detail screen may offer, driven by a
+    provider capability (M15-005).
+
+    The table below is the SINGLE source that both the screen (which
+    controls to render) and the command layer (which actions to accept)
+    agree on: a control exists for a server iff its ``capability`` is in the
+    provider's advertised set AND the server's local state is in
+    ``state_gates``. Every other control is hidden, not shown disabled.
+
+    Adding a new shared flow (e.g. snapshots when M13-004 ships) means
+    adding one row here plus the nav transition - no per-provider UI code.
+    """
+
+    capability: Capability
+    action: str  # nav action name (== PowerAction.value for power controls)
+    label: str
+    state_gates: frozenset[ServerLifecycleState]
+
+
+#: The shared control table. Power controls reuse the M08-008 preconditions
+#: verbatim; the table is provider-neutral - every provider renders exactly
+#: the controls its capability set advertises (shared flows, M15-005).
+SERVER_CONTROLS: tuple[ServerControl, ...] = (
+    ServerControl(
+        capability=Capability.POWER,
+        action=PowerAction.POWER_ON.value,
+        label="Power on",
+        state_gates=_POWER_PRECONDITION[PowerAction.POWER_ON],
+    ),
+    ServerControl(
+        capability=Capability.POWER,
+        action=PowerAction.POWER_OFF.value,
+        label="Power off",
+        state_gates=_POWER_PRECONDITION[PowerAction.POWER_OFF],
+    ),
+    ServerControl(
+        capability=Capability.POWER,
+        action=PowerAction.REBOOT.value,
+        label="Reboot",
+        state_gates=_POWER_PRECONDITION[PowerAction.REBOOT],
+    ),
+)
+
+
+def available_server_controls(
+    state: ServerLifecycleState, capabilities: set[Capability] | frozenset[Capability]
+) -> list[ServerControl]:
+    """The controls available for one server: capability-gated AND
+    state-gated, in table order. Unsupported controls are hidden, never
+    shown disabled."""
+    return [
+        control
+        for control in SERVER_CONTROLS
+        if control.capability in capabilities and state in control.state_gates
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class PowerCommandResult:
     server: CloudServer
@@ -1147,7 +1211,7 @@ class PowerOperationExecutor:
         # native idempotency header, e.g. ArvanCloud), probe first so a
         # timed-out mutation is never blindly re-applied.
         if operation.attempts >= 2 and supports_power_probe(provider):
-            probe_method = getattr(provider, "probe_power_effect")
+            probe_method = provider.probe_power_effect
             try:
                 probe = await probe_method(server.provider_server_id, action.value)
             except ProviderError:
@@ -1467,6 +1531,11 @@ class PowerControlsService:
     No enforcement happens here: pressing a button calls
     PowerCommandService, which re-checks ownership, state and capability at
     execution time and is idempotent per command key.
+
+    Capability-driven (M15-005): the control set comes from the shared
+    ``SERVER_CONTROLS`` table - the SAME table the command gate uses - so
+    every provider renders exactly the controls its advertised capabilities
+    support, and shared flows are reused verbatim across providers.
     """
 
     _LABELS: ClassVar[dict[PowerAction, str]] = {
@@ -1500,16 +1569,21 @@ class PowerControlsService:
         else:
             capabilities = set(provider.capabilities)
 
+        controls = available_server_controls(server.state, capabilities)
         actions = tuple(
             PowerActionOption(
-                action=action,
-                label=self._LABELS[action],
+                action=PowerAction(control.action),
+                label=control.label,
                 callback=encode_callback(
-                    Callback(flow="servers", screen=action.value, args=(str(server.id),)),
+                    Callback(
+                        flow="servers",
+                        screen=control.action,
+                        args=(str(server.id),),
+                    ),
                     self._signing_key,
                 ),
             )
-            for action in available_power_actions(server.state, capabilities)
+            for control in controls
         )
         return ServerPowerView(
             server_id=server.id,
