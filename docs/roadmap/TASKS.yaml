@@ -2205,13 +2205,41 @@ tasks:
   milestone: M11
   title: Document/test restore drill
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M11-007
   acceptance:
   - Restore into clean environment verified.
-  evidence: []
+  evidence:
+  - '2026-08-24: Documented and tested the restore drill (M11-008); acceptance ''Restore into clean environment verified''
+    holds. NEW restore path in src/cloud_platform/backup/job.py: parse_backup_filename (the UTC timestamp embedded in the
+    platform''s own filename pattern; ValueError on foreign names), list_backups (only platform-named files, newest first;
+    a missing directory is empty, not an error), RestoreError, build_pg_restore_command (psql --single-transaction --quiet
+    <dsn> - the dump is plain SQL from pg_dump --format=plain, so the restore is all-or-nothing) and PostgresRestoreJob(dsn,
+    key, output_dir, runner): select_backup_file (an explicit filename must match a platform backup, otherwise RestoreError
+    listing the known files; otherwise the newest), run() = resolve file -> read + decrypt with the configured 32-byte key
+    (SecretBoxError -> RestoreError BEFORE anything reaches the database) -> empty-dump check -> stream the SQL to the injectable
+    psql runner (non-zero exit -> RestoreError with the STDERR scrubbed by the M11-007 _scrub: no DSN, no password) -> logs
+    a safe completion line. The backup file is never modified or deleted by a restore, so a failed restore can be retried
+    from the same file. CLI: python -m cloud_platform.backup gained --restore [FILENAME] (const ''latest'' selects the newest)
+    and --target-dsn (restore into a clean environment; defaults to the configured database URL with the +asyncpg driver suffix
+    stripped); success prints ''restore ok: <filename>'', failure prints a scrubbed ''restore failed: <reason>'' and exits
+    1. Documentation: docs/operations/RUNBOOK.md gained a ''Restore drill'' section - the three-step procedure (clean PostgreSQL
+    instance, run the restore command with --target-dsn, verify table counts/spot-check queries), the four verified safety
+    properties (wrong key aborts before the DB via the Fernet MAC, only platform-named files are selectable, the backup file
+    is untouched by a failed restore, psql error output is scrubbed), the rollback (drop/recreate the clean DB or restore
+    the previous file; production is never the drill target) and the drill cadence (monthly + after any key/path/command change).
+    TESTS: tests/unit/test_restore_drill.py (11 tests) verifies the whole drill end to end with fakes - THE clean-environment
+    round trip: a backup produced by the real PostgresBackupJob (fake pg_dump emitting the dump bytes) is restored from a
+    fresh directory into a fake psql sink and the restored SQL is byte-identical to the original dump and delivered exactly
+    once; latest picks the newest of two backups (the older one is never restored); a named backup restores exactly that file;
+    a missing named backup is rejected; an empty directory is rejected; a WRONG key (the file was encrypted with a different
+    MasterKey) aborts with ''decryption failed'' and NOTHING reaches the psql sink; a corrupted file (one byte flipped) aborts
+    the same way; a psql failure (exit 1 with the DSN + password echoed in stderr) raises a RestoreError whose message contains
+    neither the DSN nor the password (scrubbed to ***) and the backup file is byte-identical afterwards; the psql command
+    uses --single-transaction; config validation (empty DSN rejected) and foreign/unparseable files in the backup dir are
+    invisible to selection. The existing M11-007 backup suite still passes unchanged. Full suite 1264 passed.'
 - id: M11-009
   milestone: M11
   title: Add chaos tests for provider timeouts

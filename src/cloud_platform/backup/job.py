@@ -192,6 +192,172 @@ class PostgresBackupJob:
         return deleted
 
 
+# ---------------------------------------------------------------------------
+# Restore (M11-008)
+# ---------------------------------------------------------------------------
+
+
+def parse_backup_filename(name: str) -> datetime:
+    """The UTC timestamp embedded in a backup filename.
+
+    Raises:
+        ValueError: The name is not a platform backup filename.
+    """
+    match = _BACKUP_NAME.match(name)
+    if match is None:
+        raise ValueError(f"not a platform backup filename: {name!r}")
+    return datetime.strptime(match.group(1), _TIMESTAMP_FORMAT).replace(tzinfo=UTC)
+
+
+def list_backups(output_dir: Path) -> list[Path]:
+    """All platform backup files in the directory, newest first.
+
+    Foreign files and unparseable names are never listed.
+    """
+    out: list[tuple[datetime, Path]] = []
+    if not output_dir.is_dir():
+        return []
+    for entry in output_dir.iterdir():
+        try:
+            stamped = parse_backup_filename(entry.name)
+        except ValueError:
+            continue
+        if entry.is_file():
+            out.append((stamped, entry))
+    out.sort(key=lambda pair: pair[0], reverse=True)
+    return [path for _stamped, path in out]
+
+
+class RestoreError(Exception):
+    """A restore run failed (missing file, bad key, I/O)."""
+
+
+def build_pg_restore_command(dsn: str) -> list[str]:
+    """The psql command that applies a plain-format dump to the DSN.
+
+    The dump is plain SQL (``pg_dump --format=plain``), so ``psql`` is the
+    restore vehicle; ``--single-transaction`` makes the restore all-or-nothing.
+    """
+    return ["psql", "--single-transaction", "--quiet", dsn]
+
+
+class PostgresRestoreJob:
+    """One restore: pick a backup -> decrypt -> stream through psql.
+
+    Acceptance: **restore into a clean environment verified.** The job is the
+    documented restore path (see docs/operations/RUNBOOK.md "Restore drill"):
+
+    - The backup file must exist and carry a valid embedded timestamp;
+      ``latest=True`` picks the newest platform backup.
+    - The file is decrypted with the configured 32-byte key (a key that does
+      not match the one used for the backup fails the Fernet MAC and raises
+      ``RestoreError`` before anything reaches the database).
+    - The decrypted SQL is streamed to psql against the target DSN; a
+      non-zero psql exit (constraint failure, etc.) is a ``RestoreError``
+      that carries the scrubbed output (no DSN, no password).
+    - The DSN never reaches logs or exception messages (``redact_dsn`` /
+      ``_scrub``, same discipline as the backup job).
+
+    The job NEVER deletes or modifies the backup file: a failed restore must
+    leave the source pristine for a retry.
+    """
+
+    def __init__(
+        self,
+        *,
+        dsn: str,
+        key: MasterKey,
+        output_dir: Path,
+        runner: Callable[[Sequence[str], bytes], Awaitable[subprocess.CompletedProcess[bytes]]]
+        | None = None,
+    ) -> None:
+        if not dsn or not dsn.strip():
+            raise ValueError("dsn must not be empty")
+        self._dsn = dsn
+        self._key = key
+        self._output_dir = output_dir
+        self._box = FernetSecretBox(key)
+        self._runner = runner or self._run_psql
+
+    async def _run_psql(
+        self, command: Sequence[str], sql: bytes
+    ) -> subprocess.CompletedProcess[bytes]:
+        # The argv contains the DSN; run in a thread and pipe the SQL in via
+        # stdin (it is already decrypted in memory for this one run).
+        return await asyncio.to_thread(
+            subprocess.run,
+            list(command),
+            input=sql,
+            capture_output=True,
+            check=False,
+        )
+
+    def select_backup_file(self, filename: str | None = None, *, latest: bool = True) -> Path:
+        """Resolve which backup file to restore.
+
+        ``filename`` names one file explicitly; otherwise (or with
+        ``latest=True``) the newest platform backup is chosen.
+        """
+        backups = list_backups(self._output_dir)
+        if filename is not None:
+            for path in backups:
+                if path.name == filename:
+                    return path
+            raise RestoreError(
+                f"backup file {filename!r} not found in {self._output_dir} "
+                f"(known: {[p.name for p in backups] or 'none'})"
+            )
+        if not latest and not backups:
+            raise RestoreError(f"no backups found in {self._output_dir}")
+        if not backups:
+            raise RestoreError(f"no backups found in {self._output_dir}")
+        return backups[0]
+
+    async def run(self, filename: str | None = None, *, latest: bool = True) -> str:
+        """Restore one backup; returns the restored filename.
+
+        The whole sequence is fail-fast: file resolution, decryption and the
+        psql run each raise ``RestoreError`` on failure; the backup file is
+        never modified or deleted.
+        """
+        started = time.perf_counter()
+        backup = self.select_backup_file(filename, latest=latest)
+        try:
+            ciphertext = backup.read_bytes().decode("ascii")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise RestoreError(f"cannot read backup {backup.name}: {type(exc).__name__}") from exc
+        try:
+            sql = self._box.decrypt_bytes(ciphertext)
+        except SecretBoxError as exc:
+            # Wrong key (or a corrupted file): the Fernet MAC failed, so
+            # nothing is applied - the restore is verifiably aborted.
+            raise RestoreError(
+                f"decryption failed for {backup.name} (wrong key or corrupted "
+                f"file): {type(exc).__name__}"
+            ) from exc
+        if not sql.strip():
+            raise RestoreError(f"backup {backup.name} decrypted to an empty dump")
+
+        command = build_pg_restore_command(self._dsn)
+        try:
+            proc = await self._runner(command, sql)
+        except Exception as exc:
+            raise RestoreError(f"psql could not be executed: {type(exc).__name__}") from exc
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", "replace") if proc.stderr else ""
+            raise RestoreError(
+                f"psql failed (exit {proc.returncode}) restoring {backup.name}: "
+                f"{_scrub(stderr, self._dsn)[:500]}"
+            )
+        logger.info(
+            "restore complete: %s (%d bytes) in %.2fs",
+            backup.name,
+            len(sql),
+            time.perf_counter() - started,
+        )
+        return backup.name
+
+
 def build_backup_config(settings: Settings) -> BackupConfig:
     """Assemble the backup config from platform settings.
 
