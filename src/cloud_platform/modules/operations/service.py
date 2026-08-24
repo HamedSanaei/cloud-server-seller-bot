@@ -452,6 +452,8 @@ class ProvisioningWorker:
         claimed.fail(reason)
         await self._ops.save(claimed)
         await self._release_hold(server)
+        # M11-006: the provisioning-failure alert feed.
+        metrics.record_provisioning_failure("worker")
         if server.state in (
             ServerLifecycleState.REQUESTED,
             ServerLifecycleState.PROVISIONING,
@@ -567,6 +569,9 @@ class CreateTimeoutReconciler:
 
         def bump(outcome: ReconciliationOutcome) -> None:
             counts[outcome] = counts.get(outcome, 0) + 1
+            # M11-006: the reconciliation drift alert feed (every outcome of
+            # every round, per reconciler - drift = failed / marked_for_review).
+            metrics.record_reconciliation("create", outcome.value)
 
         in_flight_ops = await self._ops.list_in_flight(OperationType.SERVER_CREATE)
         requested_servers = await self._servers.list_requested()
@@ -745,6 +750,8 @@ class CreateTimeoutReconciler:
 
         if remote is None:
             # The provider resource vanished: the create failed at the provider.
+            # M11-006: the provisioning-failure alert feed (reconciliation stage).
+            metrics.record_provisioning_failure("reconciliation")
             try:
                 server.transition_to(ServerLifecycleState.ERROR)
                 await self._servers.save(server)
@@ -783,6 +790,8 @@ class CreateTimeoutReconciler:
         op.fail(reason)
         await self._ops.save(op)
         await self._release_hold(server)
+        # M11-006: the provisioning-failure alert feed (intent stage).
+        metrics.record_provisioning_failure("intent")
         if server.state in (
             ServerLifecycleState.REQUESTED,
             ServerLifecycleState.PROVISIONING,
@@ -2362,6 +2371,8 @@ class DeleteTimeoutReconciler:
 
         def bump(outcome: DeleteReconciliationOutcome) -> None:
             counts[outcome] = counts.get(outcome, 0) + 1
+            # M11-006: the reconciliation drift alert feed.
+            metrics.record_reconciliation("delete", outcome.value)
 
         # 1) IN_FLIGHT delete operations past the timeout (ambiguous window).
         for op in await self._ops.list_in_flight(OperationType.SERVER_DELETE):

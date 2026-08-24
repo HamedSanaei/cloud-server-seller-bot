@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from arq.connections import RedisSettings
@@ -150,6 +151,7 @@ async def process_deletes(ctx: dict[str, object]) -> None:
         )
         from cloud_platform.modules.billing.service import FinalChargeService
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.domain import OperationType
         from cloud_platform.modules.operations.repository import (
             SqlAlchemyOperationRepository,
         )
@@ -209,6 +211,14 @@ async def process_deletes(ctx: dict[str, object]) -> None:
             executor=executor,
         )
         await worker.process_pending_deletes()
+        # M11-006: the queue-age alert feed for the delete work queue.
+        ops_repo = SqlAlchemyOperationRepository(SessionFactory)
+        metrics.record_operation_queue_age(
+            OperationType.SERVER_DELETE.value,
+            await ops_repo.oldest_pending_age_seconds(
+                [OperationType.SERVER_DELETE], datetime.now(UTC)
+            ),
+        )
 
 
 async def reconcile_deletes(ctx: dict[str, object]) -> None:

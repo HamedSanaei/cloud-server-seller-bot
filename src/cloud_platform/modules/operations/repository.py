@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -165,6 +165,24 @@ class SqlAlchemyOperationRepository:
                 .all()
             )
             return [_to_domain(row) for row in rows]
+
+    async def oldest_pending_age_seconds(
+        self, operation_types: Sequence[OperationType], now: datetime
+    ) -> float | None:
+        """Age (seconds) of the oldest PENDING operation; None when empty."""
+        async with self._session_factory() as session:
+            values = [t.value for t in operation_types]
+            oldest = await session.scalar(
+                select(func.min(_OperationModel.created_at)).where(
+                    _OperationModel.operation_type.in_(values),
+                    _OperationModel.status == OperationStatus.PENDING.value,
+                )
+            )
+            if oldest is None:
+                return None
+            if oldest.tzinfo is None:
+                oldest = oldest.replace(tzinfo=UTC)
+            return (now - oldest).total_seconds()
 
     async def claim(self, operation_id: UUID) -> Operation | None:
         """Atomically claim a PENDING operation; None when the race is lost."""

@@ -297,6 +297,15 @@ class OperationRepository(Protocol):
         """All PENDING operations of the given types (worker queue)."""
         ...
 
+    async def oldest_pending_age_seconds(
+        self, operation_types: Sequence[OperationType], now: datetime
+    ) -> float | None:
+        """Age (seconds) of the oldest PENDING operation of the given types.
+
+        None when the queue is empty (M11-006 queue-age alert feed).
+        """
+        ...
+
     async def claim(self, operation_id: UUID) -> Operation | None:
         """Atomically claim a PENDING operation (-> IN_FLIGHT, attempts+1).
 

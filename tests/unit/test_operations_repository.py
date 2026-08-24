@@ -128,3 +128,26 @@ class TestClaim:
         db.execute = AsyncMock(return_value=MagicMock(rowcount=0))
 
         assert await _repo(db).claim(uuid4()) is None
+
+
+class TestOldestPendingAge:
+    """M11-006 queue-age feed: the age of the oldest PENDING operation."""
+
+    async def test_empty_queue_is_none(self, db: AsyncMock) -> None:
+        from datetime import UTC, datetime
+
+        db.scalar = AsyncMock(return_value=None)
+        age = await _repo(db).oldest_pending_age_seconds(
+            [OperationType.SERVER_DELETE], datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+        )
+        assert age is None
+
+    async def test_naive_created_at_treated_as_utc(self, db: AsyncMock) -> None:
+        from datetime import UTC, datetime
+
+        created = datetime(2026, 8, 24, 11, 30)  # naive, as the DB returns it
+        db.scalar = AsyncMock(return_value=created)
+        age = await _repo(db).oldest_pending_age_seconds(
+            [OperationType.SERVER_DELETE], datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+        )
+        assert age == 30 * 60

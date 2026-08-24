@@ -17,7 +17,13 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
+from prometheus_client import (
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 from cloud_platform.providers.errors import (
     ProviderAuthError,
@@ -113,6 +119,42 @@ class PlatformMetrics:
             registry=self.registry,
         )
 
+        # -- Alert feeds (M11-006) ------------------------------------------
+        # Spend: daily provider cost in minor units (gauge, set by the cost
+        # circuit breaker as it aggregates the current UTC day).
+        self.daily_global_provider_cost_minor = Gauge(
+            "cloud_platform_daily_global_provider_cost_minor",
+            "Provider cost (minor units) accrued in the current UTC day, all accounts",
+            registry=self.registry,
+        )
+        self.daily_provider_cost_minor = Gauge(
+            "cloud_platform_daily_provider_cost_minor",
+            "Provider cost (minor units) accrued in the current UTC day, per provider",
+            ("provider",),
+            registry=self.registry,
+        )
+        # Provisioning failures by the stage that detected them.
+        self.provisioning_failures_total = Counter(
+            "cloud_platform_provisioning_failures_total",
+            "Permanent provisioning failures by stage",
+            ("stage",),
+            registry=self.registry,
+        )
+        # Reconciliation drift: local state diverged from provider reality.
+        self.reconciliation_outcomes_total = Counter(
+            "cloud_platform_reconciliation_outcomes_total",
+            "Reconciliation round outcomes by reconciler and outcome",
+            ("reconciler", "outcome"),
+            registry=self.registry,
+        )
+        # Queue age: seconds since the oldest PENDING operation was created.
+        self.operation_queue_age_seconds = Gauge(
+            "cloud_platform_operation_queue_age_seconds",
+            "Age of the oldest pending operation, in seconds",
+            ("operation_type",),
+            registry=self.registry,
+        )
+
     # -- instrumentation helpers ------------------------------------------
 
     @asynccontextmanager
@@ -150,6 +192,29 @@ class PlatformMetrics:
     def record_billing_event(self, event: str, result: str) -> None:
         """Count one billing fund event (e.g. hold_created / hold_captured)."""
         self.billing_events_total.labels(event=event, result=result).inc()
+
+    # -- alert-feed helpers (M11-006) --------------------------------------
+
+    def record_daily_provider_cost(self, global_minor: int, by_provider: dict[str, int]) -> None:
+        """Set the current-UTC-day provider cost gauges (the spend alert feed)."""
+        self.daily_global_provider_cost_minor.set(global_minor)
+        for provider, minor in by_provider.items():
+            self.daily_provider_cost_minor.labels(provider=provider).set(minor)
+
+    def record_provisioning_failure(self, stage: str) -> None:
+        """Count one permanent provisioning failure (worker|reconciliation|intent)."""
+        self.provisioning_failures_total.labels(stage=stage).inc()
+
+    def record_reconciliation(self, reconciler: str, outcome: str) -> None:
+        """Count one reconciliation outcome (drift is failed/marked_for_review)."""
+        self.reconciliation_outcomes_total.labels(reconciler=reconciler, outcome=outcome).inc()
+
+    def record_operation_queue_age(self, operation_type: str, age_seconds: float | None) -> None:
+        """Set the age of the oldest pending operation; None clears the gauge."""
+        if age_seconds is None:
+            self.operation_queue_age_seconds.labels(operation_type=operation_type).set(0)
+        else:
+            self.operation_queue_age_seconds.labels(operation_type=operation_type).set(age_seconds)
 
     def render(self) -> bytes:
         """The Prometheus text exposition for the /metrics endpoint."""

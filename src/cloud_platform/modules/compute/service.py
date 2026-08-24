@@ -15,9 +15,10 @@ hold.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Protocol
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID, uuid4
 
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
@@ -29,6 +30,11 @@ from cloud_platform.modules.catalog.domain import (
 )
 from cloud_platform.modules.compute.domain import (
     CloudServer,
+    CostCircuitBreaker,
+    CostLimit,
+    CostLimitRepository,
+    CostLimitScopeKind,
+    CostLimitTrigger,
     MaintenanceBlock,
     MaintenanceScope,
     MaintenanceSwitchRepository,
@@ -62,6 +68,10 @@ from cloud_platform.modules.wallet.domain import (
     HoldRepository,
     WalletRepository,
 )
+from cloud_platform.observability.metrics import metrics
+
+if TYPE_CHECKING:
+    from cloud_platform.modules.billing.service import AccrualPeriodRepository
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +98,10 @@ class QuotaExceededError(CreateServerCommandError):
 
 class MaintenanceBlockedError(CreateServerCommandError):
     """Raised when a maintenance switch blocks new orders for the scope."""
+
+
+class CostLimitReachedError(CreateServerCommandError):
+    """Raised when a daily cost circuit breaker halts new spend for the scope."""
 
 
 class MaintenanceSwitchError(Exception):
@@ -134,6 +148,7 @@ class CreateServerService:
         quota: QuotaPolicy | None = None,
         maintenance: MaintenanceSwitchService | None = None,
         terms: TermsGate | None = None,
+        cost_breaker: CostCircuitBreaker | None = None,
     ) -> None:
         if not book_name or not book_name.strip():
             raise ValueError("book_name must not be empty")
@@ -149,6 +164,7 @@ class CreateServerService:
         self._quota = quota or QuotaPolicy()
         self._maintenance = maintenance
         self._terms = terms
+        self._cost_breaker = cost_breaker
 
     @staticmethod
     def _hold_key(idempotency_key: str) -> str:
@@ -196,6 +212,7 @@ class CreateServerService:
             OfferNotFoundError: Unknown offer (from the catalog port).
             OfferDisabledError: Offer hidden/disabled.
             MaintenanceBlockedError: A maintenance switch blocks the scope.
+            CostLimitReachedError: A daily cost circuit breaker tripped.
             NoProviderAccountError: No active account with the provider.
             QuotaExceededError: Concurrent or lifetime quota reached.
             InsufficientHoldBalanceError: Wallet balance below the price.
@@ -241,6 +258,22 @@ class CreateServerService:
             raise NoProviderAccountError(
                 f"user {user.id} has no active {offer_ref.provider_key} account"
             )
+
+        # 3.5 Cost circuit breaker (M10-004), when wired: a tripped daily
+        # provider-cost cap (global or this account's) halts NEW spend.
+        # Checked before any money is reserved, like the maintenance switch.
+        if self._cost_breaker is not None:
+            trigger = await self._cost_breaker.check(account.id)
+            if trigger is not None:
+                where = (
+                    "all provider accounts"
+                    if trigger.scope is CostLimitScopeKind.GLOBAL
+                    else f"provider account {trigger.provider_account_id}"
+                )
+                raise CostLimitReachedError(
+                    f"new orders halted for {where}: daily provider cost "
+                    f"{trigger.spent_minor} reached the limit {trigger.limit_minor}"
+                )
 
         # 4. Price (versioned price book).
         when = at if at is not None else datetime.now(UTC)
@@ -629,3 +662,250 @@ class MaintenanceSwitchService:
     async def is_order_blocked(self, provider_key: str, location_id: str) -> bool:
         """True when new orders for the scope are currently blocked."""
         return await self.blocking_scope(provider_key, location_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# Cost circuit breakers (M10-004)
+# ---------------------------------------------------------------------------
+
+
+class CostCircuitBreakerService:
+    """Daily provider-cost caps that can halt new spend (M10-004).
+
+    Acceptance: **global/provider-account daily thresholds can halt new
+    spend.** The daily spend is the provider COST accrued today (UTC day,
+    the ``cost_minor`` of the accrual-period records - what the platform
+    actually spends with providers), scoped to:
+
+    - the GLOBAL limit: every server of every provider account;
+    - a PROVIDER ACCOUNT limit: only that account's (non-deleted) servers.
+
+    A scope whose accrued cost reaches its limit is tripped; the create
+    command consults :meth:`check` before reserving any funds and refuses
+    new orders while a scope is tripped. The account's own limit is the
+    most specific trigger and wins over the global one in the error. No
+    limit row, a disabled row, or a limit of 0-or-less never trips
+    (``active`` is False), so the breaker is opt-in per scope.
+
+    This is a gate on NEW spend only: existing servers keep running and
+    keep accruing until an operator raises the limit or the day rolls
+    over; nothing here stops, bills, or deletes anything.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit_repo: CostLimitRepository,
+        server_repo: ServerRepository,
+        accrual_repo: AccrualPeriodRepository,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._limits = limit_repo
+        self._servers = server_repo
+        self._accruals = accrual_repo
+        self._now = clock or (lambda: datetime.now(UTC))
+
+    def _day_window(self, now: datetime) -> tuple[datetime, datetime]:
+        """The current UTC day as a half-open [start, end) window."""
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return day_start, day_start + timedelta(days=1)
+
+    async def _spent_today(self, server_ids: frozenset[UUID], now: datetime) -> int:
+        day_start, day_end = self._day_window(now)
+        return await self._accruals.daily_cost_total(day_start, day_end, server_ids)
+
+    async def check(self, provider_account_id: UUID) -> CostLimitTrigger | None:
+        """The tripped scope for new spend on this account, if any."""
+        now = self._now()
+
+        # M11-006: the spend alert feed - always set, so the gauge reflects
+        # the current UTC day even when no cost limit is configured.
+        all_ids = frozenset(await self._servers.list_non_deleted_ids())
+        global_spent = await self._spent_today(all_ids, now)
+        metrics.record_daily_provider_cost(global_spent, {})
+
+        # Most specific first: the account's own limit, then the global one.
+        account_limit = await self._limits.get_for_account(provider_account_id)
+        if account_limit is not None and account_limit.active:
+            account_ids = frozenset(
+                await self._servers.list_account_server_ids(provider_account_id)
+            )
+            spent = await self._spent_today(account_ids, now)
+            if spent >= account_limit.limit_minor:
+                return CostLimitTrigger(
+                    scope=CostLimitScopeKind.PROVIDER_ACCOUNT,
+                    provider_account_id=provider_account_id,
+                    limit_minor=account_limit.limit_minor,
+                    spent_minor=spent,
+                )
+
+        global_limit = await self._limits.get_global()
+        if global_limit is not None and global_limit.active:
+            if global_spent >= global_limit.limit_minor:
+                return CostLimitTrigger(
+                    scope=CostLimitScopeKind.GLOBAL,
+                    provider_account_id=None,
+                    limit_minor=global_limit.limit_minor,
+                    spent_minor=global_spent,
+                )
+        return None
+
+    async def status(self, provider_account_id: UUID | None = None) -> list[tuple[CostLimit, int]]:
+        """(limit, spent_today) for every active limit (inspection)."""
+        now = self._now()
+        day_start, day_end = self._day_window(now)
+        out: list[tuple[CostLimit, int]] = []
+        for limit in await self._limits.list_all():
+            if not limit.active:
+                continue
+            if limit.scope is CostLimitScopeKind.GLOBAL:
+                ids = frozenset(await self._servers.list_non_deleted_ids())
+            elif provider_account_id is not None and (
+                limit.provider_account_id != provider_account_id
+            ):
+                continue
+            else:
+                assert limit.provider_account_id is not None
+                ids = frozenset(
+                    await self._servers.list_account_server_ids(limit.provider_account_id)
+                )
+            spent = await self._accruals.daily_cost_total(day_start, day_end, ids)
+            out.append((limit, spent))
+        return out
+
+
+class CostLimitAdminService:
+    """Admin commands that manage the daily cost limits (M10-004).
+
+    Mutations are admin-gated (``admin:manage_settings``) and audited, like
+    the maintenance switches (M10-005). Setting a limit of 0 or disabling a
+    row disables enforcement for the scope (no limit = no breaker).
+    """
+
+    def __init__(
+        self,
+        *,
+        limit_repo: CostLimitRepository,
+        audit_repo: AuditRepository,
+    ) -> None:
+        self._limits = limit_repo
+        self._audit = AuditTrail(audit_repo)
+
+    @staticmethod
+    def _actor_context(actor: User | None) -> tuple[ActorType, UUID | None]:
+        if actor is None:
+            return ActorType.SYSTEM, None
+        return ActorType.ADMIN, actor.id
+
+    @staticmethod
+    def _authorize(actor: User | None) -> None:
+        if actor is not None:
+            PermissionChecker(actor).require(Permission.ADMIN_MANAGE_SETTINGS)
+
+    async def set_global(
+        self,
+        *,
+        actor: User | None,
+        limit_minor: int,
+        enabled: bool = True,
+        reason: str = "",
+    ) -> CostLimit:
+        """Set (or clear) the global daily provider-cost cap."""
+        self._authorize(actor)
+        if limit_minor < 0:
+            raise ValueError("limit_minor must not be negative")
+        saved = await self._limits.upsert(
+            CostLimit(
+                scope=CostLimitScopeKind.GLOBAL,
+                limit_minor=limit_minor,
+                enabled=enabled,
+            )
+        )
+        actor_type, actor_id = self._actor_context(actor)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="cost_limit.set",
+            resource_type="cost_limit",
+            resource_id="global",
+            reason=reason,
+            metadata={
+                "scope": "global",
+                "limit_minor": str(limit_minor),
+                "enabled": str(enabled),
+            },
+        )
+        return saved
+
+    async def set_for_account(
+        self,
+        *,
+        actor: User | None,
+        provider_account_id: UUID,
+        limit_minor: int,
+        enabled: bool = True,
+        reason: str = "",
+    ) -> CostLimit:
+        """Set (or clear) one provider account's daily provider-cost cap."""
+        self._authorize(actor)
+        if limit_minor < 0:
+            raise ValueError("limit_minor must not be negative")
+        saved = await self._limits.upsert(
+            CostLimit(
+                scope=CostLimitScopeKind.PROVIDER_ACCOUNT,
+                limit_minor=limit_minor,
+                provider_account_id=provider_account_id,
+                enabled=enabled,
+            )
+        )
+        actor_type, actor_id = self._actor_context(actor)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="cost_limit.set",
+            resource_type="cost_limit",
+            resource_id=str(provider_account_id),
+            reason=reason,
+            metadata={
+                "scope": "provider_account",
+                "provider_account_id": str(provider_account_id),
+                "limit_minor": str(limit_minor),
+                "enabled": str(enabled),
+            },
+        )
+        return saved
+
+    async def clear(
+        self,
+        *,
+        actor: User | None,
+        provider_account_id: UUID | None = None,
+        reason: str = "",
+    ) -> bool:
+        """Remove a limit row (global or one account's). True when removed."""
+        self._authorize(actor)
+        if provider_account_id is None:
+            removed = await self._limits.remove(CostLimitScopeKind.GLOBAL)
+            resource_id = "global"
+            scope = "global"
+        else:
+            removed = await self._limits.remove(
+                CostLimitScopeKind.PROVIDER_ACCOUNT, provider_account_id
+            )
+            resource_id = str(provider_account_id)
+            scope = "provider_account"
+        actor_type, actor_id = self._actor_context(actor)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="cost_limit.clear",
+            resource_type="cost_limit",
+            resource_id=resource_id,
+            reason=reason,
+            metadata={"scope": scope, "removed": str(removed)},
+        )
+        return removed
+
+    async def list(self) -> list[CostLimit]:
+        """Every configured limit row (inspection, read-only)."""
+        return await self._limits.list_all()

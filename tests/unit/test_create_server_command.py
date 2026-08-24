@@ -162,6 +162,7 @@ class _Deps:
         self,
         quota: QuotaPolicy | None = None,
         maintenance: MaintenanceSwitchService | None = None,
+        cost_breaker=None,
     ) -> CreateServerService:
         return CreateServerService(
             server_repo=self.servers,  # type: ignore[arg-type]
@@ -175,6 +176,7 @@ class _Deps:
             book_name="retail-eur",
             quota=quota,
             maintenance=maintenance,
+            cost_breaker=cost_breaker,
         )
 
     def run(self, **overrides: object):
@@ -187,8 +189,11 @@ class _Deps:
         kwargs.update(overrides)
         quota = kwargs.pop("quota", None)
         maintenance = kwargs.pop("maintenance", None)
+        cost_breaker = kwargs.pop("cost_breaker", None)
         return (
-            self.service(quota=quota, maintenance=maintenance).create_server(**kwargs)  # type: ignore[arg-type]
+            self.service(
+                quota=quota, maintenance=maintenance, cost_breaker=cost_breaker
+            ).create_server(**kwargs)  # type: ignore[arg-type]
         )
 
 

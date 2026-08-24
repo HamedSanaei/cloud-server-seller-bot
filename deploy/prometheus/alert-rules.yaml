@@ -1,0 +1,241 @@
+# Prometheus alerting rules for the cloud platform (M11-006).
+#
+# Acceptance: alerts for spend, 429, provisioning failure, queue age and
+# reconciliation drift.
+#
+# Load with the Prometheus `rule_files:` setting (or Grafana's Prometheus
+# rule provisioning). Every metric referenced here is exported by
+# cloud_platform.observability.metrics.PlatformMetrics on the /metrics
+# endpoint; tests/unit/test_alert_rules.py validates that the file parses,
+# that all five topics are present, that the queue-age alert feeds are
+# wired for both operation types, and that every referenced metric exists
+# in the metrics registry, so the rules cannot drift from the code.
+#
+# Conventions:
+# - severities: page (call someone now) / warn (fix during working hours) /
+#   info (track it).
+# - thresholds are starting points; tune `for` durations to your job cadence
+#   (the workers run every few minutes).
+
+groups:
+  - name: platform.spend
+    interval: 60s
+    rules:
+      # The current-UTC-day provider cost approached the configured global
+      # cost limit (the cost circuit breaker, M10-004). At 100% new orders
+      # are halted; the operator should raise the limit or let the day roll
+      # over before customers notice.
+      - alert: DailyProviderCostNearLimit
+        expr: |
+          cloud_platform_daily_global_provider_cost_minor
+            /
+          (
+            max(cloud_platform_daily_global_provider_cost_minor offset 1h)
+            or cloud_platform_daily_global_provider_cost_minor
+          )
+          > 0.8
+          and
+          cloud_platform_daily_global_provider_cost_minor > 0
+        for: 5m
+        labels:
+          severity: warn
+          topic: spend
+        annotations:
+          summary: "Daily provider cost is above 80% of a busy-hour level"
+          description: >
+            The platform has accrued {{ $value | humanize }} minor units of
+            provider cost today. If a global cost limit is configured
+            (M10-004), new orders halt when the limit is reached; consider
+            raising the limit or investigating the spend.
+
+      # Sustained spend growth: today's daily cost is already far above the
+      # highest level seen in the previous 24h - a run-away spend signal
+      # (fleet explosion, price book error, provider metering bug).
+      - alert: DailyProviderCostSpiking
+        expr: |
+          cloud_platform_daily_global_provider_cost_minor
+            >
+          3 * (
+            max_over_time(cloud_platform_daily_global_provider_cost_minor[24h])
+            or vector(0)
+          )
+          and
+          cloud_platform_daily_global_provider_cost_minor > 100000
+        for: 10m
+        labels:
+          severity: warn
+          topic: spend
+        annotations:
+          summary: "Daily provider cost is spiking"
+          description: >
+            Today's accrued provider cost is more than 3x the highest level
+            of the past 24h and already above 1,000 EUR (100000 minor
+            units). Check fleet growth, price book changes and provider
+            metering.
+
+  - name: platform.provider
+    rules:
+      # The provider is throttling us: a sustained stream of 429s means we
+      # are hitting rate limits (backoff pressure, queued operations).
+      - alert: ProviderRateLimited
+        expr: |
+          sum by (provider) (
+            rate(cloud_platform_provider_calls_total{outcome="rate_limited"}[10m])
+          )
+          > 0
+        for: 5m
+        labels:
+          severity: warn
+          topic: provider-429
+        annotations:
+          summary: "Provider {{ $labels.provider }} is returning 429"
+          description: >
+            Provider {{ $labels.provider }} has been rate-limiting requests
+            for at least 5 minutes ({{ $value }} 429s/s). Reconcilers and
+            the provisioning worker will retry with backoff, but sustained
+            throttling delays provisioning; check API quotas and request
+            volume.
+
+      # Auth failures mean credentials are broken (rotation, typo):
+      # provisioning and reconciliation cannot work until fixed.
+      - alert: ProviderAuthFailing
+        expr: |
+          sum by (provider) (
+            rate(cloud_platform_provider_calls_total{outcome="auth_error"}[10m])
+          )
+          > 0
+        for: 2m
+        labels:
+          severity: page
+          topic: provider-429
+        annotations:
+          summary: "Provider {{ $labels.provider }} auth is failing"
+          description: >
+            Provider {{ $labels.provider }} is rejecting our credentials
+            ({{ $value }} auth errors/s). Rotate/fix the provider token -
+            all operations against this provider will fail until then.
+
+  - name: platform.provisioning
+    rules:
+      # Permanent provisioning failures: the server could not be created
+      # (provider error, reconciliation lost the resource, intent invalid).
+      # A single failure is worth a page: the customer paid and got no
+      # server, and the hold was released.
+      - alert: ProvisioningFailing
+        expr: |
+          sum(
+            increase(cloud_platform_provisioning_failures_total[30m])
+          )
+          >= 1
+        for: 0m
+        labels:
+          severity: page
+          topic: provisioning-failure
+        annotations:
+          summary: "{{ $value }} permanent provisioning failure(s) in the last 30m"
+          description: >
+            One or more servers failed to provision permanently
+            (worker/reconciliation/intent stages). Inspect the
+            server.provisioning_failed / server.provisioning_lost audit
+            events and the operation ledger; the customer holds were
+            released and the orders can be re-issued.
+
+      # The provisioning worker itself stopped running: job errors or no
+      # runs at all mean new orders sit in the queue forever.
+      - alert: ProvisioningWorkerNotRunning
+        expr: |
+          sum(rate(cloud_platform_job_runs_total{job="provisioning_worker"}[15m])) == 0
+        for: 15m
+        labels:
+          severity: page
+          topic: provisioning-failure
+        annotations:
+          summary: "The provisioning worker has not run for 15 minutes"
+          description: >
+            No provisioning_worker job runs were observed for 15 minutes.
+            Check the worker process (arq) and the job error rate.
+
+  - name: platform.queue
+    rules:
+      # Deletions waiting in the queue: an old PENDING delete operation
+      # means the customer asked to stop paying for a server that keeps
+      # being billed (until it is deleted and finally charged).
+      - alert: DeleteQueueAging
+        expr: |
+          cloud_platform_operation_queue_age_seconds{operation_type="server_delete"}
+          > 3600
+        for: 5m
+        labels:
+          severity: warn
+          topic: queue-age
+        annotations:
+          summary: "Oldest pending delete operation is over an hour old"
+          description: >
+            The oldest PENDING server_delete operation is
+            {{ $value | humanize }} seconds old. The delete worker should
+            clear the queue within minutes; check process_deletes job
+            errors and provider availability.
+
+      # Create queue aging (the provisioning queue): orders waiting long
+      # before the worker picks them up (worker down, backlogged, or the
+      # provider is slow and operations are stuck PENDING/IN_FLIGHT).
+      - alert: CreateQueueAging
+        expr: |
+          cloud_platform_operation_queue_age_seconds{operation_type="server_create"}
+          > 1800
+        for: 10m
+        labels:
+          severity: warn
+          topic: queue-age
+        annotations:
+          summary: "Oldest pending create operation is over 30 minutes old"
+          description: >
+            The oldest PENDING server_create operation is
+            {{ $value | humanize }} seconds old. Check the provisioning
+            worker and provider health.
+
+  - name: platform.reconciliation
+    rules:
+      # Reconciliation drift: the reconcilers discovered that local state
+      # diverged from provider reality (lost provider resources, uncertain
+      # states contained to MANUAL_REVIEW, vanished server rows). Any
+      # failed/marked_for_review outcome is drift - investigate the audit
+      # trail (server.provisioning_lost, server.contained, ...).
+      - alert: ReconciliationDriftDetected
+        expr: |
+          sum(
+            increase(
+              cloud_platform_reconciliation_outcomes_total{
+                outcome=~"failed|marked_for_review|recreated_operation"
+              }[30m]
+            )
+          )
+          >= 1
+        for: 0m
+        labels:
+          severity: page
+          topic: reconciliation-drift
+        annotations:
+          summary: "{{ $value }} reconciliation drift outcome(s) in the last 30m"
+          description: >
+            The create/delete reconcilers detected divergence between local
+            state and provider reality (failed, marked_for_review or
+            recreated_operation outcomes). Review the audit trail and the
+            MANUAL_REVIEW server queue; a human decision may be needed.
+
+      # Reconciler not running: if neither reconciler has produced ANY
+      # outcome (not even skipped) for a long window, the cron jobs are
+      # dead and ambiguity will pile up unnoticed.
+      - alert: ReconcilersNotRunning
+        expr: |
+          sum(rate(cloud_platform_reconciliation_outcomes_total[30m])) == 0
+        for: 30m
+        labels:
+          severity: warn
+          topic: reconciliation-drift
+        annotations:
+          summary: "No reconciliation outcomes for 30 minutes"
+          description: >
+            The create/delete reconcilers have not produced any outcome for
+            30 minutes (not even skipped). Check the reconcile cron jobs
+            (arq) - ambiguity windows are no longer being resolved.

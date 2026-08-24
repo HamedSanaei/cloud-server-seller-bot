@@ -289,6 +289,42 @@ class LowBalanceNotification(Base):
     sent_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", nullable=False)
 
 
+class CostLimit(Base):
+    """A daily provider-cost cap for one scope (M10-004).
+
+    The global row (provider_account_id NULL) caps spend across every
+    provider account; a per-account row caps one account's servers.
+    When the accrued provider cost of the current UTC day reaches the
+    limit, new orders for the scope are blocked (circuit breaker).
+
+    Attributes:
+        id: Primary key
+        scope: "global" or "provider_account"
+        provider_account_id: The account (per-account scopes only)
+        limit_minor: Daily cap in provider-cost minor units
+        enabled: Whether the limit is enforced
+        updated_at: Last change
+    """
+
+    __tablename__ = "cost_limits"
+    __table_args__ = (
+        UniqueConstraint(
+            "scope",
+            "provider_account_id",
+            name="uq_cost_limits_scope_account",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    scope = Column(String, nullable=False)
+    provider_account_id = Column(
+        PG_UUID, ForeignKey("provider_accounts.id", ondelete="CASCADE"), nullable=True
+    )
+    limit_minor = Column(BigInteger, nullable=False)
+    enabled = Column(Boolean, nullable=False, server_default="true")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+
+
 class Server(Base):
     """Represents a cloud server instance with lifecycle states.
 

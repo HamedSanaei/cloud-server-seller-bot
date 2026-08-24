@@ -110,6 +110,13 @@ class AccrualPeriodRepository(Protocol):
         """Sum of selling_minor billed to the wallet at/after month_start (caps)."""
         ...
 
+    async def daily_cost_total(
+        self, day_start: datetime, day_end: datetime, server_ids: frozenset[UUID]
+    ) -> int:
+        """Sum of cost_minor (provider spend) with period_start in [start, end)
+        restricted to ``server_ids`` (cost circuit breakers, M10-004)."""
+        ...
+
 
 class JobLock(Protocol):
     """Port for a lock that serializes accrual runs across processes."""

@@ -1864,13 +1864,46 @@ tasks:
   milestone: M10
   title: Implement cost circuit breakers
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M06-008
   acceptance:
   - Global/provider-account daily thresholds can halt new spend.
-  evidence: []
+  evidence:
+  - '2026-08-24: Implemented cost circuit breakers (M10-004); acceptance ''Global/provider-account daily thresholds can halt
+    new spend'' holds. Design: the daily spend of the platform is the provider COST accrued in the current UTC day (the cost_minor
+    of the accrual-period records, M06-005) - what we actually spend with providers. A scope whose accrued cost reaches its
+    configured cap is ''tripped'' and new orders for that scope are refused until the limit is raised or the day rolls over.
+    NEW domain (compute/domain.py): CostLimitScopeKind (GLOBAL / PROVIDER_ACCOUNT), CostLimit (scope, limit_minor int minor
+    units, provider_account_id for per-account rows, enabled; validated: global has no account id, account needs one, no negative
+    limits; active = enabled and limit > 0 so a zero/disabled row never trips), CostLimitTrigger (the tripped scope + limit
+    + spent level for the error message), CostLimitRepository port (get_global / get_for_account / list_all / upsert / remove)
+    and the CostCircuitBreaker port the create command consults: check(provider_account_id) -> CostLimitTrigger | None (most
+    specific first - the account''s own limit before the global one). NEW service (compute/service.py): CostCircuitBreakerService(limit_repo,
+    server_repo, accrual_repo, clock) - _day_window gives the current UTC day as a half-open [start, end); check() sums today''s
+    cost via the NEW AccrualPeriodRepository.daily_cost_total(day_start, day_end, server_ids) (port + SqlAlchemy implementation:
+    SUM(cost_minor) over period_start in the window restricted to the given server ids, empty set -> 0) for the account''s
+    own servers (NEW ServerRepository.list_account_server_ids, non-deleted) against the account limit, then over every non-deleted
+    server (NEW ServerRepository.list_non_deleted_ids) against the global limit; status() returns (limit, spent_today) for
+    every active limit for inspection. GATE in CreateServerService: optional cost_breaker constructor param wired at step
+    3.5 - right after the provider-account lookup, BEFORE any funds are reserved (same fail-fast position as the M10-005 maintenance
+    switch, which stays in front of it); a tripped scope raises the new CostLimitReachedError (a CreateServerCommandError)
+    naming the scope (all provider accounts / provider account <id>) and the spent-vs-limit minor amounts. Admin side: CostLimitAdminService(limit_repo,
+    audit_repo) with set_global / set_for_account (admin-gated via admin:manage_settings, audited as cost_limit.set with scope/limit/enabled
+    metadata; a limit of 0 or enabled=False disables the scope) and clear (cost_limit.clear, True when a row was removed)
+    - the admin API surface lands with M14-003. DB: new cost_limits table (alembic 0020, model in db/base.py) with unique
+    (scope, provider_account_id) - one row per scope, provider_account_id NULL for the global row, FK to provider_accounts
+    CASCADE. 20 new tests: check() - no limits never trip, a global trip blocks every account (spent aggregated across accounts),
+    an account trip blocks only that account, the account trigger wins over a simultaneously tripped global one (most specific),
+    disabled and zero limits never trip, the queried window is exactly the current UTC day with the right server set, and
+    a per-account scope ignores other accounts'' spend; status() - active limits listed with their spent today, inactive limits
+    skipped; create-command gate - a tripped breaker raises CostLimitReachedError and is consulted for the order''s account
+    BEFORE any hold is created or server row persisted (create_hold and servers.create both zero calls), a clear breaker allows
+    the normal happy path; admin - set_global audited with metadata, a non-admin actor is rejected (PermissionDeniedError)
+    with no row written, clear removes the row (True then False), negative limits rejected, list returns all rows; domain
+    validation (global rejects an account id, account requires one, negative rejected, active requires enabled+positive).
+    Also added the cost_breaker parameter to the existing create-command test harness (_Deps). Full suite 1197 passed.'
 - id: M10-005
   milestone: M10
   title: Implement provider/location maintenance switches
@@ -1959,14 +1992,43 @@ tasks:
   milestone: M10
   title: Add security regression tests
   priority: P0
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M10-002
   - M10-003
   acceptance:
   - Ownership, callback replay, secret redaction covered.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added the cross-cutting security regression suite (M10-009); acceptance ''Ownership, callback replay, secret
+    redaction covered'' holds. New tests/unit/test_security_regressions.py (33 tests) re-asserts in ONE module the security
+    invariants that every feature module promises individually, so a future refactor that breaks any of them fails the same
+    test file. 1) OWNERSHIP (no existence oracle, uniform outcomes, no audit probing of foreign ids): the delete confirmation
+    screen is None for a foreign server AND a missing one (and for a server already in DELETING - a uniform None, no state-leak)
+    with zero audit rows written for the probe; PowerControlsService.detail is None for foreign and missing alike while the
+    owner gets the capability-gated actions (a provider without the POWER capability exposes no actions); PowerCommandService.power_off
+    on a foreign server and on a missing server raise the SAME NotServerOwnerError type (the command re-checks ownership at
+    execution time, not the UI); MyServersService.list_servers never leaks foreign rows (filtered to the acting user, total
+    0 for the owner) and get_server returns a uniform None for a foreign detail id; WalletHistoryService.history for a wallet
+    the user does not own yields the same empty page (total 0) as a nonexistent wallet - the owner''s ledger entries are never
+    visible to the attacker. 2) CALLBACK REPLAY (an effect happens at most once; tampered callbacks are rejected, not re-interpreted):
+    the delete execute-callback round-trips with the idempotency key intact and a key-swap forgery (e.g. delete:execute:<id>:ik-99
+    under the old signature) fails signature verification; the delete saga replay (request twice with the same key) produces
+    exactly ONE operation for the saga key, ONE provider delete call and ONE final charge (the operation ledger is the replay
+    guard); the create command first delivery creates the intent (hold reserved once, one server row) and the second delivery
+    of the same command replays the stored outcome - create_hold stays at 1 call and servers.create at 1 call - and an idempotency
+    key owned by another user is rejected with CreateServerCommandError before any funds move; the payment webhook endpoint:
+    a replayed (gateway-retried) callback returns duplicate_ignored and wallet.add_funds is awaited exactly once, and an attacker
+    who inflates amount_minor in the body but keeps the honest signature gets a 401 with no deposit (signature binds the body).
+    3) SECRET REDACTION (secrets never reach output): the structlog redaction processor masks hetzner_api_token / authorization
+    / password / api_key / provider_credential_encryption_key / ssh_private_key / token / client_secret values in flat, nested
+    and list-shaped events while leaving non-sensitive fields (user_id, server_id, action, count) untouched; a Bearer pattern
+    in free text is masked with the secret removed; backup DSN redaction keeps host/port/db and masks the password (passwordless
+    DSNs pass through unchanged); FernetSecretBox envelopes: repr/str never contain the plaintext or the ciphertext token,
+    decrypt round-trips, a tampered token (first char flipped) raises SecretBoxError (MAC check), and a wrong master key also
+    raises SecretBoxError. The webhook signature helpers are asserted directly too: verify_gateway_signature accepts the honest
+    pair and rejects a tampered body, a wrong secret, and (from the existing M09 suite) empty secrets/signatures and non-latin1
+    signatures. Full suite 1230 passed.'
 - id: M11-001
   milestone: M11
   title: Add Prometheus metrics
@@ -2069,13 +2131,47 @@ tasks:
   milestone: M11
   title: Create alert rules
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M11-001
   acceptance:
   - Alerts for spend, 429, provisioning failure, queue age, reconciliation drift.
-  evidence: []
+  evidence:
+  - '2026-08-24: Created the alert rules (M11-006); acceptance ''Alerts for spend, 429, provisioning failure, queue age, reconciliation
+    drift'' holds. NEW deploy/prometheus/alert-rules.yaml: five rule groups (platform.spend / platform.provider / platform.provisioning
+    / platform.queue / platform.reconciliation), 10 alerts, each with a topic label, severity (page/warn), for-duration, summary+description
+    annotations, loadable via Prometheus rule_files or Grafana rule provisioning. SPEND: DailyProviderCostNearLimit (current-UTC-day
+    provider cost above 80% of the prior-hour level for 5m) and DailyProviderCostSpiking (today >3x the max of the past 24h
+    and already >1,000 EUR). 429: ProviderRateLimited (sustained rate(provider_calls_total{outcome=''rate_limited''}) per
+    provider, 5m) and ProviderAuthFailing (auth_error, 2m, page - broken credentials halt all operations against the provider).
+    PROVISIONING: ProvisioningFailing (increase(provisioning_failures_total[30m]) >= 1, page - the customer paid and got no
+    server) and ProvisioningWorkerNotRunning (no provisioning_worker job runs for 15m, page). QUEUE AGE: DeleteQueueAging
+    (oldest PENDING server_delete > 1h for 5m - the customer keeps being billed for a server that should be gone) and CreateQueueAging
+    (oldest PENDING server_create > 30m for 10m). RECONCILIATION DRIFT: ReconciliationDriftDetected (increase(reconciliation_outcomes_total{outcome=~''failed|marked_for_review|recreated_operation''}[30m])
+    >= 1, page - local state diverged from provider reality) and ReconcilersNotRunning (no outcome at all, not even skipped,
+    for 30m - the cron is dead and ambiguity piles up). To make every topic observable the metrics module gained four alert-feed
+    metrics (observability/metrics.py, closed label sets only): cloud_platform_daily_global_provider_cost_minor gauge (no
+    labels) + cloud_platform_daily_provider_cost_minor gauge (label provider - reserved for per-provider breakdowns), cloud_platform_provisioning_failures_total
+    counter (label stage: worker|reconciliation|intent), cloud_platform_reconciliation_outcomes_total counter (labels reconciler
+    create|delete + the closed outcome enum values) and cloud_platform_operation_queue_age_seconds gauge (label operation_type)
+    with helpers record_daily_provider_cost / record_provisioning_failure / record_reconciliation / record_operation_queue_age.
+    WIRING: CostCircuitBreakerService.check now always sets the global spend gauge (the current UTC day''s provider cost)
+    so the spend alerts work even with no cost limit configured; ProvisioningWorker._fail_permanent records stage=worker,
+    CreateTimeoutReconciler._reconcile_provisioning''s lost-resource branch records stage=reconciliation and _fail_intent
+    records stage=intent; both CreateTimeoutReconciler.reconcile and DeleteTimeoutReconciler.reconcile count EVERY outcome
+    (including skipped) into the drift feed via their bump(); the process_deletes worker job sets the server_delete queue-age
+    gauge after each run via the NEW OperationRepository.oldest_pending_age_seconds(operation_types, now) port method (SqlAlchemy
+    implementation: MIN(created_at) over PENDING rows, naive DB timestamps normalized to UTC, None for an empty queue). TESTS:
+    tests/unit/test_alert_rules.py (9 tests) pins the file to the code - it parses, groups and alert names are unique, every
+    rule has expr/for/severity/topic/annotations, all five acceptance topics are present, the 429 alert targets outcome=''rate_limited'',
+    the queue-age alerts reference BOTH operation types, and EVERY metric name referenced by any rule exists in the rendered
+    PlatformMetrics registry (the rules cannot drift from the code); tests/unit/test_alert_feed_metrics.py (7 tests) verifies
+    the wiring - check() sets the spend gauge to the day''s cost and still trips the breaker, the gauge is set even with no
+    limit configured, the worker failure path increments stage=worker (process_server with a missing provisioning spec), every
+    reconcile() outcome lands in the feed with reconciler=''create'' and the feed total equals the returned counts total,
+    and the 429 feed maps ProviderRateLimited to the closed rate_limited label via the existing provider_call helper; tests/unit/test_operations_repository.py
+    gained oldest_pending_age tests (empty queue is None, naive created_at treated as UTC). Full suite 1250 passed.'
 - id: M11-007
   milestone: M11
   title: Automate PostgreSQL backups

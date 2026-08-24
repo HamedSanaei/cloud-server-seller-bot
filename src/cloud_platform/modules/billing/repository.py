@@ -124,6 +124,25 @@ class SqlAlchemyAccrualPeriodRepository:
             )
             return int(total or 0)
 
+    async def daily_cost_total(
+        self, day_start: datetime, day_end: datetime, server_ids: frozenset[UUID]
+    ) -> int:
+        """Sum of provider cost (cost_minor) accrued in [day_start, day_end).
+
+        Empty ``server_ids`` yields 0 (no servers in the scope = no spend).
+        """
+        if not server_ids:
+            return 0
+        async with self._session_factory() as session:
+            total = await session.scalar(
+                select(func.coalesce(func.sum(_AccrualPeriodModel.cost_minor), 0)).where(
+                    _AccrualPeriodModel.period_start >= day_start,
+                    _AccrualPeriodModel.period_start < day_end,
+                    _AccrualPeriodModel.server_id.in_(list(server_ids)),
+                )
+            )
+            return int(total or 0)
+
 
 class PostgresAdvisoryAccrualLock:
     """Accrual run lock backed by a Postgres session-level advisory lock.

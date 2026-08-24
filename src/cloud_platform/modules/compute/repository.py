@@ -18,11 +18,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import Catalog as _CatalogModel
+from cloud_platform.db.base import CostLimit as _CostLimitModel
 from cloud_platform.db.base import MaintenanceBlock as _MaintenanceBlockModel
 from cloud_platform.db.base import Provider as _ProviderModel
 from cloud_platform.db.base import Server as _ServerModel
 from cloud_platform.modules.compute.domain import (
     CloudServer,
+    CostLimit,
+    CostLimitScopeKind,
     MaintenanceBlock,
     MaintenanceScope,
     ProvisioningSpec,
@@ -221,6 +224,39 @@ class SqlAlchemyServerRepository:
             ).all()
             return [_to_domain(server_row, str(name)) for server_row, name in rows]
 
+    async def list_non_deleted_ids(self) -> list[UUID]:
+        """Ids of every server not in the DELETED state (cost accounting)."""
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(_ServerModel.id).where(
+                            _ServerModel.state != ServerLifecycleState.DELETED.value
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return list(rows)
+
+    async def list_account_server_ids(self, provider_account_id: UUID) -> list[UUID]:
+        """Ids of the account's non-deleted servers (per-account cost scope)."""
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(_ServerModel.id).where(
+                            _ServerModel.provider_account_id == provider_account_id,
+                            _ServerModel.state != ServerLifecycleState.DELETED.value,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return list(rows)
+
     async def get_provisioning_spec(self, server_id: UUID) -> ProvisioningSpec | None:
         """Resolve the plan/location/currency the server's catalog offer maps to."""
         async with self._session_factory() as session:
@@ -394,6 +430,116 @@ class SqlAlchemyMaintenanceSwitchRepository:
                     select(_MaintenanceBlockModel).where(
                         _MaintenanceBlockModel.provider_key == scope.provider_key,
                         _MaintenanceBlockModel.location_id == (scope.location_id or ""),
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.commit()
+            return True
+
+
+class SqlAlchemyCostLimitRepository:
+    """Durable storage for daily cost limits (M10-004)."""
+
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+    ) -> None:
+        self._session_factory = session_factory
+
+    @staticmethod
+    def _to_domain(row: _CostLimitModel) -> CostLimit:
+        return CostLimit(
+            scope=CostLimitScopeKind(str(_attr(row, "scope"))),
+            limit_minor=int(_attr(row, "limit_minor")),
+            provider_account_id=_attr(row, "provider_account_id"),
+            enabled=bool(_attr(row, "enabled")),
+        )
+
+    @staticmethod
+    def _scope_filter(scope: CostLimitScopeKind, provider_account_id: UUID | None) -> Any:
+        if scope is CostLimitScopeKind.GLOBAL:
+            return _CostLimitModel.scope == scope.value
+        return (
+            _CostLimitModel.scope == scope.value,
+            _CostLimitModel.provider_account_id == provider_account_id,
+        )
+
+    async def get_global(self) -> CostLimit | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_CostLimitModel).where(
+                        _CostLimitModel.scope == CostLimitScopeKind.GLOBAL.value
+                    )
+                )
+            ).scalar_one_or_none()
+            return self._to_domain(row) if row is not None else None
+
+    async def get_for_account(self, provider_account_id: UUID) -> CostLimit | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_CostLimitModel).where(
+                        _CostLimitModel.scope == CostLimitScopeKind.PROVIDER_ACCOUNT.value,
+                        _CostLimitModel.provider_account_id == provider_account_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            return self._to_domain(row) if row is not None else None
+
+    async def list_all(self) -> list[CostLimit]:
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(_CostLimitModel).order_by(
+                            _CostLimitModel.scope, _CostLimitModel.provider_account_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [self._to_domain(row) for row in rows]
+
+    async def upsert(self, limit: CostLimit) -> CostLimit:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_CostLimitModel).where(
+                        _CostLimitModel.scope == limit.scope.value,
+                        _CostLimitModel.provider_account_id == limit.provider_account_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = _CostLimitModel(
+                    scope=limit.scope.value,
+                    provider_account_id=limit.provider_account_id,
+                    limit_minor=limit.limit_minor,
+                    enabled=limit.enabled,
+                )
+                session.add(row)
+            else:
+                cast_any: Any = row
+                cast_any.limit_minor = limit.limit_minor
+                cast_any.enabled = limit.enabled
+            await session.commit()
+            await session.refresh(row)
+            return self._to_domain(row)
+
+    async def remove(
+        self, scope: CostLimitScopeKind, provider_account_id: UUID | None = None
+    ) -> bool:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_CostLimitModel).where(
+                        _CostLimitModel.scope == scope.value,
+                        _CostLimitModel.provider_account_id == provider_account_id,
                     )
                 )
             ).scalar_one_or_none()

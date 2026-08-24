@@ -257,6 +257,96 @@ class MaintenanceBlock:
     updated_at: datetime | None = None
 
 
+# ---------------------------------------------------------------------------
+# Cost circuit breakers (M10-004)
+# ---------------------------------------------------------------------------
+
+
+class CostLimitScopeKind(StrEnum):
+    """The scope of one daily provider-cost limit."""
+
+    GLOBAL = "global"
+    PROVIDER_ACCOUNT = "provider_account"
+
+
+@dataclass(frozen=True, slots=True)
+class CostLimit:
+    """A daily provider-cost cap for one scope (M10-004).
+
+    ``limit_minor`` is the maximum provider cost (minor units) accrued in a
+    UTC day: the global cap covers every provider account, the per-account
+    cap only that account's servers. An entry with ``enabled`` False means
+    "no limit" for the scope (the breaker never trips).
+    """
+
+    scope: CostLimitScopeKind
+    limit_minor: int
+    provider_account_id: UUID | None = None
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if self.scope is CostLimitScopeKind.PROVIDER_ACCOUNT and self.provider_account_id is None:
+            raise ValueError("a provider-account limit needs a provider_account_id")
+        if self.scope is CostLimitScopeKind.GLOBAL and self.provider_account_id is not None:
+            raise ValueError("a global limit has no provider_account_id")
+        if self.limit_minor < 0:
+            raise ValueError("limit_minor must not be negative")
+
+    @property
+    def active(self) -> bool:
+        """Whether this limit can block orders."""
+        return self.enabled and self.limit_minor > 0
+
+
+@dataclass(frozen=True, slots=True)
+class CostLimitTrigger:
+    """Why new spend is halted: which limit tripped, at what level."""
+
+    scope: CostLimitScopeKind
+    provider_account_id: UUID | None
+    limit_minor: int
+    spent_minor: int
+
+
+class CostLimitRepository(Protocol):
+    """Port for cost-limit persistence (one row per scope)."""
+
+    async def get_global(self) -> CostLimit | None:
+        """The global limit row, or None."""
+        ...
+
+    async def get_for_account(self, provider_account_id: UUID) -> CostLimit | None:
+        """The provider-account limit row, or None."""
+        ...
+
+    async def list_all(self) -> list[CostLimit]:
+        """Every cost-limit row (inspection/reporting)."""
+        ...
+
+    async def upsert(self, limit: CostLimit) -> CostLimit:
+        """Create or update the limit for its scope."""
+        ...
+
+    async def remove(
+        self, scope: CostLimitScopeKind, provider_account_id: UUID | None = None
+    ) -> bool:
+        """Remove a limit row; True when a row was removed."""
+        ...
+
+
+class CostCircuitBreaker(Protocol):
+    """Port consulted by the create command before reserving funds (M10-004).
+
+    Returns the tripped :class:`CostLimitTrigger` (the most specific one:
+    the account's own limit before the global one) or None when new spend
+    for the order's scope is allowed.
+    """
+
+    async def check(self, provider_account_id: UUID) -> CostLimitTrigger | None:
+        """Whether new spend for this provider account is halted."""
+        ...
+
+
 def is_order_blocked(
     blocks: Sequence[MaintenanceBlock], provider_key: str, location_id: str
 ) -> bool:
@@ -316,6 +406,14 @@ class ServerRepository(Protocol):
 
     async def list_deletion_in_progress(self) -> list[CloudServer]:
         """All servers in DELETE_REQUESTED or DELETING (deletion reconciliation)."""
+        ...
+
+    async def list_non_deleted_ids(self) -> list[UUID]:
+        """Ids of every server not in the DELETED state (cost accounting)."""
+        ...
+
+    async def list_account_server_ids(self, provider_account_id: UUID) -> list[UUID]:
+        """Ids of the account's non-deleted servers (per-account cost scope)."""
         ...
 
     async def save(self, server: CloudServer) -> CloudServer:
