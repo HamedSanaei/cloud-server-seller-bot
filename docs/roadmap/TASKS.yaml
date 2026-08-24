@@ -2887,13 +2887,31 @@ tasks:
   milestone: M14
   title: Implement admin API
   priority: P1
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M10-001
   acceptance:
   - Search/actions are RBAC/audited.
-  evidence: []
+  evidence:
+  - '2026-08-24: Admin API (M14-003); acceptance ''Search/actions are RBAC/audited'' holds. RBAC GATE: _admin_auth(permission)
+    dependency factory resolves the authenticated identity to its platform User via the user repository and enforces in the
+    APPLICATION LAYER - unknown actor or non-admin both get the same stable 403 forbidden envelope (no existence leak), active-status
+    required, then PermissionChecker.require(permission); each endpoint declares its permission: user search/detail/status
+    under admin:manage_users, audit query under admin:manage_settings. SEARCH: new SqlAlchemyUserRepository.search(query,
+    offset, limit) does case-insensitive substring match over username OR email with created_at-descending order and bounded
+    limit (max 100 clamped). ACTIONS AUDITED: POST /v1/admin/users/{id}/status requires an Idempotency-Key AND a non-empty
+    reason (400 validation_error without one; nothing mutated asserted), validates status against the UserStatus enum, updates
+    via the repository, and records through AuditTrail.record_mutation as ActorType.ADMIN event action=admin.user.status_changed
+    with reason and metadata={status} - the chokepoint itself rejects admin events lacking a reason. AUDIT QUERY: GET /v1/admin/audit
+    is read-only over the audit repository supporting get_by_actor(actor_id) or get_by_resource(resource_type+resource_id)
+    with 400 when no filter given; returns serialized events incl. actor/reason/metadata/occurred_at. SURFACE wired into create_app
+    under /v1/admin; contract doc docs/api/REST_API_V1.md documents the admin table + RBAC/audit semantics. TESTS tests/unit/test_api_admin.py
+    (8): non-admin 403 envelope, unknown-actor 403, search matches username AND email substrings, detail 404 envelope for
+    missing users, status change requires reason and performs zero mutation without it, successful change audited as ADMIN
+    event with correct actor/reason/metadata, mutations require idempotency key (428), audit query by resource pair plus missing-filter
+    validation error - all through dependency overrides with fake repos (no DB). Full gates: ruff format/check clean, mypy
+    clean (125 files), 1681 passed 11 skipped, provider-branching gate 73 modules clean.'
 - id: M14-004
   milestone: M14
   title: Build customer web panel shell
@@ -2909,7 +2927,7 @@ tasks:
   milestone: M14
   title: Build admin web panel shell
   priority: P2
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M14-003

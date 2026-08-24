@@ -100,6 +100,22 @@ Exceeding the limit returns `429` + envelope code `rate_limited` with a
 | `POST /v1/auth/tokens`                     | live   | `tokens:manage`; returns plaintext EXACTLY ONCE |
 | `DELETE /v1/auth/tokens/{token_id}`        | live   | `tokens:manage`; revokes immediately (idempotent) |
 
+## Admin surface (`/v1/admin`, RBAC + audited)
+
+Admin endpoints require an authenticated actor whose platform User holds
+the corresponding admin permission (application-layer RBAC via
+`PermissionChecker`); non-admins get the same `403 forbidden` envelope as
+unknown ids - no existence leaks. Mutations require a reason and an
+idempotency key, and are audited as ADMIN-actor events (the audit
+chokepoint rejects admin events without a reason).
+
+| method & path                              | permission              | notes |
+|--------------------------------------------|-------------------------|-------|
+| `GET  /v1/admin/users?q&offset&limit`      | `admin:manage_users`    | substring search over username/email |
+| `GET  /v1/admin/users/{user_id}`           | `admin:manage_users`    | full profile |
+| `POST /v1/admin/users/{user_id}/status`    | `admin:manage_users`    | `{status, reason}`; audited |
+| `GET  /v1/admin/audit?actor_id=` or `?resource_type=&resource_id=` | `admin:manage_settings` | read-only trail query |
+
 ## Scopes
 
 Stable scope strings (`modules/tokens/domain.py::TokenScope`):

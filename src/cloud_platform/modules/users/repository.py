@@ -106,6 +106,22 @@ class SqlAlchemyUserRepository:
             row = result.scalar_one_or_none()
             return _to_domain(row) if row is not None else None
 
+    async def search(self, query: str, *, offset: int = 0, limit: int = 20) -> list[User]:
+        """Substring search over username/email (admin API, M14-003)."""
+        pattern = f"%{(query or '').strip()}%"
+        async with self._session_factory() as session:
+            stmt = (
+                select(SQLAlchemyUser)
+                .where(
+                    (SQLAlchemyUser.username.ilike(pattern)) | (SQLAlchemyUser.email.ilike(pattern))
+                )
+                .order_by(SQLAlchemyUser.created_at.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            return [_to_domain(row) for row in rows]
+
     async def update_status(self, user_id: UUID, status: UserStatus) -> User:
         """Update a user's status. Raises UserNotFound if missing."""
         async with self._session_factory() as session:

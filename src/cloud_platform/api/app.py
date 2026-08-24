@@ -87,6 +87,11 @@ def create_app() -> FastAPI:
     install_error_handlers(app)
     app.include_router(v1_router)
 
+    # M14-003: admin surface (RBAC + audited actions).
+    from cloud_platform.api.v1.admin import router as admin_router
+
+    app.include_router(admin_router)
+
     # M14-002: bind the revocable-token authenticator for bearer auth.
     from cloud_platform.core.config import get_settings
     from cloud_platform.core.container import get_container
