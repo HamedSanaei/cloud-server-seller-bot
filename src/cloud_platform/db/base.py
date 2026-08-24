@@ -885,3 +885,26 @@ class ServerBackupSettingsRow(Base):
     surcharge_bps_at_change = Column(Integer, nullable=False, server_default="0")
     updated_by = Column(PG_UUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+
+
+class IpAddressRow(Base):
+    """A user-owned provider IP resource (M13-008).
+
+    Floating IPs are independently billable: the row exists (and accrues)
+    regardless of ``server_id`` binding. ``provider_key`` +
+    ``provider_ip_id`` is unique - one row per provider-side address.
+    """
+
+    __tablename__ = "ip_addresses"
+    __table_args__ = (UniqueConstraint("provider_key", "provider_ip_id", name="uq_ips_provider"),)
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    provider_account_id = Column(PG_UUID, nullable=False)
+    provider_key = Column(String(32), nullable=False)
+    provider_ip_id = Column(String(64), nullable=False)
+    ip = Column(String(64), nullable=False)
+    kind = Column(String(16), nullable=False, server_default="floating")
+    location_id = Column(String(32), nullable=True)
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")

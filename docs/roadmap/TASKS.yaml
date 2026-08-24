@@ -2808,13 +2808,29 @@ tasks:
   milestone: M13
   title: Implement Primary/Floating IP features
   priority: P2
-  status: ready
+  status: done
   owner_hint: H2
   depends_on:
   - M07-005
   acceptance:
   - Independent resource billing supported.
-  evidence: []
+  evidence:
+  - '2026-08-24: Primary/Floating IP features (M13-008); acceptance ''Independent resource billing supported'' holds. INDEPENDENT
+    BILLING CORE: NEW modules/pricing/floating.py FloatingIpRateCard(currency, per_ip_month_minor) is an EXPLICIT OPERATOR
+    INPUT (never a hardcoded provider price; 0 = free-by-decision) with floating_monthly_minor scaling by IP count and floating_hourly_quantum_minor
+    using the exact Decimal/720 ROUND_HALF_UP convention - tests pin hand computations (2 IPs x 1080 minor/month -> 3 minor/hour
+    aggregate; 1 IP -> 2 half-up). IpService.accrual_quantum_minor proves billing follows EXISTENCE not binding: unbound vs
+    bound cost identical (asserted equal), releasing an IP drops the bill immediately, per-user scoped (other user accrues
+    0) - floating IPs are resources in their own right. LIFECYCLE: NEW modules/networking/ips.py IpAddress (strict ipaddress
+    parse in __post_init__, kind primary/floating, nullable server binding) + ip_service.py IpService: allocate (quota max_ips_per_user,
+    foreign actor reads as missing), assign requires owning BOTH the IP and the target server (FakeServerRepo keyed by id
+    so stranger servers are missing), unbind, release refused while bound then 404-idempotent at provider; every mutation
+    audited (ip.allocated/assigned/unassigned/released, USER actor). PROVIDER PORT: floating_port_of probe requires all four
+    methods on optional provider.floating_ips attribute (half-ported adapters rejected); HetznerFloatingIpApi implements GET/POST
+    /floating_ips, actions/assign + unassign, DELETE idempotent via ProviderNotFound catch. PERSISTENCE: IpAddressRow + migration
+    0026_add_ip_addresses (unique provider_key+provider_ip_id, FK user CASCADE / server SET NULL; smoke head bumped to 0026,
+    migration gate passed). Container ip_service() factory wired. Full gates: ruff format/check clean, mypy clean (138 files),
+    1753 passed 11 skipped, migration gate passed, provider-branching gate 84 modules clean.'
 - id: M13-009
   milestone: M13
   title: Implement volumes

@@ -36,8 +36,7 @@ class ServerRepositoryPort(Protocol):
 
 
 class ProviderRegistryPort(Protocol):
-    def get(self, provider_key: str) -> Any:
-        ...
+    def get(self, provider_key: str) -> Any: ...
 
 
 class RdnsService:

@@ -118,6 +118,46 @@ class HetznerFirewallApi:
         )
 
 
+class HetznerFloatingIpApi:
+    """Floating IP lifecycle against the Hetzner Cloud API (M13-008).
+
+    ``GET/POST /floating_ips``, ``POST /floating_ips/{id}/actions/assign``
+    and ``.../unassign``, ``DELETE /floating_ips/{id}`` (404-idempotent).
+    """
+
+    def __init__(self, provider: HetznerCloudProvider) -> None:
+        self._provider = provider
+
+    async def list_floating_ips(self) -> list[tuple[str, str]]:
+        payload = await self._provider._request("GET", "/floating_ips")
+        return [
+            (str(item["id"]), str(item.get("ip", ""))) for item in payload.get("floating_ips", [])
+        ]
+
+    async def create_floating_ip(self, location_id: str) -> tuple[str, str]:
+        payload = await self._provider._request(
+            "POST", "/floating_ips", json={"home_location": location_id}
+        )
+        created = payload["floating_ip"]
+        return str(created["id"]), str(created["ip"])
+
+    async def assign_floating_ip(self, provider_ip_id: str, provider_server_id: str) -> None:
+        await self._provider._request(
+            "POST",
+            f"/floating_ips/{provider_ip_id}/actions/assign",
+            json={"server": int(provider_server_id)},
+        )
+
+    async def unassign_floating_ip(self, provider_ip_id: str) -> None:
+        await self._provider._request("POST", f"/floating_ips/{provider_ip_id}/actions/unassign")
+
+    async def delete_floating_ip(self, provider_ip_id: str) -> None:
+        try:
+            await self._provider._request("DELETE", f"/floating_ips/{provider_ip_id}")
+        except ProviderNotFound:
+            return  # already gone - deletion is idempotent
+
+
 class HetznerSshKeyApi:
     """SSH-key management against the Hetzner Cloud API (M13-001).
 
@@ -194,9 +234,10 @@ class HetznerCloudProvider:
         self._credential_source = credential_source
         self.last_rate_limit = RateLimitSnapshot(None, None, None)
         self._backoff = RateLimitBackoff(rate_limit_policy or RateLimitPolicy())
-        # M13-001/M13-006: capability-probed management ports
+        # M13-001/M13-006/M13-008: capability-probed management ports
         self.ssh_keys = HetznerSshKeyApi(self)
         self.firewalls = HetznerFirewallApi(self)
+        self.floating_ips = HetznerFloatingIpApi(self)
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}

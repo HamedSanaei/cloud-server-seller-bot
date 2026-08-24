@@ -27,6 +27,7 @@ from cloud_platform.modules.credentials.domain import (
 from cloud_platform.modules.credentials.service import CredentialRotationService
 from cloud_platform.modules.firewalls.repository import SqlAlchemyFirewallRepository
 from cloud_platform.modules.firewalls.service import FirewallService
+from cloud_platform.modules.networking.ip_service import IpService
 from cloud_platform.modules.operations.service import PowerCommandService
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
@@ -125,6 +126,19 @@ class Container:
     def catalog_repository(self) -> SqlAlchemyCatalogRepository:
         """Read-side catalog repository (REST v1 offers listing)."""
         return SqlAlchemyCatalogRepository(self.session_factory)
+
+    def ip_service(self) -> IpService:
+        """Ownership-scoped floating-IP lifecycle service (M13-008)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.networking.ip_repository import (
+            SqlAlchemyIpAddressRepository,
+        )
+
+        return IpService(
+            repo=SqlAlchemyIpAddressRepository(self.session_factory),
+            audit_repo=_audit_repository(self.session_factory),
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+        )
 
     def power_command_service(self) -> PowerCommandService:
         """Idempotent power command service (REST v1 server actions)."""
