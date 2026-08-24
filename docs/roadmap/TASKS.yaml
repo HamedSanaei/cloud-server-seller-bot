@@ -2391,18 +2391,45 @@ tasks:
   milestone: M12
   title: Create production deployment runbook
   priority: P0
-  status: ready
+  status: done
   owner_hint: supervisor
   depends_on:
   - M12-004
   acceptance:
   - Secrets, migrations, rollback and health checks documented.
-  evidence: []
+  evidence:
+  - '2026-08-24: Created the production deployment runbook (M12-005); acceptance ''Secrets, migrations, rollback and health
+    checks documented'' holds. NEW docs/operations/PRODUCTION_RUNBOOK.md structured in deploy order: (0) pre-deploy prerequisites
+    - CI green including the M12-003 migration compatibility gate (an unsafe schema change is a build failure, not a deploy
+    problem), current production SHA recorded as the rollback target, fresh encrypted backup; (1) SECRETS - a table of every
+    production secret (DB password, Telegram token, Hetzner API token, provider-credential encryption key, backup encryption
+    key) with its protection mechanism, the rule that secrets arrive only via env injection (compose holds only variable references;
+    the redaction layer is defense-in-depth, not the control), the 32-byte url-safe-base64 key format with the generation
+    command, the retention coupling between a backup encryption key and the backups made with it (keep the key until the last
+    backup expires; a wrong key fails loudly via the Fernet MAC in the M11-008 restore drill), and the key rotation procedure
+    (add new key, deploy, re-encrypt, remove old key; M10-008 workflow when implemented); (2) MIGRATIONS - migration-first
+    ordering (compose service_completed_successfully), why the gate makes upgrades backward-compatible by construction, the
+    two-phase rollout procedure for destructive changes (phase 1 code stops reading, phase 2 migration drops with a compat-override
+    naming the phase-1 release - printed by the gate, auditable in git), never edit an applied revision, downgrade as a manual
+    considered action only for purely additive migrations, financial tables append-only so their downgrades are not part of
+    the deploy path, post-deploy verification via alembic current; (3) ROLLBACK - decision rule ''code first, schema only
+    when safe'': code rollback = point PLATFORM_IMAGE at the previous immutable SHA tag and compose up -d (safe because the
+    gate guarantees old code works on the new schema; in-flight operations reconcile via idempotency keys), schema rollback
+    = rare, manual, additive-only, documented in the incident log, and rollback NEVER rewrites ledger/wallet rows, deletes
+    accrual periods, or touches provider resources (a provider operation already applied is reconciled, not undone), if the
+    rollback fails: stop, keep running, fix forward; (4) HEALTH CHECKS - ordered post-deploy checks (liveness, readiness,
+    alembic head, metrics with the concrete M11-006 alert feeds to watch, worker/arq log, one token-scoped READ-ONLY provider
+    call - explicitly never a mutating call as a smoke test - and alert confirmation for 15 minutes), plus the kill-switch
+    pointer from RUNBOOK.md. Ends with a copy-per-release deploy checklist. TESTS: tests/unit/test_production_runbook.py (5
+    tests) assert the runbook exists and covers all four acceptance areas with the concrete mechanisms (every secret variable
+    named + retention coupling; alembic/migration-first/two-phase/compat-override/M12-003 gate; PLATFORM_IMAGE SHA rollback
+    + downgrade + append-only; /health/live, /health/ready, /metrics, alembic current, read-only provider, checklist + smoke
+    reference). Full suite 1341 passed.'
 - id: M12-006
   milestone: M12
   title: Add rolling/blue-green strategy
   priority: P1
-  status: blocked
+  status: ready
   owner_hint: H2
   depends_on:
   - M12-005
@@ -2413,13 +2440,31 @@ tasks:
   milestone: M12
   title: Add post-deploy smoke tests
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M12-004
   acceptance:
   - Health + safe read-only provider checks.
-  evidence: []
+  evidence:
+  - '2026-08-24: Added the post-deploy smoke test (M12-007); acceptance ''Health + safe read-only provider checks'' holds
+    - and was executed live against a real staging deploy. NEW scripts/post_deploy_smoke.py (stdlib-only HTTP via urllib so
+    it runs anywhere; the provider check imports the app only when --provider-key is given): ordered checks - (1) GET /health/live
+    expecting status ok, (2) GET /health/ready expecting status ok, (3) GET /metrics expecting 200 + platform metric names
+    present, (4) alembic head check: repo_head_revision() computes the checkout''s head by set difference (revisions minus
+    referenced down_revisions - verified to be 0020) and prints the exact verification command for the deployed DB (docker
+    compose exec api alembic current), (5) worker/readiness check with the explicit expectation noted in the output (verify
+    the arq job list in the worker log), and (6) the provider check: one token-scoped READ call (HetznerCloudProvider.list_images)
+    that proves the credential + network path are alive - explicitly NEVER a mutation; skipped (not failed) when no token
+    is configured, FAILED with a truncated error when the call fails. Exit code 0 = every check passed, non-zero = ''do not
+    consider the deploy healthy'' (the runbook rollback section is the pointer). Documented in the production runbook health
+    section with the exact command. LIVE EXECUTION: against a freshly deployed staging stack (M12-004 image, postgres+redis+migrate+api+worker)
+    - all checks ok, ''smoke test PASSED'' (provider check correctly skipped: no token in the environment); against a dead
+    port (127.0.0.1:9999) - health checks FAIL, ''smoke test FAILED'', exit 1. TESTS: tests/unit/test_post_deploy_smoke.py
+    (14 tests) - green run (live/ready/metrics all ok), liveness failure, wrong readiness status, connection refused, worker
+    check, repo head resolves to 0020, head check with and without override, provider check skipped without token, provider
+    check read-only success (patched list_images), provider failure fails the check, main() exit codes for green (PASSED +
+    alembic line printed) and red (FAILED), and no provider check without the flag. Full suite 1341 passed.'
 - id: M13-001
   milestone: M13
   title: Implement SSH key CRUD/sync
