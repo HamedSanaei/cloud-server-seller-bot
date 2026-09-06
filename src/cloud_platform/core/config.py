@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     leaseweb_os_allowlist: str = ""
     # Only OS options that do not change the base monthly price are sellable.
     leaseweb_order_os_only_free: bool = True
+    # Contract term / billing cycle used for every order (snapshotted on the
+    # provider-order row at checkout, before any provider call).
+    leaseweb_contract_term: str = "1_MONTH"
+    leaseweb_billing_cycle: str = "1_MONTH"
     # SAFETY SWITCH: without this explicitly set to true, no code path used
     # by tests/dev verification may place a REAL billable Leaseweb order.
     leaseweb_allow_live_order_test: bool = False

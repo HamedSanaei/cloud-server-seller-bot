@@ -7,6 +7,12 @@ deterministic operation key that doubles as the IdempotencyKey sent to the
 provider — so a worker crash, a callback replay or a process restart can
 never place a second order.
 
+The row also snapshots every fact needed to correlate the order back to
+Leaseweb AFTER a lost response: exact provider product id, location, OS,
+contract term, billing cycle, the PROVIDER cost (never derived from the
+customer selling price) and the customer selling price. These snapshots
+are committed BEFORE the chargeable POST (release hardening).
+
 Status machine (coarse, reconciliation-driven):
 
     PENDING_SUBMIT -> SUBMITTED (provider order id recorded)
@@ -14,6 +20,11 @@ Status machine (coarse, reconciliation-driven):
     PROVISIONING -> ACTIVE (provider resource discovered)
     SUBMITTED/PROVISIONING -> FAILED (definitive provider rejection)
     any active -> NEEDS_REVIEW (ambiguous state for a human)
+    PENDING_SUBMIT/SUBMITTED -> OUTCOME_UNKNOWN (a billable POST was sent
+        but its result is unknown; NEVER re-POSTed automatically — a
+        READ-ONLY recovery scan (or a human) resolves it)
+    OUTCOME_UNKNOWN -> SUBMITTED (recovery attached exactly one order)
+    OUTCOME_UNKNOWN -> NEEDS_REVIEW (recovery ambiguous / no proof)
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ class OrderStatus(StrEnum):
     PROVISIONING = "provisioning"  # provider accepted; resource pending
     ACTIVE = "active"  # provider resource discovered (server id known)
     FAILED = "failed"  # definitive rejection before acceptance
+    OUTCOME_UNKNOWN = "outcome_unknown"  # billable POST sent, result unknown
     NEEDS_REVIEW = "needs_review"  # ambiguous; human must decide
 
 
@@ -66,6 +78,20 @@ class ProviderOrder:
     last_polled_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: Order-fact snapshots committed BEFORE the chargeable POST (see module
+    #: docstring). These are what a read-only recovery scan correlates on.
+    product_id: str | None = None
+    location_id: str | None = None
+    os_name: str | None = None
+    contract_term: str | None = None
+    billing_cycle: str | None = None
+    provider_cost_minor: int | None = None
+    provider_cost_currency: str | None = None
+    selling_price_minor: int | None = None
+    selling_currency: str | None = None
+    #: When the chargeable POST was sent (claim time); the recovery scan
+    #: window starts here. Set before POSTing, persisted on any outcome.
+    post_attempted_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.operation_key or not self.operation_key.strip():
@@ -85,14 +111,32 @@ class ProviderOrder:
             OrderStatus.PENDING_SUBMIT,
             OrderStatus.SUBMITTED,
             OrderStatus.PROVISIONING,
+            OrderStatus.OUTCOME_UNKNOWN,
         ):
             raise OrderStateConflict(f"order {self.id}: cannot submit from {self.status.value}")
         self.provider_order_id = provider_order_id
         if contract_id:
             self.provider_contract_id = contract_id
-        if self.status is OrderStatus.PENDING_SUBMIT:
+        if self.status in (OrderStatus.PENDING_SUBMIT, OrderStatus.OUTCOME_UNKNOWN):
             self.status = OrderStatus.SUBMITTED
         self.error = None
+
+    def mark_outcome_unknown(self, error: str) -> None:
+        """A billable POST was sent but its result is unknown (release
+        hardening). The order is NEVER automatically re-POSTed from this
+        state; a read-only recovery scan or a human resolves it."""
+        if self.status is OrderStatus.OUTCOME_UNKNOWN:
+            self.error = error
+            return
+        if self.status not in (
+            OrderStatus.PENDING_SUBMIT,
+            OrderStatus.SUBMITTED,
+        ):
+            raise OrderStateConflict(
+                f"order {self.id}: cannot mark outcome unknown from {self.status.value}"
+            )
+        self.status = OrderStatus.OUTCOME_UNKNOWN
+        self.error = error
 
     def mark_provisioning(self, *, delivery_estimate: str | None = None) -> None:
         if self.status not in (OrderStatus.SUBMITTED, OrderStatus.PROVISIONING):
@@ -157,14 +201,28 @@ class ProviderOrderRepository(Protocol):
         operation_key: str,
         provider_key: str,
         offer_id: UUID,
+        product_id: str | None = None,
+        location_id: str | None = None,
+        os_name: str | None = None,
+        contract_term: str | None = None,
+        billing_cycle: str | None = None,
+        provider_cost_minor: int | None = None,
+        provider_cost_currency: str | None = None,
+        selling_price_minor: int | None = None,
+        selling_currency: str | None = None,
     ) -> ProviderOrder:
-        """Create the PENDING_SUBMIT row (unique per server + key)."""
+        """Create the PENDING_SUBMIT row (unique per server + key) with the
+        order-fact snapshots committed before any provider call."""
         ...
 
     async def save(self, order: ProviderOrder) -> ProviderOrder: ...
 
     async def list_open(self, provider_key: str, limit: int = 100) -> list[ProviderOrder]:
         """SUBMITTED + PROVISIONING orders (reconciler candidates)."""
+        ...
+
+    async def list_outcome_unknown(self, provider_key: str, limit: int = 50) -> list[ProviderOrder]:
+        """OUTCOME_UNKNOWN orders (read-only recovery candidates)."""
         ...
 
     async def list_by_status(

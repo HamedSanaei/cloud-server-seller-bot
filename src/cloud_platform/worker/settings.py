@@ -368,7 +368,8 @@ async def process_leaseweb_orders(ctx: dict[str, object]) -> None:
 
 
 async def reconcile_leaseweb_orders(ctx: dict[str, object]) -> None:
-    """Poll open provider orders; NEVER POSTs anything (LEASEWEB-MVP)."""
+    """Poll open provider orders + resolve OUTCOME_UNKNOWN orders with
+    READ-ONLY recovery; NEVER POSTs anything (LEASEWEB-MVP)."""
     del ctx
     async with metrics.job("reconcile_leaseweb_orders"):
         from cloud_platform.core.config import get_settings
@@ -387,6 +388,11 @@ async def reconcile_leaseweb_orders(ctx: dict[str, object]) -> None:
             )
             counts = await reconciler.reconcile(limit=100)
             logger.info("leaseweb order reconciler: %s", counts)
+            # Ambiguous-outcome orders are resolved by READ-ONLY scans only:
+            # attach a proven provider order id, or escalate for a human.
+            recovery = container.order_recovery()
+            recovery_counts = await recovery.recover(limit=50)
+            logger.info("leaseweb order recovery: %s", recovery_counts)
         finally:
             await container.close()
 

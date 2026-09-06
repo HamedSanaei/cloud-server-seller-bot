@@ -16,11 +16,27 @@ OpenAPI specs (``github.com/Leaseweb/api-definitions``: ``ordering/``,
   provisioned VPS through ``GET /publicCloud/v1/vps``.
 - Management: ``GET /publicCloud/v1/vps``, ``GET /publicCloud/v1/vps/{id}``
   (state, IPs, contract/renewal data), ``POST .../start|stop|reboot``.
-- Idempotency: the Ordering API documents no ``Idempotency-Key`` header and
-  the order body carries no reference field, so the adapter enforces
-  get-before-create platform-side: before POSTing, recent orders are
-  scanned for a matching NEW_ORDER (VIRTUAL_SERVER, same location/price,
-  recent window) and a hit is returned as the result of the earlier attempt.
+- Idempotency limitation (verified against the official specs at
+  github.com/leaseweb/api-definitions): the Ordering API documents no
+  ``Idempotency-Key`` header and the order body carries no client reference
+  or correlation field, so **mathematically exactly-once provider ordering
+  is not possible**. The platform therefore guarantees exactly-once LOCAL
+  wallet effects and operation identity, and at-most-one automatic POST
+  after an ambiguous outcome, with a READ-ONLY recovery scan (and manual
+  review) before any second chargeable POST is ever considered.
+- Get-before-create backstop: before POSTing, recent NEW_ORDER
+  VIRTUAL_SERVER orders are scanned against PROVIDER-side facts only
+  (provider price snapshot, currency, contract term, billing cycle,
+  creation window — NEVER the customer selling price). Exactly one match
+  is returned as the result of the earlier attempt; several matches make
+  the outcome ambiguous (the POST is not repeated); none means the POST
+  proceeds.
+- Ambiguous-outcome classification: a billable POST whose result cannot be
+  proven (read/write timeout, dropped connection, 5xx after transmission)
+  raises :class:`ProviderOutcomeUnknown` — the platform records the
+  operation as outcome-unknown and never automatically re-POSTs it.
+  Only errors that PROVE the request was never transmitted (connect
+  refused/timeout, pool timeout) stay retryable.
 - Error mapping, throttling and retry honor the shared provider discipline
   (``_error_payload`` / ``_raise_for_status`` / ``Throttle`` from the
   Public Cloud adapter); the API key never appears in errors or logs.
@@ -46,6 +62,8 @@ from cloud_platform.providers.base import (
     Capability,
     CreateServerRequest,
     OrderingProvider,
+    OrderRecoveryResult,
+    OrderRecoveryVerdict,
     ProviderImage,
     ProviderLocation,
     ProviderPlan,
@@ -58,6 +76,7 @@ from cloud_platform.providers.errors import (
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
+    ProviderOutcomeUnknown,
     ProviderRateLimited,
     ProviderUnavailable,
 )
@@ -80,8 +99,19 @@ LEASEWEB_ORDERING_CAPABILITIES = frozenset({Capability.COMPUTE, Capability.POWER
 DEFAULT_CONTRACT_TERM = "1_MONTH"
 DEFAULT_BILLING_CYCLE = "1_MONTH"
 
-#: How far back a get-before-create scan looks for a matching order.
+#: How far back the get-before-create backstop scan looks for a matching
+#: order (a just-sent request can only be seconds/minutes old). This is a
+#: backstop ONLY: the durable recovery path (PROVIDER_OUTCOME_UNKNOWN +
+#: read-only ``recover_order``) is the real safety net and is not bounded
+#: by this window.
 ORDER_MATCH_WINDOW = timedelta(minutes=30)
+
+#: Per-page size for order scans (bounded by the provider's metadata total).
+ORDER_SCAN_PAGE = 100
+
+#: Price tolerance (minor units) when comparing provider price snapshots to
+#: the order's ``pricePerFrequency`` (the API returns major-unit floats).
+PRICE_TOLERANCE_MINOR = 1
 
 #: Order service statuses (orders API) -> coarse ticket state.
 _ORDER_STATUS_MAP: dict[str, str] = {
@@ -484,34 +514,73 @@ class LeaseWebOrderingProvider(OrderingProvider):
     async def place_order(
         self, request: CreateServerRequest, idempotency_key: IdempotencyKey
     ) -> ProvisioningTicket:
-        """POST the order once per operation key.
+        """POST the order once per operation intent.
 
-        Get-before-create: a matching NEW_ORDER from a previous attempt is
-        returned instead of POSTing again (the Ordering API has no
-        Idempotency-Key header and no reference field to correlate on).
+        The Ordering API has no Idempotency-Key header and no client
+        reference field, so exactly-once ordering cannot be guaranteed
+        provider-side. The platform ledger owns local dedup; the
+        get-before-create scan below is a defensive backstop built on
+        PROVIDER-side facts only (provider cost snapshot — never the
+        customer selling price — currency, contract term, billing cycle,
+        creation window).
+
+        - exactly one matching order  -> returned as the earlier attempt;
+        - several matching orders     -> :class:`ProviderOutcomeUnknown`
+          (ambiguous: the POST is NOT repeated);
+        - none                        -> the POST proceeds.
+
+        An ambiguous transport outcome (read/write timeout, dropped
+        connection, 5xx after transmission) raises
+        :class:`ProviderOutcomeUnknown`: the caller must NOT blindly re-POST.
         """
         del idempotency_key  # platform ledger owns dedup; scan is a backstop
-        existing = await self._find_recent_order(
-            location=request.location_id,
-            product_id=request.plan_id,
-            price_minor=request_price_minor(request),
-        )
-        if existing is not None:
-            return existing
+        provider_cost = request_provider_price_minor(request)
+        facts: dict[str, Any] = {
+            "provider_cost_minor": provider_cost,
+            "currency": request.labels.get("provider_currency") or "",
+            "contract_term": request.labels.get("contract_term") or self._contract_term,
+            "billing_cycle": request.labels.get("billing_cycle") or self._billing_cycle,
+            "since": datetime.now(UTC) - ORDER_MATCH_WINDOW,
+        }
+        matches = await self._scan_matching_orders(**facts)
+        if len(matches) == 1:
+            return ProvisioningTicket(
+                provider_order_id=matches[0],
+                state="provisioning",
+                metadata={
+                    "matched_existing": True,
+                    "location": request.location_id,
+                    "product_id": request.plan_id,
+                    "operating_system": request.image_id,
+                },
+            )
+        if len(matches) > 1:
+            raise ProviderOutcomeUnknown(
+                "get-before-create scan found several matching NEW_ORDERs "
+                f"({', '.join(matches)}); refusing to POST a possibly duplicate order"
+            )
+
         body: dict[str, str] = {
             "location": request.location_id,
             "operatingSystem": request.image_id,
-            "contractTerm": self._contract_term,
-            "billingCycle": self._billing_cycle,
+            "contractTerm": facts["contract_term"],
+            "billingCycle": facts["billing_cycle"],
         }
         payload = await self._request(
-            "POST", f"/ordering/v1/products/vps/{request.plan_id}/order", json=body
+            "POST",
+            f"/ordering/v1/products/vps/{request.plan_id}/order",
+            json=body,
+            mutating=True,
         )
         if not isinstance(payload, dict):
-            raise ProviderError("leaseweb order accepted with an unexpected payload")
+            raise ProviderOutcomeUnknown(
+                "leaseweb order POST returned an unexpected payload; outcome unknown"
+            )
         order_id = payload.get("orderId")
         if order_id is None:
-            raise ProviderError("leaseweb order response is missing orderId")
+            raise ProviderOutcomeUnknown(
+                "leaseweb order POST response is missing orderId; outcome unknown"
+            )
         return ProvisioningTicket(
             provider_order_id=str(order_id),
             state="accepted",
@@ -519,46 +588,151 @@ class LeaseWebOrderingProvider(OrderingProvider):
                 "location": request.location_id,
                 "product_id": request.plan_id,
                 "operating_system": request.image_id,
-                "contract_term": self._contract_term,
-                "billing_cycle": self._billing_cycle,
+                "contract_term": facts["contract_term"],
+                "billing_cycle": facts["billing_cycle"],
+                "provider_cost_minor": str(provider_cost),
+                "provider_currency": facts["currency"],
             },
         )
 
-    async def _find_recent_order(
-        self, *, location: str, product_id: str, price_minor: int
-    ) -> ProvisioningTicket | None:
-        """Best-effort provider-side dedup: scan recent NEW_ORDERs for a
-        matching VIRTUAL_SERVER order (same location/price, recent window)."""
+    async def recover_order(
+        self,
+        *,
+        provider_cost_minor: int,
+        currency: str,
+        contract_term: str,
+        billing_cycle: str,
+        since: datetime,
+    ) -> OrderRecoveryResult:
+        """READ-ONLY recovery: find the one order a previous POST may have
+        created, using provider-side facts only.
+
+        Exactly one candidate -> MATCHED (attach its order id and continue
+        normal reconciliation). Several candidates -> AMBIGUOUS (the orders
+        API does not expose product id, location or OS, so a human must
+        decide). None -> NO_MATCH — absence is NOT provable (the order may
+        be invisible yet or outside the scanned window), so the platform
+        escalates to manual review rather than re-POSTing.
+        """
         try:
-            payload = await self._request(
-                "GET", "/account/v1/orders", params={"limit": 50, "offset": 0}
+            matches = await self._scan_matching_orders(
+                provider_cost_minor=provider_cost_minor,
+                currency=currency,
+                contract_term=contract_term,
+                billing_cycle=billing_cycle,
+                since=since,
             )
-        except ProviderError:
-            return None
-        cutoff = datetime.now(UTC) - ORDER_MATCH_WINDOW
-        for row in _as_list(payload, "orders"):
-            if not isinstance(row, dict) or str(row.get("type") or "") != "NEW_ORDER":
+        except ProviderError as exc:
+            return OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.SCAN_FAILED,
+                candidate_count=0,
+                reason=f"recovery scan failed ({type(exc).__name__}): {exc}",
+            )
+        if len(matches) == 1:
+            return OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.MATCHED,
+                provider_order_id=matches[0],
+                candidate_count=1,
+            )
+        if len(matches) > 1:
+            return OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.AMBIGUOUS,
+                candidate_count=len(matches),
+                reason=f"{len(matches)} orders match the provider facts ({', '.join(matches)})",
+            )
+        return OrderRecoveryResult(
+            verdict=OrderRecoveryVerdict.NO_MATCH,
+            candidate_count=0,
+            reason="no matching NEW_ORDER found in the scan window; absence cannot be proven",
+        )
+
+    async def _scan_matching_orders(
+        self,
+        *,
+        provider_cost_minor: int,
+        currency: str,
+        contract_term: str,
+        billing_cycle: str,
+        since: datetime,
+    ) -> list[str]:
+        """Read-only: order ids of NEW_ORDER VIRTUAL_SERVER orders matching
+        ALL the given provider-side facts.
+
+        The orders API exposes only the product family (``VIRTUAL_SERVER``),
+        ``pricePerFrequency``, ``currency``, ``contractTerm``,
+        ``billingCycle`` and ``createdAt`` for a service — NOT the specific
+        VPS product id, location or OS. Those fields are therefore never
+        invented or compared here; when several orders satisfy the facts
+        the caller treats the outcome as AMBIGUOUS.
+        """
+        expected_term = _normalize_term(contract_term)
+        expected_cycle = _normalize_term(billing_cycle)
+        matches: list[str] = []
+        offset = 0
+        while True:
+            payload = await self._request(
+                "GET",
+                "/account/v1/orders",
+                params={"limit": ORDER_SCAN_PAGE, "offset": offset},
+            )
+            rows = _as_list(payload, "orders")
+            for row in rows:
+                if not isinstance(row, dict) or str(row.get("type") or "") != "NEW_ORDER":
+                    continue
+                created = _parse_datetime(row.get("createdAt"))
+                if created is None or created < since or created > datetime.now(UTC):
+                    continue
+                if self._order_matches_facts(
+                    row,
+                    provider_cost_minor=provider_cost_minor,
+                    currency=currency,
+                    expected_term=expected_term,
+                    expected_cycle=expected_cycle,
+                ):
+                    order_id = str(row.get("id") or "").strip()
+                    if order_id:
+                        matches.append(order_id)
+            meta = payload.get("_metadata", {}) if isinstance(payload, dict) else {}
+            total = meta.get("totalCount")
+            if (
+                not isinstance(total, int)
+                or len(rows) < ORDER_SCAN_PAGE
+                or offset + len(rows) >= total
+            ):
+                break
+            offset += len(rows)
+        # One order may carry several matching services; dedupe order ids.
+        return list(dict.fromkeys(matches))
+
+    @staticmethod
+    def _order_matches_facts(
+        row: dict[str, Any],
+        *,
+        provider_cost_minor: int,
+        currency: str,
+        expected_term: str,
+        expected_cycle: str,
+    ) -> bool:
+        """Whether ANY service of the order matches every provider fact."""
+        for service in _as_list(row, "services"):
+            if not isinstance(service, dict):
                 continue
-            created = _parse_datetime(row.get("createdAt"))
-            if created is None or created < cutoff:
+            if str(service.get("productId") or "") != "VIRTUAL_SERVER":
                 continue
-            for service in _as_list(row, "services"):
-                if not isinstance(service, dict):
-                    continue
-                if str(service.get("productId") or "") != "VIRTUAL_SERVER":
-                    continue
-                if abs(_minor(service.get("pricePerFrequency")) - price_minor) > 1:
-                    continue
-                return ProvisioningTicket(
-                    provider_order_id=str(row.get("id") or ""),
-                    state="provisioning",
-                    metadata={
-                        "matched_existing": True,
-                        "location": location,
-                        "product_id": product_id,
-                    },
-                )
-        return None
+            if (
+                provider_cost_minor > 0
+                and abs(_minor(service.get("pricePerFrequency")) - provider_cost_minor)
+                > PRICE_TOLERANCE_MINOR
+            ):
+                continue
+            if currency and str(service.get("currency") or "").upper() != currency.upper():
+                continue
+            if expected_term and _normalize_term(service.get("contractTerm")) != expected_term:
+                continue
+            if expected_cycle and _normalize_term(service.get("billingCycle")) != expected_cycle:
+                continue
+            return True
+        return False
 
     async def get_order(self, provider_order_id: str) -> ProvisioningTicket:
         """``GET /account/v1/orders/{Id}`` -> coarse ticket state."""
@@ -731,12 +905,16 @@ class LeaseWebOrderingProvider(OrderingProvider):
     # Transport
     # ------------------------------------------------------------------
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _request(
+        self, method: str, path: str, *, mutating: bool = False, **kwargs: Any
+    ) -> Any:
         operation = _operation_label(method, path)
         async with metrics.provider_call(self.key, operation):
-            return await self._perform_request(method, path, **kwargs)
+            return await self._perform_request(method, path, mutating=mutating, **kwargs)
 
-    async def _perform_request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _perform_request(
+        self, method: str, path: str, *, mutating: bool = False, **kwargs: Any
+    ) -> Any:
         if self._credential_source is not None and "headers" not in kwargs:
             credential = await self._credential_source.get()
             kwargs["headers"] = {"X-LSW-Auth": credential.value}
@@ -745,20 +923,32 @@ class LeaseWebOrderingProvider(OrderingProvider):
             await self._throttle.acquire()
             try:
                 response = await self._client.request(method, path, **kwargs)
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except httpx.TransportError as exc:
+                # TransportError covers TimeoutException, NetworkError AND
+                # RemoteProtocolError (connection dropped mid-stream).
+                if mutating and _ambiguous_transport_error(exc):
+                    # The request may have reached Leaseweb: the outcome of
+                    # a billable POST is UNKNOWN. Never re-send blindly.
+                    raise ProviderOutcomeUnknown(
+                        f"leaseweb POST outcome unknown after transport error: {exc}"
+                    ) from exc
                 raise ProviderUnavailable(str(exc)) from exc
-            if response.status_code != 429 or attempt >= self._max_retries:
+            if response.status_code != 429 or attempt >= self._max_retries or mutating:
                 break
+            # Read-only requests may honor the rate-limit pause in-adapter;
+            # a billable POST is never re-sent inside the adapter (429 is a
+            # definitive non-acceptance: the worker re-queues with the SAME
+            # key and the get-before-create backstop guards the re-attempt).
             retry_after = response.headers.get("Retry-After")
             delay = _parse_retry_after(retry_after)
             if delay is None:
                 delay = 0.5 * (2**attempt)
             await self._throttle.wait(min(delay, 30.0))
             attempt += 1
-        return self._raise_for_status(response)
+        return self._raise_for_status(response, mutating=mutating)
 
     @staticmethod
-    def _raise_for_status(response: httpx.Response) -> Any:
+    def _raise_for_status(response: httpx.Response, *, mutating: bool = False) -> Any:
         message = _error_payload(response)
         if response.status_code in (401, 403):
             raise ProviderAuthError(message)
@@ -770,6 +960,13 @@ class LeaseWebOrderingProvider(OrderingProvider):
             retry_after = response.headers.get("Retry-After")
             raise ProviderRateLimited(message, _parse_retry_after(retry_after))
         if response.status_code >= 500:
+            if mutating:
+                # The order may have been accepted server-side even though
+                # the response failed; the outcome is UNKNOWN, not "retry".
+                raise ProviderOutcomeUnknown(
+                    f"leaseweb order POST returned HTTP {response.status_code}: "
+                    f"outcome unknown; {message}"
+                )
             raise ProviderUnavailable(message)
         if response.is_error:
             raise ProviderError(message)
@@ -821,6 +1018,29 @@ class LeaseWebOrderingProvider(OrderingProvider):
         )
 
 
+def _normalize_term(value: Any) -> str:
+    """Normalize a contract term / billing cycle for comparison.
+
+    The Ordering API query parameters use underscore separators
+    (``1_MONTH``) while the orders API reports space-separated values
+    (``1 MONTH``); both normalize to the same key (``1MONTH``).
+    """
+    return str(value or "").strip().upper().replace("_", "").replace(" ", "").replace("-", "")
+
+
+def _ambiguous_transport_error(exc: Exception) -> bool:
+    """Whether a transport error proves the request was NEVER transmitted.
+
+    ``ConnectError``/``ConnectTimeout``/``PoolTimeout`` fail before any
+    bytes reach the server (no connection was established) — the mutation
+    was definitely not applied, so a retry is safe. Every other transport
+    failure (``ReadTimeout``, ``WriteTimeout``, ``RemoteProtocolError``,
+    generic timeouts) may have occurred AFTER the request was transmitted:
+    a billable POST's outcome is then unknown and must NOT be re-sent.
+    """
+    return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     if not value:
         return None
@@ -845,14 +1065,16 @@ def _first_service(payload: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def request_price_minor(request: CreateServerRequest) -> int:
-    """The price snapshot carried on the create request, when present.
+def request_provider_price_minor(request: CreateServerRequest) -> int:
+    """The PROVIDER cost snapshot carried on the create request.
 
-    The domain passes the exact monthly selling price via ``labels``
-    (``price_minor``), which the get-before-create scan compares against the
-    order's ``pricePerFrequency`` (major-unit EUR; tolerance 1 cent).
+    The domain passes the exact Leaseweb provider price (NOT the customer
+    selling price) via the ``provider_price_minor`` label; the recovery
+    scan compares it against the order's ``pricePerFrequency`` (major-unit
+    currency; 1-cent tolerance). Selling price is NEVER used to identify a
+    provider order — a reseller margin must not break recovery.
     """
-    raw = request.labels.get("price_minor", "0")
+    raw = request.labels.get("provider_price_minor", "0")
     try:
         return int(raw)
     except (TypeError, ValueError):

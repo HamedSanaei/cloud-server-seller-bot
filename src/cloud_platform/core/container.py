@@ -415,6 +415,28 @@ class Container:
             delivery_notifier=delivery_notifier,
         )
 
+    def order_recovery(self) -> Any:
+        """READ-ONLY recovery of OUTCOME_UNKNOWN orders (LEASEWEB-MVP)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.orders.service import OrderRecoveryService
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        return OrderRecoveryService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            offers_repo=self.sellable_offer_repository(),
+            orders_repo=self.provider_order_repository(),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            hold_service=self.hold_service(),
+            audit_repo=_audit_repository(self.session_factory),
+            provider_registry=self.provider_registry,
+        )
+
     def renewal_checker(
         self, user_notifier: Any | None = None, admin_notifier: Any | None = None
     ) -> Any:

@@ -244,4 +244,3 @@ Load testing, queue partitioning and evidence-based extraction.
 | M16-006 | P2 | supervisor | Evaluate billing service extraction |
 | M16-007 | P2 | supervisor | Evaluate provider-worker extraction |
 | M16-008 | P1 | supervisor | Run disaster/cost runaway game day |
-

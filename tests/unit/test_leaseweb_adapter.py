@@ -68,6 +68,14 @@ def _instance(
     }
 
 
+def _json_response(payload: Any = None) -> httpx.Response:
+    return _response(200, payload)
+
+
+def _error_response(status_code: int, message: str) -> httpx.Response:
+    return _response(status_code, {"errorMessage": message})
+
+
 class TestAuthAndTransport:
     def test_constructor_sets_lsw_auth_header(self) -> None:
         provider = LeaseWebProvider(api_key=KEY, base_url="https://x", throttle=_no_sleep())
@@ -176,3 +184,275 @@ class TestServerLifecycle:
     def test_status_normalization(self) -> None:
         assert normalize_provider_status("RUNNING") == "running"
         assert normalize_provider_status("POWERED-OFF") == "stopped"
+
+
+class TestCatalogFallbacksAndHelpers:
+    async def test_list_locations_falls_back_to_region(self) -> None:
+        provider = LeaseWebProvider(api_key="k", region="REG-1")
+        provider._client.request = AsyncMock(return_value=_json_response({"regions": []}))
+        locations = await provider.list_locations()
+        assert len(locations) == 1
+        assert locations[0].id == "REG-1"
+        assert locations[0].metadata["source"] == "configured-default"
+
+    async def test_list_locations_not_found_returns_default_region(self) -> None:
+        provider = LeaseWebProvider(api_key="k", region="FRA-2")
+        provider._client.request = AsyncMock(
+            side_effect=lambda *a, **k: _error_response(404, "no such endpoint")
+        )
+        locations = await provider.list_locations()
+        assert len(locations) == 1
+        assert locations[0].id == "FRA-2"
+
+    async def test_list_plans_parses_resources_and_prices(self) -> None:
+        provider = LeaseWebProvider(api_key="k", region="AMS")
+        provider._client.request = AsyncMock(
+            return_value=_json_response(
+                {
+                    "instanceTypes": [
+                        {
+                            "name": "vps.s.1",
+                            "displayName": "Small VPS",
+                            "cpu": 2,
+                            "memoryMb": 4096,
+                            "rootDiskSize": 80,
+                            "architecture": "arm64",
+                            "pricePerMonth": 12.99,
+                        }
+                    ]
+                }
+            )
+        )
+        plans = await provider.list_plans()
+        assert len(plans) == 1
+        plan = plans[0]
+        assert plan.id == "vps.s.1"
+        assert plan.architecture == "arm64"
+        assert plan.vcpu == 2
+        assert plan.memory_mb == 4096
+        assert plan.disk_gb == 80
+        assert plan.metadata["price_per_month"] == 12.99
+        assert plan.metadata["region"] == "AMS"
+
+    async def test_list_images_parses_os_family(self) -> None:
+        provider = LeaseWebProvider(api_key="k")
+        provider._client.request = AsyncMock(
+            return_value=_json_response(
+                {
+                    "images": [
+                        {
+                            "id": "ubuntu-24.04",
+                            "displayName": "Ubuntu 24.04",
+                            "os": "ubuntu",
+                            "version": "24.04",
+                            "architecture": "x86_64",
+                        }
+                    ]
+                }
+            )
+        )
+        images = await provider.list_images()
+        assert len(images) == 1
+        assert images[0].id == "ubuntu-24.04"
+        assert images[0].os_family == "ubuntu"
+        assert images[0].metadata["os_version"] == "24.04"
+
+    def test_memory_mb_gb_and_bad_values(self) -> None:
+        from cloud_platform.providers.leaseweb.client import _memory_mb
+
+        assert _memory_mb({"memoryGb": 2}, {}) == 2048
+        assert _memory_mb({"memory_gb": "1.5"}, {}) == 1536
+        assert _memory_mb({}, {"ram": "not-a-number"}) == 0
+        assert _memory_mb({"memoryMb": 512}, {}) == 512
+
+    def test_operation_label_shapes_uuids(self) -> None:
+        from cloud_platform.providers.leaseweb.client import _operation_label
+
+        assert (
+            _operation_label(
+                "GET",
+                "/publicCloud/v1/instances/123e4567-e89b-12d3-a456-426614174000?region=AMS",
+            )
+            == "GET /publicCloud/v1/instances/{id}"
+        )
+        assert (
+            _operation_label("POST", "/publicCloud/v1/instances")
+            == "POST /publicCloud/v1/instances"
+        )
+        assert _operation_label("GET", "/publicCloud/v1/regions") == "GET /publicCloud/v1/regions"
+
+    def test_parse_retry_after(self) -> None:
+        from cloud_platform.providers.leaseweb.client import _parse_retry_after
+
+        assert _parse_retry_after("2") == 2
+        assert _parse_retry_after("-1") == 0
+        assert _parse_retry_after("banana") is None
+        assert _parse_retry_after(None) is None
+
+
+class TestManagementActions:
+    async def test_power_actions_post_correct_paths(self) -> None:
+        provider = LeaseWebProvider(api_key="k")
+        provider._client.request = AsyncMock(return_value=_json_response({}))
+
+        await provider.power_on("svr-1", IK)
+        await provider.power_off("svr-1", IK)
+        await provider.reboot("svr-1", IK)
+        calls = provider._client.request.await_args_list
+        assert [c.args[1] for c in calls] == [
+            "/publicCloud/v1/instances/svr-1/start",
+            "/publicCloud/v1/instances/svr-1/stop",
+            "/publicCloud/v1/instances/svr-1/reboot",
+        ]
+
+    async def test_create_server_with_ssh_and_user_data(self) -> None:
+        provider = LeaseWebProvider(api_key="k", region="AMS")
+        created = _json_response(
+            {
+                "instance": {
+                    "id": "i-1",
+                    "reference": "my-server",
+                    "state": "running",
+                    "ips": [{"ip": "1.2.3.4", "version": 4}],
+                    "region": "AMS",
+                }
+            }
+        )
+        provider._client.request = AsyncMock(return_value=created)
+
+        from cloud_platform.providers.base import CreateServerRequest
+
+        request = CreateServerRequest(
+            name="my-server",
+            location_id="AMS",
+            plan_id="vps.s.1",
+            image_id="ubuntu-24.04",
+            ssh_key_ids=("key-1",),
+            user_data="#cloud-config",
+            labels={"team": "x"},
+        )
+        server = await provider.create_server(request, IK)
+        assert server.id == "i-1"
+        assert server.ipv4 == "1.2.3.4"
+        body = provider._client.request.await_args.kwargs["json"]
+        assert body["sshKey"] == "key-1"
+        assert body["userData"] == "#cloud-config"
+        assert body["labels"]["team"] == "x"
+        assert "platform-operation" in body["labels"]
+
+    async def test_create_finds_existing_by_name(self) -> None:
+        provider = LeaseWebProvider(api_key="k")
+        existing = _json_response(
+            {
+                "instances": [
+                    {
+                        "id": "i-old",
+                        "reference": "dup-name",
+                        "state": "running",
+                        "ips": [],
+                    }
+                ],
+                "_metadata": {"totalCount": 1},
+            }
+        )
+        provider._client.request = AsyncMock(return_value=existing)
+
+        from cloud_platform.providers.base import CreateServerRequest
+
+        request = CreateServerRequest(
+            name="dup-name", location_id="AMS", plan_id="vps.s.1", image_id="ubuntu-24.04"
+        )
+        server = await provider.create_server(request, IK)
+        assert server.id == "i-old"
+        assert provider._client.request.await_args.args[0] == "GET"
+
+    async def test_list_servers_paginates(self) -> None:
+        provider = LeaseWebProvider(api_key="k")
+        page1 = _json_response(
+            {
+                "instances": [
+                    {"id": "a", "reference": "a", "state": "running", "ips": []},
+                    {"id": "b", "reference": "b", "state": "running", "ips": []},
+                ],
+                "_metadata": {"totalCount": 3},
+            }
+        )
+        page2 = _json_response(
+            {
+                "instances": [{"id": "c", "reference": "c", "state": "running", "ips": []}],
+                "_metadata": {"totalCount": 3},
+            }
+        )
+        provider._client.request = AsyncMock(side_effect=[page1, page2])
+        servers = await provider.list_servers()
+        assert [s.id for s in servers] == ["a", "b", "c"]
+        assert provider._client.request.await_args_list[1].kwargs["params"]["offset"] == 2
+
+    async def test_verify_credential_sends_candidate_only(self) -> None:
+        provider = LeaseWebProvider(api_key="live-key")
+        provider._client.request = AsyncMock(return_value=_json_response([]))
+        await provider.verify_credential("candidate-key")
+        call = provider._client.request.await_args
+        assert call.kwargs["headers"]["X-LSW-Auth"] == "candidate-key"
+
+    async def test_verify_credential_rejects_bad_key(self) -> None:
+        provider = LeaseWebProvider(api_key="live-key")
+        provider._client.request = AsyncMock(
+            side_effect=lambda *a, **k: _error_response(401, "unauthorized")
+        )
+        with pytest.raises(ProviderAuthError):
+            await provider.verify_credential("bad-key")
+
+    async def test_credential_source_rotates_header(self) -> None:
+        from cloud_platform.providers.credentials import Credential
+
+        class Source:
+            async def get(self) -> Credential:
+                return Credential(value="rotated-key", key_hint="leaseweb")
+
+        provider = LeaseWebProvider(api_key="init", credential_source=Source())
+        provider._client.request = AsyncMock(return_value=_json_response([]))
+        await provider.list_locations()
+        call = provider._client.request.await_args
+        assert call.kwargs["headers"]["X-LSW-Auth"] == "rotated-key"
+
+    async def test_429_retries_with_backoff_then_succeeds(self) -> None:
+        provider = LeaseWebProvider(api_key="k", max_retries=3)
+        retry = _error_response(429, "slow down")
+        retry.headers["Retry-After"] = "0"
+        provider._client.request = AsyncMock(side_effect=[retry, _json_response([])])
+        throttle = provider._throttle
+        original_wait = throttle.wait
+
+        async def fake_wait(seconds: float) -> None:
+            assert seconds <= 30.0
+
+        throttle.wait = fake_wait  # type: ignore[method-assign]
+        await provider.list_locations()
+        assert provider._client.request.await_count == 2
+        throttle.wait = original_wait  # type: ignore[method-assign]
+
+    async def test_network_error_maps_to_unavailable(self) -> None:
+        provider = LeaseWebProvider(api_key="k", max_retries=0)
+        provider._client.request = AsyncMock(side_effect=httpx.ConnectError("boom"))
+        with pytest.raises(ProviderUnavailable):
+            await provider.list_locations()
+
+    def test_error_payload_variants(self) -> None:
+        import httpx as _httpx
+
+        from cloud_platform.providers.leaseweb.client import _error_payload
+
+        assert _error_payload(_json_response({"errorMessage": "nope"})) == "nope"
+        assert _error_payload(_json_response({"errorCode": "E42"})) == "leaseweb error E42"
+        assert _error_payload(_json_response({"errors": ["one", "two"]})) == "one"
+        assert _error_payload(_json_response({"unexpected": 1})) == "HTTP 200"
+        assert _error_payload(_httpx.Response(503, text="<html>down</html>")) == "<html>down</html>"
+
+    def test_constructor_validates_inputs(self) -> None:
+        with pytest.raises(ValueError):
+            LeaseWebProvider(api_key="")
+        with pytest.raises(ValueError):
+            LeaseWebProvider(api_key="k", max_retries=-1)
+        with pytest.raises(ValueError):
+            Throttle(max_rps=0)

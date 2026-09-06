@@ -59,7 +59,7 @@ async def handle_start(
         )
     except Exception as exc:
         # Handle unique constraint violations (username/email already taken)
-        if isinstance(exc, (ValueError, OnboardingConflict)):
+        if isinstance(exc, ValueError | OnboardingConflict):
             raise
         # sqlalchemy IntegrityError → parse into domain error
         raise OnboardingError(f"failed to create user: {exc}") from exc

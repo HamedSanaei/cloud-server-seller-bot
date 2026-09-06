@@ -30,6 +30,7 @@ from cloud_platform.providers.errors import (
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
+    ProviderOutcomeUnknown,
     ProviderRateLimited,
     ProviderUnavailable,
 )
@@ -60,6 +61,7 @@ PERMANENT_ERROR_TYPES: tuple[type[ProviderError], ...] = (
     ProviderAuthError,
     ProviderNotFound,
     ProviderConflict,
+    ProviderOutcomeUnknown,
     UnsupportedGatewayOperation,
 )
 

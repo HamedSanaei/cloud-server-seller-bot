@@ -1,4 +1,4 @@
-"""Leaseweb ordering worker + reconciler (LEASEWEB-MVP).
+"""Leaseweb ordering worker + reconciler + recovery (LEASEWEB-MVP).
 
 **Worker** (``OrderWorker``): executes PENDING_SUBMIT order intents. Each
 intent is claimed through the operation ledger (atomic PENDING -> IN_FLIGHT),
@@ -10,10 +10,22 @@ order id is persisted FIRST, then the wallet hold is captured exactly once
 
 - Definitive provider rejection (4xx before acceptance): operation FAILED,
   order FAILED, server ERROR, hold RELEASED (funds return).
-- Transient failure (timeout/5xx/429): operation re-queued with the SAME key
-  — a re-send can never create a second order because the provider order id
-  is only recorded after a successful POST and the get-before-create scan
-  inside the adapter returns the earlier order.
+- Genuinely-not-sent transport failure (connect refused/timeout, pool
+  timeout) or a definitive 429: operation re-queued with the SAME key; the
+  re-attempt is guarded by the adapter's get-before-create backstop.
+- AMBIGUOUS outcome (read/write timeout, dropped connection, 5xx after
+  transmission): the order and operation become OUTCOME_UNKNOWN — the
+  worker NEVER automatically re-POSTs. A READ-ONLY recovery scan (or a
+  human) resolves it, per the safety preference manual review > two VPSes.
+- Stale IN_FLIGHT (worker died mid-POST, > 30 min): SAME treatment — the
+  attempt becomes OUTCOME_UNKNOWN and is resolved read-only, never by a
+  blind second POST.
+
+**Recovery** (``OrderRecoveryService``): resolves OUTCOME_UNKNOWN orders
+with READ-ONLY provider scans only (``OrderingProvider.recover_order``).
+Exactly one matching provider order (provider facts only — NEVER the
+customer selling price) -> attach its id and continue normal
+reconciliation; ambiguous or no proof -> NEEDS_REVIEW for a human.
 
 **Reconciler** (``OrderReconciler``): polls SUBMITTED/PROVISIONING orders.
 It NEVER POSTs — it only inspects orders and VPSes. When the order's
@@ -24,7 +36,7 @@ record (contract endsAt when available) and delivers the server details to
 the owning user. Orders stuck past their delivery estimate go to
 NEEDS_REVIEW for a human.
 
-The activation step is shared (``OrderActivator``) so both paths converge
+The activation step is shared (``OrderActivator``) so all paths converge
 on one implementation.
 """
 
@@ -47,6 +59,7 @@ from cloud_platform.modules.compute.domain import (
 )
 from cloud_platform.modules.offers.domain import SellableOffer, SellableOfferRepository
 from cloud_platform.modules.operations.domain import (
+    Operation,
     OperationRepository,
     OperationStatus,
 )
@@ -70,10 +83,12 @@ from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
     CreateServerRequest,
     OrderingProvider,
+    OrderRecoveryResult,
+    OrderRecoveryVerdict,
     ProviderServer,
     ordering_support_of,
 )
-from cloud_platform.providers.errors import ProviderError, ProviderNotFound
+from cloud_platform.providers.errors import ProviderError, ProviderNotFound, ProviderOutcomeUnknown
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
 
@@ -83,10 +98,14 @@ logger = logging.getLogger(__name__)
 #: human is asked to look at it.
 STUCK_ORDER_GRACE = timedelta(hours=72)
 
-#: An IN_FLIGHT order-create operation older than this is presumed crashed:
-#: it is re-queued with the SAME operation key and the adapter's
-#: get-before-create scan deduplicates the provider POST.
+#: An IN_FLIGHT order-create operation older than this is presumed crashed
+#: mid-POST. It is NEVER blindly re-POSTed: the order/operation become
+#: OUTCOME_UNKNOWN and a READ-ONLY recovery scan (or a human) resolves them.
 STALE_IN_FLIGHT_GRACE = timedelta(minutes=30)
+
+#: Read-only recovery scans attempted before an unresolved OUTCOME_UNKNOWN
+#: order is escalated to NEEDS_REVIEW for a human.
+MAX_RECOVERY_SCANS = 5
 
 MONTHLY_ESTIMATE_DAYS = 30
 
@@ -95,6 +114,7 @@ class OrderWorkerOutcome(StrEnum):
     SUBMITTED = "submitted"
     REQUEUED = "requeued"
     FAILED = "failed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
     SKIPPED_IN_FLIGHT = "skipped_in_flight"
     SKIPPED_STATE = "skipped_state"
     ALREADY_ACTIVE = "already_active"
@@ -106,6 +126,12 @@ class ReconciliationOutcome(StrEnum):
     FAILED = "failed"
     MARKED_FOR_REVIEW = "marked_for_review"
     LEFT_UNCHANGED = "left_unchanged"
+
+
+class RecoveryOutcome(StrEnum):
+    RECOVERED = "recovered"  # read-only scan attached exactly one provider order
+    MARKED_FOR_REVIEW = "marked_for_review"  # ambiguous / no proof / scan exhausted
+    LEFT_UNCHANGED = "left_unchanged"  # transient scan failure; try next round
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,22 +388,20 @@ class OrderWorker:
             return OrderWorkerOutcome.SKIPPED_STATE
         if operation.status is OperationStatus.IN_FLIGHT:
             # A worker may have crashed mid-POST. After a grace period the
-            # attempt is re-queued with the SAME key: the provider POST is
-            # deduplicated by the adapter's get-before-create scan, so this
-            # can never place a second order.
+            # outcome is UNKNOWN — the POST is NEVER blindly repeated. The
+            # order + operation move to OUTCOME_UNKNOWN and a READ-ONLY
+            # recovery scan (or a human) resolves them.
             updated = operation.updated_at or operation.created_at or self._now()
             if self._now() - updated <= STALE_IN_FLIGHT_GRACE:
                 return OrderWorkerOutcome.SKIPPED_IN_FLIGHT
-            operation.requeue("stale in-flight recovered after worker crash")
-            operation.updated_at = self._now()
-            await self._ops.save(operation)
-            logger.warning(
-                "operation %s re-queued after stale in-flight (server %s); "
-                "re-attempt will use get-before-create",
-                operation.id,
-                server.id,
+            await self._mark_outcome_unknown(
+                server,
+                order,
+                operation,
+                "worker crashed around the order POST; outcome unknown, "
+                "recovery requires a read-only scan",
             )
-            return OrderWorkerOutcome.REQUEUED
+            return OrderWorkerOutcome.OUTCOME_UNKNOWN
         claimed = await self._ops.claim(operation.id)
         if claimed is None:
             return OrderWorkerOutcome.SKIPPED_IN_FLIGHT
@@ -402,18 +426,34 @@ class OrderWorker:
                 server, order, f"provider {server.provider_key!r} has no ordering port"
             )
 
+        # The request carries PROVIDER-side facts only (provider cost
+        # snapshot, currency, term, cycle). The customer selling price is
+        # NEVER sent to the provider or used to identify a provider order.
         request = CreateServerRequest(
             name=f"srv-{server.id.hex[:8]}",
-            plan_id=offer.product_id,
+            plan_id=order.product_id or offer.product_id,
             image_id=server.os,
-            location_id=offer.location_id,
+            location_id=order.location_id or offer.location_id,
             labels={
-                "price_minor": str(offer.selling_price_minor),
+                "provider_price_minor": str(offer.provider_cost_minor),
+                "provider_currency": offer.provider_cost_currency,
+                "contract_term": order.contract_term or "1_MONTH",
+                "billing_cycle": order.billing_cycle or "1_MONTH",
                 "platform_server_id": str(server.id),
             },
         )
+        # Persist the POST-attempt instant BEFORE the chargeable call: the
+        # read-only recovery scan window starts here (durable across crashes).
+        order.post_attempted_at = claimed.updated_at or self._now()
+        await self._orders.save(order)
         try:
             ticket = await ordering.place_order(request, IdempotencyKey(claimed.operation_key))
+        except ProviderOutcomeUnknown as exc:
+            # The POST may have been accepted: NEVER automatically re-POST.
+            # Order + operation -> OUTCOME_UNKNOWN; the hold stays reserved;
+            # a READ-ONLY recovery scan (or a human) resolves the outcome.
+            await self._mark_outcome_unknown(server, order, claimed, str(exc))
+            return OrderWorkerOutcome.OUTCOME_UNKNOWN
         except ProviderError as exc:
             if classify_provider_error(exc) is ErrorClass.RETRYABLE:
                 claimed.requeue(str(exc))
@@ -474,6 +514,46 @@ class OrderWorker:
             },
         )
         return OrderWorkerOutcome.SUBMITTED
+
+    async def _mark_outcome_unknown(
+        self,
+        server: CloudServer,
+        order: ProviderOrder,
+        operation: Operation,
+        reason: str,
+    ) -> None:
+        """Record a billable POST whose outcome is unknown (release
+        hardening). The hold stays reserved; no automatic re-POST follows;
+        a READ-ONLY recovery scan (or a human) resolves the order."""
+        order.mark_outcome_unknown(reason)
+        order.attempts += 1
+        await self._orders.save(order)
+        if operation.status is not OperationStatus.OUTCOME_UNKNOWN:
+            operation.mark_outcome_unknown(reason)
+        await self._ops.save(operation)
+        metrics.record_provisioning_failure("order_worker_outcome_unknown")
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            actor_id=None,
+            action="leaseweb.order_outcome_unknown",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=reason,
+            metadata={
+                "server_id": str(server.id),
+                "operation_key": operation.operation_key,
+                "post_attempted_at": order.post_attempted_at.isoformat()
+                if order.post_attempted_at
+                else "",
+            },
+        )
+        logger.error(
+            "leaseweb order %s outcome UNKNOWN (server %s): %s; "
+            "no automatic re-POST; read-only recovery required",
+            order.id,
+            server.id,
+            reason,
+        )
 
     async def _capture_hold(self, server: CloudServer) -> None:
         """Capture the checkout hold exactly once (idempotent)."""
@@ -814,3 +894,202 @@ class OrderReconciler:
             metadata={"server_id": str(server.id)},
         )
         return ReconciliationOutcome.FAILED
+
+
+class OrderRecoveryService:
+    """READ-ONLY recovery of OUTCOME_UNKNOWN orders (release hardening).
+
+    Resolves orders whose billable POST had an ambiguous outcome. It NEVER
+    POSTs anything: it asks the ordering provider for a read-only recovery
+    scan (provider-side facts only) and applies the verdict:
+
+    - MATCHED  -> attach the provider order id, complete the operation,
+      capture the hold exactly once; the normal reconciler takes over.
+    - AMBIGUOUS -> NEEDS_REVIEW (a human decides; never guess).
+    - NO_MATCH -> NEEDS_REVIEW (absence cannot be proven: the order may
+      exist but be invisible; a human verifies before any second POST).
+    - SCAN_FAILED -> stay OUTCOME_UNKNOWN; retry next round, escalating to
+      NEEDS_REVIEW after MAX_RECOVERY_SCANS bounded attempts.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_repo: ServerRepository,
+        offers_repo: SellableOfferRepository,
+        orders_repo: ProviderOrderRepository,
+        operation_repo: OperationRepository,
+        wallet_repo: WalletRepository,
+        hold_repo: HoldRepository,
+        hold_service: HoldService,
+        audit_repo: AuditRepository,
+        provider_registry: ProviderRegistry,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._servers = server_repo
+        self._offers = offers_repo
+        self._orders = orders_repo
+        self._ops = operation_repo
+        self._wallets = wallet_repo
+        self._holds = hold_repo
+        self._hold_service = hold_service
+        self._audit = AuditTrail(audit_repo)
+        self._registry = provider_registry
+        self._now = clock or (lambda: datetime.now(UTC))
+
+    async def recover(
+        self, provider_key: str = "leaseweb", limit: int = 50
+    ) -> dict[RecoveryOutcome, int]:
+        counts: dict[RecoveryOutcome, int] = {}
+        orders = (await self._orders.list_outcome_unknown(provider_key))[:limit]
+        for order in orders:
+            try:
+                outcome = await self._recover_one(order)
+            except Exception:
+                logger.exception("order recovery failed for order %s", order.id)
+                outcome = RecoveryOutcome.LEFT_UNCHANGED
+            counts[outcome] = counts.get(outcome, 0) + 1
+        return counts
+
+    async def _recover_one(self, order: ProviderOrder) -> RecoveryOutcome:
+        if not order.post_attempted_at and not order.created_at:
+            return await self._escalate(order, "order has no attempt timestamp; cannot scan")
+        server = await self._servers.get(order.server_id)
+        if server is None:
+            return await self._escalate(order, "server row missing during recovery")
+        try:
+            provider = self._registry.get(server.provider_key)
+        except KeyError:
+            return await self._escalate(order, f"provider {server.provider_key!r} not configured")
+        from cloud_platform.providers.base import ordering_support_of
+
+        ordering = ordering_support_of(provider)
+        if ordering is None or not callable(getattr(ordering, "recover_order", None)):
+            return await self._escalate(
+                order, f"provider {server.provider_key!r} has no read-only recovery port"
+            )
+
+        offer = await self._offers.get(order.offer_id) if order.offer_id else None
+        cost_minor = (
+            order.provider_cost_minor
+            if order.provider_cost_minor
+            else (offer.provider_cost_minor if offer else None)
+        )
+        if not cost_minor:
+            return await self._escalate(
+                order, "no provider cost snapshot; recovery cannot correlate safely"
+            )
+        result: OrderRecoveryResult = await ordering.recover_order(
+            provider_cost_minor=cost_minor,
+            currency=order.provider_cost_currency
+            or (offer.provider_cost_currency if offer else "")
+            or "EUR",
+            contract_term=order.contract_term or "1_MONTH",
+            billing_cycle=order.billing_cycle or "1_MONTH",
+            since=order.post_attempted_at or order.created_at or datetime.now(UTC),
+        )
+
+        if result.verdict is OrderRecoveryVerdict.MATCHED and result.provider_order_id:
+            return await self._attach(order, result.provider_order_id, result.reason)
+        if result.verdict is OrderRecoveryVerdict.AMBIGUOUS:
+            return await self._escalate(
+                order, f"recovery ambiguous: {result.reason or 'several matching orders'}"
+            )
+        if result.verdict is OrderRecoveryVerdict.NO_MATCH:
+            # A clean scan found nothing, but absence is NOT provable: the
+            # order may exist but be invisible. A human verifies manually
+            # before any second chargeable POST is ever considered.
+            return await self._escalate(
+                order, f"recovery found no matching order; {result.reason or ''}"
+            )
+        # SCAN_FAILED: transient; bounded retries, then escalate.
+        order.attempts += 1
+        await self._orders.save(order)
+        if order.attempts >= MAX_RECOVERY_SCANS:
+            return await self._escalate(
+                order, f"recovery scans exhausted; last scan failed: {result.reason or ''}"
+            )
+        logger.warning(
+            "order %s recovery scan failed (attempt %d/%d); retrying next round: %s",
+            order.id,
+            order.attempts,
+            MAX_RECOVERY_SCANS,
+            result.reason,
+        )
+        return RecoveryOutcome.LEFT_UNCHANGED
+
+    async def _attach(
+        self, order: ProviderOrder, provider_order_id: str, reason: str
+    ) -> RecoveryOutcome:
+        """Attach the proven provider order id; the normal reconciler continues."""
+        order.mark_submitted(provider_order_id)
+        order.error = None
+        await self._orders.save(order)
+
+        operation = await self._ops.get_by_key(order.operation_key)
+        if operation is not None and operation.status is OperationStatus.OUTCOME_UNKNOWN:
+            operation.complete(
+                {
+                    "provider_order_id": provider_order_id,
+                    "recovered": True,
+                    "operation_key": operation.operation_key,
+                }
+            )
+            await self._ops.save(operation)
+
+        await self._capture_hold(order)
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            actor_id=None,
+            action="leaseweb.order_recovered",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=f"read-only recovery attached provider order {provider_order_id}",
+            metadata={
+                "server_id": str(order.server_id),
+                "provider_order_id": provider_order_id,
+                "detail": reason,
+            },
+        )
+        logger.info(
+            "leaseweb order %s recovered read-only: provider_order=%s",
+            order.id,
+            provider_order_id,
+        )
+        return RecoveryOutcome.RECOVERED
+
+    async def _escalate(self, order: ProviderOrder, reason: str) -> RecoveryOutcome:
+        order.mark_needs_review(reason)
+        await self._orders.save(order)
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            actor_id=None,
+            action="leaseweb.order_review",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=reason,
+            metadata={"server_id": str(order.server_id)},
+        )
+        logger.error("leaseweb order %s escalated for manual review: %s", order.id, reason)
+        return RecoveryOutcome.MARKED_FOR_REVIEW
+
+    async def _capture_hold(self, order: ProviderOrder) -> None:
+        """Capture the checkout hold exactly once (idempotent by key)."""
+        server = await self._servers.get(order.server_id)
+        if server is None or server.idempotency_key is None:
+            return
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id is None:
+            logger.error("server %s: no wallet to capture hold on recovery", server.id)
+            return
+        from cloud_platform.modules.checkout.service import hold_key
+
+        hold = await self._holds.get_by_idempotency(wallet.id, hold_key(server.idempotency_key))
+        if hold is None or hold.id is None or hold.status is not HoldStatus.CREATED:
+            return
+        try:
+            await self._hold_service.capture_hold(
+                wallet.id, hold.id, hold_key(server.idempotency_key)
+            )
+        except Exception:
+            logger.exception("failed to capture hold %s for server %s", hold.id, server.id)

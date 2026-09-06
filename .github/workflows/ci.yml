@@ -24,7 +24,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
-          cache: "true"
+          enable-cache: true
       # --frozen: the lockfile is the single source of truth; the build fails
       # if pyproject.toml and uv.lock drift, keeping every run deterministic.
       - name: Install locked dependencies
@@ -52,7 +52,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.13"
-          cache: "true"
+          enable-cache: true
       - name: Install locked dependencies
         run: uv sync --frozen --all-groups
       # Deterministic suite: stable file order, JUnit results, and a coverage

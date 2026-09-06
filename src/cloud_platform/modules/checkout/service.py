@@ -259,7 +259,12 @@ class MonthlyCheckoutService:
             raise
 
         # 7. Provider order row + operation ledger — BOTH before any provider
-        #    call. The operation key is the IdempotencyKey of the POST.
+        #    call. The operation key is the IdempotencyKey of the POST, and
+        #    the row snapshots every provider-side fact (exact product id,
+        #    location, OS, term, cycle, PROVIDER cost and the customer
+        #    selling price as SEPARATE snapshots) so an ambiguous POST can be
+        #    recovered with read-only scans that NEVER use the selling price
+        #    to identify a provider order (release hardening).
         operation_key = order_operation_key(created.id)
         try:
             order = await self._orders.create(
@@ -267,6 +272,15 @@ class MonthlyCheckoutService:
                 operation_key=operation_key,
                 provider_key=offer.provider_key,
                 offer_id=offer.id,
+                product_id=offer.product_id,
+                location_id=offer.location_id,
+                os_name=os_name,
+                contract_term=get_settings().leaseweb_contract_term,
+                billing_cycle=get_settings().leaseweb_billing_cycle,
+                provider_cost_minor=offer.provider_cost_minor,
+                provider_cost_currency=offer.provider_cost_currency,
+                selling_price_minor=offer.selling_price_minor,
+                selling_currency=offer.selling_currency,
             )
         except Exception:
             await self._fail_intent(created, hold)

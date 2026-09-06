@@ -436,6 +436,15 @@ async def orders_retry(order_id: str) -> int:
     if order.status.value not in ("failed", "needs_review"):
         print(f"order {order_id} is {order.status.value}; only failed/needs_review may be retried")
         return 2
+    # A NEEDS_REVIEW order escalated from an unknown provider outcome may
+    # ALREADY exist at Leaseweb: re-POSTing without manual verification can
+    # buy a second VPS. The operator must check the portal first.
+    if "recovery" in (order.error or "").lower() or "outcome" in (order.error or "").lower():
+        print(
+            "WARNING: this order was escalated because a billable POST outcome was "
+            "UNKNOWN. Verify at the Leaseweb portal that NO matching order exists "
+            "BEFORE re-attempting; otherwise you may place a duplicate order."
+        )
     op_repo = SqlAlchemyOperationRepository(SessionFactory)
     op = await op_repo.get_by_key(order.operation_key)
     if op is None:
@@ -544,7 +553,16 @@ async def leaseweb_smoke_order(offer_id: str, os_index: int) -> int:
             plan_id=offer.product_id,
             image_id=os_name,
             location_id=offer.location_id,
-            labels={"price_minor": str(offer.selling_price_minor), "smoke": "1"},
+            labels={
+                # PROVIDER-side facts only: the customer selling price is
+                # never used to identify a provider order (release
+                # hardening).
+                "provider_price_minor": str(offer.provider_cost_minor),
+                "provider_currency": offer.provider_cost_currency,
+                "contract_term": "1_MONTH",
+                "billing_cycle": "1_MONTH",
+                "smoke": "1",
+            },
         ),
         IdempotencyKey(key),
     )

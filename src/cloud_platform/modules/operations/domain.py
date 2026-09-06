@@ -13,8 +13,11 @@ State machine:
     IN_FLIGHT -> PENDING   (retryable failure: re-queued, same key)
     IN_FLIGHT -> COMPLETED (provider result + correlation recorded)
     IN_FLIGHT -> FAILED    (permanent failure)
+    IN_FLIGHT -> OUTCOME_UNKNOWN (a billable mutation was sent but its
+        result is unknown; terminal, NEVER auto-retried; a READ-ONLY
+        recovery scan may resolve it to COMPLETED, otherwise a human)
 
-COMPLETED and FAILED are terminal.
+COMPLETED, FAILED and OUTCOME_UNKNOWN are terminal.
 """
 
 from __future__ import annotations
@@ -55,17 +58,28 @@ class OperationStatus(StrEnum):
     IN_FLIGHT = "in_flight"
     COMPLETED = "completed"
     FAILED = "failed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
 
 
-_TERMINAL = frozenset({OperationStatus.COMPLETED, OperationStatus.FAILED})
+_TERMINAL = frozenset(
+    {OperationStatus.COMPLETED, OperationStatus.FAILED, OperationStatus.OUTCOME_UNKNOWN}
+)
 
 _ALLOWED: dict[OperationStatus, frozenset[OperationStatus]] = {
     OperationStatus.PENDING: frozenset({OperationStatus.IN_FLIGHT}),
     OperationStatus.IN_FLIGHT: frozenset(
-        {OperationStatus.PENDING, OperationStatus.COMPLETED, OperationStatus.FAILED}
+        {
+            OperationStatus.PENDING,
+            OperationStatus.COMPLETED,
+            OperationStatus.FAILED,
+            OperationStatus.OUTCOME_UNKNOWN,
+        }
     ),
     OperationStatus.COMPLETED: frozenset(),
     OperationStatus.FAILED: frozenset(),
+    # Recovery may resolve an outcome-unknown operation once a read-only
+    # scan proves which provider order the POST created.
+    OperationStatus.OUTCOME_UNKNOWN: frozenset({OperationStatus.COMPLETED}),
 }
 
 
@@ -128,6 +142,14 @@ class Operation:
     def fail(self, error: str) -> None:
         """Permanent failure (IN_FLIGHT -> FAILED)."""
         self._transition_to(OperationStatus.FAILED)
+        self.error = error
+
+    def mark_outcome_unknown(self, error: str) -> None:
+        """A billable mutation was sent but its result is unknown
+        (IN_FLIGHT -> OUTCOME_UNKNOWN, terminal). No automated path may
+        re-send the mutation from this state: a read-only provider scan
+        (or a human) must resolve it first."""
+        self._transition_to(OperationStatus.OUTCOME_UNKNOWN)
         self.error = error
 
     def reopen_for_retry(self) -> None:

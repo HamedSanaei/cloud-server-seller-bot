@@ -1,10 +1,14 @@
-"""Order worker + reconciler safety tests (LEASEWEB-MVP).
+"""Order worker + reconciler + recovery safety tests (LEASEWEB-MVP).
 
 Acceptance:
 - one provider POST per order intent (ledger claim + get-before-create),
 - hold captured exactly once on acceptance, released on definitive rejection,
-- transient failures re-queue with the SAME key (never a second order),
-- a worker crash mid-POST is recovered by re-queuing stale IN_FLIGHT ops,
+- genuinely-not-sent failures re-queue with the SAME key (never a second order),
+- an AMBIGUOUS billable POST (timeout after transmission, 5xx, crash mid-
+  POST) NEVER triggers an automatic second POST: order + operation move to
+  OUTCOME_UNKNOWN and a READ-ONLY recovery scan (or a human) resolves them,
+- the recovery service attaches exactly one proven provider order and
+  captures the hold exactly once; ambiguous/no-proof escalates to review,
 - the reconciler only inspects; activation delivers the server once.
 """
 
@@ -12,10 +16,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
+
+import pytest
 
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.audit.domain import AuditEvent
+from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_PREPAID_MONTHLY,
     CloudServer,
@@ -30,6 +38,7 @@ from cloud_platform.modules.operations.domain import (
 from cloud_platform.modules.orders.domain import OrderStatus, ProviderOrder
 from cloud_platform.modules.orders.service import (
     OrderReconciler,
+    OrderRecoveryService,
     OrderWorker,
     RenewalInfo,
 )
@@ -39,8 +48,16 @@ from cloud_platform.modules.wallet.domain import (
     HoldStatus,
     Wallet,
 )
-from cloud_platform.providers.base import ProvisioningTicket
-from cloud_platform.providers.errors import ProviderAuthError, ProviderUnavailable
+from cloud_platform.providers.base import (
+    OrderRecoveryResult,
+    OrderRecoveryVerdict,
+    ProvisioningTicket,
+)
+from cloud_platform.providers.errors import (
+    ProviderAuthError,
+    ProviderOutcomeUnknown,
+    ProviderUnavailable,
+)
 from cloud_platform.providers.registry import ProviderRegistry
 
 USER_ID = uuid4()
@@ -167,6 +184,9 @@ class FakeOrdersRepo:
     async def list_open(self, provider_key: str, limit: int = 100) -> list[ProviderOrder]:
         return [self.order] if self.order.is_open else []
 
+    async def list_outcome_unknown(self, provider_key: str, limit: int = 50) -> list[ProviderOrder]:
+        return [self.order] if self.order.status is OrderStatus.OUTCOME_UNKNOWN else []
+
 
 class FakeOperationRepo:
     def __init__(self, op: Operation | None = None) -> None:
@@ -266,13 +286,21 @@ class FakeOrderingProvider:
     key = "leaseweb"
 
     def __init__(
-        self, *, ticket: ProvisioningTicket | None = None, error: Exception | None = None
+        self,
+        *,
+        ticket: ProvisioningTicket | None = None,
+        error: Exception | None = None,
+        recovery: OrderRecoveryResult | None = None,
     ) -> None:
         self._ticket = ticket or ProvisioningTicket(
             provider_order_id="LS-ORD-1", state="provisioning"
         )
         self._error = error
+        self._recovery = recovery or OrderRecoveryResult(
+            verdict=OrderRecoveryVerdict.NO_MATCH, reason="no candidates"
+        )
         self.posts: list[IdempotencyKey] = []
+        self.recovery_calls: list[dict[str, Any]] = []
 
     async def place_order(
         self, request: Any, idempotency_key: IdempotencyKey
@@ -281,6 +309,10 @@ class FakeOrderingProvider:
         if self._error is not None:
             raise self._error
         return self._ticket
+
+    async def recover_order(self, **facts: Any) -> OrderRecoveryResult:
+        self.recovery_calls.append(facts)
+        return self._recovery
 
     async def get_order(self, provider_order_id: str) -> ProvisioningTicket:
         return self._ticket
@@ -436,21 +468,52 @@ class TestOrderWorker:
         assert counts_b == {}
         assert len(deps_a["ordering"].posts) == 1  # one POST total
 
-    async def test_stale_in_flight_recovered_without_duplicate_order(self) -> None:
+    async def test_stale_in_flight_is_never_reposted(self) -> None:
         # Worker crashed mid-POST: operation stuck IN_FLIGHT for > 30 min.
+        # Release hardening: the outcome is UNKNOWN — NO automatic re-POST.
         old = datetime.now(UTC) - timedelta(minutes=45)
         op = _operation(OperationStatus.IN_FLIGHT)
         op.updated_at = old
         ordering = FakeOrderingProvider()
         worker, deps = _worker(ordering=ordering, op_repo=FakeOperationRepo(op))
         counts = await worker.process_pending()
-        assert counts.get("requeued") == 1
-        assert deps["op_repo"].op.status is OperationStatus.PENDING
-        # Next pass re-attempts with the same key (adapter get-before-create
-        # would deduplicate the provider side).
+        assert counts.get("outcome_unknown") == 1
+        assert deps["op_repo"].op.status is OperationStatus.OUTCOME_UNKNOWN
+        assert deps["orders"].order.status is OrderStatus.OUTCOME_UNKNOWN
+        assert deps["orders"].order.error is not None
+        assert "crash" in deps["orders"].order.error
+        # The hold stays reserved; nothing was captured or released.
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+        assert deps["hold_service"].captures == []
+        assert deps["hold_service"].releases == []
+        # NO provider POST happened, and a second worker pass must not POST.
         await worker.process_pending()
-        assert len(deps["ordering"].posts) == 1
-        assert deps["ordering"].posts[0].value == OP_KEY
+        assert deps["ordering"].posts == []
+
+    async def test_ambiguous_timeout_is_never_reposted(self) -> None:
+        # A read timeout AFTER the POST was transmitted: the order may exist
+        # at Leaseweb. The worker must NEVER automatically POST again.
+        ordering = FakeOrderingProvider(
+            error=ProviderOutcomeUnknown("read timeout after transmission")
+        )
+        worker, deps = _worker(ordering=ordering)
+        counts = await worker.process_pending()
+        assert counts.get("outcome_unknown") == 1
+        assert deps["orders"].order.status is OrderStatus.OUTCOME_UNKNOWN
+        assert deps["op_repo"].op.status is OperationStatus.OUTCOME_UNKNOWN
+        assert deps["holds"].hold.status is HoldStatus.CREATED  # funds stay reserved
+        # Second pass: the order is OUTCOME_UNKNOWN -> skipped, no POST.
+        await worker.process_pending()
+        assert len(deps["ordering"].posts) == 1  # only the ambiguous attempt
+
+    async def test_ambiguous_post_records_attempt_time(self) -> None:
+        ordering = FakeOrderingProvider(
+            error=ProviderOutcomeUnknown("connection reset after transmission")
+        )
+        worker, deps = _worker(ordering=ordering)
+        await worker.process_pending()
+        # The recovery scan window start is persisted BEFORE the POST.
+        assert deps["orders"].order.post_attempted_at is not None
 
     async def test_fresh_in_flight_is_skipped(self) -> None:
         op = _operation(OperationStatus.IN_FLIGHT)  # updated just now
@@ -618,3 +681,634 @@ class TestOwnership:
             wallet_id=uuid4(), amount=1299, currency="EUR", idempotency_key="other", id=uuid4()
         )
         assert other_hold.status is HoldStatus.CREATED
+
+
+def _outcome_unknown_order() -> ProviderOrder:
+    now = datetime.now(UTC)
+    order = _order(OrderStatus.OUTCOME_UNKNOWN)
+    order.provider_cost_minor = 999
+    order.provider_cost_currency = "EUR"
+    order.contract_term = "1_MONTH"
+    order.billing_cycle = "1_MONTH"
+    order.product_id = "VPS02_1"
+    order.location_id = "AMS-01"
+    order.os_name = "Ubuntu 24.04"
+    order.post_attempted_at = now - timedelta(minutes=1)
+    order.error = "read timeout after transmission"
+    return order
+
+
+def _recovery_worker(
+    *,
+    ordering: FakeOrderingProvider,
+    order: ProviderOrder | None = None,
+    op: Operation | None = None,
+    holds: FakeHoldRepo | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    from cloud_platform.modules.orders.service import OrderRecoveryService
+
+    op = op or _operation(OperationStatus.OUTCOME_UNKNOWN)
+    op.status = OperationStatus.OUTCOME_UNKNOWN
+    order = order or _outcome_unknown_order()
+    server_repo = FakeServerRepo(_server())
+    orders_repo = FakeOrdersRepo(order)
+    op_repo = FakeOperationRepo(op)
+    wallet_repo = FakeWalletRepo()
+    holds = holds or FakeHoldRepo()
+    hold_service = FakeHoldService(holds)
+    registry = ProviderRegistry()
+    registry.register(ordering)
+    service = OrderRecoveryService(
+        server_repo=server_repo,
+        offers_repo=FakeOfferRepo(),
+        orders_repo=orders_repo,
+        operation_repo=op_repo,
+        wallet_repo=wallet_repo,
+        hold_repo=holds,
+        hold_service=hold_service,
+        audit_repo=FakeAuditRepo(),
+        provider_registry=registry,
+    )
+    deps = {
+        "orders": orders_repo,
+        "op_repo": op_repo,
+        "servers": server_repo,
+        "holds": holds,
+        "hold_service": hold_service,
+        "ordering": ordering,
+    }
+    return service, deps
+
+
+class TestOrderRecoveryService:
+    async def test_recovery_attaches_matched_order_read_only(self) -> None:
+        ordering = FakeOrderingProvider(
+            recovery=OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.MATCHED,
+                provider_order_id="LS-ORD-9",
+                candidate_count=1,
+            )
+        )
+        service, deps = _recovery_worker(ordering=ordering)
+        counts = await service.recover()
+        assert counts.get("recovered") == 1
+        order = deps["orders"].order
+        assert order.status is OrderStatus.SUBMITTED
+        assert order.provider_order_id == "LS-ORD-9"
+        assert deps["op_repo"].op.status is OperationStatus.COMPLETED
+        # The hold is captured exactly once.
+        assert len(deps["hold_service"].captures) == 1
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        # Recovery never POSTs.
+        assert deps["ordering"].posts == []
+
+    async def test_recovery_uses_provider_facts_not_selling_price(self) -> None:
+        ordering = FakeOrderingProvider(
+            recovery=OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.MATCHED,
+                provider_order_id="LS-ORD-9",
+                candidate_count=1,
+            )
+        )
+        service, deps = _recovery_worker(ordering=ordering)
+        await service.recover()
+        facts = deps["ordering"].recovery_calls[0]
+        # Provider cost snapshot is correlated; the 1299 selling price never
+        # appears in the scan facts.
+        assert facts["provider_cost_minor"] == 999
+        assert "selling" not in " ".join(str(k) for k in facts)
+        assert facts["contract_term"] == "1_MONTH"
+        assert facts["billing_cycle"] == "1_MONTH"
+
+    async def test_recovery_ambiguous_escalates_to_review(self) -> None:
+        ordering = FakeOrderingProvider(
+            recovery=OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.AMBIGUOUS, candidate_count=2, reason="two orders"
+            )
+        )
+        service, deps = _recovery_worker(ordering=ordering)
+        counts = await service.recover()
+        assert counts.get("marked_for_review") == 1
+        assert deps["orders"].order.status is OrderStatus.NEEDS_REVIEW
+        assert deps["holds"].hold.status is HoldStatus.CREATED  # funds untouched
+        assert deps["ordering"].posts == []
+
+    async def test_recovery_no_match_escalates_absence_not_provable(self) -> None:
+        ordering = FakeOrderingProvider(
+            recovery=OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.NO_MATCH, reason="no candidates"
+            )
+        )
+        service, deps = _recovery_worker(ordering=ordering)
+        counts = await service.recover()
+        assert counts.get("marked_for_review") == 1
+        assert deps["orders"].order.status is OrderStatus.NEEDS_REVIEW
+        assert (
+            "absence" in (deps["orders"].order.error or "").lower()
+            or "no matching" in (deps["orders"].order.error or "").lower()
+        )
+        assert deps["ordering"].posts == []
+
+    async def test_recovery_scan_failed_retries_then_escalates(self) -> None:
+        ordering = FakeOrderingProvider(
+            recovery=OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.SCAN_FAILED, reason="503 down"
+            )
+        )
+        service, deps = _recovery_worker(ordering=ordering)
+        for _ in range(4):
+            counts = await service.recover()
+            assert counts.get("left_unchanged") == 1
+            assert deps["orders"].order.status is OrderStatus.OUTCOME_UNKNOWN
+        # Attempts exhausted -> a human decides.
+        counts = await service.recover()
+        assert counts.get("marked_for_review") == 1
+        assert deps["orders"].order.status is OrderStatus.NEEDS_REVIEW
+        assert deps["ordering"].posts == []
+
+    async def test_recovery_capture_is_idempotent(self) -> None:
+        ordering = FakeOrderingProvider(
+            recovery=OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.MATCHED, provider_order_id="LS-ORD-9"
+            )
+        )
+        service, deps = _recovery_worker(ordering=ordering)
+        await service.recover()
+        await service.recover()
+        # The second pass finds the order SUBMITTED (not OUTCOME_UNKNOWN) and
+        # does nothing; the hold was captured exactly once.
+        assert len(deps["hold_service"].captures) == 1
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        assert len(deps["ordering"].recovery_calls) == 1
+
+    async def test_recovery_without_any_cost_source_escalates_safely(self) -> None:
+        order = _outcome_unknown_order()
+        order.provider_cost_minor = None
+        order.offer_id = None  # no offer fallback either
+        ordering = FakeOrderingProvider()
+        service, deps = _recovery_worker(ordering=ordering, order=order)
+        counts = await service.recover()
+        assert counts.get("marked_for_review") == 1
+        assert deps["orders"].order.status is OrderStatus.NEEDS_REVIEW
+        assert deps["ordering"].recovery_calls == []  # never scanned without facts
+        assert deps["ordering"].posts == []
+
+    async def test_recovery_falls_back_to_offer_cost_for_legacy_rows(self) -> None:
+        """Orders created before migration 0031 have no snapshot; the offer
+        (still linked) supplies the provider cost for the read-only scan."""
+        order = _outcome_unknown_order()
+        order.provider_cost_minor = None
+        ordering = FakeOrderingProvider(
+            recovery=OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.MATCHED, provider_order_id="LS-ORD-9"
+            )
+        )
+        service, deps = _recovery_worker(ordering=ordering, order=order)
+        counts = await service.recover()
+        assert counts.get("recovered") == 1
+        assert deps["ordering"].recovery_calls[0]["provider_cost_minor"] == 999
+        assert deps["ordering"].posts == []
+
+
+class TestReconcilerBranches:
+    def _reconciler(
+        self,
+        *,
+        order: ProviderOrder | None = None,
+        server: CloudServer | None = None,
+        get_error: Exception | None = None,
+    ) -> tuple[OrderReconciler, dict[str, Any]]:
+        ordering = FakeOrderingProvider(
+            ticket=ProvisioningTicket(provider_order_id="LS-ORD-1", state="provisioning")
+        )
+        if get_error is not None:
+
+            async def _get(*args: Any, **kwargs: Any) -> Any:
+                raise get_error
+
+            ordering.get_order = _get  # type: ignore[method-assign]
+        order = order or _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        server = server or _server(ServerLifecycleState.PROVISIONING)
+        server_repo = FakeServerRepo(server)
+        orders_repo = FakeOrdersRepo(order)
+        wallet_repo = FakeWalletRepo()
+        holds = FakeHoldRepo()
+        renewal_repo = FakeRenewalRepo()
+        notifier = _RecordingNotifier()
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=renewal_repo,
+            wallet_repo=wallet_repo,
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+            delivery_notifier=notifier,
+        )
+        deps = {
+            "orders": orders_repo,
+            "servers": server_repo,
+            "audit": FakeAuditRepo(),
+            "ordering": ordering,
+            "holds": holds,
+        }
+        return reconciler, deps
+
+    async def test_open_order_without_provider_id_marks_review(self) -> None:
+        order = _order(OrderStatus.PROVISIONING, provider_order_id=None)
+        reconciler, _ = self._reconciler(order=order)
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+        assert order.status is OrderStatus.NEEDS_REVIEW
+
+    async def test_missing_server_fails_order(self) -> None:
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        server_repo = FakeServerRepo(_server(ServerLifecycleState.PROVISIONING))
+        server_repo.server = None
+        ordering = FakeOrderingProvider()
+        orders_repo = FakeOrdersRepo(order)
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("failed") == 1
+        assert order.status is OrderStatus.FAILED
+
+    async def test_missing_offer_marks_review(self) -> None:
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        order.offer_id = uuid4()  # unknown offer id
+        reconciler, _ = self._reconciler(order=order)
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+        assert order.status is OrderStatus.NEEDS_REVIEW
+
+    async def test_unregistered_provider_left_unchanged(self) -> None:
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        server_repo = FakeServerRepo(_server(ServerLifecycleState.PROVISIONING))
+        orders_repo = FakeOrdersRepo(order)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=ProviderRegistry(),  # empty: leaseweb unregistered
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("left_unchanged") == 1
+        assert order.status is OrderStatus.PROVISIONING
+
+    async def test_get_order_not_found_marks_review_and_audits(self) -> None:
+        from cloud_platform.providers.errors import ProviderNotFound
+
+        audit = FakeAuditRepo()
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        server_repo = FakeServerRepo(_server(ServerLifecycleState.PROVISIONING))
+        orders_repo = FakeOrdersRepo(order)
+        registry = ProviderRegistry()
+        ordering = FakeOrderingProvider()
+
+        async def _nf(*args: Any, **kwargs: Any) -> Any:
+            raise ProviderNotFound("gone")
+
+        ordering.get_order = _nf  # type: ignore[method-assign]
+        registry.register(ordering)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=audit,
+            provider_registry=registry,
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+        assert order.status is OrderStatus.NEEDS_REVIEW
+        assert any(e.action == "leaseweb.order_review" for e in audit.events)
+
+    async def test_stuck_order_marks_review(self) -> None:
+        now = datetime.now(UTC)
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        order.delivery_estimate = (now - timedelta(days=5)).isoformat()
+        ticket = ProvisioningTicket(
+            provider_order_id="LS-ORD-1",
+            state="provisioning",
+            metadata={"delivery_estimate": order.delivery_estimate},
+        )
+        ordering = FakeOrderingProvider(ticket=ticket)
+        server_repo = FakeServerRepo(_server(ServerLifecycleState.PROVISIONING))
+        orders_repo = FakeOrdersRepo(order)
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+        assert order.status is OrderStatus.NEEDS_REVIEW
+
+    async def test_not_stuck_still_provisioning(self) -> None:
+        now = datetime.now(UTC)
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        order.delivery_estimate = (now + timedelta(hours=2)).isoformat()
+        ticket = ProvisioningTicket(
+            provider_order_id="LS-ORD-1",
+            state="provisioning",
+            metadata={"delivery_estimate": order.delivery_estimate},
+        )
+        reconciler, deps = self._reconciler(
+            order=order, server=_server(ServerLifecycleState.PROVISIONING)
+        )
+        deps["ordering"]._ticket = ticket
+        counts = await reconciler.reconcile()
+        assert counts.get("still_provisioning") == 1
+        assert order.status is OrderStatus.PROVISIONING
+
+    async def test_activate_match_error_marks_review(self) -> None:
+        from cloud_platform.providers.errors import ProviderUnavailable
+
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        ordering = FakeOrderingProvider(
+            ticket=ProvisioningTicket(provider_order_id="LS-ORD-1", state="provisioned")
+        )
+
+        async def _boom(*args: Any, **kwargs: Any) -> str:
+            raise ProviderUnavailable("scan failed")
+
+        ordering.match_vps_for_order = _boom  # type: ignore[method-assign]
+        server_repo = FakeServerRepo(_server(ServerLifecycleState.PROVISIONING))
+        orders_repo = FakeOrdersRepo(order)
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+
+    async def test_cancelled_after_capture_requires_refund(self) -> None:
+        ticket = ProvisioningTicket(provider_order_id="LS-ORD-1", state="failed")
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        server = _server(ServerLifecycleState.PROVISIONING)
+        holds = FakeHoldRepo()
+        holds.hold.capture()  # the hold was already captured on acceptance
+        server_repo = FakeServerRepo(server)
+        orders_repo = FakeOrdersRepo(order)
+        wallet_repo = FakeWalletRepo()
+        audit = FakeAuditRepo()
+        ordering = FakeOrderingProvider(ticket=ticket)
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=wallet_repo,
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds),
+            audit_repo=audit,
+            provider_registry=registry,
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("failed") == 1
+        assert holds.hold.status is HoldStatus.CAPTURED  # not released
+        assert any(e.action == "checkout.refund_required" for e in audit.events)
+
+    async def test_reconcile_loop_exception_counts_left_unchanged(self) -> None:
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+
+        class BrokenServerRepo(FakeServerRepo):
+            async def get(self, server_id: UUID) -> CloudServer | None:
+                raise RuntimeError("db down")
+
+        orders_repo = FakeOrdersRepo(order)
+        registry = ProviderRegistry()
+        registry.register(FakeOrderingProvider())
+        reconciler = OrderReconciler(
+            server_repo=BrokenServerRepo(_server(ServerLifecycleState.PROVISIONING)),
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("left_unchanged") == 1
+
+
+class TestRecoveryEscalation:
+    def _service(
+        self, *, order: ProviderOrder, server: CloudServer, registry: ProviderRegistry
+    ) -> OrderRecoveryService:
+        from cloud_platform.modules.orders.service import OrderRecoveryService
+
+        return OrderRecoveryService(
+            server_repo=FakeServerRepo(server),
+            offers_repo=FakeOfferRepo(),
+            orders_repo=FakeOrdersRepo(order),
+            operation_repo=FakeOperationRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+        )
+
+    async def test_order_without_timestamps_escalates(self) -> None:
+        order = _order(OrderStatus.OUTCOME_UNKNOWN)
+        order.post_attempted_at = None
+        order.created_at = None
+        service = self._service(
+            order=order,
+            server=_server(ServerLifecycleState.PROVISIONING),
+            registry=ProviderRegistry(),
+        )
+        counts = await service.recover()
+        assert counts.get("marked_for_review") == 1
+        assert order.status is OrderStatus.NEEDS_REVIEW
+
+    async def test_missing_server_escalates(self) -> None:
+        order = _outcome_unknown_order()
+        from cloud_platform.modules.orders.service import OrderRecoveryService
+
+        server_repo = FakeServerRepo(_server(ServerLifecycleState.PROVISIONING))
+        server_repo.server = None
+        service = OrderRecoveryService(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=FakeOrdersRepo(order),
+            operation_repo=FakeOperationRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=ProviderRegistry(),
+        )
+        counts = await service.recover()
+        assert counts.get("marked_for_review") == 1
+
+    async def test_unregistered_provider_escalates(self) -> None:
+        order = _outcome_unknown_order()
+        service = self._service(
+            order=order,
+            server=_server(ServerLifecycleState.PROVISIONING),
+            registry=ProviderRegistry(),  # leaseweb not registered
+        )
+        counts = await service.recover()
+        assert counts.get("marked_for_review") == 1
+
+    async def test_recovery_exception_counts_left_unchanged(self) -> None:
+        order = _outcome_unknown_order()
+
+        class BrokenOrdersRepo(FakeOrdersRepo):
+            async def list_outcome_unknown(
+                self, provider_key: str, limit: int = 50
+            ) -> list[ProviderOrder]:
+                raise RuntimeError("db down")
+
+        from cloud_platform.modules.orders.service import OrderRecoveryService
+
+        service = OrderRecoveryService(
+            server_repo=FakeServerRepo(_server(ServerLifecycleState.PROVISIONING)),
+            offers_repo=FakeOfferRepo(),
+            orders_repo=BrokenOrdersRepo(order),
+            operation_repo=FakeOperationRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=FakeHoldRepo(),
+            hold_service=FakeHoldService(FakeHoldRepo()),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=ProviderRegistry(),
+        )
+        with pytest.raises(RuntimeError):
+            await service.recover()
+
+
+class TestActivatorBranches:
+    def _activator(
+        self,
+        *,
+        ordering: FakeOrderingProvider,
+        remote: Any = None,
+        server: CloudServer | None = None,
+        order: ProviderOrder | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        from cloud_platform.modules.orders.service import OrderActivator
+
+        server = server or _server(ServerLifecycleState.PROVISIONING)
+        order = order or _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        server_repo = FakeServerRepo(server)
+        orders_repo = FakeOrdersRepo(order)
+        renewal_repo = FakeRenewalRepo()
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        activator = OrderActivator(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            renewal_repo=renewal_repo,
+            audit_trail=AuditTrail(FakeAuditRepo()),
+            provider_registry=registry,
+            delivery_notifier=_RecordingNotifier(),
+        )
+        deps = {
+            "servers": server_repo,
+            "orders": orders_repo,
+            "renewals": renewal_repo,
+        }
+        return activator, deps
+
+    async def test_activate_falls_back_to_vps_id_when_remote_unavailable(self) -> None:
+        ordering = FakeOrderingProvider()
+
+        async def _unavailable(provider_server_id: str) -> Any:
+            raise ProviderUnavailable("vps api down")
+
+        ordering.get_server = _unavailable  # type: ignore[method-assign]
+        activator, deps = self._activator(ordering=ordering)
+        info = await activator.activate(
+            server=deps["servers"].server,
+            order=deps["orders"].order,
+            offer=_offer(),
+            vps_id="vps-9",
+            ordering=ordering,
+        )
+        assert deps["servers"].server.provider_server_id == "vps-9"
+        assert deps["servers"].server.state is ServerLifecycleState.RUNNING
+        assert deps["orders"].order.status is OrderStatus.ACTIVE
+        assert info.renewal_date_estimated is True
+
+    async def test_activate_uses_remote_ips_and_contract_end(self) -> None:
+        ordering = FakeOrderingProvider()
+        remote = MagicMock()
+        remote.id = "vps-7"
+        remote.ipv4 = "1.2.3.4"
+        remote.ipv6 = "::1"
+        remote.metadata = {"contract_ends_at": "2026-08-01T00:00:00+00:00"}
+        ordering.get_server = AsyncMock(return_value=remote)  # type: ignore[method-assign]
+        activator, deps = self._activator(ordering=ordering)
+        info = await activator.activate(
+            server=deps["servers"].server,
+            order=deps["orders"].order,
+            offer=_offer(),
+            vps_id="vps-7",
+            ordering=ordering,
+        )
+        server = deps["servers"].server
+        assert server.provider_server_id == "vps-7"
+        assert server.ipv4 == "1.2.3.4"
+        assert server.ipv6 == "::1"
+        assert info.renewal_date_estimated is False
+        assert info.provider_renewal_at == datetime(2026, 8, 1, tzinfo=UTC)
+        renewal = deps["renewals"].upserted[0]
+        assert renewal.provider_renewal_at == info.provider_renewal_at
+
+    def test_parse_iso_datetime_variants(self) -> None:
+        from cloud_platform.modules.orders.service import _parse_iso_datetime
+
+        assert _parse_iso_datetime(None) is None
+        assert _parse_iso_datetime("") is None
+        assert _parse_iso_datetime("not-a-date") is None
+        dt = _parse_iso_datetime("2026-08-01T00:00:00Z")
+        assert dt == datetime(2026, 8, 1, tzinfo=UTC)
+        naive = _parse_iso_datetime("2026-08-01T00:00:00")
+        assert naive == datetime(2026, 8, 1, tzinfo=UTC)

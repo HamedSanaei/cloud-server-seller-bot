@@ -4,18 +4,30 @@
 
 repos:
   # Ruff: Fast Python linter and formatter
+  # Keep the pin in lockstep with the ruff version in pyproject.toml's dev
+  # dependencies so `uv run ruff check .` and the pre-commit hook enforce the
+  # SAME rule set (one coherent quality policy).
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.0
+    rev: v0.16.4
     hooks:
       - id: ruff
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
   # MyPy: Static type checker
+  # Pin tracks the mypy version in pyproject.toml's dev dependencies and runs
+  # the same scope as the repository gate (`uv run mypy src`) so the hook and
+  # the gate enforce the same policy.
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.17.0
+    rev: v1.20.2
     hooks:
       - id: mypy
+        args: [src]
+        # The hook appends every staged filename by default; that would check
+        # scripts/ and tests/ too (yaml stubs, module-layout conflicts) and
+        # duplicate src/cloud_platform. Restrict it to the repository gate's
+        # scope: `uv run mypy src`.
+        pass_filenames: false
         additional_dependencies:
           - pydantic>=2.11,<3
           - pydantic-settings>=2.10,<3
@@ -30,6 +42,11 @@ repos:
           - python-json-logger>=3.3,<4
           - structlog>=25,<26
           - uvicorn[standard]>=0.35,<1
+          - prometheus-client>=0.20,<1
+          - pytest>=8,<9
+          - cryptography>=43,<46
+          - opentelemetry-sdk>=1.24,<2
+          - opentelemetry-exporter-otlp-proto-grpc>=1.24,<2
 
   # Secret detection
   - repo: https://github.com/Yelp/detect-secrets

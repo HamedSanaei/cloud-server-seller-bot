@@ -482,6 +482,20 @@ class ProviderOrder(Base):
     error = Column(Text, nullable=True)
     attempts = Column(Integer, nullable=False, server_default="0")
     last_polled_at = Column(DateTime(timezone=True), nullable=True)
+    #: Order-fact snapshots committed BEFORE the chargeable POST (release
+    #: hardening): what a read-only recovery scan correlates on. Provider
+    #: cost and customer selling price are separate snapshots; the customer
+    #: price is NEVER used to identify a provider order.
+    product_id = Column(String(64), nullable=True)
+    location_id = Column(String(32), nullable=True)
+    os_name = Column(String, nullable=True)
+    contract_term = Column(String(32), nullable=True)
+    billing_cycle = Column(String(32), nullable=True)
+    provider_cost_minor = Column(BigInteger, nullable=True)
+    provider_cost_currency = Column(String(3), nullable=True)
+    selling_price_minor = Column(BigInteger, nullable=True)
+    selling_currency = Column(String(3), nullable=True)
+    post_attempted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
 

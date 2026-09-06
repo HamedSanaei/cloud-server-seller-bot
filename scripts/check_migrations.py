@@ -121,7 +121,7 @@ def _downgrade_func(tree: ast.Module) -> ast.FunctionDef | None:
 def _has_body(func: ast.FunctionDef | None) -> bool:
     if func is None:
         return False
-    return any(not isinstance(s, (ast.Pass, ast.Expr)) for s in func.body) or any(
+    return any(not isinstance(s, ast.Pass | ast.Expr) for s in func.body) or any(
         isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) for s in func.body
     )
 

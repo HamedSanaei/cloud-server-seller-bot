@@ -40,6 +40,16 @@ def _to_domain(row: _ProviderOrderModel) -> ProviderOrder:
         last_polled_at=_attr(row, "last_polled_at"),
         created_at=_attr(row, "created_at"),
         updated_at=_attr(row, "updated_at"),
+        product_id=_attr(row, "product_id"),
+        location_id=_attr(row, "location_id"),
+        os_name=_attr(row, "os_name"),
+        contract_term=_attr(row, "contract_term"),
+        billing_cycle=_attr(row, "billing_cycle"),
+        provider_cost_minor=_attr(row, "provider_cost_minor"),
+        provider_cost_currency=_attr(row, "provider_cost_currency"),
+        selling_price_minor=_attr(row, "selling_price_minor"),
+        selling_currency=_attr(row, "selling_currency"),
+        post_attempted_at=_attr(row, "post_attempted_at"),
     )
 
 
@@ -94,6 +104,15 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
         operation_key: str,
         provider_key: str,
         offer_id: UUID,
+        product_id: str | None = None,
+        location_id: str | None = None,
+        os_name: str | None = None,
+        contract_term: str | None = None,
+        billing_cycle: str | None = None,
+        provider_cost_minor: int | None = None,
+        provider_cost_currency: str | None = None,
+        selling_price_minor: int | None = None,
+        selling_currency: str | None = None,
     ) -> ProviderOrder:
         async with self._session_factory() as session:
             row = _ProviderOrderModel(
@@ -102,6 +121,15 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
                 provider_key=provider_key,
                 offer_id=offer_id,
                 status=OrderStatus.PENDING_SUBMIT.value,
+                product_id=product_id,
+                location_id=location_id,
+                os_name=os_name,
+                contract_term=contract_term,
+                billing_cycle=billing_cycle,
+                provider_cost_minor=provider_cost_minor,
+                provider_cost_currency=provider_cost_currency,
+                selling_price_minor=selling_price_minor,
+                selling_currency=selling_currency,
             )
             session.add(row)
             try:
@@ -146,6 +174,16 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
             cast_any.provider_service_id = order.provider_service_id
             cast_any.error = order.error
             cast_any.attempts = order.attempts
+            cast_any.product_id = order.product_id
+            cast_any.location_id = order.location_id
+            cast_any.os_name = order.os_name
+            cast_any.contract_term = order.contract_term
+            cast_any.billing_cycle = order.billing_cycle
+            cast_any.provider_cost_minor = order.provider_cost_minor
+            cast_any.provider_cost_currency = order.provider_cost_currency
+            cast_any.selling_price_minor = order.selling_price_minor
+            cast_any.selling_currency = order.selling_currency
+            cast_any.post_attempted_at = order.post_attempted_at
             cast_any.updated_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(row)
@@ -192,9 +230,18 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
         async with self._session_factory() as session:
             return list(await self._list(session, (OrderStatus.NEEDS_REVIEW,), limit))
 
+    async def list_outcome_unknown(self, provider_key: str, limit: int = 50) -> list[ProviderOrder]:
+        del provider_key
+        async with self._session_factory() as session:
+            return list(await self._list(session, (OrderStatus.OUTCOME_UNKNOWN,), limit))
+
     async def list_attention(self, provider_key: str, limit: int = 100) -> list[ProviderOrder]:
         del provider_key
         async with self._session_factory() as session:
             return list(
-                await self._list(session, (OrderStatus.FAILED, OrderStatus.NEEDS_REVIEW), limit)
+                await self._list(
+                    session,
+                    (OrderStatus.FAILED, OrderStatus.NEEDS_REVIEW, OrderStatus.OUTCOME_UNKNOWN),
+                    limit,
+                )
             )

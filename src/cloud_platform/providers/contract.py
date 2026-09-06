@@ -31,19 +31,16 @@ Usage in adapter tests::
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import pytest
 
-if TYPE_CHECKING:
-    from cloud_platform.providers.base import (
-        CloudProvider,
-        CreateServerRequest,
-        ProviderImage,
-        ProviderLocation,
-        ProviderPlan,
-        ProviderServer,
-    )
+from cloud_platform.providers.base import (
+    CloudProvider,
+    CreateServerRequest,
+    ProviderImage,
+    ProviderLocation,
+    ProviderPlan,
+    ProviderServer,
+)
 
 
 class ProviderContractTests:

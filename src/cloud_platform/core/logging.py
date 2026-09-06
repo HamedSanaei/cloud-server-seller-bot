@@ -94,7 +94,7 @@ def _redact_value(value: object) -> object:
         for pattern in _REDACT_PATTERNS:
             redacted = pattern.sub(rf"\1{_REDACTED_PLACEHOLDER}", redacted)
         return redacted
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_redact_value(v) for v in value]
     return value
 

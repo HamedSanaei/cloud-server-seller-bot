@@ -18,6 +18,7 @@ from cloud_platform.modules.audit.domain import AuditEvent
 from cloud_platform.modules.checkout.service import (
     CheckoutReplayError,
     MonthlyCheckoutService,
+    OfferCatalogViewService,
     OfferUnavailableError,
     OsUnavailableError,
     UserNotActiveError,
@@ -171,8 +172,17 @@ class FakeOrdersRepo:
         return self.by_server.get(server_id)
 
     async def create(
-        self, *, server_id: UUID, operation_key: str, provider_key: str, offer_id: UUID
+        self,
+        *,
+        server_id: UUID,
+        operation_key: str,
+        provider_key: str,
+        offer_id: UUID,
+        **snapshots: Any,
     ) -> Any:
+        # Release hardening: the checkout snapshots every provider-side fact
+        # (product id, location, OS, term, cycle, provider cost, selling
+        # price) on the order row BEFORE any provider call.
         order = type(
             "Order",
             (),
@@ -182,6 +192,7 @@ class FakeOrdersRepo:
                 "operation_key": operation_key,
                 "provider_key": provider_key,
                 "offer_id": offer_id,
+                **snapshots,
             },
         )()
         self.by_server[server_id] = order
@@ -324,6 +335,18 @@ class TestCheckoutSafety:
         # Order intent with the deterministic operation key.
         assert result.order.operation_key == f"order-create:{server.id}"
         assert deps["orders"].by_server[server.id] is result.order
+        # Release hardening: provider-side facts are snapshotted BEFORE any
+        # provider call (provider cost and selling price stay separate).
+        order_row = deps["orders"].by_server[server.id]
+        assert order_row.product_id == "VPS02_1"
+        assert order_row.location_id == "AMS-01"
+        assert order_row.os_name == "Ubuntu 24.04"
+        assert order_row.contract_term == "1_MONTH"
+        assert order_row.billing_cycle == "1_MONTH"
+        assert order_row.provider_cost_minor == 999
+        assert order_row.provider_cost_currency == "EUR"
+        assert order_row.selling_price_minor == 1299
+        assert order_row.selling_currency == "EUR"
         # Operation ledger row exists.
         op = await deps["ops"].get_or_create(
             operation_key=f"order-create:{server.id}",
@@ -405,3 +428,401 @@ class TestCheckoutSafety:
         # OS validation happens BEFORE the hold; nothing persisted.
         assert deps["servers"].servers == []
         assert deps["holds"].holds == {}
+
+
+class TestCheckoutErrorPaths:
+    async def test_user_without_id_is_rejected(self) -> None:
+        service, _ = _make_service(offer=_offer())
+        user = _user()
+        user.id = None
+        from cloud_platform.modules.checkout.service import CheckoutError
+
+        with pytest.raises(CheckoutError):
+            await service.create_order(
+                user=user, offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-1"
+            )
+
+    async def test_provider_not_configured_is_rejected(self) -> None:
+        from cloud_platform.modules.checkout.service import OfferUnavailableError
+
+        wallet_repo = FakeWalletRepo(10_000)
+        hold_repo = FakeHoldRepo(wallet_repo)
+        registry = type(
+            "Registry",
+            (),
+            {"get": lambda self, key: (_ for _ in ()).throw(KeyError(key))},
+        )()
+        service = MonthlyCheckoutService(
+            server_repo=FakeServerRepo(),
+            offers_repo=FakeOfferRepo(_offer()),
+            account_repo=FakeAccountRepo(),
+            wallet_repo=wallet_repo,
+            hold_repo=hold_repo,
+            orders_repo=FakeOrdersRepo(),
+            operation_repo=FakeOperationRepo(),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+        )
+        with pytest.raises(OfferUnavailableError):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-2"
+            )
+
+    async def test_provider_without_ordering_port_is_rejected(self) -> None:
+        from cloud_platform.modules.checkout.service import OfferUnavailableError
+
+        class NoOrdering:
+            key = "leaseweb"
+
+        wallet_repo = FakeWalletRepo(10_000)
+        registry = type("Registry", (), {"get": lambda self, key: NoOrdering()})()
+        service = MonthlyCheckoutService(
+            server_repo=FakeServerRepo(),
+            offers_repo=FakeOfferRepo(_offer()),
+            account_repo=FakeAccountRepo(),
+            wallet_repo=wallet_repo,
+            hold_repo=FakeHoldRepo(wallet_repo),
+            orders_repo=FakeOrdersRepo(),
+            operation_repo=FakeOperationRepo(),
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+        )
+        with pytest.raises(OfferUnavailableError):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-3"
+            )
+
+    async def test_product_api_down_is_rejected(self) -> None:
+        service, _ = _make_service(ordering=FakeOrderingProvider(product_ok=False))
+        with pytest.raises(OfferUnavailableError):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-4"
+            )
+
+    async def test_no_wallet_is_rejected(self) -> None:
+        from cloud_platform.modules.checkout.service import NoWalletError
+
+        service, _ = _make_service(offer=_offer())
+
+        class NoWalletRepo:
+            async def get(self, user_id: UUID) -> None:
+                return None
+
+        service._wallets = NoWalletRepo()  # type: ignore[assignment]
+        with pytest.raises(NoWalletError):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-5"
+            )
+
+    async def test_order_create_failure_compensates(self) -> None:
+        service, deps = _make_service(offer=_offer())
+
+        class BrokenOrdersRepo(FakeOrdersRepo):
+            async def create(self, **kwargs: Any) -> Any:
+                raise RuntimeError("db constraint")
+
+        service._orders = BrokenOrdersRepo()  # type: ignore[assignment]
+        with pytest.raises(RuntimeError):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-6"
+            )
+        # Compensation: the created server is ERROR and the hold is released.
+        assert deps["servers"].servers[-1].state is ServerLifecycleState.ERROR
+        assert len(deps["holds"].holds) == 1
+        assert next(iter(deps["holds"].holds.values())).status is HoldStatus.RELEASED
+
+    async def test_operation_create_failure_compensates(self) -> None:
+        service, deps = _make_service(offer=_offer())
+
+        class BrokenOpsRepo(FakeOperationRepo):
+            async def get_or_create(self, **kwargs: Any) -> Any:
+                raise RuntimeError("db constraint")
+
+        service._ops = BrokenOpsRepo()  # type: ignore[assignment]
+        with pytest.raises(RuntimeError):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-7"
+            )
+        assert deps["servers"].servers[-1].state is ServerLifecycleState.ERROR
+        assert next(iter(deps["holds"].holds.values())).status is HoldStatus.RELEASED
+
+    async def test_concurrent_duplicate_replays_original(self) -> None:
+        service, deps = _make_service(offer=_offer())
+
+        class RacingServerRepo(FakeServerRepo):
+            async def create(self, server: CloudServer, intent: Any) -> CloudServer:
+                from cloud_platform.modules.compute.domain import ServerCreateError
+
+                raise ServerCreateError("duplicate idempotency key")
+
+        racing = RacingServerRepo()
+        racing.by_key["k-8"] = deps["servers"].servers[0] if deps["servers"].servers else None
+        # Seed the original intent exactly like the first checkout would.
+        first, _ = _make_service(offer=_offer())
+        result = await first.create_order(
+            user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-8"
+        )
+        assert result.replayed is False
+        racing.by_key["k-8"] = result.server
+        service._servers = racing  # type: ignore[assignment]
+        service._orders.by_server[result.server.id] = result.order  # type: ignore[attr-defined]
+        replay = await service.create_order(
+            user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-8"
+        )
+        assert replay.replayed is True
+        assert replay.server.id == result.server.id
+
+    async def test_replay_without_wallet_returns_hold_none(self) -> None:
+        service, _ = _make_service(offer=_offer())
+        first = await service.create_order(
+            user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-9"
+        )
+        assert first.replayed is False
+
+        class NoWalletRepo:
+            async def get(self, user_id: UUID) -> None:
+                return None
+
+        service._wallets = NoWalletRepo()  # type: ignore[assignment]
+        replay = await service.create_order(
+            user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k-9"
+        )
+        assert replay.replayed is True
+        assert replay.hold is None
+
+    async def test_release_hold_without_id_is_noop(self) -> None:
+        service, _ = _make_service(offer=_offer())
+        hold = Hold(
+            wallet_id=WALLET_ID,
+            amount=1299,
+            currency="EUR",
+            idempotency_key="orphan",
+            id=None,
+        )
+        await service._release_hold(hold)  # must not raise
+
+
+class FakeListOfferRepo(FakeOfferRepo):
+    def __init__(self, offers: list[SellableOffer]) -> None:
+        super().__init__(offers[0] if offers else None)
+        self._offers = offers
+
+    async def list_sellable(self, provider_key: str) -> list[SellableOffer]:
+        return [o for o in self._offers if o.sellable]
+
+
+def _detail() -> Any:
+    from cloud_platform.providers.leaseweb.ordering import (
+        LeasewebProduct,
+        LeasewebProductDetail,
+        LeasewebProductOption,
+    )
+
+    product = LeasewebProduct(
+        id="VPS02_1",
+        name="VPS S",
+        location="AMS-01",
+        vcpu=2,
+        ram_gb=4,
+        disk_gb=100,
+        traffic="10 TB",
+        currency="EUR",
+        monthly_price_minor=999,
+        provider_price_minor=999,
+    )
+    return LeasewebProductDetail(
+        product=product,
+        os_options=(
+            LeasewebProductOption(
+                name="Ubuntu 24.04", price_minor=0, currency="EUR", selected=False
+            ),
+            LeasewebProductOption(name="Debian 12", price_minor=0, currency="EUR", selected=False),
+            LeasewebProductOption(
+                name="Windows 2022", price_minor=1500, currency="EUR", selected=False
+            ),
+        ),
+        control_panels=(),
+        disk_upgrades=(),
+        slas=(),
+        available_locations=("AMS-01",),
+        contract_terms={"1_MONTH": 999},
+        billing_cycles={"1_MONTH": 999},
+    )
+
+
+def _view_service(
+    *,
+    offers: list[SellableOffer] | None = None,
+    detail: Any | None = None,
+    no_ordering: bool = False,
+    missing_provider: bool = False,
+) -> OfferCatalogViewService:
+    from cloud_platform.modules.checkout.service import OfferCatalogViewService
+
+    offers = offers if offers is not None else [_offer()]
+
+    class FakeOrdering:
+        key = "leaseweb"
+
+        async def get_product(self, location_id: str, product_id: str) -> Any:
+            return detail if detail is not None else _detail()
+
+        async def place_order(self, request: Any, idempotency_key: Any) -> Any:
+            raise AssertionError("view service must not place orders")
+
+        async def get_order(self, provider_order_id: str) -> Any:
+            raise AssertionError("view service must not poll orders")
+
+    class NoOrdering:
+        key = "leaseweb"
+
+    def _get(self, key: str) -> Any:
+        if missing_provider:
+            raise KeyError(key)
+        return NoOrdering() if no_ordering else FakeOrdering()
+
+    registry = type("Registry", (), {"get": _get})()
+    wallet_repo = FakeWalletRepo(10_000)
+    return OfferCatalogViewService(
+        offers_repo=FakeListOfferRepo(offers),
+        provider_registry=registry,
+        wallet_repo=wallet_repo,
+        signing_key="test-signing-key",
+    )
+
+
+class TestOfferCatalogViews:
+    def test_empty_signing_key_rejected(self) -> None:
+        from cloud_platform.modules.checkout.service import OfferCatalogViewService
+
+        with pytest.raises(ValueError):
+            OfferCatalogViewService(
+                offers_repo=FakeListOfferRepo([_offer()]),
+                provider_registry=type("R", (), {"get": lambda self, k: None})(),
+                wallet_repo=FakeWalletRepo(100),
+                signing_key="",
+            )
+
+    async def test_os_options_provider_missing(self) -> None:
+        service = _view_service(missing_provider=True)
+        with pytest.raises(OfferUnavailableError):
+            await service.os_options(_offer())
+
+    async def test_os_options_no_ordering_port(self) -> None:
+        service = _view_service(no_ordering=True)
+        with pytest.raises(OfferUnavailableError):
+            await service.os_options(_offer())
+
+    async def test_os_options_free_only_by_default(self) -> None:
+        service = _view_service()
+        options = await service.os_options(_offer())
+        assert [o.name for o in options] == ["Ubuntu 24.04", "Debian 12"]
+        assert options[0].select_callback  # signed callback present
+        assert options[1].index == 1
+
+    async def test_os_options_all_when_flag_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import cloud_platform.modules.checkout.service as checkout_mod
+
+        settings = type("S", (), {"leaseweb_order_os_only_free": False})()
+        monkeypatch.setattr(checkout_mod, "get_settings", lambda: settings)
+        service = _view_service()
+        options = await service.os_options(_offer())
+        assert [o.name for o in options] == [
+            "Ubuntu 24.04",
+            "Debian 12",
+            "Windows 2022",
+        ]
+
+    async def test_os_by_index_out_of_range(self) -> None:
+        service = _view_service()
+        with pytest.raises(OsUnavailableError):
+            await service.os_by_index(_offer(), 7)
+
+    async def test_confirmation_unsellable_offer(self) -> None:
+        service = _view_service(offers=[_offer(sellable=False)])
+        with pytest.raises(OfferUnavailableError):
+            await service.confirmation(user_id=USER_ID, offer_id=OFFER_ID, os_index=0)
+
+    async def test_confirmation_shows_exact_price_and_sufficiency(self) -> None:
+        service = _view_service(offers=[_offer(price=1299)])
+        view = await service.confirmation(user_id=USER_ID, offer_id=OFFER_ID, os_index=0)
+        assert view.os_name == "Ubuntu 24.04"
+        assert view.offer.monthly_price_minor == 1299
+        assert view.balance_minor == 10_000
+        assert view.sufficient is True
+        assert view.confirm_callback and view.back_callback and view.cancel_callback
+
+        poor = _view_service(offers=[_offer(price=1299)])
+        poor._wallets = FakeWalletRepo(500)  # type: ignore[assignment]
+        low = await poor.confirmation(user_id=USER_ID, offer_id=OFFER_ID, os_index=0)
+        assert low.sufficient is False
+
+    async def test_os_screen_unsellable(self) -> None:
+        service = _view_service(offers=[_offer(sellable=False)])
+        with pytest.raises(OfferUnavailableError):
+            await service.os_screen(offer_id=OFFER_ID)
+
+    async def test_os_screen_no_free_options(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering import (
+            LeasewebProduct,
+            LeasewebProductDetail,
+            LeasewebProductOption,
+        )
+
+        product = LeasewebProduct(
+            id="VPS02_1",
+            name="VPS S",
+            location="AMS-01",
+            vcpu=2,
+            ram_gb=4,
+            disk_gb=100,
+            traffic="10 TB",
+            currency="EUR",
+            monthly_price_minor=999,
+            provider_price_minor=999,
+        )
+        paid_only = LeasewebProductDetail(
+            product=product,
+            os_options=(
+                LeasewebProductOption(
+                    name="Windows 2022", price_minor=1500, currency="EUR", selected=False
+                ),
+            ),
+            control_panels=(),
+            disk_upgrades=(),
+            slas=(),
+            available_locations=("AMS-01",),
+            contract_terms={"1_MONTH": 999},
+            billing_cycles={"1_MONTH": 999},
+        )
+        service = _view_service(detail=paid_only)
+        with pytest.raises(OsUnavailableError):
+            await service.os_screen(offer_id=OFFER_ID)
+
+    async def test_os_screen_returns_data(self) -> None:
+        service = _view_service()
+        view, options, back, cancel = await service.os_screen(offer_id=OFFER_ID)
+        assert view.product_id == "VPS02_1"
+        assert len(options) == 2
+        assert back and cancel
+
+    async def test_plans_screen_no_offers(self) -> None:
+        service = _view_service(offers=[])
+        with pytest.raises(OfferUnavailableError):
+            await service.plans_screen("AMS-01")
+
+    async def test_plans_screen_sorted_by_name(self) -> None:
+        # _offer() has a fixed OFFER_ID; build a second sellable offer.
+        other = _offer()
+        object.__setattr__(other, "id", uuid4())
+        object.__setattr__(other, "name", "VPS L")
+        object.__setattr__(other, "vcpu", 4)
+        service = _view_service(offers=[other, _offer()])
+        views, back, cancel = await service.plans_screen("AMS-01")
+        assert [v.name for v in views] == ["VPS L", "VPS S"]
+        assert back and cancel
+
+    async def test_plan_callback_returns_signed(self) -> None:
+        service = _view_service()
+        callback = service.plan_callback(OFFER_ID)
+        assert "offers:plans" in callback
