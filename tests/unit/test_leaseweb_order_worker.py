@@ -57,6 +57,7 @@ from cloud_platform.providers.base import (
 )
 from cloud_platform.providers.errors import (
     ProviderAuthError,
+    ProviderNotFound,
     ProviderOutcomeUnknown,
     ProviderUnavailable,
 )
@@ -295,7 +296,15 @@ class FakeOrderingProvider:
         recovery: OrderRecoveryResult | None = None,
     ) -> None:
         self._ticket = ticket or ProvisioningTicket(
-            provider_order_id="LS-ORD-1", state="provisioning"
+            provider_order_id="LS-ORD-1",
+            state="provisioning",
+            metadata={
+                "product_id": "VIRTUAL_SERVER",
+                "price_per_frequency_minor": 999,
+                "currency": "EUR",
+                "contract_term": "1 MONTH",
+                "billing_cycle": "1 MONTH",
+            },
         )
         self._error = error
         self._recovery = recovery or OrderRecoveryResult(
@@ -918,6 +927,232 @@ class TestOrderRecoveryService:
         assert counts.get("recovered") == 1
         assert deps["ordering"].recovery_calls[0]["provider_cost_minor"] == 999
         assert deps["ordering"].posts == []
+
+
+def _manual_worker(
+    *,
+    ordering: FakeOrderingProvider | None = None,
+    order: ProviderOrder | None = None,
+    op: Operation | None = None,
+    server: CloudServer | None = None,
+    holds: FakeHoldRepo | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    from cloud_platform.modules.orders.service import OrderManualResolutionService
+
+    if op is None:
+        op = _operation(OperationStatus.OUTCOME_UNKNOWN)
+        op.status = OperationStatus.OUTCOME_UNKNOWN
+    order = order or _outcome_unknown_order()
+    server = server or _server(ServerLifecycleState.REQUESTED)
+    ordering = ordering or FakeOrderingProvider()
+    server_repo = FakeServerRepo(server)
+    orders_repo = FakeOrdersRepo(order)
+    op_repo = FakeOperationRepo(op)
+    wallet_repo = FakeWalletRepo()
+    holds = holds or FakeHoldRepo()
+    hold_service = FakeHoldService(holds)
+    audit_repo = FakeAuditRepo()
+    registry = ProviderRegistry()
+    registry.register(ordering)
+    service = OrderManualResolutionService(
+        server_repo=server_repo,
+        orders_repo=orders_repo,
+        operation_repo=op_repo,
+        wallet_repo=wallet_repo,
+        hold_repo=holds,
+        hold_service=hold_service,
+        audit_repo=audit_repo,
+        provider_registry=registry,
+    )
+    deps = {
+        "orders": orders_repo,
+        "op_repo": op_repo,
+        "servers": server_repo,
+        "holds": holds,
+        "hold_service": hold_service,
+        "ordering": ordering,
+        "audit": audit_repo,
+    }
+    return service, deps
+
+
+class TestOrderManualResolutionService:
+    async def test_retry_failed_reopens_definitive_failure(self) -> None:
+        """A DEFINITIVELY FAILED order is re-queued under the SAME local
+        operation identity; the server returns to REQUESTED so the worker
+        picks it up. No provider call of any kind happens during retry."""
+        order = _order(OrderStatus.FAILED)
+        op = _operation(OperationStatus.FAILED)
+        server = _server(ServerLifecycleState.ERROR)
+        service, deps = _manual_worker(order=order, op=op, server=server)
+        resolved_order, resolved_op = await service.retry_failed(
+            ORDER_ID, reason="verified the provider rejected the POST; nothing created"
+        )
+        assert resolved_order.status is OrderStatus.PENDING_SUBMIT
+        assert resolved_order.error is None
+        assert resolved_op.status is OperationStatus.PENDING
+        assert resolved_op.operation_key == OP_KEY  # SAME local identity
+        assert deps["servers"].server.state is ServerLifecycleState.REQUESTED
+        assert deps["ordering"].posts == []
+        assert len(deps["audit"].events) == 1
+        assert deps["audit"].events[0].action == "order.retry"
+
+    async def test_retry_failed_refuses_ambiguous_order(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        service, deps = _manual_worker()  # order OUTCOME_UNKNOWN, op OUTCOME_UNKNOWN
+        with pytest.raises(OrderManualResolutionError):
+            await service.retry_failed(ORDER_ID, reason="retry anyway")
+        # No state change at all.
+        assert deps["orders"].order.status is OrderStatus.OUTCOME_UNKNOWN
+        assert deps["op_repo"].op.status is OperationStatus.OUTCOME_UNKNOWN
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+        assert deps["ordering"].posts == []
+
+    async def test_retry_failed_refuses_non_failed_operation(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        order = _order(OrderStatus.FAILED)
+        op = _operation(OperationStatus.OUTCOME_UNKNOWN)
+        service, _deps = _manual_worker(order=order, op=op)
+        with pytest.raises(OrderManualResolutionError, match="not FAILED"):
+            await service.retry_failed(ORDER_ID, reason="x")
+
+    async def test_retry_failed_requires_reason(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        order = _order(OrderStatus.FAILED)
+        op = _operation(OperationStatus.FAILED)
+        server = _server(ServerLifecycleState.ERROR)
+        service, _deps = _manual_worker(order=order, op=op, server=server)
+        with pytest.raises(OrderManualResolutionError, match="reason"):
+            await service.retry_failed(ORDER_ID, reason="  ")
+
+    async def test_resolve_existing_attaches_verified_order_read_only(self) -> None:
+        """The operator-verified provider order is attached after a READ-ONLY
+        validation; the operation completes; the hold is captured exactly
+        once; nothing is ever POSTed."""
+        ordering = FakeOrderingProvider()
+        service, deps = _manual_worker(ordering=ordering)
+        order, operation = await service.resolve_existing(
+            ORDER_ID, "LS-ORD-9", reason="verified at Leaseweb portal"
+        )
+        assert order.status is OrderStatus.SUBMITTED
+        assert order.provider_order_id == "LS-ORD-9"
+        assert order.error is None
+        assert operation.status is OperationStatus.COMPLETED
+        assert operation.provider_response is not None
+        assert operation.provider_response["resolved_by"] == "manual"
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        assert len(deps["hold_service"].captures) == 1
+        assert deps["ordering"].posts == []  # NEVER POSTs
+        assert len(deps["audit"].events) == 1
+        assert deps["audit"].events[0].action == "order.resolve_existing"
+        assert deps["audit"].events[0].metadata["provider_order_id"] == "LS-ORD-9"
+
+    async def test_resolve_existing_accepts_needs_review_provenance(self) -> None:
+        order = _outcome_unknown_order()
+        order.status = OrderStatus.NEEDS_REVIEW
+        order.error = "recovery ambiguous: unproven candidate"
+        service, deps = _manual_worker(order=order)
+        order, operation = await service.resolve_existing(ORDER_ID, "LS-ORD-9", reason="verified")
+        assert order.status is OrderStatus.SUBMITTED
+        assert operation.status is OperationStatus.COMPLETED
+        assert len(deps["hold_service"].captures) == 1
+
+    async def test_resolve_existing_repeated_is_idempotent(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        service, deps = _manual_worker()
+        await service.resolve_existing(ORDER_ID, "LS-ORD-9", reason="verified")
+        # The order is now SUBMITTED: a second resolution is refused and the
+        # hold is captured exactly ONCE.
+        with pytest.raises(OrderManualResolutionError):
+            await service.resolve_existing(ORDER_ID, "LS-ORD-9", reason="again")
+        assert len(deps["hold_service"].captures) == 1
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        assert len(deps["audit"].events) == 1
+
+    async def test_resolve_existing_refuses_wrong_product(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        ordering = FakeOrderingProvider(
+            ticket=ProvisioningTicket(
+                provider_order_id="LS-ORD-9",
+                state="provisioning",
+                metadata={"product_id": "DEDICATED_SERVER"},
+            )
+        )
+        service, deps = _manual_worker(ordering=ordering)
+        with pytest.raises(OrderManualResolutionError, match="DEDICATED_SERVER"):
+            await service.resolve_existing(ORDER_ID, "LS-ORD-9", reason="wrong product")
+        assert deps["orders"].order.status is OrderStatus.OUTCOME_UNKNOWN  # unchanged
+        assert deps["op_repo"].op.status is OperationStatus.OUTCOME_UNKNOWN
+        assert deps["holds"].hold.status is HoldStatus.CREATED  # never captured
+        assert deps["ordering"].posts == []
+
+    async def test_resolve_existing_refuses_price_mismatch(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        ordering = FakeOrderingProvider(
+            ticket=ProvisioningTicket(
+                provider_order_id="LS-ORD-9",
+                state="provisioning",
+                metadata={"product_id": "VIRTUAL_SERVER", "price_per_frequency_minor": 1999},
+            )
+        )
+        service, deps = _manual_worker(ordering=ordering)
+        with pytest.raises(OrderManualResolutionError, match="price"):
+            await service.resolve_existing(ORDER_ID, "LS-ORD-9", reason="wrong price")
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+
+    async def test_resolve_existing_refuses_when_validation_get_fails(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        ordering = FakeOrderingProvider()
+
+        async def _fail(*args: Any, **kwargs: Any) -> Any:
+            raise ProviderNotFound("order gone")
+
+        ordering.get_order = _fail  # type: ignore[method-assign]
+        service, deps = _manual_worker(ordering=ordering)
+        with pytest.raises(OrderManualResolutionError, match="read-only validation"):
+            await service.resolve_existing(ORDER_ID, "LS-ORD-9", reason="x")
+        assert deps["orders"].order.status is OrderStatus.OUTCOME_UNKNOWN
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+        assert deps["ordering"].posts == []
+
+    async def test_resolve_not_created_requeues_same_identity(self) -> None:
+        """Verified absence: OUTCOME_UNKNOWN -> PENDING under the SAME local
+        operation key, order back to PENDING_SUBMIT; the worker may then
+        POST once more (a NEW provider order)."""
+        service, deps = _manual_worker()
+        order, operation = await service.resolve_not_created(
+            ORDER_ID, reason="verified no order exists at the portal"
+        )
+        assert order.status is OrderStatus.PENDING_SUBMIT
+        assert operation.status is OperationStatus.PENDING
+        assert operation.operation_key == OP_KEY  # SAME local identity
+        assert deps["servers"].server.state is ServerLifecycleState.REQUESTED
+        assert deps["ordering"].posts == []  # resolution itself never POSTs
+        assert len(deps["audit"].events) == 1
+        assert deps["audit"].events[0].action == "order.resolve_not_created"
+
+    async def test_resolve_not_created_refuses_when_operation_not_unknown(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        op = _operation(OperationStatus.FAILED)
+        service, deps = _manual_worker(op=op)
+        with pytest.raises(OrderManualResolutionError, match="OUTCOME_UNKNOWN"):
+            await service.resolve_not_created(ORDER_ID, reason="x")
+        assert deps["orders"].order.status is OrderStatus.OUTCOME_UNKNOWN
+
+    async def test_resolve_not_created_requires_reason(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        service, _deps = _manual_worker()
+        with pytest.raises(OrderManualResolutionError, match="reason"):
+            await service.resolve_not_created(ORDER_ID, reason="")
 
 
 class TestReconcilerBranches:

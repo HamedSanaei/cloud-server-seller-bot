@@ -10,9 +10,6 @@ Commands::
                                  prints the API key, never orders anything)
     leaseweb sync-offers         Refresh the sellable-offer price book from
                                  the Leaseweb ordering API
-    leaseweb smoke-order         Place a REAL order — requires
-                                 LEASEWEB_ALLOW_LIVE_ORDER_TEST=true AND
-                                 --yes; every other path refuses
     offers list [--all]          Sellable offers (or all rows)
     offers enable <offer_id>     Operator-enable an offer
     offers disable <offer_id>    Hide an offer from sale
@@ -24,8 +21,14 @@ Commands::
     orders list                  Open provider orders
     orders attention             FAILED + NEEDS_REVIEW orders
     orders inspect <order_id>    One order with its server/operation
-    orders retry <order_id>      Reopen a FAILED order intent for the worker
-                                 (same deterministic operation key -> safe)
+    orders retry <order_id>      Reopen a DEFINITIVELY FAILED order intent
+                                 (same local operation key; no provider dedup)
+    orders resolve-existing <order_id> <provider_order_id> --reason R --yes
+                                 Attach a provider order id a human verified
+                                 (ambiguous POST; read-only validation, no POST)
+    orders resolve-not-created <order_id> --reason R --yes
+                                 Re-queue an ambiguous intent after the human
+                                 verified the provider created nothing
     renewals list [--attention]  Renewal records (attention queue)
     renewals check               Run the daily renewal pass right now
 
@@ -41,6 +44,7 @@ import logging
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 from cloud_platform.core.config import get_settings
@@ -423,39 +427,138 @@ async def orders_inspect(order_id: str) -> int:
     return 0
 
 
-async def orders_retry(order_id: str) -> int:
-    from cloud_platform.db.session import SessionFactory
-    from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
-    from cloud_platform.modules.orders.repository import SqlAlchemyProviderOrderRepository
+def _cli_admin_user() -> Any:
+    from cloud_platform.modules.users.domain import Role, User, UserStatus
 
-    orders_repo = SqlAlchemyProviderOrderRepository(SessionFactory)
-    order = await orders_repo.get(UUID(order_id))
-    if order is None:
-        print(f"order {order_id} not found")
-        return 1
-    if order.status.value not in ("failed", "needs_review"):
-        print(f"order {order_id} is {order.status.value}; only failed/needs_review may be retried")
-        return 2
-    # A NEEDS_REVIEW order escalated from an unknown provider outcome may
-    # ALREADY exist at Leaseweb: re-POSTing without manual verification can
-    # buy a second VPS. The operator must check the portal first.
-    if "recovery" in (order.error or "").lower() or "outcome" in (order.error or "").lower():
-        print(
-            "WARNING: this order was escalated because a billable POST outcome was "
-            "UNKNOWN. Verify at the Leaseweb portal that NO matching order exists "
-            "BEFORE re-attempting; otherwise you may place a duplicate order."
+    return User(
+        username="cli-operator",
+        email="operator@local",
+        status=UserStatus.ACTIVE,
+        role=Role.ADMIN,
+    )
+
+
+async def orders_retry(order_id: str, reason: str) -> int:
+    """Reopen a DEFINITIVELY FAILED order intent for a worker retry.
+
+    Only definitive failures (provider rejection, nothing created) qualify.
+    Ambiguous orders (OUTCOME_UNKNOWN / NEEDS_REVIEW) are REFUSED here: they
+    must be resolved with ``orders resolve-existing`` / ``resolve-not-created``
+    after the operator verified the provider state at the portal.
+    """
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+    container = create_container()
+    try:
+        service = container.order_manual_resolution()
+        order, op = await service.retry_failed(
+            UUID(order_id), actor=_cli_admin_user(), reason=reason
         )
-    op_repo = SqlAlchemyOperationRepository(SessionFactory)
-    op = await op_repo.get_by_key(order.operation_key)
-    if op is None:
-        print(f"operation for order {order_id} missing; run checkout again")
+    except OrderManualResolutionError as exc:
+        print(f"REFUSED: {exc}")
+        return 2
+    except LookupError as exc:
+        print(exc)
         return 1
-    if op.status.value == "failed":
-        op.reopen_for_retry()
-        await op_repo.save(op)
+    finally:
+        await container.close()
     print(
-        f"order {order_id} reopened (operation {op.id} status={op.status.value}); "
-        f"the worker will re-attempt with the SAME idempotency key — no duplicate order is possible"
+        f"order {order.id} reopened (operation {op.id} status={op.status.value}, "
+        f"server re-queued); the worker will re-attempt with the SAME local "
+        "operation key."
+    )
+    print(
+        "Leaseweb ordering has NO provider-side idempotency: this retry is safe ONLY "
+        "because the previous attempt was DEFINITIVELY rejected without creating an "
+        "order. Verify at the portal before retrying if there is any doubt."
+    )
+    return 0
+
+
+async def orders_resolve_existing(
+    order_id: str, provider_order_id: str, reason: str, yes: bool
+) -> int:
+    """Attach the provider order id a human VERIFIED at the Leaseweb portal
+    corresponds to an ambiguous POST. Performs a READ-ONLY validation of the
+    supplied id; NEVER POSTs; captures the hold exactly once."""
+    if not yes:
+        print(
+            "REFUSED: pass --yes to confirm. This attaches a provider order id you "
+            "verified at the Leaseweb portal; it NEVER POSTs to Leaseweb."
+        )
+        return 2
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+    container = create_container()
+    try:
+        service = container.order_manual_resolution()
+        order, op = await service.resolve_existing(
+            UUID(order_id),
+            provider_order_id,
+            actor=_cli_admin_user(),
+            reason=reason,
+        )
+    except OrderManualResolutionError as exc:
+        print(f"REFUSED: {exc}")
+        return 2
+    except LookupError as exc:
+        print(exc)
+        return 1
+    finally:
+        await container.close()
+    print(
+        f"order {order.id} resolved: attached provider_order_id="
+        f"{order.provider_order_id} status={order.status.value} "
+        f"operation={op.status.value}"
+    )
+    print(
+        "The read-only reconciler will poll the order; the wallet hold was "
+        "captured exactly once (if this was a customer order). No provider POST "
+        "was made."
+    )
+    return 0
+
+
+async def orders_resolve_not_created(order_id: str, reason: str, yes: bool) -> int:
+    """Re-queue an ambiguous order intent AFTER the operator verified at the
+    Leaseweb portal that the ambiguous POST created NO order. The retry is a
+    NEW provider POST under the same local operation key — Leaseweb has no
+    provider-side idempotency — so this is only safe after verified absence.
+    """
+    if not yes:
+        print(
+            "REFUSED: pass --yes to confirm. This re-queues the intent so the worker "
+            "will place a NEW provider order. Only do this after you verified at the "
+            "Leaseweb portal that the ambiguous POST created nothing."
+        )
+        return 2
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+    container = create_container()
+    try:
+        service = container.order_manual_resolution()
+        order, op = await service.resolve_not_created(
+            UUID(order_id), actor=_cli_admin_user(), reason=reason
+        )
+    except OrderManualResolutionError as exc:
+        print(f"REFUSED: {exc}")
+        return 2
+    except LookupError as exc:
+        print(exc)
+        return 1
+    finally:
+        await container.close()
+    print(
+        f"order {order.id} re-queued (operation {op.id} status={op.status.value}) "
+        "with the SAME local operation key."
+    )
+    print(
+        "WARNING: the worker will now place a NEW provider order. Leaseweb provides "
+        "NO provider-side idempotency — this is safe ONLY because you verified the "
+        "ambiguous POST created nothing at the portal."
     )
     return 0
 
@@ -501,81 +604,6 @@ async def renewals_check() -> int:
 
 
 # ---------------------------------------------------------------------------
-# leaseweb smoke-order — real order ONLY with explicit env switch + --yes
-# ---------------------------------------------------------------------------
-
-
-async def leaseweb_smoke_order(offer_id: str, os_index: int) -> int:
-    settings = get_settings()
-    if not settings.leaseweb_allow_live_order_test:
-        print(
-            "REFUSED: placing a real Leaseweb order requires "
-            "LEASEWEB_ALLOW_LIVE_ORDER_TEST=true (explicit environment switch).\n"
-            "This is a BILLABLE action. See docs/operations/RUNBOOK.md for the "
-            "controlled procedure."
-        )
-        return 2
-    print("WARNING: this places a REAL, billable Leaseweb VPS order.")
-    from cloud_platform.core.idempotency import IdempotencyKey
-    from cloud_platform.db.session import SessionFactory
-    from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
-    from cloud_platform.providers.base import CreateServerRequest
-    from cloud_platform.providers.leaseweb.ordering import LeaseWebOrderingProvider
-
-    repo = SqlAlchemySellableOfferRepository(SessionFactory)
-    offer = await repo.get(UUID(offer_id))
-    if offer is None or not offer.sellable:
-        print(f"offer {offer_id} is not sellable; aborting")
-        return 1
-    provider = LeaseWebOrderingProvider(
-        api_key=settings.leaseweb_api_key,
-        base_url=settings.leaseweb_api_base_url,
-        locations=(offer.location_id,),
-    )
-    detail = await provider.get_product(offer.location_id, offer.product_id)
-    options = (
-        detail.free_os_options() if settings.leaseweb_order_os_only_free else detail.os_options
-    )
-    if os_index < 0 or os_index >= len(options):
-        print(f"OS index {os_index} out of range (0..{len(options) - 1})")
-        return 1
-    os_name = options[os_index].name
-    print(
-        f"offer={offer.ref} os={os_name} monthly={offer.selling_price_minor} "
-        f"{offer.selling_currency}"
-    )
-    from uuid import uuid4
-
-    key = f"smoke-order:{uuid4()}"
-    ticket = await provider.place_order(
-        CreateServerRequest(
-            name=f"smoke-{key[-8:]}",
-            plan_id=offer.product_id,
-            image_id=os_name,
-            location_id=offer.location_id,
-            labels={
-                # PROVIDER-side facts only: the customer selling price is
-                # never used to identify a provider order (release
-                # hardening).
-                "provider_price_minor": str(offer.provider_cost_minor),
-                "provider_currency": offer.provider_cost_currency,
-                "contract_term": "1_MONTH",
-                "billing_cycle": "1_MONTH",
-                "smoke": "1",
-            },
-        ),
-        IdempotencyKey(key),
-    )
-    print(f"ORDER PLACED: provider_order_id={ticket.provider_order_id} state={ticket.state}")
-    print(
-        "Track it: uv run python -m cloud_platform.cli orders inspect "
-        "(after the checkout flow) or the Leaseweb portal. "
-        "This order is NOT linked to a platform server."
-    )
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
 
@@ -588,10 +616,6 @@ def _parser() -> argparse.ArgumentParser:
     lsw_sub = lsw.add_subparsers(dest="subcommand", required=True)
     lsw_sub.add_parser("doctor", help="read-only pre-flight diagnostics")
     lsw_sub.add_parser("sync-offers", help="refresh the sellable-offer price book")
-    smoke = lsw_sub.add_parser("smoke-order", help="REAL billable order (guarded)")
-    smoke.add_argument("--offer", required=True, help="sellable offer id")
-    smoke.add_argument("--os-index", type=int, default=0, help="OS option index")
-    smoke.add_argument("--yes", action="store_true", help="confirm the billable action")
 
     offers = sub.add_parser("offers", help="sellable-offer management")
     offers_sub = offers.add_subparsers(dest="subcommand", required=True)
@@ -627,8 +651,22 @@ def _parser() -> argparse.ArgumentParser:
     orders_sub.add_parser("attention")
     inspect = orders_sub.add_parser("inspect")
     inspect.add_argument("order_id")
-    retry = orders_sub.add_parser("retry")
+    retry = orders_sub.add_parser("retry", help="reopen a DEFINITIVELY FAILED order intent")
     retry.add_argument("order_id")
+    retry.add_argument("--reason", default="operator retry of a definitively failed order")
+    resolve_existing_p = orders_sub.add_parser(
+        "resolve-existing", help="attach a provider order id verified at the portal"
+    )
+    resolve_existing_p.add_argument("order_id")
+    resolve_existing_p.add_argument("provider_order_id")
+    resolve_existing_p.add_argument("--reason", required=True)
+    resolve_existing_p.add_argument("--yes", action="store_true")
+    resolve_not_created_p = orders_sub.add_parser(
+        "resolve-not-created", help="re-queue an intent after verified non-creation"
+    )
+    resolve_not_created_p.add_argument("order_id")
+    resolve_not_created_p.add_argument("--reason", required=True)
+    resolve_not_created_p.add_argument("--yes", action="store_true")
 
     renewals = sub.add_parser("renewals")
     renewals_sub = renewals.add_subparsers(dest="subcommand", required=True)
@@ -647,14 +685,6 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return 0 if result.ok else 1
         if args.subcommand == "sync-offers":
             return await leaseweb_sync_offers()
-        if args.subcommand == "smoke-order":
-            if not args.yes:
-                print(
-                    "REFUSED: pass --yes to confirm. This is a BILLABLE action and "
-                    "requires LEASEWEB_ALLOW_LIVE_ORDER_TEST=true."
-                )
-                return 2
-            return await leaseweb_smoke_order(args.offer, args.os_index)
         print(f"unknown leaseweb subcommand {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "offers":
@@ -678,7 +708,13 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.subcommand == "inspect":
             return await orders_inspect(args.order_id)
         if args.subcommand == "retry":
-            return await orders_retry(args.order_id)
+            return await orders_retry(args.order_id, args.reason)
+        if args.subcommand == "resolve-existing":
+            return await orders_resolve_existing(
+                args.order_id, args.provider_order_id, args.reason, args.yes
+            )
+        if args.subcommand == "resolve-not-created":
+            return await orders_resolve_not_created(args.order_id, args.reason, args.yes)
     if args.command == "renewals":
         if args.subcommand == "list":
             return await renewals_list(args.attention)

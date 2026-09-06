@@ -177,6 +177,7 @@ Leaseweb support when asking whether a specific request created an order.
 6. Enable the offers you want to sell and set an explicit customer selling
    price (admin command / CLI) — a product is sellable ONLY when Leaseweb
    reports it, it is enabled, and it has an explicit sell price.
-7. Order from Telegram (`خرید سرور`). `LEASEWEB_ALLOW_LIVE_ORDER_TEST`
-   stays `false` until the controlled live-order procedure
-   (`docs/operations/RUNBOOK.md`) is followed.
+7. Order from Telegram (`خرید سرور`). There is intentionally NO CLI command
+   that can place a billable order — every POST flows through the durable
+   checkout → worker pipeline; the first real order follows the controlled
+   procedure in `docs/operations/RUNBOOK.md`.

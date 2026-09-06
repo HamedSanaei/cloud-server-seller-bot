@@ -138,6 +138,21 @@ class CloudServer:
             raise ValueError(f"invalid lifecycle transition: {self.state} -> {target}")
         self.state = target
 
+    def reset_to_requested(self) -> None:
+        """MANUAL resolution only: ERROR -> REQUESTED.
+
+        Used by the operator-facing retry/resolution flows after the operator
+        verified the failed/ambiguous attempt created no provider resource,
+        so the order worker picks the server up again. Deliberately NOT in
+        ``_ALLOWED``: no automated path may re-queue a failed server.
+        """
+        if self.state is not ServerLifecycleState.ERROR:
+            raise ValueError(
+                f"cannot reset server in state {self.state.value} to REQUESTED "
+                "(only ERROR servers may be re-queued manually)"
+            )
+        self.state = ServerLifecycleState.REQUESTED
+
     @property
     def is_containable(self) -> bool:
         """Whether this server can currently be placed under containment."""

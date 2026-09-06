@@ -2,9 +2,9 @@
 
 Every DB-backed command is exercised with patched repository classes (the
 CLI imports them lazily inside each command), and the container-backed
-commands with a patched ``create_container``. ``leaseweb smoke-order`` is
-exercised only in REFUSAL mode plus one armed-path test that asserts the
-POST carries PROVIDER-side facts (never the customer selling price).
+commands with a patched ``create_container``. There is intentionally NO
+smoke-order command (no untracked billable POST path); order retry and the
+manual resolution commands are exercised through the patched container.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import pytest
 import cloud_platform.cli as cli
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.orders.domain import OrderStatus, ProviderOrder
+from cloud_platform.modules.orders.service import OrderManualResolutionError
 from cloud_platform.modules.renewals.domain import RenewalRecord, RenewalStatus
 from cloud_platform.modules.users.domain import Role, User, UserStatus
 from cloud_platform.modules.wallet.domain import Wallet
@@ -201,78 +202,133 @@ class TestLeasewebDoctor:
         assert cli._redact("abcdefgh") == "****efgh"
 
 
-class TestSmokeOrderGuard:
-    async def test_refused_without_yes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        settings = MagicMock()
-        settings.leaseweb_allow_live_order_test = False
-        monkeypatch.setattr(cli, "get_settings", lambda: settings)
-        assert await cli.leaseweb_smoke_order(str(OFFER_ID), 0) == 2
+class TestManualOrderResolutionCommands:
+    def _container_with(self, service: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+        container = MagicMock()
+        container.order_manual_resolution = MagicMock(return_value=service)
+        container.close = AsyncMock()
+        monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
+        return container
 
-    async def test_refused_without_env_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        settings = MagicMock()
-        settings.leaseweb_allow_live_order_test = False
-        monkeypatch.setattr(cli, "get_settings", lambda: settings)
-        # Even with --yes, the env switch is the hard gate.
-        result = await cli._dispatch(
-            cli._parser().parse_args(["leaseweb", "smoke-order", "--offer", str(OFFER_ID), "--yes"])
-        )
-        assert result == 2
+    async def test_smoke_order_command_does_not_exist(self) -> None:
+        """The untracked live-order CLI path was REMOVED: no parser branch
+        can place a billable POST outside the durable checkout -> worker
+        pipeline (an ambiguous smoke POST had no recovery identity)."""
+        with pytest.raises(SystemExit):
+            cli._parser().parse_args(["leaseweb", "smoke-order", "--offer", "x", "--yes"])
 
-    async def test_armed_path_sends_provider_facts_only(
-        self, monkeypatch: pytest.MonkeyPatch
+    async def test_orders_retry_failed_success(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
-        """The guarded smoke POST carries PROVIDER-side facts — never the
-        customer selling price (release hardening)."""
-        settings = MagicMock()
-        settings.leaseweb_allow_live_order_test = True
-        settings.leaseweb_api_key = "k"
-        settings.leaseweb_api_base_url = "https://api.test"
-        settings.leaseweb_order_os_only_free = True
-        monkeypatch.setattr(cli, "get_settings", lambda: settings)
+        """Definitive FAILED retry reopens the same local operation; the
+        output never claims provider-side deduplication."""
+        order = _order(OrderStatus.FAILED)
+        op = MagicMock(id=uuid4(), status=MagicMock(value="pending"), attempts=2)
+        service = MagicMock()
+        service.retry_failed = AsyncMock(return_value=(order, op))
+        self._container_with(service, monkeypatch)
+        assert await cli.orders_retry(str(ORDER_ID), "verified nothing created") == 0
+        out = capsys.readouterr().out
+        assert "reopened" in out
+        assert "SAME local operation key" in out
+        assert "NO provider-side idempotency" in out
+        assert "duplicate order is possible" not in out
+        service.retry_failed.assert_awaited_once()
 
-        offer = _offer()
-        repo = AsyncMock()
-        repo.get = AsyncMock(return_value=offer)
-        monkeypatch.setattr(
-            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
-            _fake_repo_class(repo),
+    async def test_orders_retry_refuses_ambiguous(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        """An OUTCOME_UNKNOWN / NEEDS_REVIEW order is refused by `retry` —
+        it must be resolved with the dedicated commands, not blindly
+        reopened."""
+        service = MagicMock()
+        service.retry_failed = AsyncMock(
+            side_effect=OrderManualResolutionError(
+                "order is outcome_unknown; only definitive FAILED orders may be retried. "
+                "Ambiguous orders must be resolved with `orders resolve-existing` or "
+                "`orders resolve-not-created` after verifying at the provider portal."
+            )
         )
+        self._container_with(service, monkeypatch)
+        assert await cli.orders_retry(str(ORDER_ID), "retry anyway") == 2
+        out = capsys.readouterr().out
+        assert "REFUSED" in out
+        assert "resolve-existing" in out or "resolve-not-created" in out
+        service.retry_failed.assert_awaited_once()
 
-        captured: dict[str, Any] = {}
-
-        class _FakeProductOption:
-            name = "Ubuntu 24.04"
-            price_minor = 0
-
-        class _FakeDetail:
-            def free_os_options(self) -> list[Any]:
-                return [_FakeProductOption()]
-
-            os_options: ClassVar[list[Any]] = [_FakeProductOption()]
-
-        class _FakeProvider:
-            def __init__(self, **kw: Any) -> None:
-                pass
-
-            async def get_product(self, location_id: str, product_id: str) -> Any:
-                return _FakeDetail()
-
-            async def place_order(self, request: Any, idempotency_key: Any) -> Any:
-                captured["labels"] = request.labels
-                captured["plan"] = request.plan_id
-                captured["os"] = request.image_id
-                return MagicMock(provider_order_id="LS-SMOKE-1", state="accepted")
-
-        monkeypatch.setattr(
-            "cloud_platform.providers.leaseweb.ordering.LeaseWebOrderingProvider", _FakeProvider
+    async def test_orders_resolve_existing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        order = _order(OrderStatus.SUBMITTED)  # provider_order_id=LS-ORD-1 attached
+        op = MagicMock(id=uuid4(), status=MagicMock(value="completed"), attempts=1)
+        service = MagicMock()
+        service.resolve_existing = AsyncMock(return_value=(order, op))
+        self._container_with(service, monkeypatch)
+        args = cli._parser().parse_args(
+            [
+                "orders",
+                "resolve-existing",
+                str(ORDER_ID),
+                "LS-ORD-9",
+                "--reason",
+                "verified at portal",
+                "--yes",
+            ]
         )
-        assert await cli.leaseweb_smoke_order(str(OFFER_ID), 0) == 0
-        assert captured["plan"] == "VPS02_1"
-        assert captured["os"] == "Ubuntu 24.04"
-        assert captured["labels"]["provider_price_minor"] == "999"
-        assert captured["labels"]["provider_currency"] == "EUR"
-        assert "price_minor" not in captured["labels"]  # selling price never sent
-        assert "selling" not in " ".join(captured["labels"])
+        assert await cli._dispatch(args) == 0
+        out = capsys.readouterr().out
+        assert "LS-ORD-1" in out
+        assert "No provider POST" in out
+        service.resolve_existing.assert_awaited_once()
+
+    async def test_orders_resolve_existing_refused_without_yes(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        service = MagicMock()
+        self._container_with(service, monkeypatch)
+        args = cli._parser().parse_args(
+            ["orders", "resolve-existing", str(ORDER_ID), "LS-ORD-9", "--reason", "x"]
+        )
+        assert await cli._dispatch(args) == 2
+        assert "REFUSED" in capsys.readouterr().out
+        service.resolve_existing.assert_not_called()
+
+    async def test_orders_resolve_not_created(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        order = _order(OrderStatus.PENDING_SUBMIT)
+        op = MagicMock(id=uuid4(), status=MagicMock(value="pending"), attempts=1)
+        service = MagicMock()
+        service.resolve_not_created = AsyncMock(return_value=(order, op))
+        self._container_with(service, monkeypatch)
+        args = cli._parser().parse_args(
+            [
+                "orders",
+                "resolve-not-created",
+                str(ORDER_ID),
+                "--reason",
+                "verified nothing",
+                "--yes",
+            ]
+        )
+        assert await cli._dispatch(args) == 0
+        out = capsys.readouterr().out
+        assert "re-queued" in out
+        assert "WARNING" in out
+        assert "NO provider-side idempotency" in out
+        service.resolve_not_created.assert_awaited_once()
+
+    async def test_orders_resolve_not_created_refused_without_yes(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        service = MagicMock()
+        self._container_with(service, monkeypatch)
+        args = cli._parser().parse_args(
+            ["orders", "resolve-not-created", str(ORDER_ID), "--reason", "x"]
+        )
+        assert await cli._dispatch(args) == 2
+        assert "REFUSED" in capsys.readouterr().out
+        service.resolve_not_created.assert_not_called()
 
 
 class TestOffersCommands:
@@ -420,39 +476,18 @@ class TestOrdersCommands:
         out = capsys.readouterr().out
         assert "outcome_unknown" in out
 
-    async def test_orders_retry_warns_on_unknown_outcome(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
-    ) -> None:
-        orders_repo = AsyncMock()
-        order = _order(OrderStatus.NEEDS_REVIEW)
-        order.error = "recovery found no matching order; absence cannot be proven"
-        orders_repo.get = AsyncMock(return_value=order)
-        monkeypatch.setattr(
-            "cloud_platform.modules.orders.repository.SqlAlchemyProviderOrderRepository",
-            _fake_repo_class(orders_repo),
-        )
-        op_repo = AsyncMock()
-        op = MagicMock(id=uuid4(), status=MagicMock(value="outcome_unknown"), attempts=1)
-        op_repo.get_by_key = AsyncMock(return_value=op)
-        monkeypatch.setattr(
-            "cloud_platform.modules.operations.repository.SqlAlchemyOperationRepository",
-            _fake_repo_class(op_repo),
-        )
-        assert await cli.orders_retry(str(ORDER_ID)) == 0
-        out = capsys.readouterr().out
-        assert "WARNING" in out
-        assert "portal" in out
-
     async def test_orders_retry_rejects_non_reviewable(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        orders_repo = AsyncMock()
-        orders_repo.get = AsyncMock(return_value=_order(OrderStatus.SUBMITTED))
-        monkeypatch.setattr(
-            "cloud_platform.modules.orders.repository.SqlAlchemyProviderOrderRepository",
-            _fake_repo_class(orders_repo),
+        service = MagicMock()
+        service.retry_failed = AsyncMock(
+            side_effect=OrderManualResolutionError("order is submitted; only FAILED may be retried")
         )
-        assert await cli.orders_retry(str(ORDER_ID)) == 2
+        container = MagicMock()
+        container.order_manual_resolution = MagicMock(return_value=service)
+        container.close = AsyncMock()
+        monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
+        assert await cli.orders_retry(str(ORDER_ID), "retry") == 2
 
 
 class TestRenewalsCommands:
@@ -493,17 +528,10 @@ class TestDispatch:
         assert await cli._dispatch(args) == 0
         assert "LS-ORD-1" in capsys.readouterr().out
 
-    async def test_smoke_order_dispatch_requires_yes(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
-    ) -> None:
-        settings = MagicMock()
-        settings.leaseweb_allow_live_order_test = False
-        monkeypatch.setattr(cli, "get_settings", lambda: settings)
-        args = cli._parser().parse_args(
-            ["leaseweb", "smoke-order", "--offer", str(OFFER_ID), "--os-index", "0"]
-        )
-        assert await cli._dispatch(args) == 2
-        assert "REFUSED" in capsys.readouterr().out
+    async def test_smoke_order_parser_branch_is_gone(self) -> None:
+        """Dispatch has no smoke-order branch: the command cannot exist in
+        the parser (covered above), so there is no live-order escape hatch."""
+        assert not hasattr(cli, "leaseweb_smoke_order")
 
 
 class TestHelperPaths:

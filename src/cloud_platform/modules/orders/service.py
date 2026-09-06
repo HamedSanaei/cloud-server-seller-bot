@@ -58,7 +58,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
+from uuid import UUID
 
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
@@ -97,6 +98,7 @@ from cloud_platform.providers.base import (
     OrderRecoveryResult,
     OrderRecoveryVerdict,
     ProviderServer,
+    ProvisioningTicket,
     ordering_support_of,
 )
 from cloud_platform.providers.errors import ProviderError, ProviderNotFound, ProviderOutcomeUnknown
@@ -1092,6 +1094,348 @@ class OrderRecoveryService:
         wallet = await self._wallets.get(server.user_id)
         if wallet is None or wallet.id is None:
             logger.error("server %s: no wallet to capture hold on recovery", server.id)
+            return
+        from cloud_platform.modules.checkout.service import hold_key
+
+        hold = await self._holds.get_by_idempotency(wallet.id, hold_key(server.idempotency_key))
+        if hold is None or hold.id is None or hold.status is not HoldStatus.CREATED:
+            return
+        try:
+            await self._hold_service.capture_hold(
+                wallet.id, hold.id, hold_key(server.idempotency_key)
+            )
+        except Exception:
+            logger.exception("failed to capture hold %s for server %s", hold.id, server.id)
+
+
+class OrderManualResolutionError(Exception):
+    """An operator resolution request is not safe to apply."""
+
+
+class OrderManualResolutionService:
+    """Operator-driven resolution of provider orders (LEASEWEB-MVP).
+
+    Every method here is a MANUAL action with audit + explicit reason; none
+    of them POSTs anything. Leaseweb ordering has NO provider-side
+    idempotency, so the output never claims provider deduplication — safety
+    comes from the operator's verification:
+
+    - :meth:`retry_failed` — the order FAILED DEFINITIVELY (the provider
+      rejected the POST; nothing was created). Reopens the SAME local
+      operation identity (FAILED -> PENDING) and re-queues the server.
+    - :meth:`resolve_existing` — an ambiguous POST (OUTCOME_UNKNOWN /
+      NEEDS_REVIEW) that the operator PROVED at the provider created this
+      exact order. Attaches the provider order id after a READ-ONLY
+      validation, completes the operation, captures the hold exactly once.
+    - :meth:`resolve_not_created` — an ambiguous POST that the operator
+      PROVED created NOTHING. Returns the intent to the retryable queue
+      (OUTCOME_UNKNOWN -> PENDING, same key).
+    """
+
+    def __init__(
+        self,
+        *,
+        server_repo: ServerRepository,
+        orders_repo: ProviderOrderRepository,
+        operation_repo: OperationRepository,
+        wallet_repo: WalletRepository,
+        hold_repo: HoldRepository,
+        hold_service: HoldService,
+        audit_repo: AuditRepository,
+        provider_registry: ProviderRegistry,
+    ) -> None:
+        self._servers = server_repo
+        self._orders = orders_repo
+        self._ops = operation_repo
+        self._wallets = wallet_repo
+        self._holds = hold_repo
+        self._hold_service = hold_service
+        self._audit = AuditTrail(audit_repo)
+        self._registry = provider_registry
+
+    @staticmethod
+    def _actor_context(actor: Any | None) -> tuple[ActorType, Any | None]:
+        if actor is None:
+            return ActorType.SYSTEM, None
+        return ActorType.ADMIN, getattr(actor, "id", None)
+
+    def _require_reason(self, reason: str) -> None:
+        if not reason or not reason.strip():
+            raise OrderManualResolutionError("an explicit non-empty reason is required")
+
+    async def _order_and_operation(
+        self, order_id: UUID
+    ) -> tuple[ProviderOrder, Operation, CloudServer]:
+        order = await self._orders.get(order_id)
+        if order is None:
+            raise LookupError(f"order {order_id} not found")
+        operation = await self._ops.get_by_key(order.operation_key)
+        if operation is None:
+            raise OrderManualResolutionError(
+                f"order {order_id}: operation ledger row missing; cannot resolve"
+            )
+        server = await self._servers.get(order.server_id)
+        if server is None:
+            raise OrderManualResolutionError(
+                f"order {order_id}: server row missing; cannot resolve"
+            )
+        return order, operation, server
+
+    # -- A) definitive FAILED retry ---------------------------------------
+
+    async def retry_failed(
+        self, order_id: UUID, *, actor: Any | None = None, reason: str
+    ) -> tuple[ProviderOrder, Operation]:
+        """Reopen a DEFINITIVELY FAILED order for a retry of the same local
+        operation identity. Refuses ambiguous orders: those need
+        ``resolve-existing`` / ``resolve-not-created`` after portal
+        verification."""
+        self._require_reason(reason)
+        order, operation, server = await self._order_and_operation(order_id)
+        if order.status is not OrderStatus.FAILED:
+            raise OrderManualResolutionError(
+                f"order {order_id} is {order.status.value}; only orders that FAILED "
+                "definitively (provider rejection, nothing created) may be retried. "
+                "Ambiguous orders (OUTCOME_UNKNOWN/NEEDS_REVIEW) must be resolved with "
+                "`orders resolve-existing` or `orders resolve-not-created` after "
+                "verifying at the provider portal."
+            )
+        if operation.status is not OperationStatus.FAILED:
+            raise OrderManualResolutionError(
+                f"order {order_id}: operation is {operation.status.value}, not FAILED; cannot retry"
+            )
+
+        operation.reopen_for_retry()  # FAILED -> PENDING, SAME key (manual-only)
+        await self._ops.save(operation)
+        order.reset_to_pending_submit()  # FAILED -> PENDING_SUBMIT (manual-only)
+        await self._orders.save(order)
+        if server.state is ServerLifecycleState.ERROR:
+            server.reset_to_requested()  # ERROR -> REQUESTED (manual-only)
+            await self._servers.save(server)
+        elif server.state is not ServerLifecycleState.REQUESTED:
+            raise OrderManualResolutionError(
+                f"order {order_id}: server is {server.state.value}; cannot re-queue"
+            )
+
+        actor_type, actor_id = self._actor_context(actor)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="order.retry",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=reason,
+            metadata={
+                "server_id": str(order.server_id),
+                "operation_key": order.operation_key,
+                "provider": order.provider_key,
+                "attempts": str(operation.attempts),
+            },
+        )
+        logger.warning("order %s retried by operator (definitive FAILED): %s", order.id, reason)
+        return order, operation
+
+    # -- B) verified existing provider order ------------------------------
+
+    async def resolve_existing(
+        self,
+        order_id: UUID,
+        provider_order_id: str,
+        *,
+        actor: Any | None = None,
+        reason: str,
+    ) -> tuple[ProviderOrder, Operation]:
+        """Attach the provider order id a human PROVED belongs to this
+        ambiguous POST. Performs a READ-ONLY validation first; NEVER POSTs;
+        captures the hold exactly once."""
+        self._require_reason(reason)
+        if not provider_order_id or not provider_order_id.strip():
+            raise OrderManualResolutionError("a non-empty provider order id is required")
+        order, operation, server = await self._order_and_operation(order_id)
+        if order.status not in (OrderStatus.OUTCOME_UNKNOWN, OrderStatus.NEEDS_REVIEW):
+            raise OrderManualResolutionError(
+                f"order {order_id} is {order.status.value}; only ambiguous orders "
+                "(OUTCOME_UNKNOWN/NEEDS_REVIEW) may be resolved against an existing "
+                "provider order"
+            )
+        if operation.status is not OperationStatus.OUTCOME_UNKNOWN:
+            raise OrderManualResolutionError(
+                f"order {order_id}: operation is {operation.status.value}, not "
+                "OUTCOME_UNKNOWN; cannot attach a manually verified order id"
+            )
+
+        ordering = self._ordering_for(order, server)
+        # READ-ONLY validation of the operator-supplied provider order id.
+        try:
+            ticket = await ordering.get_order(provider_order_id)
+        except ProviderError as exc:
+            raise OrderManualResolutionError(
+                f"read-only validation of provider order {provider_order_id} failed "
+                f"({type(exc).__name__}): {exc}"
+            ) from exc
+        inconsistency = self._inconsistency(order, ticket)
+        if inconsistency:
+            raise OrderManualResolutionError(
+                f"provider order {provider_order_id} is not internally consistent "
+                f"with order {order_id}: {inconsistency}"
+            )
+
+        order.resolve_submitted(provider_order_id)  # manual-only transition
+        await self._orders.save(order)
+        operation.complete(
+            {
+                "provider_order_id": provider_order_id,
+                "resolved_by": "manual",
+                "reason": reason,
+                "operation_key": operation.operation_key,
+            }
+        )
+        await self._ops.save(operation)
+
+        await self._capture_hold(order, server)
+
+        actor_type, actor_id = self._actor_context(actor)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="order.resolve_existing",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=reason,
+            metadata={
+                "server_id": str(order.server_id),
+                "provider_order_id": provider_order_id,
+                "operation_key": order.operation_key,
+                "provider": order.provider_key,
+            },
+        )
+        logger.info(
+            "order %s resolved manually: attached provider order %s", order.id, provider_order_id
+        )
+        return order, operation
+
+    # -- C) verified absence -----------------------------------------------
+
+    async def resolve_not_created(
+        self, order_id: UUID, *, actor: Any | None = None, reason: str
+    ) -> tuple[ProviderOrder, Operation]:
+        """The operator PROVED the ambiguous POST created NOTHING at the
+        provider: return the SAME local operation identity to the retryable
+        queue (OUTCOME_UNKNOWN -> PENDING). The retry is a NEW provider POST
+        — there is no provider-side idempotency — so this is safe ONLY
+        because a human verified absence."""
+        self._require_reason(reason)
+        order, operation, server = await self._order_and_operation(order_id)
+        if order.status not in (OrderStatus.OUTCOME_UNKNOWN, OrderStatus.NEEDS_REVIEW):
+            raise OrderManualResolutionError(
+                f"order {order_id} is {order.status.value}; only ambiguous orders "
+                "(OUTCOME_UNKNOWN/NEEDS_REVIEW) may be marked as not created"
+            )
+        if operation.status is not OperationStatus.OUTCOME_UNKNOWN:
+            raise OrderManualResolutionError(
+                f"order {order_id}: operation is {operation.status.value}, not "
+                "OUTCOME_UNKNOWN; cannot re-queue after verified absence"
+            )
+        if server.state is not ServerLifecycleState.REQUESTED:
+            raise OrderManualResolutionError(
+                f"order {order_id}: server is {server.state.value}; expected REQUESTED "
+                "for an ambiguous POST"
+            )
+
+        operation.mark_verified_absent()  # OUTCOME_UNKNOWN -> PENDING, SAME key
+        await self._ops.save(operation)
+        order.reset_to_pending_submit()  # manual-only transition
+        await self._orders.save(order)
+
+        actor_type, actor_id = self._actor_context(actor)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="order.resolve_not_created",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=reason,
+            metadata={
+                "server_id": str(order.server_id),
+                "operation_key": order.operation_key,
+                "provider": order.provider_key,
+            },
+        )
+        logger.warning(
+            "order %s re-queued after operator verified NON-creation (same key): %s",
+            order.id,
+            reason,
+        )
+        return order, operation
+
+    # -- helpers ------------------------------------------------------------
+
+    def _ordering_for(self, order: ProviderOrder, server: CloudServer) -> OrderingProvider:
+        try:
+            provider = self._registry.get(server.provider_key)
+        except KeyError as exc:
+            raise OrderManualResolutionError(
+                f"order {order.id}: provider {server.provider_key!r} not configured"
+            ) from exc
+        from cloud_platform.providers.base import ordering_support_of
+
+        ordering = ordering_support_of(provider)
+        if ordering is None:
+            raise OrderManualResolutionError(
+                f"order {order.id}: provider {server.provider_key!r} has no ordering port"
+            )
+        return ordering
+
+    @staticmethod
+    def _normalize(value: Any) -> str:
+        """Provider-neutral term/cycle normalization (mirrors the adapter's:
+        ``1_MONTH`` == ``1 MONTH``)."""
+        return str(value or "").strip().upper().replace("_", "").replace(" ", "").replace("-", "")
+
+    def _inconsistency(self, order: ProviderOrder, ticket: ProvisioningTicket) -> str | None:
+        """Provider-side consistency of a candidate order against the local
+        snapshots (price/currency/term/cycle/product family). Returns an
+        error message, or None when every comparable fact matches. Facts the
+        provider response does not carry are skipped, never guessed."""
+        meta = ticket.metadata
+        product = meta.get("product_id")
+        if product and str(product) != "VIRTUAL_SERVER":
+            return f"provider order is product {product!r}, not VIRTUAL_SERVER"
+
+        price = meta.get("price_per_frequency_minor")
+        if (
+            price is not None
+            and order.provider_cost_minor
+            and abs(int(price) - order.provider_cost_minor) > 1
+        ):
+            return (
+                f"price {int(price)} does not match the provider cost snapshot "
+                f"{order.provider_cost_minor}"
+            )
+        currency = meta.get("currency")
+        if currency and order.provider_cost_currency:
+            if str(currency).upper() != order.provider_cost_currency.upper():
+                return (
+                    f"currency {currency!r} does not match snapshot "
+                    f"{order.provider_cost_currency!r}"
+                )
+        term = meta.get("contract_term")
+        if term and order.contract_term:
+            if self._normalize(term) != self._normalize(order.contract_term):
+                return f"contract term {term!r} does not match snapshot {order.contract_term!r}"
+        cycle = meta.get("billing_cycle")
+        if cycle and order.billing_cycle:
+            if self._normalize(cycle) != self._normalize(order.billing_cycle):
+                return f"billing cycle {cycle!r} does not match snapshot {order.billing_cycle!r}"
+        return None
+
+    async def _capture_hold(self, order: ProviderOrder, server: CloudServer) -> None:
+        """Capture the checkout hold exactly once (idempotent by key)."""
+        if server.idempotency_key is None:
+            return
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id is None:
+            logger.error("server %s: no wallet to capture hold on manual resolution", server.id)
             return
         from cloud_platform.modules.checkout.service import hold_key
 

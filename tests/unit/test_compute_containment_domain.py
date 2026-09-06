@@ -128,3 +128,27 @@ class TestTransitionMap:
         server.transition_to(State.PROVISIONING)
         server.transition_to(State.RUNNING)
         assert server.state is State.RUNNING
+
+
+class TestManualResetToRequested:
+    def test_reset_to_requested_from_error(self) -> None:
+        server = _server(State.ERROR)
+        server.reset_to_requested()
+        assert server.state is State.REQUESTED
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            State.REQUESTED,
+            State.PROVISIONING,
+            State.RUNNING,
+            State.STOPPED,
+            State.MANUAL_REVIEW,
+            State.DELETED,
+        ],
+    )
+    def test_reset_to_requested_refused_outside_error(self, state: State) -> None:
+        server = _server(state)
+        with pytest.raises(ValueError):
+            server.reset_to_requested()
+        assert server.state is state

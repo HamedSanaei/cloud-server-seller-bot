@@ -5,8 +5,10 @@ Operator tooling over the operation ledger:
 - **Inspect**: list FAILED operations (the dead letter queue) and fetch one
   by key; read-only, no state change.
 - **Replay safely**: reopen a FAILED operation to PENDING under the same
-  operation key. The worker then re-sends the identical key, so the provider
-  deduplicates the mutation — a replay can never double-apply. Replays are
+  operation key. The worker then re-sends the identical key; safety comes
+  from the operation having FAILED DEFINITIVELY (the provider rejected the
+  mutation — nothing was created) — NOT from provider-side deduplication,
+  which providers like Leaseweb ordering do not offer. Replays are
   admin-gated (``admin:manage_settings``), require a non-empty reason, and
   are audited (``operation.retry``).
 - **Manual review queue**: the servers in MANUAL_REVIEW with the failed

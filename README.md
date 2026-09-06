@@ -59,9 +59,10 @@ confirm (wallet hold) → worker POSTs the Leaseweb order exactly once →
 read-only reconciler delivers the server to سرورهای من. Renewals are
 charged exactly once monthly with 7/3/1-day reminders; unpaid services are
 flagged `MANUAL_CANCELLATION_REQUIRED` (portal cancellation runbook in
-`docs/operations/RUNBOOK.md`). Safety: the operation ledger key doubles as
-the provider idempotency key, holds are captured exactly once, and no test
-or dev path can place a real order without `LEASEWEB_ALLOW_LIVE_ORDER_TEST=true`.
+`docs/operations/RUNBOOK.md`). Safety: holds are captured exactly once, and
+no test, dev path or CLI command can place a real order — every billable
+POST flows through the durable checkout → worker pipeline (there is
+intentionally no live-order escape hatch).
 Design decisions: `docs/leaseweb/MVP_DESIGN.md`; roadmap: `LEASEWEB-MVP`
 tasks in `docs/roadmap/TASKS.yaml`.
 

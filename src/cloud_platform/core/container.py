@@ -437,6 +437,32 @@ class Container:
             provider_registry=self.provider_registry,
         )
 
+    def order_manual_resolution(self) -> Any:
+        """Operator-driven manual resolution of provider orders (LEASEWEB-MVP).
+
+        ``retry_failed`` (definitive FAILED only), ``resolve_existing`` and
+        ``resolve_not_created`` (ambiguous OUTCOME_UNKNOWN/NEEDS_REVIEW only)
+        — all manual-only, audited, and NEVER POSTing.
+        """
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.orders.service import OrderManualResolutionService
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        return OrderManualResolutionService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            orders_repo=self.provider_order_repository(),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            hold_service=self.hold_service(),
+            audit_repo=_audit_repository(self.session_factory),
+            provider_registry=self.provider_registry,
+        )
+
     def renewal_checker(
         self, user_notifier: Any | None = None, admin_notifier: Any | None = None
     ) -> Any:

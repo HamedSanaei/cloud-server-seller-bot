@@ -184,6 +184,44 @@ class ProviderOrder:
         self.status = OrderStatus.NEEDS_REVIEW
         self.error = error
 
+    def resolve_submitted(self, provider_order_id: str) -> None:
+        """MANUAL resolution only: attach the provider order id a human
+        verified at the provider (``resolve-existing``).
+
+        Allowed from OUTCOME_UNKNOWN and NEEDS_REVIEW (ambiguous provenance)
+        and moves the order to SUBMITTED so the normal reconciler takes over.
+        Deliberately separate from :meth:`mark_submitted`: no automated path
+        may attach an order id that was not confirmed by the provider POST.
+        """
+        if self.status not in (OrderStatus.OUTCOME_UNKNOWN, OrderStatus.NEEDS_REVIEW):
+            raise OrderStateConflict(
+                f"order {self.id}: cannot resolve-submit from {self.status.value}; "
+                "only ambiguous orders (OUTCOME_UNKNOWN/NEEDS_REVIEW) may be "
+                "resolved manually"
+            )
+        self.provider_order_id = provider_order_id
+        self.status = OrderStatus.SUBMITTED
+        self.error = None
+
+    def reset_to_pending_submit(self) -> None:
+        """MANUAL resolution only: return the order to the retryable queue.
+
+        Used by ``orders retry`` (definitive FAILED) and
+        ``resolve-not-created`` (ambiguous outcome whose non-creation a human
+        verified). Keeps the same operation key / snapshots; only a human
+        may invoke it, never an automated transition.
+        """
+        if self.status not in (
+            OrderStatus.FAILED,
+            OrderStatus.OUTCOME_UNKNOWN,
+            OrderStatus.NEEDS_REVIEW,
+        ):
+            raise OrderStateConflict(
+                f"order {self.id}: cannot reset to pending_submit from {self.status.value}"
+            )
+        self.status = OrderStatus.PENDING_SUBMIT
+        self.error = None
+
 
 class ProviderOrderRepository(Protocol):
     """Port for provider-order persistence."""

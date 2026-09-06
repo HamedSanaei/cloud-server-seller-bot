@@ -131,3 +131,37 @@ class TestStateMachine:
                 op.fail("e")
             else:
                 op.requeue("e")
+
+
+class TestManualVerifiedAbsent:
+    def test_mark_verified_absent_returns_pending_with_same_key(self) -> None:
+        op = _op(OperationStatus.IN_FLIGHT)
+        op.mark_outcome_unknown("read timeout after transmission")
+        op.mark_verified_absent()
+        assert op.status is OperationStatus.PENDING
+        assert op.error == "read timeout after transmission"  # error retained for context
+        assert op.operation_key  # SAME identity, never regenerated
+
+    @pytest.mark.parametrize(
+        "start",
+        [
+            OperationStatus.PENDING,
+            OperationStatus.IN_FLIGHT,
+            OperationStatus.COMPLETED,
+            OperationStatus.FAILED,
+        ],
+    )
+    def test_mark_verified_absent_refused_outside_outcome_unknown(
+        self, start: OperationStatus
+    ) -> None:
+        op = _op(start)
+        with pytest.raises(InvalidOperationTransition):
+            op.mark_verified_absent()
+        assert op.status is start  # no state change
+
+    def test_reopen_for_retry_is_failed_only(self) -> None:
+        op = _op(OperationStatus.IN_FLIGHT)
+        op.mark_outcome_unknown("read timeout")
+        with pytest.raises(InvalidOperationTransition):
+            op.reopen_for_retry()
+        assert op.status is OperationStatus.OUTCOME_UNKNOWN

@@ -767,6 +767,7 @@ class TestGetOrderAndMatching:
         assert ticket.state == "provisioned"
         assert ticket.provider_resource_id == "vps-77"
         assert ticket.metadata["contract_id"] == "C-42"
+        assert ticket.metadata["product_id"] == "VIRTUAL_SERVER"
         assert ticket.metadata["order_status"] == "ACTIVE"
         assert ticket.metadata["price_per_frequency_minor"] == 1299
         assert ticket.metadata["contract_term"] == "1 MONTH"

@@ -157,11 +157,15 @@ second chargeable POST:
 
 ## 6. Safety rule for live orders
 
-- `LEASEWEB_ALLOW_LIVE_ORDER_TEST=false` (default). The CLI
-  `leaseweb smoke-order` (the only verification path that POSTs a real order)
-  refuses to run unless it is explicitly `true`. Production order placement
-  (worker, real customer purchases) is the product and is not gated by the
-  flag; automated tests always mock HTTP and never create billable VPSes.
+- **There is intentionally NO CLI command that can POST a real order.** The
+  former `leaseweb smoke-order` shortcut (untracked direct provider POST with
+  a random key) was REMOVED: an ambiguous outcome there had no durable
+  recovery identity. Every billable POST must flow through the durable
+  checkout → order-worker pipeline, so an ambiguous outcome is always
+  persisted as `OUTCOME_UNKNOWN` and recoverable.
+- The first real order is placed through the bot flow with a test account,
+  per the controlled procedure in `docs/operations/RUNBOOK.md`.
+- Automated tests always mock HTTP and never create billable VPSes.
 
 ## 7. Files (MVP delta)
 

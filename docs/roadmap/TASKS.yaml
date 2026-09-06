@@ -3619,11 +3619,12 @@ tasks:
   - LSW-MVP-002
   acceptance:
   - leaseweb doctor (read-only, never prints the key), sync-offers, offers enable/disable/price, users find, wallet credit/debit via
-    WalletAdminService, orders list/inspect/retry, renewals list/check.
-  - smoke-order refuses without LEASEWEB_ALLOW_LIVE_ORDER_TEST=true and --yes.
+    WalletAdminService, orders list/inspect/attention, renewals list/check.
+  - No untracked billable POST path exists (the former leaseweb smoke-order was removed); orders retry reopens DEFINITIVELY FAILED
+    intents only; orders resolve-existing / resolve-not-created handle ambiguous OUTCOME_UNKNOWN intents after portal verification.
   evidence:
-  - '2026-09-05: cloud_platform/cli.py argparse CLI; doctor checks key presence (redacted), auth, locations, products, detail prices,
-    DB, Redis; retry reopens FAILED operations with the same deterministic key.'
+  - '2026-09-06: cloud_platform/cli.py argparse CLI; doctor checks key presence (redacted), auth, locations, products, detail prices,
+    DB, Redis; retry reopens FAILED operations with the same deterministic key; manual resolution commands added (release hardening).'
 - id: LSW-MVP-007
   milestone: LEASEWEB-MVP
   title: Deployment readiness for the monthly storefront
@@ -3636,5 +3637,6 @@ tasks:
   acceptance:
   - Env examples, compose, entrypoint carry the new settings; clean-DB migration head 0030; full gates green.
   evidence:
-  - '2026-09-05: .env.example/deploy .env.example get LEASEWEB_LOCATIONS/OS_ALLOWLIST/ALLOW_LIVE_ORDER_TEST/TELEGRAM_ADMIN_CHAT_ID/
-    SUPPORT_CONTACT; docs/leaseweb/MVP_DESIGN.md decision note; RUNBOOK renewal/cancellation procedure; ruff+mypy clean; pytest 1932 passed.'
+  - '2026-09-06: .env.example/deploy .env.example get LEASEWEB_LOCATIONS/OS_ALLOWLIST/TELEGRAM_ADMIN_CHAT_ID/SUPPORT_CONTACT
+    (live-order switch removed); docs/leaseweb/MVP_DESIGN.md decision note; RUNBOOK renewal/cancellation + ambiguity-resolution
+    procedure; ruff+mypy clean; pytest 1932 passed.'

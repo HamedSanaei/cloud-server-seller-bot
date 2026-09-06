@@ -183,8 +183,9 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
 1. **Env** — set in `.env` (or `deploy/staging/.env` with the `STAGING_`
    prefix): `LEASEWEB_API_KEY`, `LEASEWEB_LOCATIONS=AMS-01,FRA-01`,
    `TELEGRAM_BOT_TOKEN`, `CALLBACK_SIGNING_KEY`, `TELEGRAM_ADMIN_CHAT_ID`.
-   `LEASEWEB_ALLOW_LIVE_ORDER_TEST` stays `false` until the controlled
-   first-order procedure below.
+   There is NO live-order env switch and NO CLI command that can place a
+   billable order: every POST flows through the durable checkout → worker
+   pipeline (see the controlled first-order procedure below).
 2. **Schema** — `uv run alembic upgrade head` (head `0030`).
 3. **Doctor** (read-only pre-flight, never prints the key):
    `uv run python -m cloud_platform.cli leaseweb doctor`
@@ -226,10 +227,40 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
    renewal record.
 6. Verify in the Leaseweb portal that exactly ONE order/service exists.
 
-To place a REAL order outside the bot flow (diagnostics only, NOT linked
-to a platform server): `LEASEWEB_ALLOW_LIVE_ORDER_TEST=true
-uv run python -m cloud_platform.cli leaseweb smoke-order --offer <id>
---os-index 0 --yes`. Without the env switch and `--yes` it refuses.
+There is intentionally NO shortcut that POSTs a real order outside this
+pipeline: an untracked CLI POST would have no durable recovery identity if
+the response was lost. The first real order is therefore always a real
+checkout (steps 3–6), which is also the point: it exercises the exact
+production path — hold → worker POST → order id persistence → reconciler →
+delivery.
+
+### Ambiguous order (OUTCOME_UNKNOWN) resolution runbook
+
+An ambiguous POST (read/write timeout, dropped connection, 5xx, mutating
+429) leaves the order/operation `OUTCOME_UNKNOWN`: the hold stays reserved
+and NO automatic re-POST happens. The read-only recovery scan escalates to
+`needs_review` when it cannot prove which (if any) provider order exists.
+
+1. `uv run python -m cloud_platform.cli orders attention` — find the order;
+   `orders inspect <order_id>` shows the snapshots (product, location, OS,
+   provider cost) and the attempt time.
+2. **Verify at the Leaseweb portal** which of these is true:
+   - **The POST DID create exactly this order** →
+     `uv run python -m cloud_platform.cli orders resolve-existing <order_id> <provider_order_id> --reason "verified at portal" --yes`
+     The CLI performs a READ-ONLY validation of the supplied id (product
+     family, price/currency/term/cycle vs. the local snapshots), attaches
+     it, completes the operation, and captures the hold exactly once. It
+     NEVER POSTs. The normal reconciler then provisions the server.
+   - **The POST created NOTHING** →
+     `uv run python -m cloud_platform.cli orders resolve-not-created <order_id> --reason "verified no order at portal" --yes`
+     This re-queues the SAME local operation identity; the worker will
+     place a NEW provider order. Leaseweb has NO provider-side idempotency:
+     this is safe ONLY because you verified absence.
+   - **Uncertain** → leave it in `needs_review`; do not resolve. Prefer a
+     wrong-side manual review over a second VPS.
+3. `orders retry <order_id>` is ONLY for orders that FAILED DEFINITIVELY
+   (provider rejection, nothing created). It is refused for ambiguous
+   orders — use the resolve commands above.
 
 ### Renewal and cancellation runbook
 

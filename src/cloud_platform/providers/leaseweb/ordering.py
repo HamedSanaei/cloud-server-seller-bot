@@ -50,9 +50,9 @@ OpenAPI specs (``github.com/Leaseweb/api-definitions``: ``ordering/``,
   Public Cloud adapter); the API key never appears in errors or logs.
 
 No live order is ever placed from tests: tests mock the HTTP transport, and
-the only verification path that may POST a real order (``leaseweb
-smoke-order`` in the CLI) requires ``LEASEWEB_ALLOW_LIVE_ORDER_TEST=true``
-(default false).
+NO CLI command can POST a real order — every billable POST must flow
+through the durable checkout -> order worker pipeline, so an ambiguous
+outcome is always persisted and recoverable.
 """
 
 from __future__ import annotations
@@ -750,6 +750,7 @@ class LeaseWebOrderingProvider(OrderingProvider):
             metadata={
                 "contract_id": _clean_id(payload.get("contractId")),
                 "service_id": _clean_id(service.get("id")),
+                "product_id": str(service.get("productId") or ""),
                 "order_status": status,
                 "delivery_estimate": service.get("deliveryEstimate"),
                 "price_per_frequency_minor": _minor(service.get("pricePerFrequency")),

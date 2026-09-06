@@ -33,7 +33,6 @@ class Settings(BaseSettings):
     leaseweb_billing_cycle: str = "1_MONTH"
     # SAFETY SWITCH: without this explicitly set to true, no code path used
     # by tests/dev verification may place a REAL billable Leaseweb order.
-    leaseweb_allow_live_order_test: bool = False
     # Telegram admin alert chat for renewals/attention items (0 = unset).
     telegram_admin_chat_id: int = 0
     # Optional support contact shown on the support screen (e.g. @handle).

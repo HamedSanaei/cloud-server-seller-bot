@@ -156,13 +156,34 @@ class Operation:
         """Manual tooling only: FAILED -> PENDING with the same operation key.
 
         Deliberately NOT part of ``_ALLOWED``: no automated path may reopen a
-        failed operation. The replay is safe because the worker re-sends the
-        SAME operation key, so the provider deduplicates the mutation.
+        failed operation. The replay keeps the SAME local operation identity;
+        safety comes from the operator having verified that the previous
+        attempt was DEFINITIVELY rejected (no resource was created) — NOT
+        from provider-side deduplication, which some providers (e.g.
+        Leaseweb ordering) do not offer.
         """
         if self.status is not OperationStatus.FAILED:
             raise InvalidOperationTransition(
                 f"operation {self.operation_key}: {self.status.value} -> retry "
                 "(only FAILED operations may be reopened)"
+            )
+        self.status = OperationStatus.PENDING
+
+    def mark_verified_absent(self) -> None:
+        """Manual tooling only: OUTCOME_UNKNOWN -> PENDING with the same key.
+
+        Used by the operator-facing ``resolve-not-created`` flow AFTER a
+        human verified at the provider that the ambiguous mutation created
+        NO order/resource. Deliberately NOT part of ``_ALLOWED``: no
+        automated path may retry an ambiguous mutation. The replay is safe
+        ONLY because a human proved non-creation — it is NOT provider-
+        deduplicated (Leaseweb ordering has no provider-side idempotency).
+        """
+        if self.status is not OperationStatus.OUTCOME_UNKNOWN:
+            raise InvalidOperationTransition(
+                f"operation {self.operation_key}: {self.status.value} -> pending "
+                "(only OUTCOME_UNKNOWN operations may be reset after verified "
+                "absence)"
             )
         self.status = OperationStatus.PENDING
 
