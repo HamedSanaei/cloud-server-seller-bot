@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -5,6 +6,8 @@ from arq.connections import RedisSettings
 
 from cloud_platform.core.config import get_settings
 from cloud_platform.observability.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 
 async def startup(ctx: dict[str, object]) -> None:
@@ -192,6 +195,15 @@ async def process_deletes(ctx: dict[str, object]) -> None:
                     base_url=settings.hetzner_api_base_url,
                 )
             )
+        if settings.leaseweb_api_key:
+            from cloud_platform.providers.leaseweb.client import LeaseWebProvider
+
+            registry.register(
+                LeaseWebProvider(
+                    api_key=settings.leaseweb_api_key,
+                    base_url=settings.leaseweb_api_base_url,
+                )
+            )
         wallet_repo = SqlAlchemyWalletRepository(SessionFactory)
         hold_repo = SqlAlchemyHoldRepository(SessionFactory)
         hold_service = HoldService(
@@ -259,14 +271,176 @@ async def reconcile_deletes(ctx: dict[str, object]) -> None:
         await reconciler.reconcile()
 
 
+def _telegram_notifiers() -> tuple[Any, Any] | None:
+    """(delivery_notifier, renewal_notifier) when Telegram is configured."""
+    from cloud_platform.core.config import get_settings
+
+    settings = get_settings()
+    if not settings.telegram_bot_token:
+        return None
+    from aiogram import Bot
+
+    from cloud_platform.bot.notifier import (
+        TelegramOrderDeliveryNotifier,
+        TelegramRenewalNotifier,
+    )
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+
+    bot = Bot(token=settings.telegram_bot_token)
+    users = SqlAlchemyUserRepository(SessionFactory)
+    return (
+        TelegramOrderDeliveryNotifier(bot, users),
+        TelegramRenewalNotifier(bot, users, settings.telegram_admin_chat_id or None),
+    )
+
+
+async def sync_leaseweb_offers(ctx: dict[str, object]) -> None:
+    """Refresh the sellable-offer price book from the Leaseweb ordering API.
+
+    Scheduled daily (arq cron). Never touches operator-owned fields
+    (enabled, selling price). Skipped when LEASEWEB_API_KEY is unset.
+    """
+    del ctx
+    async with metrics.job("sync_leaseweb_offers"):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.providers.leaseweb.ordering import LeaseWebOrderingProvider
+        from cloud_platform.providers.leaseweb.ordering_sync import LeaseWebOrderingCatalogSyncer
+
+        settings = get_settings()
+        if not settings.leaseweb_api_key:
+            return
+        provider = LeaseWebOrderingProvider(
+            api_key=settings.leaseweb_api_key,
+            base_url=settings.leaseweb_api_base_url,
+            locations=tuple(
+                part.strip()
+                for part in (settings.leaseweb_locations or "").split(",")
+                if part.strip()
+            )
+            or ("AMS-01", "FRA-01"),
+            os_allowlist=tuple(
+                part.strip()
+                for part in (settings.leaseweb_os_allowlist or "").split(",")
+                if part.strip()
+            ),
+            order_os_only_free=settings.leaseweb_order_os_only_free,
+        )
+        syncer = LeaseWebOrderingCatalogSyncer(SessionFactory, provider)
+        result = await syncer.sync_all()
+        for name, step in result.items():
+            logger.info(
+                "leaseweb offer sync %s: fetched=%s upserted=%s errors=%s",
+                name,
+                step.total_fetched,
+                step.total_upserted,
+                step.errors,
+            )
+
+
+async def process_leaseweb_orders(ctx: dict[str, object]) -> None:
+    """Execute PENDING_SUBMIT order intents (the monthly provisioning worker).
+
+    Scheduled periodically (arq cron). Claims each intent through the
+    operation ledger (PENDING -> IN_FLIGHT) so two overlapping runs can
+    never POST the same order; the deterministic operation key is the
+    IdempotencyKey of the provider POST.
+    """
+    del ctx
+    async with metrics.job("process_leaseweb_orders"):
+        from cloud_platform.core.config import get_settings
+
+        settings = get_settings()
+        if not settings.leaseweb_api_key:
+            return
+        notifiers = _telegram_notifiers()
+        from cloud_platform.core.container import create_container
+
+        container = create_container()
+        try:
+            await container.initialize()  # registers the ordering provider
+            worker = container.order_worker(delivery_notifier=notifiers[0] if notifiers else None)
+            counts = await worker.process_pending(limit=10)
+            logger.info("leaseweb order worker: %s", counts)
+        finally:
+            await container.close()
+
+
+async def reconcile_leaseweb_orders(ctx: dict[str, object]) -> None:
+    """Poll open provider orders; NEVER POSTs anything (LEASEWEB-MVP)."""
+    del ctx
+    async with metrics.job("reconcile_leaseweb_orders"):
+        from cloud_platform.core.config import get_settings
+
+        settings = get_settings()
+        if not settings.leaseweb_api_key:
+            return
+        notifiers = _telegram_notifiers()
+        from cloud_platform.core.container import create_container
+
+        container = create_container()
+        try:
+            await container.initialize()  # registers the ordering provider
+            reconciler = container.order_reconciler(
+                delivery_notifier=notifiers[0] if notifiers else None
+            )
+            counts = await reconciler.reconcile(limit=100)
+            logger.info("leaseweb order reconciler: %s", counts)
+        finally:
+            await container.close()
+
+
+async def check_renewals(ctx: dict[str, object]) -> None:
+    """The daily renewal pass: reminders, exactly-once charge, flags."""
+    del ctx
+    async with metrics.job("check_renewals"):
+        notifiers = _telegram_notifiers()
+        from cloud_platform.core.container import create_container
+
+        container = create_container()
+        try:
+            checker = container.renewal_checker(
+                user_notifier=notifiers[1] if notifiers else None,
+                admin_notifier=notifiers[1] if notifiers else None,
+            )
+            outcomes = await checker.run()
+            logger.info("renewal checker: %s outcomes", len(outcomes))
+        finally:
+            await container.close()
+
+
+def _cron_jobs() -> list[Any]:
+    """Cron schedule for the LEASEWEB-MVP jobs (daily sync/renewal, periodic
+    order worker/reconciler). Overlapping runs are safe: the order worker
+    claims through the operation ledger and the reconciler never mutates."""
+    from arq.cron import cron
+
+    every_two_minutes = set(range(0, 60, 2))
+    every_three_minutes = set(range(0, 60, 3))
+    return [
+        cron(sync_leaseweb_offers, hour={3}, minute={17}, run_at_startup=True),
+        cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
+        cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
+        cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
+    ]
+
+
 class WorkerSettings:
+    """Default combined worker (dev / small deploys): every queue inline."""
+
     functions: ClassVar[list[Any]] = [
         reconcile_provider_resources,
         accrue_usage,
         evaluate_low_balance,
         process_deletes,
         reconcile_deletes,
+        sync_leaseweb_offers,
+        process_leaseweb_orders,
+        reconcile_leaseweb_orders,
+        check_renewals,
     ]
+    cron_jobs: ClassVar[list[Any]] = _cron_jobs()
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
