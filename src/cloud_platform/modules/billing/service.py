@@ -219,7 +219,7 @@ class AccrualJob:
 
     async def _run_servers(self, now: datetime) -> AccrualRunReport:
         report = AccrualRunReport()
-        servers = await self._servers.list_running()
+        servers = [s for s in await self._servers.list_running() if not s.is_prepaid_monthly]
         report.servers_checked = len(servers)
         for server in servers:
             try:
@@ -860,7 +860,11 @@ class LowBalancePolicyService:
     ) -> LowBalancePolicyReport:
         moment = _aware(now or datetime.now(UTC), "now")
         report = LowBalancePolicyReport()
+        # Prepaid monthly servers are billed by the renewal checker, never by
+        # the hourly low-balance/auto-delete policy (LEASEWEB-MVP).
         for server in await self._servers.list_running():
+            if server.is_prepaid_monthly:
+                continue
             report.servers_checked += 1
             try:
                 decision = await self._evaluate_one(server, config, moment)

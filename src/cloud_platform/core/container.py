@@ -20,7 +20,17 @@ from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.backups.repository import SqlAlchemyBackupSettingsRepository
 from cloud_platform.modules.backups.service import BackupsToggleService
-from cloud_platform.modules.catalog.repository import SqlAlchemyCatalogRepository
+from cloud_platform.modules.catalog.repository import (
+    SqlAlchemyCatalogRepository,
+    SqlAlchemyLocationRepository,
+)
+from cloud_platform.modules.catalog.service import (
+    BuyFlowViewService,
+    CatalogViewService,
+    OsSelectionService,
+    PurchaseConfirmationService,
+)
+from cloud_platform.modules.compute.service import CreateServerService
 from cloud_platform.modules.credentials.domain import (
     CredentialHolderLike,
 )
@@ -32,16 +42,25 @@ from cloud_platform.modules.networking.network_service import NetworkService
 from cloud_platform.modules.networking.volume_service import VolumeService
 from cloud_platform.modules.operations.service import PowerCommandService
 from cloud_platform.modules.payments.service import PaymentWebhookService
+from cloud_platform.modules.pricing.service import PriceBookService, ServerPriceSnapshotService
 from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
 from cloud_platform.modules.sshkeys.service import SshKeyService
 from cloud_platform.modules.tokens.repository import SqlAlchemyApiTokenRepository
 from cloud_platform.modules.tokens.service import TokenService
+from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+from cloud_platform.modules.wallet.domain import WalletRepository
 from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeAllocator
 from cloud_platform.providers.arvancloud.client import ArvanCloudProvider
 from cloud_platform.providers.arvancloud.sync import ArvanCloudCatalogSyncer
 from cloud_platform.providers.credentials import CredentialHolder
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
+from cloud_platform.providers.leaseweb.client import LeaseWebProvider
+from cloud_platform.providers.leaseweb.ordering import (
+    LeaseWebOrderingProvider,
+)
+from cloud_platform.providers.leaseweb.ordering_sync import LeaseWebOrderingCatalogSyncer
+from cloud_platform.providers.leaseweb.sync import LeaseWebCatalogSyncer
 from cloud_platform.providers.registry import ProviderRegistry
 
 # Re-export for convenience
@@ -79,7 +98,10 @@ class Container:
     provider_registry: ProviderRegistry
     provider_allocator: BaseProviderAllocator
     hetzner_syncer: HetznerCatalogSyncer | None
-    arvancloud_syncers: tuple[ArvanCloudCatalogSyncer, ...]
+    leaseweb_syncer: LeaseWebCatalogSyncer | None = None
+    arvancloud_syncers: tuple[ArvanCloudCatalogSyncer, ...] = ()
+    leaseweb_ordering_syncer: LeaseWebOrderingCatalogSyncer | None = None
+    leaseweb_ordering_provider: LeaseWebOrderingProvider | None = None
     credential_holders: _CredentialHolderRegistry | None = None
     credential_rotation_service: CredentialRotationService | None = None
 
@@ -129,6 +151,96 @@ class Container:
         """Read-side catalog repository (REST v1 offers listing)."""
         return SqlAlchemyCatalogRepository(self.session_factory)
 
+    def catalog_view_service(self) -> CatalogViewService:
+        """Customer-facing catalog browsing by country (M08-002)."""
+        return CatalogViewService(
+            self.catalog_repository(),
+            SqlAlchemyLocationRepository(self.session_factory),
+        )
+
+    def buy_flow_service(self) -> BuyFlowViewService:
+        """Buy-flow screens (locations/plans) with signed callbacks (M08-003)."""
+        return BuyFlowViewService(
+            self.catalog_repository(),
+            SqlAlchemyLocationRepository(self.session_factory),
+            get_settings().callback_signing_key,
+        )
+
+    def os_selection_service(self) -> OsSelectionService:
+        """Architecture-gated OS selection screen (M08-004)."""
+        return OsSelectionService(
+            self.catalog_repository(),
+            self.provider_registry,
+            get_settings().callback_signing_key,
+        )
+
+    def price_book_service(self) -> PriceBookService:
+        """The versioned price book the selling price derives from (M06)."""
+        from cloud_platform.modules.pricing.repository import SqlAlchemyPriceBookRepository
+
+        return PriceBookService(
+            SqlAlchemyPriceBookRepository(self.session_factory),
+            _audit_repository(self.session_factory),
+        )
+
+    def server_price_snapshot_service(self) -> ServerPriceSnapshotService:
+        """Immutable per-server price snapshots (M06-003)."""
+        from cloud_platform.modules.pricing.repository import (
+            SqlAlchemyServerPriceSnapshotRepository,
+        )
+
+        return ServerPriceSnapshotService(
+            SqlAlchemyServerPriceSnapshotRepository(self.session_factory),
+            _audit_repository(self.session_factory),
+        )
+
+    def purchase_confirmation_service(self) -> PurchaseConfirmationService:
+        """The buy.confirm screen: exact price policy + wallet impact (M08-005)."""
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+
+        settings = get_settings()
+        return PurchaseConfirmationService(
+            catalog_repo=self.catalog_repository(),
+            price_book_service=self.price_book_service(),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            signing_key=settings.callback_signing_key,
+            book_name=settings.price_book_name,
+        )
+
+    def create_server_service(self) -> CreateServerService:
+        """The idempotent create-server command (M06-002/M08 order path)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.provider_accounts.repository import (
+            SqlAlchemyProviderAccountRepository,
+        )
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        settings = get_settings()
+        return CreateServerService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            account_repo=SqlAlchemyProviderAccountRepository(self.session_factory),
+            catalog_repo=self.catalog_repository(),
+            price_book_service=self.price_book_service(),
+            snapshot_service=self.server_price_snapshot_service(),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            audit_repo=self.audit_repository(),
+            book_name=settings.price_book_name,
+        )
+
+    def user_repository(self) -> SqlAlchemyUserRepository:
+        """User persistence (Telegram onboarding lookups, M02-002)."""
+        return SqlAlchemyUserRepository(self.session_factory)
+
+    def wallet_repository(self) -> WalletRepository:
+        """Wallet persistence (bot confirmation screen, M08-005)."""
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+
+        return SqlAlchemyWalletRepository(self.session_factory)
+
     def audit_repository(self) -> Any:
         """Request-scoped audit log repository (web panel feeds)."""
         return _audit_repository(self.session_factory)
@@ -171,6 +283,187 @@ class Container:
             audit_repo=_audit_repository(self.session_factory),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
         )
+
+    def sellable_offer_repository(self) -> Any:
+        """Sellable-offer price book repository (LEASEWEB-MVP)."""
+        from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
+
+        return SqlAlchemySellableOfferRepository(self.session_factory)
+
+    def provider_order_repository(self) -> Any:
+        """Provider-order repository (LEASEWEB-MVP)."""
+        from cloud_platform.modules.orders.repository import (
+            SqlAlchemyProviderOrderRepository,
+        )
+
+        return SqlAlchemyProviderOrderRepository(self.session_factory)
+
+    def renewal_repository(self) -> Any:
+        """Renewal records + notification log (LEASEWEB-MVP)."""
+        from cloud_platform.modules.renewals.repository import (
+            SqlAlchemyRenewalRepository,
+        )
+
+        return SqlAlchemyRenewalRepository(self.session_factory)
+
+    def renewal_notification_repository(self) -> Any:
+        from cloud_platform.modules.renewals.repository import (
+            SqlAlchemyRenewalNotificationRepository,
+        )
+
+        return SqlAlchemyRenewalNotificationRepository(self.session_factory)
+
+    def ledger_repository(self) -> Any:
+        from cloud_platform.modules.wallet.repository import SqlAlchemyLedgerRepository
+
+        return SqlAlchemyLedgerRepository(self.session_factory)
+
+    def hold_service(self) -> Any:
+        from cloud_platform.modules.wallet.repository import (
+            HoldService,
+            SqlAlchemyHoldRepository,
+            SqlAlchemyLedgerRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        return HoldService(
+            SqlAlchemyWalletRepository(self.session_factory),
+            SqlAlchemyHoldRepository(self.session_factory),
+            SqlAlchemyLedgerRepository(self.session_factory),
+        )
+
+    def monthly_checkout_service(self) -> Any:
+        """The financially safe monthly checkout command (LEASEWEB-MVP)."""
+        from cloud_platform.modules.checkout.service import MonthlyCheckoutService
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.provider_accounts.repository import (
+            SqlAlchemyProviderAccountRepository,
+        )
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        return MonthlyCheckoutService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            offers_repo=self.sellable_offer_repository(),
+            account_repo=SqlAlchemyProviderAccountRepository(self.session_factory),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            orders_repo=self.provider_order_repository(),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            audit_repo=_audit_repository(self.session_factory),
+            provider_registry=self.provider_registry,
+        )
+
+    def offer_catalog_view_service(self) -> Any:
+        """Customer-facing monthly offer screens (LEASEWEB-MVP)."""
+        from cloud_platform.modules.checkout.service import OfferCatalogViewService
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+
+        return OfferCatalogViewService(
+            offers_repo=self.sellable_offer_repository(),
+            provider_registry=self.provider_registry,
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            signing_key=get_settings().callback_signing_key,
+        )
+
+    def order_worker(self, delivery_notifier: Any | None = None) -> Any:
+        """The PENDING_SUBMIT -> provider order worker (LEASEWEB-MVP)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.orders.service import OrderWorker
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        return OrderWorker(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            offers_repo=self.sellable_offer_repository(),
+            orders_repo=self.provider_order_repository(),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            hold_service=self.hold_service(),
+            audit_repo=_audit_repository(self.session_factory),
+            provider_registry=self.provider_registry,
+            renewal_repo=self.renewal_repository(),
+            delivery_notifier=delivery_notifier,
+        )
+
+    def order_reconciler(self, delivery_notifier: Any | None = None) -> Any:
+        """The read-only order reconciler (LEASEWEB-MVP)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.orders.service import OrderReconciler
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        return OrderReconciler(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            offers_repo=self.sellable_offer_repository(),
+            orders_repo=self.provider_order_repository(),
+            renewal_repo=self.renewal_repository(),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            hold_service=self.hold_service(),
+            audit_repo=_audit_repository(self.session_factory),
+            provider_registry=self.provider_registry,
+            delivery_notifier=delivery_notifier,
+        )
+
+    def renewal_checker(
+        self, user_notifier: Any | None = None, admin_notifier: Any | None = None
+    ) -> Any:
+        """The daily renewal checker (LEASEWEB-MVP)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.renewals.service import RenewalChecker
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        return RenewalChecker(
+            renewals_repo=self.renewal_repository(),
+            notification_repo=self.renewal_notification_repository(),
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            hold_service=self.hold_service(),
+            audit_repo=_audit_repository(self.session_factory),
+            user_notifier=user_notifier,
+            admin_notifier=admin_notifier,
+        )
+
+    def wallet_admin_service(self) -> Any:
+        """Admin wallet adjustments with mandatory audit trail."""
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+        from cloud_platform.modules.wallet.service import WalletAdminService
+
+        return WalletAdminService(
+            SqlAlchemyWalletRepository(self.session_factory),
+            self.ledger_repository(),
+            _audit_repository(self.session_factory),
+        )
+
+    def wallet_history_service(self) -> Any:
+        """User wallet balance + ledger history."""
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+        from cloud_platform.modules.wallet.service import WalletHistoryService
+
+        return WalletHistoryService(
+            SqlAlchemyWalletRepository(self.session_factory),
+            self.ledger_repository(),
+        )
+
+    def server_repository(self) -> Any:
+        """Cloud server persistence."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+
+        return SqlAlchemyServerRepository(self.session_factory)
 
     def power_command_service(self) -> PowerCommandService:
         """Idempotent power command service (REST v1 server actions)."""
@@ -231,6 +524,23 @@ class Container:
                 credential_source=arvancloud_holder,
             )
             self.provider_registry.register(arvancloud)
+        if settings.leaseweb_api_key:
+            leaseweb_holder = CredentialHolder(settings.leaseweb_api_key)
+            if holders is not None:
+                holders.register("leaseweb", leaseweb_holder)
+            if self.leaseweb_ordering_provider is not None:
+                # LEASEWEB-MVP: the ordering adapter IS the runtime provider
+                # (monthly products); the public-cloud adapter remains only
+                # for the legacy hourly catalog sync via its own instance.
+                self.leaseweb_ordering_provider._credential_source = leaseweb_holder
+                self.provider_registry.register(self.leaseweb_ordering_provider)
+            else:
+                leaseweb = LeaseWebProvider(
+                    api_key=settings.leaseweb_api_key,
+                    base_url=settings.leaseweb_api_base_url,
+                    credential_source=leaseweb_holder,
+                )
+                self.provider_registry.register(leaseweb)
 
     async def close(self) -> None:
         """Close all resources."""
@@ -289,6 +599,43 @@ def create_container() -> Container:
                 )
             )
 
+    # LeaseWeb syncer (EU second provider next to Hetzner)
+    leaseweb_syncer = None
+    if settings.leaseweb_api_key:
+        leaseweb_syncer = LeaseWebCatalogSyncer(
+            session_factory=session_factory,
+            provider=LeaseWebProvider(
+                api_key=settings.leaseweb_api_key,
+                base_url=settings.leaseweb_api_base_url,
+            ),
+        )
+
+    # LEASEWEB-MVP: ordering-VPS provider + catalog syncer (monthly
+    # products). The ordering provider is the runtime "leaseweb" adapter.
+    leaseweb_ordering_provider = None
+    leaseweb_ordering_syncer = None
+    if settings.leaseweb_api_key:
+        leaseweb_ordering_provider = LeaseWebOrderingProvider(
+            api_key=settings.leaseweb_api_key,
+            base_url=settings.leaseweb_api_base_url,
+            locations=tuple(
+                part.strip()
+                for part in (settings.leaseweb_locations or "").split(",")
+                if part.strip()
+            )
+            or ("AMS-01", "FRA-01"),
+            os_allowlist=tuple(
+                part.strip()
+                for part in (settings.leaseweb_os_allowlist or "").split(",")
+                if part.strip()
+            ),
+            order_os_only_free=settings.leaseweb_order_os_only_free,
+        )
+        leaseweb_ordering_syncer = LeaseWebOrderingCatalogSyncer(
+            session_factory=session_factory,
+            provider=leaseweb_ordering_provider,
+        )
+
     # M10-008: runtime-rotatable provider credentials - one holder per
     # configured provider, plus the verify-then-swap rotation service.
     holders = _CredentialHolderRegistry()
@@ -297,7 +644,10 @@ def create_container() -> Container:
         provider_registry=registry,
         provider_allocator=allocator,
         hetzner_syncer=hetzner_syncer,
+        leaseweb_syncer=leaseweb_syncer,
         arvancloud_syncers=tuple(arvancloud_syncers),
+        leaseweb_ordering_syncer=leaseweb_ordering_syncer,
+        leaseweb_ordering_provider=leaseweb_ordering_provider,
         credential_holders=holders,
         credential_rotation_service=CredentialRotationService(
             holders,

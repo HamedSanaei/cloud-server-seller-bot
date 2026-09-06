@@ -39,6 +39,8 @@ class InvalidOperationTransition(OperationError):
 
 class OperationType(StrEnum):
     SERVER_CREATE = "server_create"
+    #: Asynchronous provider order placement (LEASEWEB-MVP).
+    ORDER_CREATE = "order_create"
     POWER_ON = "power_on"
     POWER_OFF = "power_off"
     REBOOT = "reboot"

@@ -39,6 +39,50 @@ Implemented skeletons:
 
 This is intentionally a **starter**, not a finished reseller. Real payments, production migrations, secrets/KMS, fraud controls, provider reconciliation, and full Telegram flows are planned as tasks rather than faked.
 
+## Monthly Leaseweb VPS storefront (LEASEWEB-MVP)
+
+The runnable MVP sells **fixed-price prepaid monthly Leaseweb VPS** plans
+through the Telegram bot (Persian-first):
+
+```bash
+uv run alembic upgrade head
+uv run python -m cloud_platform.cli leaseweb doctor          # read-only pre-flight
+uv run python -m cloud_platform.cli leaseweb sync-offers    # refresh the price book
+uv run python -m cloud_platform.cli offers list --all       # find the offer id
+uv run python -m cloud_platform.cli offers price <id> 1299 EUR
+uv run python -m cloud_platform.cli offers enable <id>
+uv run python -m cloud_platform.bot.main                    # start the Telegram bot
+```
+
+Flow: `/menu` → خرید سرور → location → plan → OS → exact monthly price →
+confirm (wallet hold) → worker POSTs the Leaseweb order exactly once →
+read-only reconciler delivers the server to سرورهای من. Renewals are
+charged exactly once monthly with 7/3/1-day reminders; unpaid services are
+flagged `MANUAL_CANCELLATION_REQUIRED` (portal cancellation runbook in
+`docs/operations/RUNBOOK.md`). Safety: the operation ledger key doubles as
+the provider idempotency key, holds are captured exactly once, and no test
+or dev path can place a real order without `LEASEWEB_ALLOW_LIVE_ORDER_TEST=true`.
+Design decisions: `docs/leaseweb/MVP_DESIGN.md`; roadmap: `LEASEWEB-MVP`
+tasks in `docs/roadmap/TASKS.yaml`.
+
+## One-line VPS install + bash menu
+
+On a clean Ubuntu VPS (as root):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<org>/cloud-server-platform-starter/main/install.sh | sudo bash
+```
+
+Then operate everything from the menu (status, logs, catalog sync for
+Hetzner/LeaseWeb, backups, secrets, updates, smoke tests):
+
+```bash
+cd /opt/cloud-platform && ./platform.sh
+```
+
+Full guide: `docs/operations/INSTALL.md`. Selling checklist (price book →
+enable offers → `/menu` → ZarinPal top-up → order): same file.
+
 ## Local development
 
 1. Copy `.env.example` to `.env`.

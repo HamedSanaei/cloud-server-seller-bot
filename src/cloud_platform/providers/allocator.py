@@ -243,3 +243,62 @@ class CompositeAllocator(BaseProviderAllocator):
         if last_error:
             raise last_error
         raise AllocationError("All allocation policies failed")
+
+
+@dataclass(frozen=True, slots=True)
+class AccountShard:
+    """One provider account shard with load/limit awareness (M16-005)."""
+
+    provider: CloudProvider
+    account_id: str
+    region: str | None = None
+    weight: float = 1.0
+    active_servers: int = 0
+    max_servers: int = 100
+
+    def __post_init__(self) -> None:
+        if self.weight <= 0:
+            raise ValueError("shard weight must be > 0")
+        if self.active_servers < 0 or self.max_servers <= 0:
+            raise ValueError("shard load/limit values are invalid")
+        if self.active_servers >= self.max_servers:
+            raise ValueError("shard is at capacity")
+
+    @property
+    def load_ratio(self) -> float:
+        return self.active_servers / self.max_servers
+
+
+class ShardedAllocator:
+    """Load/limit-aware provider-account sharding (M16-005).
+
+    Picks the eligible shard with the lowest ``load_ratio / weight`` (least
+    loaded relative to its capacity, adjusted by operator weight). Full
+    shards are skipped; excluded ids are skipped; capability mismatches are
+    skipped. Deterministic: ties break by account_id.
+    """
+
+    def __init__(self, shards: Sequence[AccountShard]) -> None:
+        self._shards = list(shards)
+
+    async def allocate(self, request: AllocationRequest) -> AllocationResult:
+        candidates: list[tuple[float, AccountShard]] = []
+        for shard in self._shards:
+            if shard.account_id in request.excluded_account_ids:
+                continue
+            if shard.active_servers >= shard.max_servers:
+                continue
+            if not request.required_capabilities.issubset(shard.provider.capabilities):
+                continue
+            if request.preferred_region and shard.region != request.preferred_region:
+                continue
+            candidates.append((shard.load_ratio / shard.weight, shard))
+        if not candidates:
+            raise NoSuitableAccountError(
+                f"No shard with capabilities: {request.required_capabilities}"
+            )
+        candidates.sort(key=lambda item: (item[0], item[1].account_id))
+        _, shard = candidates[0]
+        return AllocationResult(
+            provider=shard.provider, account_id=shard.account_id, score=1.0 - shard.load_ratio
+        )

@@ -1,6 +1,7 @@
 """Provider package exports."""
 
 from cloud_platform.providers.allocator import (
+    AccountShard,
     AllAccountsExhaustedError,
     AllocationError,
     AllocationPolicy,
@@ -10,6 +11,7 @@ from cloud_platform.providers.allocator import (
     CompositeAllocator,
     NoSuitableAccountError,
     ProviderAllocator,
+    ShardedAllocator,
 )
 from cloud_platform.providers.base import (
     Capability,
@@ -70,6 +72,7 @@ __all__ = [
     "PERMANENT_ERROR_TYPES",
     "RETRYABLE_ERROR_TYPES",
     "AccountHealth",
+    "AccountShard",
     "AccountStatus",
     "ActionWaiter",
     "AllAccountsExhaustedError",
@@ -104,6 +107,7 @@ __all__ = [
     "ProviderUnavailable",
     "RetryExecutor",
     "RetryPolicy",
+    "ShardedAllocator",
     "UnsupportedGatewayOperation",
     "WaitOutcome",
     "WaitPolicy",

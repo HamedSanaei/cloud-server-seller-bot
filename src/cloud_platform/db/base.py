@@ -351,7 +351,10 @@ class Server(Base):
     provider_account_id = Column(
         PG_UUID, ForeignKey("provider_accounts.id", ondelete="CASCADE"), nullable=False
     )
-    catalog_id = Column(PG_UUID, ForeignKey("catalog.id", ondelete="RESTRICT"), nullable=False)
+    #: The hourly catalog offer pin for usage-billed servers; NULL for
+    #: prepaid monthly servers (their offer lives in sellable_offers via
+    #: provider_orders.offer_id). The FK is kept: NULL never cascades.
+    catalog_id = Column(PG_UUID, ForeignKey("catalog.id", ondelete="CASCADE"), nullable=True)
     state = Column(String, nullable=False, server_default="requested")
     contained_from = Column(String, nullable=True)
     provider_server_id = Column(String, nullable=True)
@@ -360,6 +363,13 @@ class Server(Base):
     price_per_quantum = Column(BigInteger, nullable=False)
     currency = Column(String(3), nullable=False, server_default="EUR")
     quantum_seconds = Column(Integer, nullable=False, server_default="3600")
+    #: hourly (usage-based accrual) or prepaid_monthly_fixed (fixed prepaid
+    #: monthly products, e.g. Leaseweb ordering VPS — LEASEWEB-MVP). The
+    #: accrual and low-balance jobs only ever touch ``hourly`` servers.
+    billing_model = Column(String(32), nullable=False, server_default="hourly")
+    #: The operating system the server was ordered with (prepaid monthly
+    #: path), e.g. "Ubuntu 24.04".
+    os = Column(String, nullable=True)
     idempotency_key = Column(String, unique=True, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
@@ -372,6 +382,161 @@ class Server(Base):
     provider = relationship("Provider", back_populates="servers")
     provider_account = relationship("ProviderAccount", back_populates="servers")
     catalog_entry = relationship("Catalog", back_populates="servers")
+
+
+class SellableOffer(Base):
+    """One explicitly sellable fixed-price monthly offer (LEASEWEB-MVP).
+
+    The row is the SINGLE gate for selling a provider product: a product/
+    location combination is sellable only when the provider currently
+    reports it (``provider_available``), the operator enabled it
+    (``enabled``), and it has an explicit customer selling price
+    (``selling_price_minor > 0``). Provider cost and customer selling price
+    are SEPARATE snapshots, both integer minor units — never derived from
+    each other, never float.
+
+    Attributes:
+        id: Primary key
+        provider_key: Provider name (e.g. "leaseweb")
+        product_id: Provider product id (e.g. "VPS02_1")
+        location_id: Provider location code (e.g. "AMS-01")
+        name: Product display name
+        vcpu / ram_gb / disk_gb / traffic: Product specs (refresh on sync)
+        provider_cost_minor: Provider price per month (minor units)
+        provider_cost_currency: Provider price currency
+        selling_price_minor: Admin-configured customer price per month (0 = not priced)
+        selling_currency: Customer price currency
+        billing_parameters: Contract/billing params (JSONB, e.g. contractTerm/billingCycle)
+        provider_available: Whether the provider currently reports the product
+        enabled: Whether the operator enabled it for sale
+    """
+
+    __tablename__ = "sellable_offers"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_key",
+            "product_id",
+            "location_id",
+            name="uq_sellable_offers_provider_product_location",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_key = Column(String(32), nullable=False)
+    product_id = Column(String(64), nullable=False)
+    location_id = Column(String(32), nullable=False)
+    name = Column(String, nullable=False)
+    vcpu = Column(Integer, nullable=False, server_default="0")
+    ram_gb = Column(Integer, nullable=False, server_default="0")
+    disk_gb = Column(Integer, nullable=False, server_default="0")
+    traffic = Column(String, nullable=True)
+    provider_cost_minor = Column(BigInteger, nullable=False, server_default="0")
+    provider_cost_currency = Column(String(3), nullable=False, server_default="EUR")
+    selling_price_minor = Column(BigInteger, nullable=False, server_default="0")
+    selling_currency = Column(String(3), nullable=False, server_default="EUR")
+    billing_parameters = Column(JSONB, nullable=False, server_default="{}")
+    provider_available = Column(Boolean, nullable=False, server_default="true")
+    enabled = Column(Boolean, nullable=False, server_default="false")
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+
+
+class ProviderOrder(Base):
+    """One provider-side order for a prepaid monthly server (LEASEWEB-MVP).
+
+    The order lifecycle is persisted here: the provider order id (NEVER the
+    final server id), its coarse provisioning state, delivery estimate and
+    the contract/service ids returned by the orders API. ``server_id`` is
+    unique — one order per server — and ``operation_key`` is the unique
+    IdempotencyKey the worker POSTs with (deterministic per server).
+
+    Attributes:
+        id: Primary key
+        server_id: The platform server the order provisions (unique)
+        operation_key: The operation ledger key / IdempotencyKey
+        provider_key: Provider name
+        provider_order_id: Provider order id (assigned on acceptance)
+        status: pending_submit | submitted | provisioning | active | failed | needs_review
+        delivery_estimate: Provider delivery estimate text
+        provider_contract_id / provider_service_id: From the orders API
+        error: Last error text
+        attempts: Worker execution attempts
+    """
+
+    __tablename__ = "provider_orders"
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    server_id = Column(
+        PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    operation_key = Column(String, unique=True, nullable=False)
+    provider_key = Column(String(32), nullable=False)
+    offer_id = Column(
+        PG_UUID, ForeignKey("sellable_offers.id", ondelete="RESTRICT"), nullable=False
+    )
+    provider_order_id = Column(String(64), nullable=True)
+    status = Column(String(32), nullable=False, server_default="pending_submit")
+    delivery_estimate = Column(String, nullable=True)
+    provider_contract_id = Column(String, nullable=True)
+    provider_service_id = Column(String, nullable=True)
+    error = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, server_default="0")
+    last_polled_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+
+
+class RenewalRecord(Base):
+    """Renewal state of one prepaid monthly server (LEASEWEB-MVP).
+
+    1:1 with ``servers`` (``server_id`` is the primary key). ``status`` is
+    one of active | insufficient_funds | manual_cancellation_required |
+    cancelled. ``provider_renewal_at`` is the estimated/actual provider
+    renewal instant (from the provider contract when available); the daily
+    renewal checker uses it for the 7/3/1-day warnings and the single
+    monthly charge (``auto_charge_enabled``).
+    """
+
+    __tablename__ = "renewals"
+
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), primary_key=True)
+    provider_contract_id = Column(String, nullable=True)
+    provider_order_ref = Column(String, nullable=True)
+    purchased_at = Column(DateTime(timezone=True), nullable=False)
+    provider_renewal_at = Column(DateTime(timezone=True), nullable=True)
+    renewal_date_estimated = Column(Boolean, nullable=False, server_default="false")
+    customer_price_minor = Column(BigInteger, nullable=False)
+    currency = Column(String(3), nullable=False)
+    status = Column(String(32), nullable=False, server_default="active")
+    auto_charge_enabled = Column(Boolean, nullable=False, server_default="true")
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+
+
+class RenewalNotification(Base):
+    """One deduplicated renewal reminder (LEASEWEB-MVP).
+
+    The unique (server_id, kind, for_period) constraint makes the daily
+    checker's reminders exactly-once per (server, level, renewal period):
+    repeated job runs cannot double-notify.
+    """
+
+    __tablename__ = "renewal_notifications"
+    __table_args__ = (
+        UniqueConstraint(
+            "server_id",
+            "kind",
+            "for_period",
+            name="uq_renewal_notifications_server_kind_period",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
+    kind = Column(String(32), nullable=False)
+    for_period = Column(DateTime(timezone=True), nullable=False)
+    sent_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", nullable=False)
 
 
 class Outbox(Base):

@@ -54,7 +54,9 @@ async def handle_start(
     # --- New user path ---
     resolved_email = email or _generate_email(username)
     try:
-        user = await user_repo.create(User(username=username, email=resolved_email))
+        user = await user_repo.create(
+            User(username=username, email=resolved_email, telegram_user_id=telegram_user_id)
+        )
     except Exception as exc:
         # Handle unique constraint violations (username/email already taken)
         if isinstance(exc, (ValueError, OnboardingConflict)):
@@ -67,6 +69,18 @@ async def handle_start(
     await wallet_repo.get_or_create(user.id, currency="EUR")
     logger.info("Created user %s with wallet", username)
     return user
+
+
+async def ensure_telegram_link(
+    user_repo: SqlAlchemyUserRepository, user: User, telegram_user_id: int
+) -> User:
+    """Link a user's Telegram identity when it was not recorded at creation.
+
+    Returns the updated user. No-op when already linked.
+    """
+    if user.telegram_user_id == telegram_user_id or user.id is None:
+        return user
+    return await user_repo.update_telegram_user_id(user.id, telegram_user_id)
 
 
 def _generate_email(username: str) -> str:

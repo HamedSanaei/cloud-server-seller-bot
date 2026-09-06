@@ -48,3 +48,12 @@ class ProviderAccountRepository(Protocol):
         draining and disabled accounts do not.
         """
         ...
+
+    async def get_or_create_active(self, user_id: UUID, provider_key: str) -> ProviderAccount:
+        """The user's ACTIVE account, created fresh (ACTIVE) on first use.
+
+        Idempotent: the (user, provider) pair is unique, so concurrent
+        callers resolve to one account row. The provider row is created on
+        demand when the platform has never synced it.
+        """
+        ...

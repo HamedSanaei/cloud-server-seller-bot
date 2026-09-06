@@ -97,6 +97,13 @@ _ALLOWED: dict[ServerLifecycleState, frozenset[ServerLifecycleState]] = {
 }
 
 
+#: Billing model for usage-based (hourly) servers — the default path.
+BILLING_MODEL_HOURLY = "hourly"
+
+#: Billing model for fixed prepaid monthly products (LEASEWEB-MVP).
+BILLING_MODEL_PREPAID_MONTHLY = "prepaid_monthly_fixed"
+
+
 @dataclass(slots=True)
 class CloudServer:
     id: UUID
@@ -105,6 +112,8 @@ class CloudServer:
     provider_account_id: UUID
     state: ServerLifecycleState
     provider_server_id: str | None = None
+    ipv4: str | None = None
+    ipv6: str | None = None
     contained_from: ServerLifecycleState | None = None
     idempotency_key: str | None = None
     created_at: datetime | None = None
@@ -112,6 +121,17 @@ class CloudServer:
     deleted_at: datetime | None = None
     low_balance_since: datetime | None = None
     quantum_seconds: int = 3600
+    #: ``hourly`` or ``prepaid_monthly_fixed`` — the accrual and low-balance
+    #: jobs only ever touch ``hourly`` servers (LEASEWEB-MVP).
+    billing_model: str = BILLING_MODEL_HOURLY
+    #: The operating system the server was ordered with (prepaid monthly
+    #: path only), e.g. "Ubuntu 24.04".
+    os: str | None = None
+
+    @property
+    def is_prepaid_monthly(self) -> bool:
+        """Whether this server is billed as a fixed prepaid monthly product."""
+        return self.billing_model == BILLING_MODEL_PREPAID_MONTHLY
 
     def transition_to(self, target: ServerLifecycleState) -> None:
         if target not in _ALLOWED[self.state]:
@@ -172,7 +192,9 @@ class ServerCreateIntent:
     (informational; the price snapshot is authoritative for billing).
     """
 
-    catalog_id: UUID
+    #: The hourly catalog offer pin (usage-billed servers); None for prepaid
+    #: monthly servers whose offer lives in sellable_offers (LEASEWEB-MVP).
+    catalog_id: UUID | None
     cost_minor: int
     currency: str
     idempotency_key: str
@@ -386,6 +408,10 @@ class ServerRepository(Protocol):
 
     async def list_requested(self) -> list[CloudServer]:
         """All servers in REQUESTED state (provisioning intents)."""
+        ...
+
+    async def list_requested_prepaid(self) -> list[CloudServer]:
+        """All REQUESTED prepaid-monthly servers (the ordering worker's queue)."""
         ...
 
     async def list_provisioning(self) -> list[CloudServer]:

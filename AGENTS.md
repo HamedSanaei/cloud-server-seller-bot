@@ -55,5 +55,11 @@ Do not claim a gate passed unless it was actually run.
 - Destructive provider operations require explicit application-layer authorization and an idempotency key.
 - Do not implement "temporary" shortcuts that allow negative wallet races, double provisioning or deletion without reconciliation.
 
+## Commit & contribution policy
+- No agent may put its own name in a commit: no author/committer identity changes, and no "Co-Authored-By", "Generated with <tool>", signature or attribution footers of any kind.
+- No agent may become a repository contributor: never add agent identities to CONTRIBUTORS files, git config `user.name`/`user.email`, repository metadata, tags or releases.
+- Commits are authored solely under the repository owner's identity. Agents must never create commits, tags or releases attributed to themselves.
+- Do not modify git author/committer configuration.
+
 ## Documentation discipline
 Update architecture docs only when the invariant/contract truly changes. Avoid giant session-history docs. Preserve durable decisions, public contracts, task evidence and operational runbooks.

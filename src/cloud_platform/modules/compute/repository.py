@@ -64,6 +64,8 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         provider_account_id=_attr(row, "provider_account_id"),
         state=ServerLifecycleState(_attr(row, "state")),
         provider_server_id=_attr(row, "provider_server_id"),
+        ipv4=_attr(row, "ipv4"),
+        ipv6=_attr(row, "ipv6"),
         contained_from=_state_or_none(_attr(row, "contained_from")),
         idempotency_key=_attr(row, "idempotency_key"),
         created_at=_aware_or_none(_attr(row, "created_at")),
@@ -71,6 +73,8 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         deleted_at=_aware_or_none(_attr(row, "deleted_at")),
         low_balance_since=_aware_or_none(_attr(row, "low_balance_since")),
         quantum_seconds=int(_attr(row, "quantum_seconds") or 3600),
+        billing_model=str(_attr(row, "billing_model") or "hourly"),
+        os=_attr(row, "os"),
     )
 
 
@@ -164,6 +168,18 @@ class SqlAlchemyServerRepository:
             rows = (
                 await session.execute(
                     _server_stmt().where(_ServerModel.state == ServerLifecycleState.REQUESTED.value)
+                )
+            ).all()
+            return [_to_domain(server_row, str(name)) for server_row, name in rows]
+
+    async def list_requested_prepaid(self) -> list[CloudServer]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    _server_stmt().where(
+                        _ServerModel.state == ServerLifecycleState.REQUESTED.value,
+                        _ServerModel.billing_model == "prepaid_monthly_fixed",
+                    )
                 )
             ).all()
             return [_to_domain(server_row, str(name)) for server_row, name in rows]
@@ -296,6 +312,7 @@ class SqlAlchemyServerRepository:
             cast_any.last_accrued_at = server.last_accrued_at
             cast_any.deleted_at = server.deleted_at
             cast_any.low_balance_since = server.low_balance_since
+            cast_any.os = server.os
             await session.commit()
             await session.refresh(server_row)
             return _to_domain(server_row, str(provider_name))
@@ -330,6 +347,8 @@ class SqlAlchemyServerRepository:
                 state=server.state.value,
                 price_per_quantum=intent.cost_minor,
                 currency=intent.currency,
+                billing_model=server.billing_model,
+                os=server.os,
                 idempotency_key=intent.idempotency_key,
             )
             session.add(row)

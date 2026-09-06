@@ -12,14 +12,42 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://cloud:cloud@localhost:5432/cloud"
     redis_url: str = "redis://localhost:6379/0"
     telegram_bot_token: str = ""
+    # M08-001: HMAC key for signed Telegram callback buttons. Must be set
+    # whenever the bot runs; empty disables callback-driven flows (services
+    # reject an empty key at construction time).
+    callback_signing_key: str = ""
     hetzner_api_token: str = ""
     hetzner_api_base_url: str = "https://api.hetzner.cloud/v1"
+    leaseweb_api_key: str = ""
+    leaseweb_api_base_url: str = "https://api.leaseweb.com"
+    # LEASEWEB-MVP: ordering-VPS catalog scope (comma-separated allowlist).
+    # Only these locations are ever synced or sold.
+    leaseweb_locations: str = "AMS-01,FRA-01"
+    # Optional comma-separated OS allowlist; empty = every free OS option.
+    leaseweb_os_allowlist: str = ""
+    # Only OS options that do not change the base monthly price are sellable.
+    leaseweb_order_os_only_free: bool = True
+    # SAFETY SWITCH: without this explicitly set to true, no code path used
+    # by tests/dev verification may place a REAL billable Leaseweb order.
+    leaseweb_allow_live_order_test: bool = False
+    # Telegram admin alert chat for renewals/attention items (0 = unset).
+    telegram_admin_chat_id: int = 0
+    # Optional support contact shown on the support screen (e.g. @handle).
+    support_contact: str = ""
     arvancloud_api_key: str = ""
     arvancloud_api_base_url: str = "https://napi.arvancloud.ir/ecc/v1"
     arvancloud_region: str = ""
     provider_credential_encryption_key: str = ""
+    zarinpal_merchant_id: str = ""
+    zarinpal_base_url: str = "https://api.zarinpal.com/pg/v4/payment"
+    zarinpal_sandbox: bool = False
+    zarinpal_callback_url: str = ""
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
     default_currency: str = "EUR"
+    # The OPERATOR-declared price book the selling price is derived from
+    # (M08-005): confirmation, holds and immutable server price snapshots
+    # all read the SAME book. There is no versioned book by default.
+    price_book_name: str = "retail-eur"
     customer_billing_quantum_seconds: int = Field(default=3600, ge=60)
     low_balance_threshold_minor: int = Field(default=5000, ge=0)
     low_balance_grace_hours: int = Field(default=24, ge=0)

@@ -2,7 +2,10 @@
 # Image entrypoint (M12-002): one image, several entry points.
 #
 #   docker run <image> api                # uvicorn on :8000 (default)
-#   docker run <image> worker              # arq job runner
+#   docker run <image> worker              # arq job runner (all queues)
+#   docker run <image> worker-provisioning # arq: provisioning queue only (M16-004)
+#   docker run <image> worker-billing      # arq: billing queue only (M16-004)
+#   docker run <image> worker-notify       # arq: notify queue only (M16-004)
 #   docker run <image> backup              # one encrypted pg_dump run
 #   docker run <image> migrate             # alembic upgrade head
 #   docker run <image> sh -c "..."         # anything else, verbatim
@@ -20,6 +23,18 @@ case "${1:-api}" in
     worker)
         shift || true
         exec arq "cloud_platform.worker.settings.WorkerSettings" "$@"
+        ;;
+    worker-provisioning)
+        shift || true
+        exec arq "cloud_platform.worker.settings.ProvisioningWorkerSettings" "$@"
+        ;;
+    worker-billing)
+        shift || true
+        exec arq "cloud_platform.worker.settings.BillingWorkerSettings" "$@"
+        ;;
+    worker-notify)
+        shift || true
+        exec arq "cloud_platform.worker.settings.NotifyWorkerSettings" "$@"
         ;;
     backup)
         shift || true

@@ -35,6 +35,7 @@ def _to_domain(row: SQLAlchemyUser) -> User:
         role=Role(_attr(row, "role")),
         terms_version=_attr(row, "terms_version"),
         terms_accepted_at=_attr(row, "terms_accepted_at"),
+        telegram_user_id=_attr(row, "telegram_user_id"),
         created_at=_attr(row, "created_at"),
         updated_at=_attr(row, "updated_at"),
     )
@@ -48,6 +49,7 @@ def _to_row(domain: User) -> SQLAlchemyUser:
             email=domain.email,
             status=domain.status.value,
             role=domain.role.value,
+            telegram_user_id=domain.telegram_user_id,
         )
     else:
         row = SQLAlchemyUser(
@@ -58,6 +60,7 @@ def _to_row(domain: User) -> SQLAlchemyUser:
             role=domain.role.value,
             terms_version=domain.terms_version,
             terms_accepted_at=domain.terms_accepted_at,
+            telegram_user_id=domain.telegram_user_id,
             created_at=domain.created_at,
             updated_at=datetime.now(UTC),
         )
@@ -160,6 +163,23 @@ class SqlAlchemyUserRepository:
             result = await session.execute(stmt)
             row = result.scalar_one_or_none()
             return _to_domain(row) if row is not None else None
+
+    async def update_telegram_user_id(self, user_id: UUID, telegram_user_id: int) -> User:
+        """Link (or re-link) a user's Telegram identity.
+
+        Used by onboarding when the Telegram id was not recorded at creation
+        time (rows created before the column existed).
+        """
+        async with self._session_factory() as session:
+            stmt = select(SQLAlchemyUser).where(SQLAlchemyUser.id == user_id)
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+            if row is None:
+                raise UserNotFound(f"User with id {user_id} not found")
+            cast(Any, row).telegram_user_id = telegram_user_id
+            await session.commit()
+            await session.refresh(row)
+            return _to_domain(row)
 
 
 def _terms_to_domain(row: SQLAlchemyTermsVersion) -> TermsVersion:

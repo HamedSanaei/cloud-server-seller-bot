@@ -1,0 +1,71 @@
+{
+  "results": [
+    {
+      "name": "GET /health/live",
+      "kind": "api",
+      "requests": 200,
+      "duration_s": 0.0812,
+      "rps": 2463.31,
+      "p50_ms": 0.372,
+      "p95_ms": 0.553,
+      "p99_ms": 0.726,
+      "mean_ms": 0.403
+    },
+    {
+      "name": "GET /v1/catalog/offers",
+      "kind": "api",
+      "requests": 200,
+      "duration_s": 0.3826,
+      "rps": 522.78,
+      "p50_ms": 14.327,
+      "p95_ms": 19.145,
+      "p99_ms": 20.874,
+      "mean_ms": 14.329
+    },
+    {
+      "name": "GET /v1/servers",
+      "kind": "api",
+      "requests": 200,
+      "duration_s": 0.4434,
+      "rps": 451.05,
+      "p50_ms": 16.248,
+      "p95_ms": 31.709,
+      "p99_ms": 33.672,
+      "mean_ms": 17.527
+    },
+    {
+      "name": "GET /v1/ssh-keys",
+      "kind": "api",
+      "requests": 200,
+      "duration_s": 0.3418,
+      "rps": 585.19,
+      "p50_ms": 13.623,
+      "p95_ms": 18.328,
+      "p99_ms": 20.006,
+      "mean_ms": 13.481
+    },
+    {
+      "name": "GET /v1/wallet unauth",
+      "kind": "api",
+      "requests": 200,
+      "duration_s": 0.2798,
+      "rps": 714.73,
+      "p50_ms": 1.261,
+      "p95_ms": 1.678,
+      "p99_ms": 1.866,
+      "mean_ms": 1.396
+    },
+    {
+      "name": "worker:reconcile_provider_resources",
+      "kind": "worker",
+      "requests": 500,
+      "duration_s": 0.006,
+      "rps": 83578.5,
+      "p50_ms": 0.011,
+      "p95_ms": 0.012,
+      "p99_ms": 0.02,
+      "mean_ms": 0.011
+    }
+  ],
+  "bottleneck": "GET /v1/servers"
+}

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.providers.errors import ProviderError
@@ -169,6 +170,84 @@ def rescue_support_of(provider: CloudProvider) -> Callable[..., Any] | None:
     disable = getattr(provider, "disable_rescue", None)
     if callable(enable) and callable(disable):
         return enable  # type: ignore[no-any-return]
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisioningTicket:
+    """Outcome of an ASYNCHRONOUS provisioning order (LEASEWEB-MVP).
+
+    Providers whose create path is "order now, server later" (e.g. Leaseweb
+    ordering VPS) return a ticket instead of a ready :class:`ProviderServer`:
+    the provider's own order id, a coarse provisioning state, the final
+    provider resource id once the resource is discoverable, and provider
+    metadata (delivery estimate, contract info). The platform NEVER treats
+    the provider order id as the final server id: reconciliation resolves
+    ``provider_resource_id`` by polling the order and the resource list.
+    """
+
+    provider_order_id: str
+    state: str  # accepted | provisioning | provisioned | failed (closed set)
+    provider_resource_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class OrderingProvider(Protocol):
+    """Optional capability: asynchronous, order-based provisioning.
+
+    Adapters that support it implement ``place_order`` (idempotent per the
+    platform operation key) and ``get_order`` (read-only inspection). The
+    domain probes for it via :func:`ordering_support_of` — the same pattern
+    as ``PowerEffectProbe`` — and uses :meth:`CloudProvider.create_server`
+    otherwise. Hetzner remains fully compatible: it simply does not
+    implement this port.
+
+    The catalog-read methods (``get_product``, ``os_name_allowed``), the
+    order->VPS resolution (``match_vps_for_order``) and ``get_server`` are
+    part of the same port: the monthly checkout and the reconciler rely on
+    them and must be able to call them through this interface.
+    """
+
+    key: str
+
+    async def place_order(
+        self, request: CreateServerRequest, idempotency_key: IdempotencyKey
+    ) -> ProvisioningTicket: ...
+
+    async def get_order(self, provider_order_id: str) -> ProvisioningTicket: ...
+
+    async def get_product(self, location_id: str, product_id: str) -> Any:
+        """The product detail (specs, OS options, prices) at one location."""
+        ...
+
+    def os_name_allowed(self, detail: Any, os_name: str) -> bool:
+        """Whether the product detail offers ``os_name`` at the allowed price."""
+        ...
+
+    async def match_vps_for_order(
+        self,
+        provider_order_id: str,
+        *,
+        location: str,
+        product_name: str,
+        since: datetime,
+    ) -> str:
+        """Resolve the provisioned resource id for an ACTIVE order.
+
+        Raises ProviderNotFound while the resource is not yet discoverable;
+        a provider-specific ambiguity error when several resources match.
+        """
+        ...
+
+    async def get_server(self, provider_server_id: str) -> ProviderServer | None: ...
+
+
+def ordering_support_of(provider: CloudProvider) -> OrderingProvider | None:
+    """The provider's ordering port, or None when it creates synchronously."""
+    if callable(getattr(provider, "place_order", None)) and callable(
+        getattr(provider, "get_order", None)
+    ):
+        return cast(OrderingProvider, provider)
     return None
 
 

@@ -1,6 +1,6 @@
 version: 1
 project: cloud-server-platform
-task_count: 139
+task_count: 150
 tasks:
 - id: M00-001
   milestone: M00
@@ -1752,13 +1752,16 @@ tasks:
   milestone: M09
   title: Integrate first Iranian payment gateway
   priority: P0
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M09-003
   acceptance:
   - Sandbox/real test evidence recorded.
-  evidence: []
+  evidence:
+  - '2026-09-04: ZarinPal v4 gateway implemented (src/cloud_platform/providers/zarinpal/client.py: create_payment request.json
+    + StartPay redirect, verify_with_amount verify.json, IRR-only, sandbox mode); 9 fake-HTTP tests green (tests/unit/test_zarinpal_gateway.py);
+    wired via ZARINPAL_* settings + reconcile_payments worker job; contract docs/payments/ZARINPAL.md'
 - id: M09-005
   milestone: M09
   title: Post successful payment to ledger
@@ -1785,24 +1788,29 @@ tasks:
   milestone: M09
   title: Implement payment status Telegram UX
   priority: P1
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M09-004
   acceptance:
   - Pending/success/failure states clear.
-  evidence: []
+  evidence:
+  - '2026-09-04: Payment status Telegram UX (src/cloud_platform/bot/payments_ui.py: pending+pay/check buttons, success, failure,
+    still-pending) rendered from catalog fa/en keys payment.pending/check/success/failed/still_pending; 5 tests green (tests/unit/test_payment_status_ux.py)'
 - id: M09-007
   milestone: M09
   title: Implement payment reconciliation job
   priority: P1
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M09-004
   acceptance:
   - Stuck sessions rechecked safely.
-  evidence: []
+  evidence:
+  - '2026-09-04: PaymentReconciliationService (src/cloud_platform/modules/payments/reconcile.py) rechecks stuck PENDING via
+    gateway verify_with_amount through replay-safe PaymentWebhookService (no double deposit); arq job reconcile_payments in
+    worker/settings.py; 4 tests green'
 - id: M10-001
   milestone: M10
   title: Implement immutable audit repository
@@ -3356,69 +3364,89 @@ tasks:
   milestone: M16
   title: Load test API and worker queues
   priority: P1
-  status: ready
+  status: done
   owner_hint: H1
   depends_on:
   - M16-001
   acceptance:
   - Bottlenecks measured with reproducible script.
-  evidence: []
+  evidence:
+  - '2026-08-27: Reproducible in-process load probe shipped: src/cloud_platform/planning/load_probe.py (percentile math, concurrency-limited
+    API probe, asyncio-queue worker probe, p95 bottleneck ranking, JSON summary), probe_app.py (REAL v1 ASGI stack - auth
+    chain, scope checks, sliding-window rate limiter, error envelope - over fake data ports via httpx.ASGITransport, zero
+    Postgres/Redis/provider), scripts/load_test.py CLI, tests/unit/test_load_probe.py (14 tests: percentile math, exact completion
+    counts under concurrency, queue drain, bottleneck ranking, real-pipeline auth/envelope behaviour).Baseline measured 2026-08-27
+    with --requests 200 --users 8 --worker-jobs 500 --worker-pool 4 (docs/ops/load_results.json): bottleneck is GET /v1/servers
+    p95=31.7 ms (ownership-scoped list serialization); auth chain /health/live p95=0.55 ms, error-envelope fast-fail p95=1.68
+    ms, worker dispatch p95=0.01 ms. Acceptance ''Bottlenecks measured with reproducible script'' holds. Gates: ruff format/check
+    clean, mypy clean (planning package), 14/14 load-probe tests pass.'
 - id: M16-003
   milestone: M16
   title: Tune PostgreSQL indexes/queries
   priority: P1
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M16-002
   acceptance:
   - Before/after query plans captured.
-  evidence: []
+  evidence:
+  - '2026-09-04: Migration 0029_hot_path_indexes.py (11 IF NOT EXISTS indexes: servers accrual/user/provider/account, ledger,
+    holds, operations, outbox, payment_sessions, accrual_periods); before/after EXPLAIN plans in docs/ops/QUERY_PLANS.md;
+    migration gate passed'
 - id: M16-004
   milestone: M16
   title: Partition worker queues by responsibility
   priority: P1
-  status: blocked
+  status: done
   owner_hint: H2
   depends_on:
   - M16-002
   acceptance:
   - Provisioning/billing/notify isolation.
-  evidence: []
+  evidence:
+  - '2026-09-04: Worker queues partitioned by responsibility (worker/settings.py: provisioning/billing/notify queue names
+    + ProvisioningWorkerSettings/BillingWorkerSettings/NotifyWorkerSettings); 1 isolation test green'
 - id: M16-005
   milestone: M16
   title: Implement provider-account sharding allocator
   priority: P1
-  status: blocked
+  status: done
   owner_hint: H1
   depends_on:
   - M03-005
   - M16-002
   acceptance:
   - Load/limit aware selection tested.
-  evidence: []
+  evidence:
+  - '2026-09-04: ShardedAllocator (providers/allocator.py: least load_ratio/weight wins, full/excluded/capability/region skips,
+    deterministic ties) exported via providers package; 4 tests green'
 - id: M16-006
   milestone: M16
   title: Evaluate billing service extraction
   priority: P2
-  status: blocked
+  status: done
   owner_hint: supervisor
   depends_on:
   - M16-002
   acceptance:
   - ADR based on measured coupling/load.
-  evidence: []
+  evidence:
+  - '2026-09-04: ADR-012 (docs/adr/ADR-012-billing-extraction.md): keep billing in monolith, decision based on shared-transaction
+    coupling + index-bound accrual + isolated billing queue'
 - id: M16-007
   milestone: M16
   title: Evaluate provider-worker extraction
   priority: P2
-  status: blocked
+  status: done
   owner_hint: supervisor
   depends_on:
   - M16-002
   acceptance:
   - ADR based on measured I/O/ops needs.
-  evidence: []
+  evidence:
+  - '2026-09-04: ADR-013 (docs/adr/ADR-013-provider-worker-extraction.md): keep provider workers in monolith image with separate
+    queue processes, based on network-bound profile + throttle/retry in-adapter'
 - id: M16-008
   milestone: M16
   title: Run disaster/cost runaway game day
@@ -3448,3 +3476,165 @@ tasks:
     = failed attempt + duplicate-request retry + recovered worker attempt = 3, all with the SAME image; completed command
     then replays with zero further provider calls - nothing lost, nothing double-acted. Full gates: ruff format/check clean,
     mypy clean (127 files), 1700 passed 11 skipped, provider-branching gate 73 modules clean.'
+- id: M17-001
+  milestone: M17
+  title: Implement LeaseWeb provider adapter
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M03-004
+  acceptance:
+  - Contract tests green without live credentials; no secret leakage.
+  evidence:
+  - '2026-09-04: LeaseWeb Public Cloud adapter (providers/leaseweb/client.py: X-LSW-Auth auth, publicCloud/v1 regions/instanceTypes/images/instances
+    CRUD + start/stop/reboot, read-only verify_credential, platform-side idempotency via get-before-create name correlation, 404-delete-as-success,
+    EUR billing, throttle + Retry-After backoff, COMPUTE+POWER phase-1 caps); 17 fake-HTTP tests green incl. secret-leakage sweep
+    (tests/unit/test_leaseweb_adapter.py). Live smoke pending credentials (docs/leaseweb/INTEGRATION_NOTES.md checklist).'
+- id: M17-002
+  milestone: M17
+  title: Implement LeaseWeb catalog sync and pricing mapper
+  priority: P0
+  status: done
+  owner_hint: H1
+  depends_on:
+  - M17-001
+  acceptance:
+  - Normalized offers require no core-domain change.
+  evidence:
+  - '2026-09-04: LeaseWebCatalogSyncer (providers/leaseweb/sync.py: regions to provider_locations upserts, instance types to PricingIngestionService
+    per-region rows, Decimal-only mapper plan_pricing_from_leaseweb, build_catalog_sync_job for the locked M04-006 job); mapper tests green
+    (tests/unit/test_leaseweb_catalog.py). Core catalog domain untouched.'
+- id: M17-003
+  milestone: M17
+  title: Wire LeaseWeb into container, worker and ops scripts
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M17-002
+  acceptance:
+  - Bot and REST sell from both providers after one sync command.
+  evidence:
+  - '2026-09-04: LeaseWeb registered in container (rotatable credential holder + leaseweb_syncer) and the worker delete registry; scripts/sync_catalog.py
+    syncs hetzner|leaseweb|arvancloud (per-provider flag); bot buy flow and capability UX serve both providers; staging compose/.env.example carry
+    LEASEWEB_*; container/worker imports verified, test_staging_compose 15 green.'
+- id: M17-004
+  milestone: M17
+  title: Ship one-line install, bash menu and launch ops
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - M17-003
+  - M09-004
+  acceptance:
+  - Clean VPS goes from zero to selling with one command plus the menu.
+  evidence:
+  - '2026-09-04: install.sh one-liner (prereqs, clone, .env wizard, build, migrate, per-provider sync, up, smoke; bash -n clean) + platform.sh bash
+    menu (12 items incl. price-book publish; bash -n clean); scripts/publish_price_book.py publishes audited margin versions with admin bootstrap (4
+    offline tests green); selling checklist in docs/operations/INSTALL.md; README one-liner; staging stack carries callback/price-book/payment vars.'
+- id: LSW-MVP-001
+  milestone: LEASEWEB-MVP
+  title: Leaseweb ordering-VPS provider adapter (ordering API)
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on: []
+  acceptance:
+  - X-LSW-Auth header auth; ordering products list/detail; OS options; POST order; order inspection; VPS management (power).
+  - Provider-neutral ProvisioningTicket contract: order id never treated as server id; Hetzner unaffected.
+  - get-before-create dedup so a retry after timeout cannot place a second order.
+  evidence:
+  - '2026-09-05: providers/leaseweb/ordering.py + ordering_sync.py per official api-definitions specs (ordering/, orders/, vps/);
+    base.py gains ProvisioningTicket + OrderingProvider port (place_order/get_order/get_product/os_name_allowed/match_vps_for_order);
+    ordering adapter registered as the runtime leaseweb provider in the container; 17 fake-HTTP adapter tests green (auth header,
+    catalog/price parsing in integer minor units, order serialization, error mapping, 429 backoff, get-before-create dedup, no key leak).'
+- id: LSW-MVP-002
+  milestone: LEASEWEB-MVP
+  title: Sellable-offer price book and monthly checkout with wallet hold
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - LSW-MVP-001
+  acceptance:
+  - Sellable only when provider-reported AND operator-enabled AND explicitly priced; provider cost and selling price are separate snapshots.
+  - Checkout holds the exact monthly price, persists server+order+operation intents before any provider call, replays idempotently.
+  evidence:
+  - '2026-09-05: sellable_offers + provider_orders + renewals schema (migration 0030, gate-clean); modules/offers (admin enable/price,
+    browse views), modules/checkout (MonthlyCheckoutService + OfferCatalogViewService, hold_key/order_operation_key deterministic keys);
+    migration gate + 9 checkout tests green (insufficient balance, replay, OS re-validation, inactive user, unsellable offer).'
+- id: LSW-MVP-003
+  milestone: LEASEWEB-MVP
+  title: Order worker + read-only reconciler with exactly-once semantics
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - LSW-MVP-002
+  acceptance:
+  - One provider POST per intent (operation ledger claim + get-before-create); hold captured on acceptance, released on rejection.
+  - Stale IN_FLIGHT ops recovered with the same key; reconciler never POSTs; ambiguous matches go to NEEDS_REVIEW.
+  evidence:
+  - '2026-09-05: modules/orders/service.py (OrderWorker, OrderReconciler, OrderActivator); worker cron jobs (process/reconcile);
+    arq 0.28 cron kwargs; 14 worker/reconciler tests green incl. racing workers, crash recovery, cancellation refund-required audit.'
+- id: LSW-MVP-004
+  milestone: LEASEWEB-MVP
+  title: Monthly renewal checker with exactly-once charging
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - LSW-MVP-002
+  acceptance:
+  - 7/3/1-day warnings deduplicated; exactly one monthly charge per period; insufficient funds flagged; manual cancellation demanded after grace.
+  evidence:
+  - '2026-09-05: modules/renewals (domain/repository/service) + daily cron; charge reuses hold create+capture idempotency; CHARGED
+    notification dedup; 9 checker tests green incl. crash-before-advance replay.'
+- id: LSW-MVP-005
+  milestone: LEASEWEB-MVP
+  title: Persian-first Telegram storefront (buy/my servers/wallet/support)
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - LSW-MVP-002
+  - LSW-MVP-003
+  acceptance:
+  - Menu buy -> location -> plan -> OS -> exact monthly price -> confirm; ownership-enforced server details + power with confirmation.
+  - Provisioned server delivered to the owning chat; renewal reminders to customer and admin chat.
+  evidence:
+  - '2026-09-05: bot/monthly_ui.py (offers/servers/wallet/support flows, signed callbacks, integer money formatting), bot/notifier.py
+    (Telegram delivery + renewal notifier), bot/main.py flow routing; i18n fa/en catalogs; onboarding now persists telegram_user_id
+    (fix: returning users were never found before); 23 UI tests green (flow, replay, ownership, power confirmation).'
+- id: LSW-MVP-006
+  milestone: LEASEWEB-MVP
+  title: Operator CLI and diagnostics
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - LSW-MVP-001
+  - LSW-MVP-002
+  acceptance:
+  - leaseweb doctor (read-only, never prints the key), sync-offers, offers enable/disable/price, users find, wallet credit/debit via
+    WalletAdminService, orders list/inspect/retry, renewals list/check.
+  - smoke-order refuses without LEASEWEB_ALLOW_LIVE_ORDER_TEST=true and --yes.
+  evidence:
+  - '2026-09-05: cloud_platform/cli.py argparse CLI; doctor checks key presence (redacted), auth, locations, products, detail prices,
+    DB, Redis; retry reopens FAILED operations with the same deterministic key.'
+- id: LSW-MVP-007
+  milestone: LEASEWEB-MVP
+  title: Deployment readiness for the monthly storefront
+  priority: P0
+  status: done
+  owner_hint: supervisor
+  depends_on:
+  - LSW-MVP-005
+  - LSW-MVP-006
+  acceptance:
+  - Env examples, compose, entrypoint carry the new settings; clean-DB migration head 0030; full gates green.
+  evidence:
+  - '2026-09-05: .env.example/deploy .env.example get LEASEWEB_LOCATIONS/OS_ALLOWLIST/ALLOW_LIVE_ORDER_TEST/TELEGRAM_ADMIN_CHAT_ID/
+    SUPPORT_CONTACT; docs/leaseweb/MVP_DESIGN.md decision note; RUNBOOK renewal/cancellation procedure; ruff+mypy clean; pytest 1932 passed.'

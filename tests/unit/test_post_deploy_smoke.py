@@ -67,12 +67,12 @@ class TestHealthChecks:
 class TestMigrationHead:
     def test_repo_head_is_the_latest_revision(self) -> None:
         head = smoke.repo_head_revision()
-        assert head == "0028", f"expected 0028 to be the head, got {head!r}"
+        assert head == "0030", f"expected 0030 to be the head, got {head!r}"
 
     def test_check_reports_expected_head(self) -> None:
         result = smoke.check_migration_head("http://x", None)
         assert result.ok
-        assert "0028" in result.detail
+        assert "0030" in result.detail
 
     def test_check_with_override(self) -> None:
         result = smoke.check_migration_head("http://x", "0099")

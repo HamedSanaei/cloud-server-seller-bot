@@ -214,6 +214,10 @@ class ProvisioningWorker:
         server = await self._servers.get(server_id)
         if server is None:
             return ProvisioningOutcome.SKIPPED_STATE
+        if server.is_prepaid_monthly:
+            # Prepaid monthly servers are provisioned by the ordering worker
+            # (order-based async provisioning), never by this hourly worker.
+            return ProvisioningOutcome.SKIPPED_STATE
         if server.state is not ServerLifecycleState.REQUESTED and (
             server.state is not ServerLifecycleState.PROVISIONING
         ):
@@ -406,7 +410,9 @@ class ProvisioningWorker:
         if limit <= 0:
             return {}
         counts: dict[ProvisioningOutcome, int] = {}
-        candidates = (await self._servers.list_requested())[:limit]
+        candidates = [s for s in await self._servers.list_requested() if not s.is_prepaid_monthly][
+            :limit
+        ]
         if not candidates:
             return counts
         in_flight_counts = await self._in_flight_counts_by_account()
@@ -616,8 +622,11 @@ class CreateTimeoutReconciler:
 
         # 2) REQUESTED servers whose operation row is missing (crash before the
         #    worker created it). Recreating it is safe: a PENDING operation has
-        #    never called the provider, and the key is deterministic.
+        #    never called the provider, and the key is deterministic. Prepaid
+        #    monthly servers are owned by the ordering reconciler instead.
         for server in requested_servers:
+            if server.is_prepaid_monthly:
+                continue
             existing = await self._ops.get_by_key(server_operation_key(server.id))
             if existing is None:
                 await self._ops.get_or_create(
@@ -630,8 +639,11 @@ class CreateTimeoutReconciler:
                 bump(ReconciliationOutcome.RECREATED_OPERATION)
 
         # 3) PROVISIONING servers past the timeout (provider created it, but it
-        #    never finished).
+        #    never finished). Prepaid monthly servers are owned by the ordering
+        #    reconciler instead.
         for server in provisioning_servers:
+            if server.is_prepaid_monthly:
+                continue
             prov_op = await self._ops.get_by_key(server_operation_key(server.id))
             if prov_op is None or prov_op.status is not OperationStatus.COMPLETED:
                 # Row/operation mismatch we cannot safely infer; contain it.

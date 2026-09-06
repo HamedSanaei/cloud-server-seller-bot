@@ -61,3 +61,36 @@ class SqlAlchemyProviderAccountRepository:
                 return None
             row, provider_name = result
             return _to_domain(row, str(provider_name))
+
+    async def get_or_create_active(self, user_id: UUID, provider_key: str) -> ProviderAccount:
+        existing = await self.get_active(user_id, provider_key)
+        if existing is not None:
+            return existing
+        async with self._session_factory() as session:
+            provider_stmt = select(_ProviderModel).where(_ProviderModel.name == provider_key)
+            provider_row = (await session.execute(provider_stmt)).scalars().first()
+            if provider_row is None:
+                from cloud_platform.modules.catalog.repository import provider_key_to_uuid
+
+                provider_row = _ProviderModel(
+                    id=provider_key_to_uuid(provider_key),
+                    name=provider_key,
+                    region="global",
+                )
+                session.add(provider_row)
+                await session.flush()
+            account_stmt = select(_ProviderAccountModel).where(
+                _ProviderAccountModel.user_id == user_id,
+                _ProviderAccountModel.provider_id == provider_row.id,
+            )
+            account_row = (await session.execute(account_stmt)).scalars().first()
+            if account_row is None:
+                account_row = _ProviderAccountModel(
+                    user_id=user_id,
+                    provider_id=provider_row.id,
+                    status=ProviderAccountStatus.ACTIVE.value,
+                )
+                session.add(account_row)
+                await session.commit()
+            await session.refresh(account_row)
+            return _to_domain(account_row, provider_key)

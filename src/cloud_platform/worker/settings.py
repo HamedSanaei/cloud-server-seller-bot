@@ -410,6 +410,53 @@ async def check_renewals(ctx: dict[str, object]) -> None:
             await container.close()
 
 
+async def reconcile_payments(ctx: dict[str, object]) -> None:
+    """Recheck stuck PENDING payment sessions (M09-007).
+
+    Verifies each stuck session against its gateway and credits through the
+    same replay-safe webhook service — a recheck can never double-deposit.
+    Skipped entirely when no gateway is configured.
+    """
+    del ctx
+    async with metrics.job("reconcile_payments"):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
+        from cloud_platform.modules.payments.reconcile import PaymentReconciliationService
+        from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
+        from cloud_platform.modules.payments.service import PaymentWebhookService
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyLedgerRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        settings = get_settings()
+        if not settings.zarinpal_merchant_id:
+            return
+        from cloud_platform.providers.zarinpal.client import ZarinPalGateway
+
+        gateway = ZarinPalGateway(
+            merchant_id=settings.zarinpal_merchant_id,
+            base_url=settings.zarinpal_base_url,
+            sandbox=settings.zarinpal_sandbox,
+            callback_url=settings.zarinpal_callback_url,
+        )
+        try:
+            service = PaymentReconciliationService(
+                payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                webhook_service=PaymentWebhookService(
+                    payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                    wallet_repo=SqlAlchemyWalletRepository(SessionFactory),
+                    ledger_repo=SqlAlchemyLedgerRepository(SessionFactory),
+                ),
+                gateway=gateway,
+                audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+            )
+            await service.run()
+        finally:
+            await gateway.close()
+
+
 def _cron_jobs() -> list[Any]:
     """Cron schedule for the LEASEWEB-MVP jobs (daily sync/renewal, periodic
     order worker/reconciler). Overlapping runs are safe: the order worker
@@ -435,6 +482,7 @@ class WorkerSettings:
         evaluate_low_balance,
         process_deletes,
         reconcile_deletes,
+        reconcile_payments,
         sync_leaseweb_offers,
         process_leaseweb_orders,
         reconcile_leaseweb_orders,
@@ -446,3 +494,42 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_jobs = 20
     job_timeout = 120
+
+
+# M16-004: queue partitioning by responsibility. Each role runs as its own
+# arq worker process with an isolated queue so a billing backlog can never
+# starve provisioning (and vice versa). Enqueue with
+# ``await redis.enqueue_job("accrue_usage", _queue_name="billing")`` etc.
+PROVISIONING_FUNCTIONS: list[Any] = [
+    reconcile_provider_resources,
+    process_deletes,
+    reconcile_deletes,
+]
+BILLING_FUNCTIONS: list[Any] = [accrue_usage, evaluate_low_balance, reconcile_payments]
+
+
+class ProvisioningWorkerSettings(WorkerSettings):
+    """Provisioning queue: creates, deletes, provider reconciliation."""
+
+    queue_name = "provisioning"
+    functions: ClassVar[list[Any]] = PROVISIONING_FUNCTIONS
+    max_jobs = 10
+
+
+class BillingWorkerSettings(WorkerSettings):
+    """Billing queue: accrual, low-balance policy, payment reconciliation."""
+
+    queue_name = "billing"
+    functions: ClassVar[list[Any]] = BILLING_FUNCTIONS
+    max_jobs = 10
+
+
+class NotifyWorkerSettings(WorkerSettings):
+    """Notify queue: Telegram/low-balance notifications (same functions, own queue)."""
+
+    queue_name = "notify"
+    functions: ClassVar[list[Any]] = []
+    max_jobs = 20
+
+
+WORKER_QUEUES: tuple[str, ...] = ("provisioning", "billing", "notify")

@@ -165,6 +165,8 @@ class User:
     role: Role = Role.USER
     terms_version: int | None = None
     terms_accepted_at: datetime | None = None
+    #: Telegram identity used by the bot for onboarding and notifications.
+    telegram_user_id: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
