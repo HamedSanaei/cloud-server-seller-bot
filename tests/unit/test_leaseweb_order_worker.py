@@ -1,14 +1,16 @@
 """Order worker + reconciler + recovery safety tests (LEASEWEB-MVP).
 
 Acceptance:
-- one provider POST per order intent (ledger claim + get-before-create),
+- one provider POST per order intent (atomic ledger claim — NO account-wide
+  similarity dedup: two independent same-plan checkouts POST twice),
 - hold captured exactly once on acceptance, released on definitive rejection,
 - genuinely-not-sent failures re-queue with the SAME key (never a second order),
 - an AMBIGUOUS billable POST (timeout after transmission, 5xx, crash mid-
   POST) NEVER triggers an automatic second POST: order + operation move to
   OUTCOME_UNKNOWN and a READ-ONLY recovery scan (or a human) resolves them,
-- the recovery service attaches exactly one proven provider order and
-  captures the hold exactly once; ambiguous/no-proof escalates to review,
+- the recovery service only attaches a PROVEN provider order (the Leaseweb
+  adapter never reports MATCHED — generic candidates escalate to review)
+  and captures the hold exactly once; ambiguous/no-proof escalates to review,
 - the reconciler only inspects; activation delivers the server once.
 """
 
@@ -154,7 +156,7 @@ class FakeServerRepo:
         self.saved: list[CloudServer] = []
 
     async def get(self, server_id: UUID) -> CloudServer | None:
-        return self.server if server_id == SERVER_ID else None
+        return self.server
 
     async def list_requested_prepaid(self) -> list[CloudServer]:
         return [self.server] if self.server.state is ServerLifecycleState.REQUESTED else []
@@ -171,10 +173,10 @@ class FakeOrdersRepo:
         self.saved: list[ProviderOrder] = []
 
     async def get_by_server(self, server_id: UUID) -> ProviderOrder | None:
-        return self.order if server_id == SERVER_ID else None
+        return self.order
 
     async def get(self, order_id: UUID) -> ProviderOrder | None:
-        return self.order if order_id == ORDER_ID else None
+        return self.order
 
     async def save(self, order: ProviderOrder) -> ProviderOrder:
         self.order = order
@@ -194,7 +196,7 @@ class FakeOperationRepo:
         self.saved: list[Operation] = []
 
     async def get_by_key(self, operation_key: str) -> Operation | None:
-        return self.op if operation_key == OP_KEY else None
+        return self.op
 
     async def claim(self, operation_id: UUID) -> Operation | None:
         if self.op.status is not OperationStatus.PENDING:
@@ -522,6 +524,54 @@ class TestOrderWorker:
         counts = await worker.process_pending()
         assert counts.get("skipped_in_flight") == 1
         assert deps["ordering"].posts == []
+
+    async def test_two_independent_same_offer_checkouts_post_twice(self) -> None:
+        """RELEASE-BLOCKER regression: two DIFFERENT customers race to buy
+        the exact same offer. Each local operation identity must produce
+        its OWN provider POST with its OWN operation key and its own
+        provider order id — no cross-operation dedup."""
+        posts: list[tuple[str, str]] = []
+        ordering = FakeOrderingProvider()
+
+        async def place(request: Any, ik: IdempotencyKey) -> ProvisioningTicket:
+            order_id = f"LS-ORD-{len(posts) + 1}"
+            posts.append((ik.value, order_id))
+            return ProvisioningTicket(provider_order_id=order_id, state="accepted")
+
+        ordering.place_order = place  # type: ignore[method-assign]
+
+        # Checkout A (existing fixtures) and an independent checkout B.
+        server_b = _server()
+        server_b.id = uuid4()
+        server_b.idempotency_key = "bot-monthly:def"
+        order_b = _order()
+        order_b.id = uuid4()
+        order_b.server_id = server_b.id
+        order_b.operation_key = f"order-create:{server_b.id}"
+        op_b = _operation(OperationStatus.PENDING)
+        op_b.operation_key = order_b.operation_key
+
+        worker_a, deps_a = _worker(ordering=ordering)
+        worker_b, deps_b = _worker(
+            ordering=ordering,
+            op_repo=FakeOperationRepo(op_b),
+            order=order_b,
+            server=server_b,
+        )
+        counts_a = await worker_a.process_pending()
+        counts_b = await worker_b.process_pending()
+        assert counts_a.get("submitted") == 1
+        assert counts_b.get("submitted") == 1
+        # Exactly TWO provider POSTs with DISTINCT operation keys and
+        # DISTINCT provider order ids.
+        assert len(posts) == 2
+        assert {key for key, _ in posts} == {OP_KEY, order_b.operation_key}
+        assert {order_id for _, order_id in posts} == {"LS-ORD-1", "LS-ORD-2"}
+        # Both local operations are independent and both orders submitted.
+        assert deps_a["orders"].order.provider_order_id == "LS-ORD-1"
+        assert deps_b["orders"].order.provider_order_id == "LS-ORD-2"
+        assert deps_a["orders"].order.operation_key == OP_KEY
+        assert deps_b["orders"].order.operation_key == order_b.operation_key
 
 
 class TestOrderReconciler:

@@ -21,16 +21,24 @@ OpenAPI specs (``github.com/Leaseweb/api-definitions``: ``ordering/``,
   ``Idempotency-Key`` header and the order body carries no client reference
   or correlation field, so **mathematically exactly-once provider ordering
   is not possible**. The platform therefore guarantees exactly-once LOCAL
-  wallet effects and operation identity, and at-most-one automatic POST
-  after an ambiguous outcome, with a READ-ONLY recovery scan (and manual
-  review) before any second chargeable POST is ever considered.
-- Get-before-create backstop: before POSTing, recent NEW_ORDER
-  VIRTUAL_SERVER orders are scanned against PROVIDER-side facts only
-  (provider price snapshot, currency, contract term, billing cycle,
-  creation window — NEVER the customer selling price). Exactly one match
-  is returned as the result of the earlier attempt; several matches make
-  the outcome ambiguous (the POST is not repeated); none means the POST
-  proceeds.
+  wallet effects and operation identity, at-most-one automatic POST per
+  operation, and reconciliation/manual review before any second chargeable
+  POST is ever considered.
+- Ledger-owned dedup (release hardening): a fresh claimed operation ALWAYS
+  POSTs exactly once. Account-wide order similarity is NEVER used to
+  suppress or reuse an order — two independent customers may legitimately
+  buy the same plan at the same price in the same location, and the Orders
+  API cannot tell their orders apart (it exposes no exact VPS product id,
+  location, OS or client reference). The platform operation ledger
+  (atomic claim + deterministic key) owns dedup.
+- Read-only recovery: an ambiguous POST (``PROVIDER_OUTCOME_UNKNOWN``) is
+  resolved by a READ-ONLY scan that counts recent NEW_ORDER
+  VIRTUAL_SERVER candidates by PROVIDER-side facts only (provider price
+  snapshot, currency, contract term, billing cycle, creation window —
+  NEVER the customer selling price). Because generic similarity cannot
+  PROVE ownership, ANY candidate count (0, 1 or many) escalates to manual
+  review: this adapter never auto-attaches a candidate (it never returns
+  a MATCHED verdict).
 - Ambiguous-outcome classification: a billable POST whose result cannot be
   proven (read/write timeout, dropped connection, 5xx after transmission)
   raises :class:`ProviderOutcomeUnknown` — the platform records the
@@ -99,11 +107,10 @@ LEASEWEB_ORDERING_CAPABILITIES = frozenset({Capability.COMPUTE, Capability.POWER
 DEFAULT_CONTRACT_TERM = "1_MONTH"
 DEFAULT_BILLING_CYCLE = "1_MONTH"
 
-#: How far back the get-before-create backstop scan looks for a matching
-#: order (a just-sent request can only be seconds/minutes old). This is a
-#: backstop ONLY: the durable recovery path (PROVIDER_OUTCOME_UNKNOWN +
-#: read-only ``recover_order``) is the real safety net and is not bounded
-#: by this window.
+#: How far back the READ-ONLY recovery scan looks for candidate orders
+#: matching the provider facts of an OUTCOME_UNKNOWN operation. This scan
+#: only COUNTS candidates — it never auto-attaches one — and the result is
+#: escalated to a human for review.
 ORDER_MATCH_WINDOW = timedelta(minutes=30)
 
 #: Per-page size for order scans (bounded by the provider's metadata total).
@@ -514,57 +521,40 @@ class LeaseWebOrderingProvider(OrderingProvider):
     async def place_order(
         self, request: CreateServerRequest, idempotency_key: IdempotencyKey
     ) -> ProvisioningTicket:
-        """POST the order once per operation intent.
+        """POST the order exactly once per claimed local operation.
 
         The Ordering API has no Idempotency-Key header and no client
-        reference field, so exactly-once ordering cannot be guaranteed
-        provider-side. The platform ledger owns local dedup; the
-        get-before-create scan below is a defensive backstop built on
-        PROVIDER-side facts only (provider cost snapshot — never the
-        customer selling price — currency, contract term, billing cycle,
-        creation window).
+        reference field (verified against the official spec), so
+        provider-side exactly-once ordering cannot be guaranteed. The
+        platform operation ledger (atomic claim + deterministic key
+        ``order-create:{server_id}``) is the ONLY dedup mechanism: this
+        method always POSTs for a claimed operation and NEVER scans recent
+        account orders to guess whether an earlier attempt exists.
 
-        - exactly one matching order  -> returned as the earlier attempt;
-        - several matching orders     -> :class:`ProviderOutcomeUnknown`
-          (ambiguous: the POST is NOT repeated);
-        - none                        -> the POST proceeds.
+        Account-wide similarity (VIRTUAL_SERVER + price + currency + term +
+        cycle + time) is deliberately NOT used to suppress or reuse an
+        order: two independent customers can legitimately buy the exact
+        same plan at the same price in the same location, and the Orders
+        API cannot tell their orders apart (no exact product id, location,
+        OS or client reference).
 
-        An ambiguous transport outcome (read/write timeout, dropped
-        connection, 5xx after transmission) raises
-        :class:`ProviderOutcomeUnknown`: the caller must NOT blindly re-POST.
+        Outcomes:
+        - 201 with an ``orderId``      -> ``accepted`` ticket.
+        - definitive provider rejection -> the mapped provider error; no
+          order was created and the caller releases the hold.
+        - ambiguous (transport error after transmission, 5xx, mutating
+          429, unreadable/missing ``orderId``) ->
+          :class:`ProviderOutcomeUnknown`: the caller must NEVER blindly
+          re-POST; the operation becomes OUTCOME_UNKNOWN and is resolved
+          by READ-ONLY recovery or human review.
         """
-        del idempotency_key  # platform ledger owns dedup; scan is a backstop
+        del idempotency_key  # the platform ledger owns local dedup
         provider_cost = request_provider_price_minor(request)
-        facts: dict[str, Any] = {
-            "provider_cost_minor": provider_cost,
-            "currency": request.labels.get("provider_currency") or "",
-            "contract_term": request.labels.get("contract_term") or self._contract_term,
-            "billing_cycle": request.labels.get("billing_cycle") or self._billing_cycle,
-            "since": datetime.now(UTC) - ORDER_MATCH_WINDOW,
-        }
-        matches = await self._scan_matching_orders(**facts)
-        if len(matches) == 1:
-            return ProvisioningTicket(
-                provider_order_id=matches[0],
-                state="provisioning",
-                metadata={
-                    "matched_existing": True,
-                    "location": request.location_id,
-                    "product_id": request.plan_id,
-                    "operating_system": request.image_id,
-                },
-            )
-        if len(matches) > 1:
-            raise ProviderOutcomeUnknown(
-                "get-before-create scan found several matching NEW_ORDERs "
-                f"({', '.join(matches)}); refusing to POST a possibly duplicate order"
-            )
-
         body: dict[str, str] = {
             "location": request.location_id,
             "operatingSystem": request.image_id,
-            "contractTerm": facts["contract_term"],
-            "billingCycle": facts["billing_cycle"],
+            "contractTerm": request.labels.get("contract_term") or self._contract_term,
+            "billingCycle": request.labels.get("billing_cycle") or self._billing_cycle,
         }
         payload = await self._request(
             "POST",
@@ -588,10 +578,10 @@ class LeaseWebOrderingProvider(OrderingProvider):
                 "location": request.location_id,
                 "product_id": request.plan_id,
                 "operating_system": request.image_id,
-                "contract_term": facts["contract_term"],
-                "billing_cycle": facts["billing_cycle"],
+                "contract_term": body["contractTerm"],
+                "billing_cycle": body["billingCycle"],
                 "provider_cost_minor": str(provider_cost),
-                "provider_currency": facts["currency"],
+                "provider_currency": request.labels.get("provider_currency") or "",
             },
         )
 
@@ -604,15 +594,25 @@ class LeaseWebOrderingProvider(OrderingProvider):
         billing_cycle: str,
         since: datetime,
     ) -> OrderRecoveryResult:
-        """READ-ONLY recovery: find the one order a previous POST may have
-        created, using provider-side facts only.
+        """READ-ONLY recovery for an OUTCOME_UNKNOWN operation (release
+        hardening).
 
-        Exactly one candidate -> MATCHED (attach its order id and continue
-        normal reconciliation). Several candidates -> AMBIGUOUS (the orders
-        API does not expose product id, location or OS, so a human must
-        decide). None -> NO_MATCH — absence is NOT provable (the order may
-        be invisible yet or outside the scanned window), so the platform
-        escalates to manual review rather than re-POSTing.
+        The Orders API exposes NO provider-side identifier that correlates
+        an order to the exact ordering VPS product, location,
+        OS/configuration or to a client reference (verified against the
+        official spec). Generic similarity — VIRTUAL_SERVER family,
+        provider price snapshot, currency, term, cycle, creation window —
+        can therefore NEVER PROVE that a candidate belongs to the local
+        operation: another customer's identical order satisfies the same
+        facts. Attaching the wrong order would capture the wrong wallet and
+        could double-provision, so the platform prefers manual review.
+
+        Verdicts (this adapter NEVER returns MATCHED):
+        - zero candidates   -> NO_MATCH: absence is NOT provable (the order
+          may be invisible yet or outside the window); escalate.
+        - one or more       -> AMBIGUOUS: unproven candidate(s); a human
+          decides. The candidate ids are reported in the reason.
+        - scan failed       -> SCAN_FAILED (transient; bounded retries).
         """
         try:
             matches = await self._scan_matching_orders(
@@ -628,22 +628,23 @@ class LeaseWebOrderingProvider(OrderingProvider):
                 candidate_count=0,
                 reason=f"recovery scan failed ({type(exc).__name__}): {exc}",
             )
-        if len(matches) == 1:
+        if not matches:
             return OrderRecoveryResult(
-                verdict=OrderRecoveryVerdict.MATCHED,
-                provider_order_id=matches[0],
-                candidate_count=1,
+                verdict=OrderRecoveryVerdict.NO_MATCH,
+                candidate_count=0,
+                reason="no matching NEW_ORDER found in the scan window; absence cannot be proven",
             )
-        if len(matches) > 1:
-            return OrderRecoveryResult(
-                verdict=OrderRecoveryVerdict.AMBIGUOUS,
-                candidate_count=len(matches),
-                reason=f"{len(matches)} orders match the provider facts ({', '.join(matches)})",
-            )
+        # One OR several candidates: the Orders API cannot prove that any of
+        # them belongs to this operation (no exact product/location/OS or
+        # client reference), so even a single candidate is never attached.
         return OrderRecoveryResult(
-            verdict=OrderRecoveryVerdict.NO_MATCH,
-            candidate_count=0,
-            reason="no matching NEW_ORDER found in the scan window; absence cannot be proven",
+            verdict=OrderRecoveryVerdict.AMBIGUOUS,
+            candidate_count=len(matches),
+            reason=(
+                f"{len(matches)} generic candidate(s) match the provider facts "
+                f"({', '.join(matches)}); the Orders API cannot prove which "
+                "belongs to this operation — manual review required"
+            ),
         )
 
     async def _scan_matching_orders(
@@ -661,9 +662,9 @@ class LeaseWebOrderingProvider(OrderingProvider):
         The orders API exposes only the product family (``VIRTUAL_SERVER``),
         ``pricePerFrequency``, ``currency``, ``contractTerm``,
         ``billingCycle`` and ``createdAt`` for a service — NOT the specific
-        VPS product id, location or OS. Those fields are therefore never
-        invented or compared here; when several orders satisfy the facts
-        the caller treats the outcome as AMBIGUOUS.
+        VPS product id, location or OS, and no client reference. Those
+        fields are therefore never invented or compared here; the caller
+        treats ANY candidate count as unproven and escalates to a human.
         """
         expected_term = _normalize_term(contract_term)
         expected_cycle = _normalize_term(billing_cycle)
@@ -936,9 +937,10 @@ class LeaseWebOrderingProvider(OrderingProvider):
             if response.status_code != 429 or attempt >= self._max_retries or mutating:
                 break
             # Read-only requests may honor the rate-limit pause in-adapter;
-            # a billable POST is never re-sent inside the adapter (429 is a
-            # definitive non-acceptance: the worker re-queues with the SAME
-            # key and the get-before-create backstop guards the re-attempt).
+            # a billable POST is never re-sent inside the adapter: a mutating
+            # 429 is classified conservatively as an unknown outcome (the
+            # Leaseweb contract does not state that a 429 guarantees the
+            # request was NOT processed).
             retry_after = response.headers.get("Retry-After")
             delay = _parse_retry_after(retry_after)
             if delay is None:
@@ -957,6 +959,15 @@ class LeaseWebOrderingProvider(OrderingProvider):
         if response.status_code in (409, 423) or "already" in message.lower():
             raise ProviderConflict(message)
         if response.status_code == 429:
+            if mutating:
+                # Conservative classification (release hardening): the
+                # Leaseweb contract does NOT state that a 429 guarantees the
+                # request was not processed — the order may exist. The
+                # outcome of a billable POST is UNKNOWN and is never
+                # automatically re-sent.
+                raise ProviderOutcomeUnknown(
+                    f"leaseweb order POST returned HTTP 429: outcome unknown; {message}"
+                )
             retry_after = response.headers.get("Retry-After")
             raise ProviderRateLimited(message, _parse_retry_after(retry_after))
         if response.status_code >= 500:

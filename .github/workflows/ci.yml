@@ -96,3 +96,46 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
           retention-days: 14
+
+  migration-smoke:
+    # LEASEWEB-MVP release gate: migrate a FRESH PostgreSQL database to head
+    # and assert the alembic head was reached. This makes the clean-DB
+    # migration smoke test reproducible in CI instead of local-only.
+    name: Fresh-PostgreSQL migration smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cloud
+          POSTGRES_PASSWORD: cloud
+          POSTGRES_DB: cloud
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cloud"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      - name: Migrate a fresh database to head
+        env:
+          DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
+        run: uv run alembic upgrade head
+      - name: Assert head revision reached
+        env:
+          DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
+        run: |
+          head_rev="$(uv run alembic heads | awk '{print $1}')"
+          current_rev="$(uv run alembic current | awk '{print $1}')"
+          echo "alembic head=$head_rev current=$current_rev"
+          test -n "$head_rev"
+          test "$head_rev" = "$current_rev"

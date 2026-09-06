@@ -195,15 +195,18 @@ class ProvisioningTicket:
 class OrderRecoveryVerdict(StrEnum):
     """Outcome of a READ-ONLY provider-order recovery scan (LEASEWEB-MVP).
 
-    ``MATCHED``: exactly one order matching the provider-side facts was
-    found — it is safe to attach it. ``NO_MATCH``: a clean scan found no
-    candidate (absence can NOT be proven: the order may be invisible yet,
-    or the scan window is limited — the platform escalates to human
-    review). ``AMBIGUOUS``: several candidates match the provider-side
-    facts and the API exposes no further distinguishing fields — a human
-    must decide; the platform never guesses. ``SCAN_FAILED``: the scan
-    itself could not complete (transient); the platform retries it a
-    bounded number of times before escalating.
+    ``MATCHED``: the adapter PROVED that exactly one order belongs to the
+    local operation via a provider-side identity (e.g. a client reference /
+    true idempotency key). Generic price/time similarity is NEVER proof of
+    ownership: an adapter whose API cannot expose such an identity must
+    return ``AMBIGUOUS`` instead of ``MATCHED``. ``NO_MATCH``: a clean
+    scan found no candidate (absence can NOT be proven: the order may be
+    invisible yet, or the scan window is limited — the platform escalates
+    to human review). ``AMBIGUOUS``: one or more candidates match the
+    provider-side facts but none can be proven to belong to this
+    operation — a human must decide; the platform never guesses.
+    ``SCAN_FAILED``: the scan itself could not complete (transient); the
+    platform retries it a bounded number of times before escalating.
     """
 
     MATCHED = "matched"
@@ -264,8 +267,12 @@ class OrderingProvider(Protocol):
 
         Provider-side facts only (provider price snapshot, currency, term,
         cycle, creation window) — the customer selling price is NEVER part
-        of provider correlation. Exactly one candidate -> MATCHED; several
-        -> AMBIGUOUS; none -> NO_MATCH (absence not provable).
+        of provider correlation. A candidate may be reported MATCHED only
+        when the provider API exposes an identity that PROVES the order
+        belongs to this operation (client reference / idempotency identity);
+        generic similarity (price/term/cycle/time) is NEVER sufficient —
+        with only generic facts, one candidate is AMBIGUOUS just like
+        several, and zero is NO_MATCH (absence not provable).
         """
         ...
 

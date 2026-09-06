@@ -11,21 +11,32 @@ order id is persisted FIRST, then the wallet hold is captured exactly once
 - Definitive provider rejection (4xx before acceptance): operation FAILED,
   order FAILED, server ERROR, hold RELEASED (funds return).
 - Genuinely-not-sent transport failure (connect refused/timeout, pool
-  timeout) or a definitive 429: operation re-queued with the SAME key; the
-  re-attempt is guarded by the adapter's get-before-create backstop.
+  timeout — the ONLY transport errors that prove nothing was transmitted):
+  operation re-queued with the SAME key; the retry is a fresh POST of the
+  same operation identity (no account-wide similarity heuristics — the
+  ledger owns dedup).
 - AMBIGUOUS outcome (read/write timeout, dropped connection, 5xx after
-  transmission): the order and operation become OUTCOME_UNKNOWN — the
-  worker NEVER automatically re-POSTs. A READ-ONLY recovery scan (or a
-  human) resolves it, per the safety preference manual review > two VPSes.
+  transmission, mutating 429, missing orderId): the order and operation
+  become OUTCOME_UNKNOWN — the worker NEVER automatically re-POSTs. A
+  READ-ONLY recovery scan (or a human) resolves it, per the safety
+  preference manual review > two VPSes.
 - Stale IN_FLIGHT (worker died mid-POST, > 30 min): SAME treatment — the
   attempt becomes OUTCOME_UNKNOWN and is resolved read-only, never by a
   blind second POST.
 
+**Dedup ownership** (release hardening): the durable local operation ledger
+is the ONLY dedup mechanism for fresh orders. ``place_order`` always POSTs
+for a claimed operation and never suppresses a POST because a similar
+recent account order exists — two customers buying the same plan at the
+same price produce two independent provider POSTs.
+
 **Recovery** (``OrderRecoveryService``): resolves OUTCOME_UNKNOWN orders
 with READ-ONLY provider scans only (``OrderingProvider.recover_order``).
-Exactly one matching provider order (provider facts only — NEVER the
-customer selling price) -> attach its id and continue normal
-reconciliation; ambiguous or no proof -> NEEDS_REVIEW for a human.
+The Leaseweb adapter NEVER reports MATCHED: the Orders API exposes no
+identifier that proves an order belongs to a local operation (no exact
+product id, location, OS or client reference), so any candidate count
+escalates to NEEDS_REVIEW for a human. (MATCHED remains part of the port
+contract for providers that CAN prove identity.)
 
 **Reconciler** (``OrderReconciler``): polls SUBMITTED/PROVISIONING orders.
 It NEVER POSTs — it only inspects orders and VPSes. When the order's

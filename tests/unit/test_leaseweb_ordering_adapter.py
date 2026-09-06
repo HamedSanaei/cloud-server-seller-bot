@@ -2,8 +2,11 @@
 
 Covers the Ordering API contract: X-LSW-Auth header, product list/detail
 parsing, price parsing (integer minor units, no float), order request
-serialization, get-before-create dedup, error mapping and rate-limit
-retry. POSTs are always mocked — no real order can ever be placed here.
+serialization, LEDGER-OWNED dedup (a fresh operation always POSTs exactly
+once — account-wide order similarity never suppresses or reuses an order),
+conservative ambiguous-outcome classification, read-only recovery (generic
+candidates are NEVER auto-attached), error mapping and rate-limit retry.
+POSTs are always mocked — no real order can ever be placed here.
 """
 
 from __future__ import annotations
@@ -261,8 +264,6 @@ class TestOrdering:
 
         def handler(m: str, p: str, **kw: Any) -> httpx.Response:
             seen.update(method=m, path=p, body=kw.get("json"))
-            if m == "GET":
-                return _response(200, {"orders": []})
             return _response(201, {"orderId": "LS-ORD-123"})
 
         provider = _provider(handler)
@@ -279,87 +280,134 @@ class TestOrdering:
         assert ticket.provider_order_id == "LS-ORD-123"
         assert ticket.state == "accepted"
 
-    async def test_get_before_create_uses_provider_facts_not_selling_price(self) -> None:
-        """Regression: provider cost 12.99 / customer selling price 18.99 —
-        recovery identifies the earlier order by PROVIDER facts only; the
-        customer selling price must never be correlated with."""
-        calls: list[str] = []
+    async def test_two_independent_same_plan_orders_are_two_posts(self) -> None:
+        """RELEASE-BLOCKER regression: customer A and customer B buy the
+        exact same VPS02_1 / AMS-01 / Ubuntu / 12.99 EUR five minutes
+        apart. Each MUST produce its own provider POST and its own order
+        id — the previous get-before-create heuristic returned A's order
+        as B's and never POSTed for B."""
+        posts: list[str] = []
 
         def handler(m: str, p: str, **kw: Any) -> httpx.Response:
-            calls.append(f"{m} {p}")
-            if m == "GET" and p == "/account/v1/orders":
-                return _response(200, {"orders": [_order_row()]})
-            return _response(201, {"orderId": "LS-ORD-NEW"})
+            if m == "POST":
+                posts.append(f"{m} {p}")
+                return _response(201, {"orderId": f"LS-ORD-{len(posts)}"})
+            return _response(200, {"orders": [_order_row("LS-ORD-A")]})
 
         provider = _provider(handler)
-        # Selling price (1899) differs from provider cost (1299): the
-        # previous implementation would FAIL to match. Provider facts win.
-        request = _order_request(provider_price_minor="1299", provider_currency="EUR")
-        ticket = await provider.place_order(request, IK)
-        assert ticket.provider_order_id == "LS-ORD-OLD"
-        assert ticket.state == "provisioning"
-        assert "POST /ordering/v1/products/vps/VPS02_1/order" not in calls
+        ticket_a = await provider.place_order(_order_request(), IK)
+        ticket_b = await provider.place_order(
+            _order_request(), IdempotencyKey("order-create:other")
+        )
+        # Exactly TWO independent POSTs, no reuse of A's provider order.
+        assert len(posts) == 2
+        assert ticket_a.provider_order_id == "LS-ORD-1"
+        assert ticket_b.provider_order_id == "LS-ORD-2"
+        assert ticket_a.provider_order_id != ticket_b.provider_order_id
+        assert ticket_a.state == "accepted"
+        assert ticket_b.state == "accepted"
 
-    async def test_two_products_same_price_is_ambiguous_no_post(self) -> None:
-        """Two different VPS products with the same provider price: the
-        orders API cannot tell them apart — the POST is refused as
-        ambiguous instead of matching either candidate."""
+    async def test_one_unrelated_prior_order_never_suppresses_fresh_post(self) -> None:
+        """The account contains exactly ONE recent VIRTUAL_SERVER order
+        matching price/currency/term/cycle. The current local operation is
+        brand-new and unrelated: the prior order MUST NOT suppress the
+        POST — the account is never even scanned during a fresh POST."""
         calls: list[str] = []
 
         def handler(m: str, p: str, **kw: Any) -> httpx.Response:
             calls.append(f"{m} {p}")
-            if m == "GET" and p == "/account/v1/orders":
-                return _response(200, {"orders": [_order_row("LS-ORD-A"), _order_row("LS-ORD-B")]})
-            return _response(201, {"orderId": "LS-ORD-NEW"})
-
-        provider = _provider(handler)
-        with pytest.raises(ProviderOutcomeUnknown):
-            await provider.place_order(_order_request(), IK)
-        # NEVER a second POST when the earlier attempt's outcome is unclear.
-        assert all(not c.startswith("POST") for c in calls)
-
-    async def test_same_price_different_location_is_ambiguous_no_post(self) -> None:
-        """The orders API exposes no location: two same-price candidates
-        (e.g. AMS-01 and FRA-01) cannot be told apart — AMBIGUOUS, no
-        false match to either, no POST."""
-        calls: list[str] = []
-
-        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
-            calls.append(f"{m} {p}")
-            if m == "GET" and p == "/account/v1/orders":
-                return _response(
-                    200,
-                    {
-                        "orders": [
-                            _order_row("LS-ORD-AMS"),
-                            _order_row(
-                                "LS-ORD-FRA",
-                                created_at=(datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
-                            ),
-                        ]
-                    },
-                )
-            return _response(201, {"orderId": "LS-ORD-NEW"})
-
-        provider = _provider(handler)
-        with pytest.raises(ProviderOutcomeUnknown):
-            await provider.place_order(_order_request(), IK)
-        assert all(not c.startswith("POST") for c in calls)
-
-    async def test_term_normalization_matches_underscore_and_space_forms(self) -> None:
-        """The ordering API uses 1_MONTH; the orders API reports 1 MONTH."""
-        calls: list[str] = []
-
-        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
-            calls.append(f"{m} {p}")
-            if m == "GET" and p == "/account/v1/orders":
-                return _response(200, {"orders": [_order_row(term="1 MONTH", cycle="1 MONTH")]})
-            return _response(201, {"orderId": "LS-ORD-NEW"})
+            if m == "POST":
+                return _response(201, {"orderId": "LS-ORD-NEW"})
+            return _response(200, {"orders": [_order_row("LS-ORD-OLD")]})
 
         provider = _provider(handler)
         ticket = await provider.place_order(_order_request(), IK)
-        assert ticket.provider_order_id == "LS-ORD-OLD"
-        assert "POST" not in " ".join(calls)
+        assert ticket.provider_order_id == "LS-ORD-NEW"
+        assert calls == ["POST /ordering/v1/products/vps/VPS02_1/order"]
+
+    async def test_different_plan_same_price_still_posts_fresh_order(self) -> None:
+        """One prior VPS02_1 / 12.99 order exists; the new operation orders
+        a DIFFERENT VPS product at the same 12.99. The previous provider
+        order is never reused: a fresh POST must occur."""
+        calls: list[str] = []
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            calls.append(f"{m} {p}")
+            if m == "POST":
+                return _response(201, {"orderId": "LS-ORD-OTHER-PLAN"})
+            return _response(200, {"orders": [_order_row("LS-ORD-A")]})
+
+        provider = _provider(handler)
+        ticket = await provider.place_order(_order_request(), IK)
+        assert ticket.provider_order_id == "LS-ORD-OTHER-PLAN"
+        assert sum(1 for c in calls if c.startswith("POST")) == 1
+
+    async def test_different_location_same_price_still_posts_fresh_order(self) -> None:
+        """One prior AMS-01 / 12.99 order exists; the new operation orders
+        FRA-01 at the same 12.99. The Orders API cannot show location, so
+        a fresh POST MUST occur — the AMS order is never attached to FRA."""
+        calls: list[str] = []
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            calls.append(f"{m} {p}")
+            if m == "POST":
+                return _response(201, {"orderId": "LS-ORD-FRA-NEW"})
+            return _response(200, {"orders": [_order_row("LS-ORD-AMS")]})
+
+        provider = _provider(handler)
+        request = CreateServerRequest(
+            name="srv-test",
+            plan_id="VPS02_1",
+            image_id="Ubuntu 24.04",
+            location_id="FRA-01",
+            labels={
+                "provider_price_minor": "1299",
+                "provider_currency": "EUR",
+                "contract_term": "1_MONTH",
+                "billing_cycle": "1_MONTH",
+            },
+        )
+        ticket = await provider.place_order(request, IK)
+        assert ticket.provider_order_id == "LS-ORD-FRA-NEW"
+        assert sum(1 for c in calls if c.startswith("POST")) == 1
+
+    async def test_unreachable_orders_endpoint_never_blocks_a_fresh_post(self) -> None:
+        """The local operation ledger — not the account order history — is
+        the dedup mechanism. If GET /account/v1/orders is down, a fresh
+        POST still proceeds (the previous get-before-create backstop would
+        have blocked it)."""
+        posts = 0
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            nonlocal posts
+            if m == "POST":
+                posts += 1
+                return _response(201, {"orderId": "LS-ORD-1"})
+            raise httpx.ConnectError("orders endpoint unreachable")
+
+        provider = _provider(handler)
+        ticket = await provider.place_order(_order_request(), IK)
+        assert ticket.provider_order_id == "LS-ORD-1"
+        assert posts == 1
+
+    async def test_recovery_normalizes_underscore_and_space_term_forms(self) -> None:
+        """The ordering API uses 1_MONTH; the orders API reports 1 MONTH.
+        The read-only recovery scan must still count the candidate (and
+        escalate it as unproven, never attach it)."""
+        provider = _provider(
+            lambda m, p, **kw: _response(
+                200, {"orders": [_order_row(term="1 MONTH", cycle="1 MONTH")]}
+            )
+        )
+        result = await provider.recover_order(
+            provider_cost_minor=1299,
+            currency="EUR",
+            contract_term="1_MONTH",
+            billing_cycle="1_MONTH",
+            since=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        assert result.verdict is OrderRecoveryVerdict.AMBIGUOUS
+        assert result.candidate_count == 1
 
     async def test_order_missing_order_id_is_unknown_outcome(self) -> None:
         """A 201 without orderId cannot be trusted: the outcome is unknown,
@@ -376,7 +424,11 @@ class TestRecoveryScan:
         provider = _provider(lambda m, p, **kw: _response(200, orders_payload))
         return provider, provider
 
-    async def test_matched_attaches_the_one_candidate(self) -> None:
+    async def test_single_generic_candidate_is_ambiguous_never_matched(self) -> None:
+        """RELEASE-BLOCKER regression: exactly ONE generic candidate
+        matching price/currency/term/cycle/time is NOT proof of ownership
+        (another customer's identical order satisfies the same facts). The
+        adapter must NOT auto-attach it — AMBIGUOUS, no provider_order_id."""
         provider, _ = await self._recover({"orders": [_order_row("LS-ORD-9")]})
         result = await provider.recover_order(
             provider_cost_minor=1299,
@@ -385,8 +437,28 @@ class TestRecoveryScan:
             billing_cycle="1_MONTH",
             since=datetime.now(UTC) - timedelta(minutes=5),
         )
-        assert result.verdict is OrderRecoveryVerdict.MATCHED
-        assert result.provider_order_id == "LS-ORD-9"
+        assert result.verdict is OrderRecoveryVerdict.AMBIGUOUS
+        assert result.provider_order_id is None
+        assert result.candidate_count == 1
+        assert "cannot prove" in result.reason
+
+    async def test_single_candidate_with_equipment_id_is_still_not_attached(self) -> None:
+        """Even a candidate that already carries an ``equipmentId`` is not
+        auto-attached: the equipment chain proves the order's SPEC (another
+        same-spec order has the same attributes), not its ownership by this
+        local operation — a human decides."""
+        row = _order_row("LS-ORD-9")
+        row["services"][0]["equipmentId"] = "vps-77"
+        provider, _ = await self._recover({"orders": [row]})
+        result = await provider.recover_order(
+            provider_cost_minor=1299,
+            currency="EUR",
+            contract_term="1_MONTH",
+            billing_cycle="1_MONTH",
+            since=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        assert result.verdict is OrderRecoveryVerdict.AMBIGUOUS
+        assert result.provider_order_id is None
         assert result.candidate_count == 1
 
     async def test_ambiguous_when_several_candidates(self) -> None:
@@ -520,9 +592,12 @@ class TestMutatingTransport:
             await provider.place_order(_order_request(), IK)
         assert sum(1 for c in calls if c.startswith("POST")) == 1
 
-    async def test_429_after_post_is_a_definitive_rejection(self) -> None:
-        """A 429 response proves the request was received and NOT processed:
-        retrying with the same key is safe (no in-adapter re-send)."""
+    async def test_mutating_429_is_conservatively_unknown_outcome(self) -> None:
+        """The Leaseweb contract does NOT state that a 429 guarantees the
+        request was NOT processed. A billable POST that returns 429 is
+        therefore classified conservatively as an unknown outcome (never
+        automatically re-sent) — the operation escalates to read-only
+        recovery / manual review instead of a blind second POST."""
         calls: list[str] = []
 
         def handler(m: str, p: str, **kw: Any) -> httpx.Response:
@@ -532,28 +607,10 @@ class TestMutatingTransport:
             return _response(200, {"orders": []})
 
         provider = _provider(handler)
-        with pytest.raises(ProviderRateLimited):
+        with pytest.raises(ProviderOutcomeUnknown):
             await provider.place_order(_order_request(), IK)
         # The adapter never re-sends a billable POST internally.
         assert sum(1 for c in calls if c.startswith("POST")) == 1
-
-    async def test_scan_failure_blocks_the_post(self) -> None:
-        """If the get-before-create scan cannot run, the POST must NOT
-        proceed (a duplicate may already exist): retryable failure, zero
-        POST attempts."""
-        posts = 0
-
-        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
-            nonlocal posts
-            if m == "POST":
-                posts += 1
-                return _response(201, {"orderId": "LS-ORD-1"})
-            raise httpx.ConnectError("orders endpoint unreachable")
-
-        provider = _provider(handler)
-        with pytest.raises(ProviderUnavailable):
-            await provider.place_order(_order_request(), IK)
-        assert posts == 0
 
 
 class TestErrorMapping:

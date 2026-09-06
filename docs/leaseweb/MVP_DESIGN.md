@@ -80,8 +80,11 @@ Decisions:
 ## 3. Idempotency for chargeable POSTs
 
 The Ordering API has no `Idempotency-Key` header and the order body has no
-reference field, so exactly-once rests on the platform ledger (the same
-pattern as ArvanCloud M15):
+reference field (verified against the official spec), so **provider-side
+exactly-once ordering is impossible**. The platform guarantees exactly-once
+LOCAL wallet effects, exactly-once LOCAL operation identity, at-most-one
+automatic POST per operation, and reconciliation/manual review before any
+second chargeable POST:
 
 1. Checkout persists, in ONE transaction, the `REQUESTED` server row (unique
    `idempotency_key` = signed bot-callback key), the wallet hold (unique
@@ -91,13 +94,21 @@ pattern as ArvanCloud M15):
 2. The worker claims the operation atomically (`PENDING -> IN_FLIGHT`), so two
    workers can never POST the same order. The provider order id is persisted
    before the hold is captured.
-3. A worker crash/timeout leaves the op `IN_FLIGHT`/`PENDING` with the same
-   key; the reconciler re-issues the POST only through the SAME claimed
-   operation (never a fresh key), preceded by a get-before-create scan of
-   recent orders (`GET /account/v1/orders`) as a best-effort provider-side
-   dedup (match: NEW_ORDER within 30 min, VIRTUAL_SERVER product, same
-   location + price).
-4. Reconcile-vs-place separation: the reconciler **never POSTs** — it only
+3. A fresh claimed operation **always POSTs exactly once** — there is **no
+   get-before-create scan** and no account-wide similarity dedup. Recent
+   orders are never used to suppress or reuse an order: the Orders API cannot
+   distinguish two independent customers buying the same plan at the same
+   price (it exposes no exact product id, location, OS or client reference),
+   so two same-plan checkouts produce two independent POSTs and two distinct
+   provider order ids.
+4. A worker crash around the POST / an ambiguous outcome leaves the
+   operation `OUTCOME_UNKNOWN` — it is **never** re-POSTed automatically. A
+   READ-ONLY recovery scan (`GET /account/v1/orders`, provider facts only)
+   counts candidates; because generic similarity cannot prove identity, ANY
+   candidate count (0, 1 or many) escalates to `needs_review` for a human.
+   The operator verifies at the portal and may then reopen the operation
+   (same key) via `orders retry`.
+5. Reconcile-vs-place separation: the reconciler **never POSTs** — it only
    inspects orders and VPSes. Only the claimed worker path mutates.
 
 ## 4. Checkout money flow (financially safe)
@@ -114,8 +125,11 @@ pattern as ArvanCloud M15):
    `capture-leaseweb-order:{ik}` is unique).
 6. Definitive provider rejection (4xx before acceptance) → order FAILED,
    server ERROR, hold released.
-7. Ambiguous (timeout/5xx/429) → op re-queued with the SAME key; never a
-   second POST without a successful reconciliation first.
+7. Ambiguous (read/write timeout after transmission, dropped connection,
+   5xx, mutating 429 — a 429 does NOT provably mean the order was not
+   processed) → order/operation `OUTCOME_UNKNOWN`; the hold stays reserved;
+   NO automatic second POST. Only provably pre-transmission failures
+   (connect refused/timeout, pool timeout) re-queue with the SAME key.
 8. Reconciliation finds the provisioned VPS (order service `equipmentId`, else
    VPS list matched by datacenter+pack+startedAt window; ambiguity →
    `needs_review`) → server RUNNING with provider id + IPs; renewal record
