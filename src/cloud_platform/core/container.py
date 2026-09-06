@@ -387,6 +387,7 @@ class Container:
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
             hold_repo=SqlAlchemyHoldRepository(self.session_factory),
             hold_service=self.hold_service(),
+            ledger_repo=self.ledger_repository(),
             audit_repo=_audit_repository(self.session_factory),
             provider_registry=self.provider_registry,
             renewal_repo=self.renewal_repository(),
@@ -396,6 +397,7 @@ class Container:
     def order_reconciler(self, delivery_notifier: Any | None = None) -> Any:
         """The read-only order reconciler (LEASEWEB-MVP)."""
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
         from cloud_platform.modules.orders.service import OrderReconciler
         from cloud_platform.modules.wallet.repository import (
             SqlAlchemyHoldRepository,
@@ -406,10 +408,12 @@ class Container:
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             offers_repo=self.sellable_offer_repository(),
             orders_repo=self.provider_order_repository(),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
             renewal_repo=self.renewal_repository(),
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
             hold_repo=SqlAlchemyHoldRepository(self.session_factory),
             hold_service=self.hold_service(),
+            ledger_repo=self.ledger_repository(),
             audit_repo=_audit_repository(self.session_factory),
             provider_registry=self.provider_registry,
             delivery_notifier=delivery_notifier,
@@ -454,11 +458,14 @@ class Container:
 
         return OrderManualResolutionService(
             server_repo=SqlAlchemyServerRepository(self.session_factory),
+            offers_repo=self.sellable_offer_repository(),
             orders_repo=self.provider_order_repository(),
             operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            renewal_repo=self.renewal_repository(),
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
             hold_repo=SqlAlchemyHoldRepository(self.session_factory),
             hold_service=self.hold_service(),
+            ledger_repo=self.ledger_repository(),
             audit_repo=_audit_repository(self.session_factory),
             provider_registry=self.provider_registry,
         )

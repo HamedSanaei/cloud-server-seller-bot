@@ -57,6 +57,7 @@ outcome is always persisted and recoverable.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -96,6 +97,8 @@ from cloud_platform.providers.leaseweb.client import (
     _parse_retry_after,
     normalize_provider_status,
 )
+
+logger = logging.getLogger(__name__)
 
 #: Advertised capabilities: COMPUTE (order + manage) and POWER (start/stop/
 #: reboot). Delete/rebuild/snapshot are NOT advertised: the current VPS API
@@ -797,54 +800,94 @@ class LeaseWebOrderingProvider(OrderingProvider):
     ) -> str:
         """Resolve the provisioned VPS id for an ACTIVE order.
 
-        1. The order service's ``equipmentId``, when it identifies a VPS.
-        2. Otherwise the VPS list is matched on (datacenter, pack, startedAt
-           window); exactly one match wins, none is NotFound, several is
-           :class:`VpsMatchAmbiguous` (a human must decide).
+        ONLY the provider-supported identity may auto-attach a VPS: the
+        order service's ``equipmentId``, confirmed by a successful GET of
+        that EXACT VPS id. There is NO fallback heuristic: datacenter + pack
+        + startedAt similarity against the account VPS list is diagnostic
+        evidence only and NEVER produces a provider_server_id, because the
+        VPS API does not link a VPS to the ordering request that created it
+        — a same-pack same-location VPS may belong to another customer's
+        independent order.
+
+        Raises :class:`ProviderNotFound` while the resource is not yet
+        provably discoverable (no ``equipmentId`` yet, or the exact VPS GET
+        fails): the caller keeps polling. A bounded wait policy (not a
+        similarity heuristic) escalates to manual review.
         """
         order = await self.get_order(provider_order_id)
         equipment_id = order.provider_resource_id
         if equipment_id:
+            # equipmentId is strong identity IF the exact VPS resolves.
             try:
                 vps = await self.get_server(equipment_id)
-            except ProviderError:
-                vps = None
+            except ProviderError as exc:
+                # 5xx/timeout on a READ-ONLY GET: keep waiting; never guess.
+                raise ProviderNotFound(
+                    f"order {provider_order_id}: equipmentId {equipment_id} "
+                    f"not resolvable yet ({type(exc).__name__})"
+                ) from exc
             if vps is not None:
                 return vps.id
-
-        params: dict[str, Any] = {"limit": 100, "offset": 0}
-        candidates: list[str] = []
-        while True:
-            payload = await self._request("GET", "/publicCloud/v1/vps", params=params)
-            items = _as_list(payload, "vps", "data", "items")
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("datacenter") or "") != location:
-                    continue
-                if str(item.get("pack") or "") != product_name:
-                    continue
-                started = _parse_datetime(item.get("startedAt"))
-                if started is not None and (started < since - timedelta(hours=2)):
-                    continue
-                candidates.append(str(item.get("id") or ""))
-            meta = payload.get("_metadata", {}) if isinstance(payload, dict) else {}
-            total = meta.get("totalCount")
-            if not isinstance(total, int) or len(candidates) >= total or not items:
-                break
-            params["offset"] = int(params["offset"]) + len(items)
-        unique = sorted(set(c for c in candidates if c))
-        if len(unique) == 1:
-            return unique[0]
-        if len(unique) > 1:
-            raise VpsMatchAmbiguous(
-                f"order {provider_order_id}: {len(unique)} VPSes match "
-                f"{location}/{product_name}; manual review required"
+            raise ProviderNotFound(
+                f"order {provider_order_id}: equipmentId {equipment_id} VPS not "
+                "found yet (not provisioned or id not visible)"
             )
+
+        # No equipmentId yet: STILL_PROVISIONING. The account VPS list is
+        # scanned READ-ONLY for OPERATOR DIAGNOSTICS only — a same
+        # (datacenter, pack) VPS is NOT proof of ownership, so no candidate
+        # is ever returned or attached.
+        await self._log_diagnostic_candidates(provider_order_id, location, product_name, since)
         raise ProviderNotFound(
-            f"order {provider_order_id}: no provisioned VPS found yet at "
-            f"{location} for {product_name!r}"
+            f"order {provider_order_id}: provider reports no equipmentId yet; "
+            f"waiting for the exact resource identity (no heuristic attach)"
         )
+
+    async def _log_diagnostic_candidates(
+        self,
+        provider_order_id: str,
+        location: str,
+        product_name: str,
+        since: datetime,
+    ) -> None:
+        """Read-only VPS-list scan; logs similarity candidates for the
+        operator but NEVER returns or attaches one (release hardening:
+        account-wide similarity is not ownership)."""
+        try:
+            params: dict[str, Any] = {"limit": 100, "offset": 0}
+            similar: list[str] = []
+            while True:
+                payload = await self._request("GET", "/publicCloud/v1/vps", params=params)
+                items = _as_list(payload, "vps", "data", "items")
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("datacenter") or "") != location:
+                        continue
+                    if str(item.get("pack") or "") != product_name:
+                        continue
+                    started = _parse_datetime(item.get("startedAt"))
+                    if started is not None and (started < since - timedelta(hours=2)):
+                        continue
+                    similar.append(str(item.get("id") or ""))
+                meta = payload.get("_metadata", {}) if isinstance(payload, dict) else {}
+                total = meta.get("totalCount")
+                if not isinstance(total, int) or len(similar) >= total or not items:
+                    break
+                params["offset"] = int(params["offset"]) + len(items)
+            logger.info(
+                "order %s: %d similar VPS(es) at %s/%s (diagnostics only, NOT attached)",
+                provider_order_id,
+                len({c for c in similar if c}),
+                location,
+                product_name,
+            )
+        except ProviderError as exc:
+            logger.warning(
+                "order %s: diagnostic VPS-list scan failed (%s); continuing to wait",
+                provider_order_id,
+                type(exc).__name__,
+            )
 
     async def get_vps_credentials(self, provider_server_id: str) -> list[dict[str, str]]:
         """``GET /publicCloud/v1/vps/{vpsId}/credentials`` (usernames only;

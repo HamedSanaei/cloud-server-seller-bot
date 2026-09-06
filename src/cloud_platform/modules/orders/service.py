@@ -5,8 +5,18 @@ intent is claimed through the operation ledger (atomic PENDING -> IN_FLIGHT),
 so two workers can never POST the same order; the operation key is the
 IdempotencyKey of the provider POST and is deterministic per server
 (``order-create:{server_id}``). On provider acceptance (201) the provider
-order id is persisted FIRST, then the wallet hold is captured exactly once
-(``HoldService.capture_hold`` is idempotent, ledger key unique).
+order id is persisted FIRST (never lost), then the operation is completed,
+then the LOCAL payment settlement runs (``OrderSettlementService``).
+
+**Payment settlement barrier** (release hardening): provider acceptance and
+local charge settlement are DIFFERENT facts. The wallet hold is captured
+exactly once (``HoldService.capture_hold`` is idempotent with a
+deterministic CHARGE ledger key, and re-running it repairs a missing CHARGE
+without a second wallet debit). A capture failure NEVER marks the provider
+order failed, NEVER releases the hold and NEVER re-POSTs: the order keeps
+its provider order id, settlement stays pending, and the reconciler retries
+the LOCAL capture only. Activation and delivery are blocked until
+``settlement_status`` is COMPLETE (hold CAPTURED + exactly one CHARGE).
 
 - Definitive provider rejection (4xx before acceptance): operation FAILED,
   order FAILED, server ERROR, hold RELEASED (funds return).
@@ -39,13 +49,18 @@ escalates to NEEDS_REVIEW for a human. (MATCHED remains part of the port
 contract for providers that CAN prove identity.)
 
 **Reconciler** (``OrderReconciler``): polls SUBMITTED/PROVISIONING orders.
-It NEVER POSTs — it only inspects orders and VPSes. When the order's
-service turns ACTIVE it resolves the provisioned VPS (equipment id, else
-datacenter+pack+startedAt matching; ambiguity -> NEEDS_REVIEW), writes the
-server's provider id/IPs, transitions it RUNNING, creates the renewal
-record (contract endsAt when available) and delivers the server details to
-the owning user. Orders stuck past their delivery estimate go to
-NEEDS_REVIEW for a human.
+It NEVER POSTs — it only inspects orders and VPSes, and it also repairs
+accepted-but-unsettled orders (local capture only). When the order's
+service turns ACTIVE it resolves the provisioned VPS using the ONLY
+provider-supported identity — the order's ``equipmentId`` confirmed by a
+GET of that exact VPS (``match_vps_for_order``). Datacenter/pack similarity
+against the account VPS list is diagnostic evidence only and NEVER
+auto-attaches a VPS; without a usable ``equipmentId`` the order keeps
+polling and escalates to NEEDS_REVIEW after a bounded grace period. Once
+settled and provably provisioned it writes the server's provider id/IPs,
+transitions it RUNNING, creates the renewal record (contract endsAt when
+available) and delivers the server details to the owning user. Orders stuck
+past their delivery estimate go to NEEDS_REVIEW for a human.
 
 The activation step is shared (``OrderActivator``) so all paths converge
 on one implementation.
@@ -71,6 +86,7 @@ from cloud_platform.modules.compute.domain import (
 )
 from cloud_platform.modules.offers.domain import SellableOffer, SellableOfferRepository
 from cloud_platform.modules.operations.domain import (
+    InvalidOperationTransition,
     Operation,
     OperationRepository,
     OperationStatus,
@@ -79,6 +95,7 @@ from cloud_platform.modules.orders.domain import (
     OrderStatus,
     ProviderOrder,
     ProviderOrderRepository,
+    SettlementStatus,
 )
 from cloud_platform.modules.renewals.domain import (
     RenewalRecord,
@@ -87,7 +104,10 @@ from cloud_platform.modules.renewals.domain import (
 )
 from cloud_platform.modules.wallet.domain import (
     HoldRepository,
+    HoldStateConflictError,
     HoldStatus,
+    InsufficientBalanceError,
+    LedgerRepository,
     WalletRepository,
 )
 from cloud_platform.modules.wallet.repository import HoldService
@@ -119,6 +139,16 @@ STALE_IN_FLIGHT_GRACE = timedelta(minutes=30)
 #: Read-only recovery scans attempted before an unresolved OUTCOME_UNKNOWN
 #: order is escalated to NEEDS_REVIEW for a human.
 MAX_RECOVERY_SCANS = 5
+
+#: Local settlement repair attempts before an accepted-but-unsettled order
+#: is escalated to NEEDS_REVIEW (financial attention). The retries only
+#: touch the wallet/ledger — never the provider.
+MAX_SETTLEMENT_ATTEMPTS = 5
+
+#: Bounded wait for a provider order to expose a usable ``equipmentId``
+#: before the reconciler escalates to NEEDS_REVIEW instead of guessing a
+#: VPS from account-wide similarity.
+MAX_EQUIPMENT_WAIT = timedelta(hours=72)
 
 MONTHLY_ESTIMATE_DAYS = 30
 
@@ -238,8 +268,12 @@ class OrderActivator:
             server.ipv6 = remote.ipv6
         else:
             server.provider_server_id = vps_id
+        # REQUESTED -> RUNNING is not a legal single transition: route
+        # through PROVISIONING first (covers manual resolve-vps and the
+        # crash-recovery path where the server never left REQUESTED).
+        if server.state is ServerLifecycleState.REQUESTED:
+            server.transition_to(ServerLifecycleState.PROVISIONING)
         if server.state in (
-            ServerLifecycleState.REQUESTED,
             ServerLifecycleState.PROVISIONING,
             ServerLifecycleState.ERROR,
         ):
@@ -321,6 +355,220 @@ class OrderActivator:
         return info
 
 
+class SettlementVerdict(StrEnum):
+    """Outcome of one :meth:`OrderSettlementService.ensure_order_payment_settled`
+    pass."""
+
+    SETTLED = "settled"  # hold CAPTURED + exactly one CHARGE ledger entry
+    RETRY_LATER = "retry_later"  # transient local failure; repair next pass
+    NEEDS_REVIEW = "needs_review"  # financial attention (hold missing/released)
+
+
+class OrderSettlementService:
+    """The local payment settlement barrier for accepted provider orders.
+
+    Provider acceptance and local charge settlement are DIFFERENT facts:
+    the provider purchase already exists (its id is durably persisted
+    BEFORE this service runs), so this service ONLY touches the wallet and
+    ledger — it never contacts the provider with a mutating request and
+    never re-POSTs. Its job is to prove, before any activation/delivery:
+
+    1. the checkout hold exists and is not RELEASED,
+    2. the hold is CAPTURED (idempotent capture — the wallet can never be
+       debited twice),
+    3. exactly one CHARGE ledger entry exists (a missing entry is repaired
+       by re-running the idempotent capture path without a second debit),
+    4. a stale operation row (e.g. worker crashed after the order id was
+       saved but before the operation completed) is completed.
+
+    The verdict is durable: ``settlement_status`` is persisted on the order
+    (pending | complete | needs_review) so an accepted-but-unsettled order
+    survives restarts and is repaired by the reconciler.
+    """
+
+    def __init__(
+        self,
+        *,
+        wallet_repo: WalletRepository,
+        hold_repo: HoldRepository,
+        hold_service: HoldService,
+        ledger_repo: LedgerRepository,
+        orders_repo: ProviderOrderRepository,
+        operation_repo: OperationRepository,
+        audit_repo: AuditRepository,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._wallets = wallet_repo
+        self._holds = hold_repo
+        self._hold_service = hold_service
+        self._ledger = ledger_repo
+        self._orders = orders_repo
+        self._ops = operation_repo
+        self._audit = AuditTrail(audit_repo)
+        self._now = clock or (lambda: datetime.now(UTC))
+
+    async def ensure_order_payment_settled(
+        self, order: ProviderOrder, server: CloudServer
+    ) -> SettlementVerdict:
+        """Idempotently prove/repair the local charge for an ACCEPTED order.
+
+        Safe to invoke repeatedly (worker acceptance path, reconciler repair,
+        manual resolution). Returns the verdict; escalates financially unsafe
+        states (missing/released hold) to NEEDS_REVIEW without ever touching
+        the provider.
+        """
+        now = self._now()
+        if server.idempotency_key is None:
+            return await self._needs_review(
+                order, now, "server has no idempotency key; cannot locate the checkout hold"
+            )
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id is None:
+            return await self._needs_review(order, now, f"wallet missing for user {server.user_id}")
+        from cloud_platform.modules.checkout.service import hold_key
+
+        hold_ik = hold_key(server.idempotency_key)
+        hold = await self._holds.get_by_idempotency(wallet.id, hold_ik)
+        if hold is None or hold.id is None:
+            return await self._needs_review(
+                order,
+                now,
+                "checkout hold missing although the provider order was accepted",
+            )
+        if hold.status is HoldStatus.RELEASED:
+            return await self._needs_review(
+                order,
+                now,
+                f"hold {hold.id} was RELEASED although the provider order was accepted",
+            )
+
+        # Idempotent capture: debits the wallet at most once and posts the
+        # CHARGE under a deterministic key, so a re-run repairs a missing
+        # CHARGE entry without a second wallet debit.
+        try:
+            await self._hold_service.capture_hold(wallet.id, hold.id, hold_ik)
+        except HoldStateConflictError:
+            return await self._needs_review(
+                order,
+                now,
+                f"hold {hold.id} released while settling an accepted provider order",
+            )
+        except InsufficientBalanceError:
+            return await self._needs_review(
+                order,
+                now,
+                f"hold {hold.id} cannot be captured: wallet balance below the held amount",
+            )
+        except Exception as exc:
+            return await self._retry_later(
+                order,
+                now,
+                f"hold capture failed transiently ({type(exc).__name__}): {exc}",
+            )
+
+        # Prove the CHARGE ledger entry exists (hold CAPTURED + missing
+        # CHARGE = incomplete settlement; the next pass repairs it).
+        charge_key = f"capture-{hold_ik}"
+        try:
+            charge = await self._ledger.get_entry_by_idempotency(wallet.id, charge_key)
+        except Exception:
+            charge = None
+        if charge is None:
+            return await self._retry_later(
+                order,
+                now,
+                "hold captured but the CHARGE ledger entry is missing; "
+                "the idempotent capture will repair it on the next pass",
+            )
+
+        order.settlement_status = SettlementStatus.COMPLETE
+        order.settlement_attempted_at = now
+        order.settlement_attempts = 0
+        order.settlement_error = None
+        await self._orders.save(order)
+        await self._repair_operation(order)
+        logger.info(
+            "order %s settlement COMPLETE (hold %s captured, CHARGE posted)",
+            order.id,
+            hold.id,
+        )
+        return SettlementVerdict.SETTLED
+
+    async def _retry_later(
+        self, order: ProviderOrder, now: datetime, reason: str
+    ) -> SettlementVerdict:
+        """Record a transient settlement failure; escalate after bounded
+        attempts. Never touches the provider."""
+        order.settlement_attempts += 1
+        order.settlement_attempted_at = now
+        order.settlement_error = reason
+        if order.settlement_attempts >= MAX_SETTLEMENT_ATTEMPTS:
+            return await self._needs_review(
+                order,
+                now,
+                f"settlement retries exhausted ({MAX_SETTLEMENT_ATTEMPTS}): {reason}",
+            )
+        await self._orders.save(order)
+        logger.warning(
+            "order %s settlement pending (attempt %d/%d): %s",
+            order.id,
+            order.settlement_attempts,
+            MAX_SETTLEMENT_ATTEMPTS,
+            reason,
+        )
+        return SettlementVerdict.RETRY_LATER
+
+    async def _needs_review(
+        self, order: ProviderOrder, now: datetime, reason: str
+    ) -> SettlementVerdict:
+        """Escalate a financially unsafe state for human attention."""
+        order.settlement_status = SettlementStatus.NEEDS_REVIEW
+        order.settlement_attempted_at = now
+        order.settlement_error = reason
+        await self._orders.save(order)
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            actor_id=None,
+            action="orders.settlement_review",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=reason,
+            metadata={
+                "server_id": str(order.server_id),
+                "provider_order_id": order.provider_order_id or "",
+            },
+        )
+        logger.error(
+            "order %s settlement NEEDS_REVIEW: %s (no delivery; no provider POST)",
+            order.id,
+            reason,
+        )
+        return SettlementVerdict.NEEDS_REVIEW
+
+    async def _repair_operation(self, order: ProviderOrder) -> None:
+        """Complete a stale operation row for a settled order.
+
+        Covers the crash window where the provider order id was persisted
+        but the operation-complete save failed (or the process died between
+        the two saves): the settlement is proven and the operation metadata
+        is repaired WITHOUT any provider call.
+        """
+        op = await self._ops.get_by_key(order.operation_key)
+        if op is None or op.is_terminal:
+            return
+        try:
+            op.complete(
+                {
+                    "provider_order_id": order.provider_order_id or "",
+                    "settled": True,
+                    "operation_key": op.operation_key,
+                }
+            )
+        except InvalidOperationTransition:
+            return  # e.g. PENDING; not ours to claim again
+        await self._ops.save(op)
+
+
 class OrderWorker:
     """Executes PENDING_SUBMIT provider order intents exactly once each."""
 
@@ -334,10 +582,12 @@ class OrderWorker:
         wallet_repo: WalletRepository,
         hold_repo: HoldRepository,
         hold_service: HoldService,
+        ledger_repo: LedgerRepository,
         audit_repo: AuditRepository,
         provider_registry: ProviderRegistry,
         renewal_repo: RenewalRepository,
         delivery_notifier: OrderDeliveryNotifier | None = None,
+        settlement: OrderSettlementService | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._servers = server_repo
@@ -351,6 +601,16 @@ class OrderWorker:
         self._registry = provider_registry
         self._renewals = renewal_repo
         self._delivery = delivery_notifier or _LoggingOrderDeliveryNotifier()
+        self._settlement = settlement or OrderSettlementService(
+            wallet_repo=wallet_repo,
+            hold_repo=hold_repo,
+            hold_service=hold_service,
+            ledger_repo=ledger_repo,
+            orders_repo=orders_repo,
+            operation_repo=operation_repo,
+            audit_repo=audit_repo,
+            clock=clock,
+        )
         self._now = clock or (lambda: datetime.now(UTC))
 
     def _activator(self) -> OrderActivator:
@@ -493,8 +753,44 @@ class OrderWorker:
         )
         await self._ops.save(claimed)
 
-        # Capture the hold exactly once (idempotent by key).
-        await self._capture_hold(server)
+        # Payment settlement barrier: the provider purchase EXISTS — only
+        # the LOCAL charge may still be pending. NEVER re-POST, NEVER
+        # release the hold; repair the settlement locally only. Delivery is
+        # blocked until settlement is COMPLETE.
+        verdict = await self._settlement.ensure_order_payment_settled(order, server)
+        if verdict is SettlementVerdict.NEEDS_REVIEW:
+            order.mark_needs_review(
+                order.settlement_error or "payment settlement requires manual review"
+            )
+            await self._orders.save(order)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                actor_id=None,
+                action="leaseweb.order_settlement_review",
+                resource_type="server_order",
+                resource_id=str(order.id),
+                reason=order.settlement_error or "settlement requires review",
+                metadata={
+                    "server_id": str(server.id),
+                    "provider_order_id": ticket.provider_order_id,
+                },
+            )
+            logger.error(
+                "leaseweb order %s accepted but settlement NEEDS_REVIEW: %s",
+                order.id,
+                order.settlement_error,
+            )
+            return OrderWorkerOutcome.SUBMITTED
+        if verdict is SettlementVerdict.RETRY_LATER:
+            # The server stays REQUESTED: no delivery, no PROVISIONING. The
+            # reconciler repairs the LOCAL settlement (zero provider POSTs)
+            # and the provider order id remains durably attached.
+            logger.warning(
+                "leaseweb order %s accepted but settlement pending: %s",
+                order.id,
+                order.settlement_error,
+            )
+            return OrderWorkerOutcome.SUBMITTED
 
         if server.state is ServerLifecycleState.REQUESTED:
             server.transition_to(ServerLifecycleState.PROVISIONING)
@@ -508,7 +804,7 @@ class OrderWorker:
             await self._orders.save(order)
 
         logger.info(
-            "leaseweb order accepted: server=%s order_id=%s provider_order=%s",
+            "leaseweb order accepted: server=%s order_id=%s provider_order=%s settlement=complete",
             server.id,
             order.id,
             ticket.provider_order_id,
@@ -519,7 +815,7 @@ class OrderWorker:
             action="leaseweb.order_accepted",
             resource_type="server_order",
             resource_id=str(order.id),
-            reason=f"provider order {ticket.provider_order_id} accepted",
+            reason=f"provider order {ticket.provider_order_id} accepted and settled",
             metadata={
                 "server_id": str(server.id),
                 "provider_order_id": ticket.provider_order_id,
@@ -567,28 +863,6 @@ class OrderWorker:
             server.id,
             reason,
         )
-
-    async def _capture_hold(self, server: CloudServer) -> None:
-        """Capture the checkout hold exactly once (idempotent)."""
-        if server.idempotency_key is None:
-            return
-        wallet = await self._wallets.get(server.user_id)
-        if wallet is None or wallet.id is None:
-            logger.error("server %s: no wallet to capture hold", server.id)
-            return
-        from cloud_platform.modules.checkout.service import hold_key
-
-        hold = await self._holds.get_by_idempotency(wallet.id, hold_key(server.idempotency_key))
-        if hold is None or hold.id is None or hold.status is not HoldStatus.CREATED:
-            return
-        try:
-            await self._hold_service.capture_hold(
-                wallet.id, hold.id, hold_key(server.idempotency_key)
-            )
-        except Exception:
-            logger.exception("failed to capture hold %s for server %s", hold.id, server.id)
-        else:
-            logger.info("hold %s captured for server %s (order accepted)", hold.id, server.id)
 
     async def _recover_active(
         self, server: CloudServer, order: ProviderOrder
@@ -681,13 +955,16 @@ class OrderReconciler:
         server_repo: ServerRepository,
         offers_repo: SellableOfferRepository,
         orders_repo: ProviderOrderRepository,
+        operation_repo: OperationRepository,
         renewal_repo: RenewalRepository,
         wallet_repo: WalletRepository,
         hold_repo: HoldRepository,
         hold_service: HoldService,
+        ledger_repo: LedgerRepository,
         audit_repo: AuditRepository,
         provider_registry: ProviderRegistry,
         delivery_notifier: OrderDeliveryNotifier | None = None,
+        settlement: OrderSettlementService | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._servers = server_repo
@@ -700,6 +977,16 @@ class OrderReconciler:
         self._audit = AuditTrail(audit_repo)
         self._registry = provider_registry
         self._delivery = delivery_notifier or _LoggingOrderDeliveryNotifier()
+        self._settlement = settlement or OrderSettlementService(
+            wallet_repo=wallet_repo,
+            hold_repo=hold_repo,
+            hold_service=hold_service,
+            ledger_repo=ledger_repo,
+            orders_repo=orders_repo,
+            operation_repo=operation_repo,
+            audit_repo=audit_repo,
+            clock=clock,
+        )
         self._now = clock or (lambda: datetime.now(UTC))
 
     async def reconcile(
@@ -770,6 +1057,36 @@ class OrderReconciler:
             return ReconciliationOutcome.LEFT_UNCHANGED
 
         order.last_polled_at = self._now()
+
+        # Settlement barrier: an accepted provider order whose LOCAL charge
+        # is not settled must not be activated or delivered. Repair the
+        # local settlement (never a provider POST); escalate financially
+        # unsafe states for a human.
+        if order.settlement_status is not SettlementStatus.COMPLETE:
+            verdict = await self._settlement.ensure_order_payment_settled(order, server)
+            if verdict is SettlementVerdict.NEEDS_REVIEW:
+                order.mark_needs_review(
+                    order.settlement_error or "payment settlement requires manual review"
+                )
+                await self._orders.save(order)
+                await self._audit.record_mutation(
+                    actor_type=ActorType.SYSTEM,
+                    actor_id=None,
+                    action="leaseweb.order_settlement_review",
+                    resource_type="server_order",
+                    resource_id=str(order.id),
+                    reason=order.settlement_error or "settlement requires review",
+                    metadata={"server_id": str(order.server_id)},
+                )
+                return ReconciliationOutcome.MARKED_FOR_REVIEW
+            if verdict is SettlementVerdict.RETRY_LATER:
+                # Local-only repair continues on the next poll; the server
+                # stays un-delivered and the provider order id stays attached.
+                return ReconciliationOutcome.LEFT_UNCHANGED
+            if server.state is ServerLifecycleState.REQUESTED:
+                server.transition_to(ServerLifecycleState.PROVISIONING)
+                await self._servers.save(server)
+
         if ticket.state == "provisioned":
             return await self._activate(order, server, offer, ordering)
 
@@ -820,7 +1137,27 @@ class OrderReconciler:
                 since=server.created_at or datetime.now(UTC),
             )
         except ProviderNotFound:
-            # Provider says ACTIVE but no VPS is visible yet: keep polling.
+            # Provider says ACTIVE but no provable VPS identity yet
+            # (equipmentId absent or its exact GET failed): keep polling —
+            # NEVER auto-attach a similar account VPS. After a bounded wait
+            # the order escalates to a human instead of guessing.
+            since = order.post_attempted_at or order.created_at or datetime.now(UTC)
+            if self._now() - since > MAX_EQUIPMENT_WAIT:
+                order.mark_needs_review(
+                    "no usable provider equipmentId within the bounded wait; "
+                    "verify the provisioned VPS manually (orders resolve-vps)"
+                )
+                await self._orders.save(order)
+                await self._audit.record_mutation(
+                    actor_type=ActorType.SYSTEM,
+                    actor_id=None,
+                    action="leaseweb.order_review",
+                    resource_type="server_order",
+                    resource_id=str(order.id),
+                    reason="equipmentId wait exceeded",
+                    metadata={"server_id": str(order.server_id)},
+                )
+                return ReconciliationOutcome.MARKED_FOR_REVIEW
             order.mark_provisioning()
             await self._orders.save(order)
             return ReconciliationOutcome.STILL_PROVISIONING
@@ -1126,32 +1463,61 @@ class OrderManualResolutionService:
     - :meth:`resolve_existing` — an ambiguous POST (OUTCOME_UNKNOWN /
       NEEDS_REVIEW) that the operator PROVED at the provider created this
       exact order. Attaches the provider order id after a READ-ONLY
-      validation, completes the operation, captures the hold exactly once.
+      validation, completes the operation and runs the SAME payment
+      settlement barrier as the worker: the hold is captured exactly once;
+      if the capture fails, the provider id stays attached and the
+      settlement is repaired by the reconciler (never a provider POST).
     - :meth:`resolve_not_created` — an ambiguous POST that the operator
       PROVED created NOTHING. Returns the intent to the retryable queue
       (OUTCOME_UNKNOWN -> PENDING, same key).
+    - :meth:`resolve_vps` — a SUBMITTED/PROVISIONING order whose exact VPS
+      the operator verified at the provider portal. Validates the VPS
+      READ-ONLY (existence + provider-side datacenter/pack cross-check),
+      requires settlement COMPLETE, then activates + delivers through the
+      normal activator.
+
+    All preconditions are validated BEFORE any row is saved.
     """
 
     def __init__(
         self,
         *,
         server_repo: ServerRepository,
+        offers_repo: SellableOfferRepository,
         orders_repo: ProviderOrderRepository,
         operation_repo: OperationRepository,
+        renewal_repo: RenewalRepository,
         wallet_repo: WalletRepository,
         hold_repo: HoldRepository,
         hold_service: HoldService,
+        ledger_repo: LedgerRepository,
         audit_repo: AuditRepository,
         provider_registry: ProviderRegistry,
+        delivery_notifier: OrderDeliveryNotifier | None = None,
+        settlement: OrderSettlementService | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._servers = server_repo
+        self._offers = offers_repo
         self._orders = orders_repo
         self._ops = operation_repo
+        self._renewals = renewal_repo
         self._wallets = wallet_repo
         self._holds = hold_repo
         self._hold_service = hold_service
         self._audit = AuditTrail(audit_repo)
         self._registry = provider_registry
+        self._delivery = delivery_notifier or _LoggingOrderDeliveryNotifier()
+        self._settlement = settlement or OrderSettlementService(
+            wallet_repo=wallet_repo,
+            hold_repo=hold_repo,
+            hold_service=hold_service,
+            ledger_repo=ledger_repo,
+            orders_repo=orders_repo,
+            operation_repo=operation_repo,
+            audit_repo=audit_repo,
+            clock=clock,
+        )
 
     @staticmethod
     def _actor_context(actor: Any | None) -> tuple[ActorType, Any | None]:
@@ -1192,6 +1558,9 @@ class OrderManualResolutionService:
         verification."""
         self._require_reason(reason)
         order, operation, server = await self._order_and_operation(order_id)
+        # Validate EVERY precondition before mutating/saving any row: the
+        # repositories commit independently, so a late validation failure
+        # must not leave a partially transitioned local state.
         if order.status is not OrderStatus.FAILED:
             raise OrderManualResolutionError(
                 f"order {order_id} is {order.status.value}; only orders that FAILED "
@@ -1200,22 +1569,29 @@ class OrderManualResolutionService:
                 "`orders resolve-existing` or `orders resolve-not-created` after "
                 "verifying at the provider portal."
             )
-        if operation.status is not OperationStatus.FAILED:
+        if operation.status not in (OperationStatus.FAILED, OperationStatus.PENDING):
             raise OrderManualResolutionError(
-                f"order {order_id}: operation is {operation.status.value}, not FAILED; cannot retry"
+                f"order {order_id}: operation is {operation.status.value}; cannot retry "
+                "(expected FAILED, or PENDING when an earlier retry partially saved)"
+            )
+        if server.state not in (ServerLifecycleState.ERROR, ServerLifecycleState.REQUESTED):
+            raise OrderManualResolutionError(
+                f"order {order_id}: server is {server.state.value}; cannot re-queue "
+                "(expected ERROR or REQUESTED)"
             )
 
-        operation.reopen_for_retry()  # FAILED -> PENDING, SAME key (manual-only)
-        await self._ops.save(operation)
-        order.reset_to_pending_submit()  # FAILED -> PENDING_SUBMIT (manual-only)
-        await self._orders.save(order)
+        # Idempotent durable transitions: a re-run after a partial save
+        # (crash between the independent repository commits) completes the
+        # remaining steps instead of failing halfway.
+        if operation.status is OperationStatus.FAILED:
+            operation.reopen_for_retry()  # FAILED -> PENDING, SAME key (manual-only)
+            await self._ops.save(operation)
+        if order.status is OrderStatus.FAILED:
+            order.reset_to_pending_submit()  # FAILED -> PENDING_SUBMIT (manual-only)
+            await self._orders.save(order)
         if server.state is ServerLifecycleState.ERROR:
             server.reset_to_requested()  # ERROR -> REQUESTED (manual-only)
             await self._servers.save(server)
-        elif server.state is not ServerLifecycleState.REQUESTED:
-            raise OrderManualResolutionError(
-                f"order {order_id}: server is {server.state.value}; cannot re-queue"
-            )
 
         actor_type, actor_id = self._actor_context(actor)
         await self._audit.record_mutation(
@@ -1246,8 +1622,15 @@ class OrderManualResolutionService:
         reason: str,
     ) -> tuple[ProviderOrder, Operation]:
         """Attach the provider order id a human PROVED belongs to this
-        ambiguous POST. Performs a READ-ONLY validation first; NEVER POSTs;
-        captures the hold exactly once."""
+        ambiguous POST. Performs a READ-ONLY validation first; NEVER POSTs.
+        The provider id is attached durably FIRST; then the SAME payment
+        settlement barrier as the worker runs — the hold is captured exactly
+        once, and a capture failure leaves the provider id attached with
+        settlement pending (repaired by the reconciler, never re-POSTed).
+
+        Returns (order, operation); the caller must read
+        ``order.settlement_status`` to report whether settlement is complete.
+        """
         self._require_reason(reason)
         if not provider_order_id or not provider_order_id.strip():
             raise OrderManualResolutionError("a non-empty provider order id is required")
@@ -1292,7 +1675,10 @@ class OrderManualResolutionService:
         )
         await self._ops.save(operation)
 
-        await self._capture_hold(order, server)
+        # Settlement barrier (same as the worker): the provider purchase
+        # already exists; never re-POST, never release the hold. A pending
+        # capture leaves the provider id attached; the reconciler repairs.
+        await self._settlement.ensure_order_payment_settled(order, server)
 
         actor_type, actor_id = self._actor_context(actor)
         await self._audit.record_mutation(
@@ -1368,6 +1754,129 @@ class OrderManualResolutionService:
         )
         return order, operation
 
+    # -- B.2) verified provider VPS resource -------------------------------
+
+    async def resolve_vps(
+        self,
+        order_id: UUID,
+        vps_id: str,
+        *,
+        actor: Any | None = None,
+        reason: str,
+    ) -> tuple[ProviderOrder, Operation]:
+        """Attach the provisioned VPS id the operator VERIFIED at the
+        provider portal for an order whose exact resource identity never
+        became provable automatically (no usable ``equipmentId``).
+
+        - READ-ONLY toward the provider: validates the VPS exists and, when
+          the VPS API exposes them, cross-checks datacenter/pack against the
+          offer's provider-side facts (never guesses missing fields).
+        - Requires settlement COMPLETE (hold CAPTURED + CHARGE): delivery
+          must never happen for an unsettled purchase.
+        - Activates through the normal ``OrderActivator`` (server RUNNING,
+          renewal record, delivery) and audits the manual resolution.
+        - NEVER POSTs anything.
+        """
+        self._require_reason(reason)
+        if not vps_id or not vps_id.strip():
+            raise OrderManualResolutionError("a non-empty provider VPS id is required")
+        order, operation, server = await self._order_and_operation(order_id)
+        if not order.provider_order_id:
+            raise OrderManualResolutionError(
+                f"order {order_id} has no provider order id; use `orders resolve-existing` first"
+            )
+        if order.status not in (
+            OrderStatus.SUBMITTED,
+            OrderStatus.PROVISIONING,
+            OrderStatus.NEEDS_REVIEW,
+        ):
+            raise OrderManualResolutionError(
+                f"order {order_id} is {order.status.value}; resolve-vps requires a "
+                "SUBMITTED/PROVISIONING order with an attached provider order id"
+            )
+        if server.provider_server_id:
+            raise OrderManualResolutionError(
+                f"server {server.id} already has provider_server_id "
+                f"{server.provider_server_id!r}; nothing to resolve"
+            )
+        offer = await self._offers.get(order.offer_id) if order.offer_id else None
+        if offer is None:
+            raise OrderManualResolutionError(
+                f"order {order_id}: sellable offer row missing; cannot activate"
+            )
+
+        ordering = self._ordering_for(order, server)
+        # READ-ONLY validation of the operator-supplied VPS id.
+        try:
+            remote = await ordering.get_server(vps_id)
+        except ProviderError as exc:
+            raise OrderManualResolutionError(
+                f"read-only VPS lookup of {vps_id} failed ({type(exc).__name__}): {exc}"
+            ) from exc
+        if remote is None:
+            raise OrderManualResolutionError(
+                f"provider VPS {vps_id} does not exist (read-only lookup)"
+            )
+        meta = getattr(remote, "metadata", None) or {}
+        datacenter = str(meta.get("datacenter") or "")
+        pack = str(meta.get("pack") or "")
+        if datacenter and offer.location_id and datacenter != offer.location_id:
+            raise OrderManualResolutionError(
+                f"VPS {vps_id} datacenter {datacenter!r} does not match the offer "
+                f"location {offer.location_id!r}"
+            )
+        if pack and offer.name and pack != offer.name:
+            raise OrderManualResolutionError(
+                f"VPS {vps_id} pack {pack!r} does not match the offer product {offer.name!r}"
+            )
+
+        # Settlement barrier: never deliver an unsettled purchase.
+        verdict = await self._settlement.ensure_order_payment_settled(order, server)
+        if verdict is not SettlementVerdict.SETTLED:
+            if verdict is SettlementVerdict.NEEDS_REVIEW:
+                order.mark_needs_review(
+                    order.settlement_error or "payment settlement requires manual review"
+                )
+                await self._orders.save(order)
+            raise OrderManualResolutionError(
+                "payment settlement is not COMPLETE (hold must be CAPTURED with "
+                "a CHARGE ledger entry); resolve the financial state before "
+                "attaching the VPS"
+            )
+
+        activator = OrderActivator(
+            server_repo=self._servers,
+            offers_repo=self._offers,
+            orders_repo=self._orders,
+            renewal_repo=self._renewals,
+            audit_trail=self._audit,
+            provider_registry=self._registry,
+            delivery_notifier=self._delivery,
+        )
+        await activator.activate(
+            server=server, order=order, offer=offer, vps_id=vps_id, ordering=ordering
+        )
+
+        actor_type, actor_id = self._actor_context(actor)
+        await self._audit.record_mutation(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="order.resolve_vps",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=reason,
+            metadata={
+                "server_id": str(order.server_id),
+                "provider_order_id": order.provider_order_id or "",
+                "provider_vps_id": vps_id,
+                "operation_key": order.operation_key,
+            },
+        )
+        logger.warning(
+            "order %s manually resolved to VPS %s (settled): %s", order.id, vps_id, reason
+        )
+        return order, operation
+
     # -- helpers ------------------------------------------------------------
 
     def _ordering_for(self, order: ProviderOrder, server: CloudServer) -> OrderingProvider:
@@ -1428,23 +1937,3 @@ class OrderManualResolutionService:
             if self._normalize(cycle) != self._normalize(order.billing_cycle):
                 return f"billing cycle {cycle!r} does not match snapshot {order.billing_cycle!r}"
         return None
-
-    async def _capture_hold(self, order: ProviderOrder, server: CloudServer) -> None:
-        """Capture the checkout hold exactly once (idempotent by key)."""
-        if server.idempotency_key is None:
-            return
-        wallet = await self._wallets.get(server.user_id)
-        if wallet is None or wallet.id is None:
-            logger.error("server %s: no wallet to capture hold on manual resolution", server.id)
-            return
-        from cloud_platform.modules.checkout.service import hold_key
-
-        hold = await self._holds.get_by_idempotency(wallet.id, hold_key(server.idempotency_key))
-        if hold is None or hold.id is None or hold.status is not HoldStatus.CREATED:
-            return
-        try:
-            await self._hold_service.capture_hold(
-                wallet.id, hold.id, hold_key(server.idempotency_key)
-            )
-        except Exception:
-            logger.exception("failed to capture hold %s for server %s", hold.id, server.id)

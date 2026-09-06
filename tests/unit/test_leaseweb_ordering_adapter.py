@@ -801,8 +801,15 @@ class TestGetOrderAndMatching:
         )
         assert vps_id == "vps-77"
 
-    async def test_match_vps_falls_back_to_list_and_is_ambiguous(self) -> None:
+    async def test_match_vps_never_attaches_single_similar_vps(self) -> None:
+        """Release hardening: with NO equipmentId, exactly ONE account VPS
+        with the same datacenter + pack + recent startedAt is only
+        DIAGNOSTIC evidence — it must never be auto-attached (it may belong
+        to another customer's independent order)."""
+        calls: list[str] = []
+
         def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            calls.append(f"{m} {p}")
             if p == "/account/v1/orders/LS-ORD-1":
                 return _response(
                     200, {"id": "LS-ORD-1", "services": [{"productId": "VIRTUAL_SERVER"}]}
@@ -812,20 +819,97 @@ class TestGetOrderAndMatching:
                     200,
                     {
                         "vps": [
-                            {"id": "vps-1", "datacenter": "AMS-01", "pack": "VPS S"},
-                            {"id": "vps-2", "datacenter": "AMS-01", "pack": "VPS S"},
+                            {
+                                "id": "vps-1",
+                                "datacenter": "AMS-01",
+                                "pack": "VPS S",
+                                "startedAt": datetime.now(UTC).isoformat(),
+                            }
                         ]
                     },
                 )
             return _response(404, {"errorMessage": "gone"})
 
         provider = _provider(handler)
-        from cloud_platform.providers.leaseweb.ordering import VpsMatchAmbiguous
+        from cloud_platform.providers.errors import ProviderNotFound
 
-        with pytest.raises(VpsMatchAmbiguous):
+        with pytest.raises(ProviderNotFound):
             await provider.match_vps_for_order(
                 "LS-ORD-1", location="AMS-01", product_name="VPS S", since=datetime.now(UTC)
             )
+        # The account list was consulted for OPERATOR DIAGNOSTICS only — and
+        # the single similar candidate was still never attached.
+        assert any("/publicCloud/v1/vps" in c for c in calls)
+        assert all("vps-1" not in c for c in calls)  # no id ever returned
+
+    async def test_match_vps_never_attaches_when_equipment_vps_missing(self) -> None:
+        """equipmentId present but its exact VPS GET fails (404/transient):
+        keep waiting — ProviderNotFound — and do NOT fall back to the
+        account VPS list."""
+        calls: list[str] = []
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            calls.append(f"{m} {p}")
+            if p == "/account/v1/orders/LS-ORD-1":
+                return _response(
+                    200,
+                    {
+                        "id": "LS-ORD-1",
+                        "services": [{"productId": "VIRTUAL_SERVER", "equipmentId": "vps-77"}],
+                    },
+                )
+            if p == "/publicCloud/v1/vps/vps-77":
+                return _response(404, {"errorMessage": "not yet visible"})
+            return _response(200, {"vps": []})
+
+        provider = _provider(handler)
+        from cloud_platform.providers.errors import ProviderNotFound
+
+        with pytest.raises(ProviderNotFound):
+            await provider.match_vps_for_order(
+                "LS-ORD-1", location="AMS-01", product_name="VPS S", since=datetime.now(UTC)
+            )
+        assert calls == [
+            "GET /account/v1/orders/LS-ORD-1",
+            "GET /publicCloud/v1/vps/vps-77",
+        ]
+
+    async def test_match_vps_waits_when_equipment_id_absent(self) -> None:
+        """ACTIVE order without equipmentId: STILL_PROVISIONING — the exact
+        identity must appear; no heuristic VPS is chosen."""
+        calls: list[str] = []
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            calls.append(f"{m} {p}")
+            if p == "/account/v1/orders/LS-ORD-1":
+                return _response(
+                    200, {"id": "LS-ORD-1", "services": [{"productId": "VIRTUAL_SERVER"}]}
+                )
+            if p == "/publicCloud/v1/vps":
+                return _response(
+                    200,
+                    {
+                        "vps": [
+                            {
+                                "id": "vps-9",
+                                "datacenter": "AMS-01",
+                                "pack": "VPS S",
+                                "startedAt": datetime.now(UTC).isoformat(),
+                            }
+                        ]
+                    },
+                )
+            return _response(404, {"errorMessage": "gone"})
+
+        provider = _provider(handler)
+        from cloud_platform.providers.errors import ProviderNotFound
+
+        with pytest.raises(ProviderNotFound):
+            await provider.match_vps_for_order(
+                "LS-ORD-1", location="AMS-01", product_name="VPS S", since=datetime.now(UTC)
+            )
+        # The list scan ran (diagnostics) but the similar VPS was NOT used.
+        assert any("/publicCloud/v1/vps" in c for c in calls)
 
     async def test_match_vps_returns_none_when_unprovisioned(self) -> None:
         def handler(m: str, p: str, **kw: Any) -> httpx.Response:

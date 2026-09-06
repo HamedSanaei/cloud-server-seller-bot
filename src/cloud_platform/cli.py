@@ -26,6 +26,10 @@ Commands::
     orders resolve-existing <order_id> <provider_order_id> --reason R --yes
                                  Attach a provider order id a human verified
                                  (ambiguous POST; read-only validation, no POST)
+    orders resolve-vps <order_id> <vps_id> --reason R --yes
+                                 Attach the provisioned VPS id a human verified
+                                 at the portal (read-only VPS validation, no
+                                 POST; requires settlement complete)
     orders resolve-not-created <order_id> --reason R --yes
                                  Re-queue an ambiguous intent after the human
                                  verified the provider created nothing
@@ -513,10 +517,67 @@ async def orders_resolve_existing(
         f"{order.provider_order_id} status={order.status.value} "
         f"operation={op.status.value}"
     )
+    if order.settlement_status.value == "complete":
+        print(
+            "Settlement COMPLETE: the wallet hold was captured exactly once with "
+            "its CHARGE ledger entry. The read-only reconciler will poll the "
+            "order; delivery is allowed. No provider POST was made."
+        )
+    elif order.settlement_status.value == "needs_review":
+        print(
+            "ATTENTION: settlement NEEDS_REVIEW — "
+            f"{order.settlement_error or 'see order'}. The provider order id "
+            "stays attached and the hold stays reserved; NO delivery will happen "
+            "until a human resolves the financial state. No provider POST was made."
+        )
+    else:
+        print(
+            "Settlement PENDING: the provider order id stays attached and the "
+            "hold stays reserved; the reconciler retries the LOCAL capture only "
+            "(never a provider POST). Delivery is BLOCKED until settlement is "
+            "complete."
+        )
+    return 0
+
+
+async def orders_resolve_vps(order_id: str, vps_id: str, reason: str, yes: bool) -> int:
+    """Attach the provisioned VPS id a human VERIFIED at the Leaseweb portal
+    for an order whose exact resource identity never became provable
+    automatically (no usable equipmentId). READ-ONLY validation of the VPS;
+    NEVER POSTs; requires settlement COMPLETE; activates + delivers through
+    the normal activator."""
+    if not yes:
+        print(
+            "REFUSED: pass --yes to confirm. This attaches the exact provider "
+            "VPS id you verified at the Leaseweb portal for this order; it NEVER "
+            "POSTs to Leaseweb and requires the payment settlement to be complete."
+        )
+        return 2
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+    container = create_container()
+    try:
+        service = container.order_manual_resolution()
+        order, _op = await service.resolve_vps(
+            UUID(order_id), vps_id, actor=_cli_admin_user(), reason=reason
+        )
+    except OrderManualResolutionError as exc:
+        print(f"REFUSED: {exc}")
+        return 2
+    except LookupError as exc:
+        print(exc)
+        return 1
+    finally:
+        await container.close()
     print(
-        "The read-only reconciler will poll the order; the wallet hold was "
-        "captured exactly once (if this was a customer order). No provider POST "
-        "was made."
+        f"order {order.id} resolved: attached provider VPS id {vps_id} "
+        f"(provider_order_id={order.provider_order_id} status={order.status.value})"
+    )
+    print(
+        "Settlement was complete; the server is now RUNNING with its renewal "
+        "record, and the owning user was notified with the server details. "
+        "No provider POST was made."
     )
     return 0
 
@@ -661,6 +722,13 @@ def _parser() -> argparse.ArgumentParser:
     resolve_existing_p.add_argument("provider_order_id")
     resolve_existing_p.add_argument("--reason", required=True)
     resolve_existing_p.add_argument("--yes", action="store_true")
+    resolve_vps_p = orders_sub.add_parser(
+        "resolve-vps", help="attach the provisioned VPS id verified at the portal"
+    )
+    resolve_vps_p.add_argument("order_id")
+    resolve_vps_p.add_argument("vps_id")
+    resolve_vps_p.add_argument("--reason", required=True)
+    resolve_vps_p.add_argument("--yes", action="store_true")
     resolve_not_created_p = orders_sub.add_parser(
         "resolve-not-created", help="re-queue an intent after verified non-creation"
     )
@@ -713,6 +781,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return await orders_resolve_existing(
                 args.order_id, args.provider_order_id, args.reason, args.yes
             )
+        if args.subcommand == "resolve-vps":
+            return await orders_resolve_vps(args.order_id, args.vps_id, args.reason, args.yes)
         if args.subcommand == "resolve-not-created":
             return await orders_resolve_not_created(args.order_id, args.reason, args.yes)
     if args.command == "renewals":

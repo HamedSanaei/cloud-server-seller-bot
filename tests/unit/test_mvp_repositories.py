@@ -100,6 +100,10 @@ def _order_row(**overrides: Any) -> MagicMock:
     row.selling_price_minor = 1299
     row.selling_currency = "EUR"
     row.post_attempted_at = None
+    row.settlement_status = "pending"
+    row.settlement_attempted_at = None
+    row.settlement_attempts = 0
+    row.settlement_error = None
     for k, v in overrides.items():
         setattr(row, k, v)
     return row

@@ -496,6 +496,13 @@ class ProviderOrder(Base):
     selling_price_minor = Column(BigInteger, nullable=True)
     selling_currency = Column(String(3), nullable=True)
     post_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    #: Local payment settlement sub-state (release hardening): provider
+    #: acceptance and local charge settlement are different facts; delivery
+    #: is blocked until settlement is complete (hold CAPTURED + CHARGE entry).
+    settlement_status = Column(String(32), nullable=False, server_default="pending")
+    settlement_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    settlement_attempts = Column(Integer, nullable=False, server_default="0")
+    settlement_error = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
 

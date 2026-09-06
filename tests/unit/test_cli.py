@@ -278,8 +278,40 @@ class TestManualOrderResolutionCommands:
         assert await cli._dispatch(args) == 0
         out = capsys.readouterr().out
         assert "LS-ORD-1" in out
-        assert "No provider POST" in out
+        # Settlement is still PENDING on the fake order: the CLI must NOT
+        # claim the hold was captured — delivery stays blocked.
+        assert "never a provider POST" in out
+        assert "Settlement PENDING" in out
+        assert "BLOCKED" in out
         service.resolve_existing.assert_awaited_once()
+
+    async def test_orders_resolve_existing_settled_reports_capture(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        from cloud_platform.modules.orders.domain import SettlementStatus
+
+        order = _order(OrderStatus.SUBMITTED)
+        order.settlement_status = SettlementStatus.COMPLETE
+        op = MagicMock(id=uuid4(), status=MagicMock(value="completed"), attempts=1)
+        service = MagicMock()
+        service.resolve_existing = AsyncMock(return_value=(order, op))
+        self._container_with(service, monkeypatch)
+        args = cli._parser().parse_args(
+            [
+                "orders",
+                "resolve-existing",
+                str(ORDER_ID),
+                "LS-ORD-9",
+                "--reason",
+                "verified at portal",
+                "--yes",
+            ]
+        )
+        assert await cli._dispatch(args) == 0
+        out = capsys.readouterr().out
+        assert "Settlement COMPLETE" in out
+        assert "captured exactly once" in out
+        assert "No provider POST was made" in out
 
     async def test_orders_resolve_existing_refused_without_yes(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any

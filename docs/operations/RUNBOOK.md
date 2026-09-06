@@ -249,8 +249,12 @@ and NO automatic re-POST happens. The read-only recovery scan escalates to
      `uv run python -m cloud_platform.cli orders resolve-existing <order_id> <provider_order_id> --reason "verified at portal" --yes`
      The CLI performs a READ-ONLY validation of the supplied id (product
      family, price/currency/term/cycle vs. the local snapshots), attaches
-     it, completes the operation, and captures the hold exactly once. It
-     NEVER POSTs. The normal reconciler then provisions the server.
+     it, completes the operation, and runs the settlement barrier (hold
+     captured exactly once + CHARGE ledger entry). It NEVER POSTs. If the
+     capture fails, the provider id stays attached, settlement stays
+     pending, and the reconciler retries the LOCAL capture — the CLI does
+     NOT print "fully resolved/captured" in that case. Only after
+     settlement completes does the normal reconciler provision the server.
    - **The POST created NOTHING** →
      `uv run python -m cloud_platform.cli orders resolve-not-created <order_id> --reason "verified no order at portal" --yes`
      This re-queues the SAME local operation identity; the worker will
@@ -261,6 +265,40 @@ and NO automatic re-POST happens. The read-only recovery scan escalates to
 3. `orders retry <order_id>` is ONLY for orders that FAILED DEFINITIVELY
    (provider rejection, nothing created). It is refused for ambiguous
    orders — use the resolve commands above.
+4. **Order accepted but the VPS is not appearing** — the reconciler
+   attaches a VPS ONLY via the exact order's `equipmentId` (plus a
+   successful GET of that VPS). While `equipmentId` is absent, it keeps
+   polling (`STILL_PROVISIONING`); after the bounded grace period the order
+   goes to `needs_review` — never a guessed resource id.
+   - If you verified at the portal which VPS belongs to this order →
+     `uv run python -m cloud_platform.cli orders resolve-vps <order_id> <vps_id> --reason "verified at portal" --yes`
+     (READ-ONLY validation that the VPS exists; audit-trailed; same
+     settlement gate: no delivery until the hold is CAPTURED and the CHARGE
+     ledger entry exists).
+   - The VPS list scan (datacenter+pack+startedAt) is diagnostic only and
+     is NEVER used to auto-attach a VPS.
+
+### Accepted order, failed local capture (settlement) runbook
+
+The provider purchase EXISTS once Leaseweb returns an order id — only the
+LOCAL charge can be pending. The platform never re-POSTs, never releases
+the hold, and never marks the provider order FAILED because a capture
+failed.
+
+1. Symptoms: `orders attention` lists the order as SUBMITTED with
+   settlement pending/needs-review; server still REQUESTED (no delivery);
+   audit events `leaseweb.order_settlement_*`.
+2. The periodic reconciler retries the idempotent LOCAL capture
+   (deterministic ledger key, bounded attempts). A missing CHARGE entry is
+   re-posted WITHOUT a second wallet debit — the wallet is debited exactly
+   once, and exactly one CHARGE exists.
+3. If the hold is RELEASED or missing after provider acceptance, or the
+   retry budget is exhausted → `NEEDS_REVIEW`; no delivery until a human
+   reviews the wallet/ledger (never resolve by touching balances with
+   ad-hoc SQL — use the admin credit/debit commands).
+4. Check settlement state per order:
+   `uv run python -m cloud_platform.cli orders inspect <order_id>`
+   (shows `settlement_status`/`settlement_error`/`settlement_attempts`).
 
 ### Renewal and cancellation runbook
 

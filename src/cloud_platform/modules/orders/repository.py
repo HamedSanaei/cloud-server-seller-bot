@@ -16,6 +16,7 @@ from cloud_platform.modules.orders.domain import (
     OrderStatus,
     ProviderOrder,
     ProviderOrderRepository,
+    SettlementStatus,
 )
 
 
@@ -50,6 +51,10 @@ def _to_domain(row: _ProviderOrderModel) -> ProviderOrder:
         selling_price_minor=_attr(row, "selling_price_minor"),
         selling_currency=_attr(row, "selling_currency"),
         post_attempted_at=_attr(row, "post_attempted_at"),
+        settlement_status=SettlementStatus(str(_attr(row, "settlement_status") or "pending")),
+        settlement_attempted_at=_attr(row, "settlement_attempted_at"),
+        settlement_attempts=int(_attr(row, "settlement_attempts") or 0),
+        settlement_error=_attr(row, "settlement_error"),
     )
 
 
@@ -184,6 +189,10 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
             cast_any.selling_price_minor = order.selling_price_minor
             cast_any.selling_currency = order.selling_currency
             cast_any.post_attempted_at = order.post_attempted_at
+            cast_any.settlement_status = order.settlement_status.value
+            cast_any.settlement_attempted_at = order.settlement_attempted_at
+            cast_any.settlement_attempts = order.settlement_attempts
+            cast_any.settlement_error = order.settlement_error
             cast_any.updated_at = datetime.now(UTC)
             await session.commit()
             await session.refresh(row)

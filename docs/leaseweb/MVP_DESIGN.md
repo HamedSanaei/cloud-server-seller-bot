@@ -120,9 +120,12 @@ second chargeable POST:
 3. Wallet hold: `leaseweb-order:{idempotency_key}` (atomic, race-free).
 4. Idempotency replay returns the original server/hold/order — repeated
    Telegram callbacks can never double-charge or double-order.
-5. Worker POSTs the order; on **201 (accepted)** the hold is captured exactly
-   once (`HoldService.capture_hold` is idempotent; ledger key
-   `capture-leaseweb-order:{ik}` is unique).
+5. Worker POSTs the order; on **201 (accepted)** the `provider_order_id` is
+   persisted FIRST, then the payment settlement barrier runs: the hold is
+   captured exactly once (`HoldService.capture_hold` is idempotent; ledger
+   key `capture-leaseweb-order:{ik}` is unique) and a matching CHARGE ledger
+   entry is asserted. Delivery is blocked until settlement is complete
+   (hold CAPTURED + exactly one CHARGE).
 6. Definitive provider rejection (4xx before acceptance) → order FAILED,
    server ERROR, hold released.
 7. Ambiguous (read/write timeout after transmission, dropped connection,
@@ -130,11 +133,21 @@ second chargeable POST:
    processed) → order/operation `OUTCOME_UNKNOWN`; the hold stays reserved;
    NO automatic second POST. Only provably pre-transmission failures
    (connect refused/timeout, pool timeout) re-queue with the SAME key.
-8. Reconciliation finds the provisioned VPS (order service `equipmentId`, else
-   VPS list matched by datacenter+pack+startedAt window; ambiguity →
-   `needs_review`) → server RUNNING with provider id + IPs; renewal record
-   created from `contract.endsAt`; the user is notified with connection
-   details.
+8. Settlement retry is LOCAL-only: the reconciler re-runs the idempotent
+   hold capture (zero Leaseweb POSTs) until `SETTLED`; a missing CHARGE
+   ledger entry is re-posted without a second wallet debit; bounded retries,
+   then `NEEDS_REVIEW` (hold released/missing after acceptance is also
+   `NEEDS_REVIEW`, never delivered).
+9. Reconciliation attaches the provisioned VPS ONLY via the exact order's
+   `equipmentId` + a successful GET of that VPS. While `equipmentId` is
+   absent or the VPS GET is temporarily 404 → keep polling (STILL_
+   PROVISIONING); after a bounded grace period → `needs_review`. The VPS
+   list (datacenter+pack+startedAt) is diagnostic only and is NEVER
+   auto-attached (an unrelated customer's single recently-started VPS
+   satisfies the same facts). `orders resolve-vps` exists for manual
+   resource resolution (read-only, audit-trailed). Server RUNNING with
+   provider id + IPs; renewal record created from `contract.endsAt`; the
+   user is notified with connection details.
 
 ## 5. Renewals (MVP safeguards)
 

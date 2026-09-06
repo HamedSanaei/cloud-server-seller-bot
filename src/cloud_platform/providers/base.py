@@ -296,8 +296,17 @@ class OrderingProvider(Protocol):
     ) -> str:
         """Resolve the provisioned resource id for an ACTIVE order.
 
-        Raises ProviderNotFound while the resource is not yet discoverable;
-        a provider-specific ambiguity error when several resources match.
+        MAY auto-attach ONLY on a provider-supported identity: the order's
+        own resource reference (e.g. Leaseweb ``equipmentId``) confirmed by
+        a successful GET of that exact resource. Generic similarity against
+        the account resource list (datacenter/pack/startedAt) is NOT proof
+        of ownership — it is diagnostic evidence only and MUST never produce
+        a provider_server_id; ``location``/``product_name``/``since`` are
+        diagnostics-only hints for that scan.
+
+        Raises ProviderNotFound while the resource is not yet provably
+        discoverable; the caller keeps polling with a bounded grace period
+        and then escalates to a human.
         """
         ...
 

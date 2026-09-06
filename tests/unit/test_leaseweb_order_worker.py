@@ -16,6 +16,7 @@ Acceptance:
 
 from __future__ import annotations
 
+import copy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -24,6 +25,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.core.money import Money
 from cloud_platform.modules.audit.domain import AuditEvent
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.compute.domain import (
@@ -37,7 +39,7 @@ from cloud_platform.modules.operations.domain import (
     OperationStatus,
     OperationType,
 )
-from cloud_platform.modules.orders.domain import OrderStatus, ProviderOrder
+from cloud_platform.modules.orders.domain import OrderStatus, ProviderOrder, SettlementStatus
 from cloud_platform.modules.orders.service import (
     OrderReconciler,
     OrderRecoveryService,
@@ -48,11 +50,14 @@ from cloud_platform.modules.renewals.domain import RenewalRecord, RenewalStatus
 from cloud_platform.modules.wallet.domain import (
     Hold,
     HoldStatus,
+    LedgerEntry,
+    LedgerEntryType,
     Wallet,
 )
 from cloud_platform.providers.base import (
     OrderRecoveryResult,
     OrderRecoveryVerdict,
+    ProviderServer,
     ProvisioningTicket,
 )
 from cloud_platform.providers.errors import (
@@ -192,23 +197,29 @@ class FakeOrdersRepo:
 
 
 class FakeOperationRepo:
+    """In-memory operation store with database semantics: reads/claims
+    return copies, and only a successful save mutates the durable state
+    (so a failing save leaves the previous durable state in place)."""
+
     def __init__(self, op: Operation | None = None) -> None:
         self.op = op or _operation()
         self.saved: list[Operation] = []
 
     async def get_by_key(self, operation_key: str) -> Operation | None:
-        return self.op
+        return copy.deepcopy(self.op)
 
     async def claim(self, operation_id: UUID) -> Operation | None:
         if self.op.status is not OperationStatus.PENDING:
             return None
-        self.op.mark_in_flight()
-        return self.op
+        claimed = copy.deepcopy(self.op)
+        claimed.mark_in_flight()
+        self.op = copy.deepcopy(claimed)
+        return claimed
 
     async def save(self, operation: Operation) -> Operation:
-        self.op = operation
+        self.op = copy.deepcopy(operation)
         self.saved.append(operation)
-        return operation
+        return copy.deepcopy(operation)
 
     async def list_open(self, *args: Any, **kwargs: Any) -> list[Operation]:
         return []
@@ -252,17 +263,88 @@ class FakeHoldRepo:
         return None
 
 
+class FakeLedgerRepo:
+    """In-memory ledger mirroring the real repo's idempotency semantics:
+    a CHARGE entry is keyed ``capture-{hold ik}`` and re-posting the same
+    key is a no-op (the real repo raises DuplicateIdempotencyError, which
+    HoldService swallows)."""
+
+    def __init__(self) -> None:
+        self.entries: dict[tuple[UUID, str], LedgerEntry] = {}
+        self.post_count = 0
+        self.fail_next_post: Exception | None = None
+
+    async def post_entry(
+        self,
+        wallet_id: UUID,
+        amount: int,
+        currency: str,
+        entry_type: LedgerEntryType,
+        idempotency_key: str,
+        *,
+        reference_type: str = "",
+        reference_id: str = "",
+        description: str = "",
+    ) -> LedgerEntry:
+        self.post_count += 1
+        if self.fail_next_post is not None:
+            exc = self.fail_next_post
+            self.fail_next_post = None
+            raise exc
+        entry = LedgerEntry(
+            id=uuid4(),
+            wallet_id=wallet_id,
+            entry_type=entry_type,
+            amount=Money(str(amount), currency),
+            reference_type=reference_type,
+            reference_id=reference_id,
+            idempotency_key=idempotency_key,
+            description=description,
+        )
+        self.entries[(wallet_id, idempotency_key)] = entry
+        return entry
+
+    async def get_entry_by_idempotency(
+        self, wallet_id: UUID, idempotency_key: str
+    ) -> LedgerEntry | None:
+        return self.entries.get((wallet_id, idempotency_key))
+
+
 class FakeHoldService:
-    def __init__(self, holds: FakeHoldRepo) -> None:
+    def __init__(self, holds: FakeHoldRepo, ledger: FakeLedgerRepo | None = None) -> None:
         self._holds = holds
+        self._ledger = ledger
         self.captures: list[tuple[UUID, UUID, str]] = []
         self.releases: list[tuple[UUID, UUID, str]] = []
+        #: When set, the next capture raises BEFORE any financial mutation
+        #: (mirrors a wallet/DB failure at capture time).
+        self.capture_error: Exception | None = None
+        #: When set, EVERY capture raises (persistent wallet outage).
+        self.persistent_capture_error: Exception | None = None
 
     async def capture_hold(self, wallet_id: UUID, hold_id: UUID, idempotency_key: str) -> Hold:
         self.captures.append((wallet_id, hold_id, idempotency_key))
+        if self.persistent_capture_error is not None:
+            raise self.persistent_capture_error
+        if self.capture_error is not None:
+            exc = self.capture_error
+            self.capture_error = None
+            raise exc
         hold = await self._holds.capture_hold(hold_id)
         if hold is None:
-            return self._holds.hold
+            hold = self._holds.hold
+        if self._ledger is not None:
+            # Mirror HoldService: deterministic CHARGE key, idempotent.
+            await self._ledger.post_entry(
+                wallet_id,
+                hold.amount,
+                hold.currency,
+                LedgerEntryType.CHARGE,
+                f"capture-{idempotency_key}",
+                reference_type="hold",
+                reference_id=str(hold.id),
+                description="hold captured",
+            )
         return hold
 
     async def release_hold(self, wallet_id: UUID, hold_id: UUID, idempotency_key: str) -> Hold:
@@ -360,6 +442,7 @@ def _worker(
     order: ProviderOrder | None = None,
     server: CloudServer | None = None,
     holds: FakeHoldRepo | None = None,
+    ledger: FakeLedgerRepo | None = None,
     notifier: _RecordingNotifier | None = None,
     clock: Any = None,
 ) -> tuple[OrderWorker, dict[str, Any]]:
@@ -369,7 +452,9 @@ def _worker(
     orders_repo = FakeOrdersRepo(order)
     wallet_repo = FakeWalletRepo()
     holds = holds or FakeHoldRepo()
-    hold_service = FakeHoldService(holds)
+    ledger = ledger or FakeLedgerRepo()
+    hold_service = FakeHoldService(holds, ledger)
+    audit_repo = FakeAuditRepo()
     renewal_repo = FakeRenewalRepo()
     notifier = notifier or _RecordingNotifier()
     registry = ProviderRegistry()
@@ -382,7 +467,8 @@ def _worker(
         wallet_repo=wallet_repo,
         hold_repo=holds,
         hold_service=hold_service,
-        audit_repo=FakeAuditRepo(),
+        ledger_repo=ledger,
+        audit_repo=audit_repo,
         provider_registry=registry,
         renewal_repo=renewal_repo,
         delivery_notifier=notifier,
@@ -394,9 +480,12 @@ def _worker(
         "servers": server_repo,
         "holds": holds,
         "hold_service": hold_service,
+        "ledger": ledger,
         "renewals": renewal_repo,
         "notifier": notifier,
         "ordering": ordering,
+        "audit": audit_repo,
+        "wallet_repo": wallet_repo,
     }
     return worker, deps
 
@@ -610,8 +699,10 @@ class TestOrderReconciler:
         orders_repo = FakeOrdersRepo(order)
         wallet_repo = FakeWalletRepo()
         holds = FakeHoldRepo()
-        hold_service = FakeHoldService(holds)
+        ledger = FakeLedgerRepo()
+        hold_service = FakeHoldService(holds, ledger)
         renewal_repo = FakeRenewalRepo()
+        audit_repo = FakeAuditRepo()
         notifier = notifier or _RecordingNotifier()
         registry = ProviderRegistry()
         registry.register(ordering)
@@ -619,11 +710,13 @@ class TestOrderReconciler:
             server_repo=server_repo,
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
+            operation_repo=FakeOperationRepo(),
             renewal_repo=renewal_repo,
             wallet_repo=wallet_repo,
             hold_repo=holds,
             hold_service=hold_service,
-            audit_repo=FakeAuditRepo(),
+            ledger_repo=ledger,
+            audit_repo=audit_repo,
             provider_registry=registry,
             delivery_notifier=notifier,
         )
@@ -634,6 +727,9 @@ class TestOrderReconciler:
             "notifier": notifier,
             "ordering": ordering,
             "holds": holds,
+            "ledger": ledger,
+            "op_repo": FakeOperationRepo(),
+            "audit": audit_repo,
         }
         return reconciler, deps
 
@@ -684,14 +780,18 @@ class TestOrderReconciler:
         counts = await reconciler.reconcile()
         assert counts.get("still_provisioning") == 1
 
-    async def test_cancelled_order_fails_and_releases_hold(self) -> None:
+    async def test_cancelled_order_fails_and_requires_refund(self) -> None:
+        """The reconciler settles the LOCAL charge first (acceptance already
+        happened), so a later provider cancellation can never silently free
+        the money: the hold stays CAPTURED and a refund is flagged."""
         ticket = ProvisioningTicket(provider_order_id="LS-ORD-1", state="failed")
         reconciler, deps = self._reconciler(ticket=ticket)
         counts = await reconciler.reconcile()
         assert counts.get("failed") == 1
         assert deps["orders"].order.status is OrderStatus.FAILED
         assert deps["servers"].server.state is ServerLifecycleState.ERROR
-        assert deps["holds"].hold.status is HoldStatus.RELEASED
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED  # never silently freed
+        assert any(e.action == "checkout.refund_required" for e in deps["audit"].events)
 
     async def test_transient_provider_error_leaves_unchanged(self) -> None:
         order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
@@ -716,7 +816,9 @@ class TestOrderReconciler:
             renewal_repo=renewal_repo,
             wallet_repo=wallet_repo,
             hold_repo=holds,
-            hold_service=FakeHoldService(holds),
+            hold_service=FakeHoldService(holds, FakeLedgerRepo()),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=FakeLedgerRepo(),
             audit_repo=FakeAuditRepo(),
             provider_registry=registry,
             delivery_notifier=notifier,
@@ -936,6 +1038,8 @@ def _manual_worker(
     op: Operation | None = None,
     server: CloudServer | None = None,
     holds: FakeHoldRepo | None = None,
+    ledger: FakeLedgerRepo | None = None,
+    notifier: _RecordingNotifier | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     from cloud_platform.modules.orders.service import OrderManualResolutionService
 
@@ -950,19 +1054,26 @@ def _manual_worker(
     op_repo = FakeOperationRepo(op)
     wallet_repo = FakeWalletRepo()
     holds = holds or FakeHoldRepo()
-    hold_service = FakeHoldService(holds)
+    ledger = ledger or FakeLedgerRepo()
+    hold_service = FakeHoldService(holds, ledger)
+    renewal_repo = FakeRenewalRepo()
+    notifier = notifier or _RecordingNotifier()
     audit_repo = FakeAuditRepo()
     registry = ProviderRegistry()
     registry.register(ordering)
     service = OrderManualResolutionService(
         server_repo=server_repo,
+        offers_repo=FakeOfferRepo(),
         orders_repo=orders_repo,
         operation_repo=op_repo,
+        renewal_repo=renewal_repo,
         wallet_repo=wallet_repo,
         hold_repo=holds,
         hold_service=hold_service,
+        ledger_repo=ledger,
         audit_repo=audit_repo,
         provider_registry=registry,
+        delivery_notifier=notifier,
     )
     deps = {
         "orders": orders_repo,
@@ -970,8 +1081,12 @@ def _manual_worker(
         "servers": server_repo,
         "holds": holds,
         "hold_service": hold_service,
+        "ledger": ledger,
         "ordering": ordering,
         "audit": audit_repo,
+        "renewals": renewal_repo,
+        "notifier": notifier,
+        "wallet_repo": wallet_repo,
     }
     return service, deps
 
@@ -1015,7 +1130,7 @@ class TestOrderManualResolutionService:
         order = _order(OrderStatus.FAILED)
         op = _operation(OperationStatus.OUTCOME_UNKNOWN)
         service, _deps = _manual_worker(order=order, op=op)
-        with pytest.raises(OrderManualResolutionError, match="not FAILED"):
+        with pytest.raises(OrderManualResolutionError, match="cannot retry"):
             await service.retry_failed(ORDER_ID, reason="x")
 
     async def test_retry_failed_requires_reason(self) -> None:
@@ -1178,6 +1293,8 @@ class TestReconcilerBranches:
         orders_repo = FakeOrdersRepo(order)
         wallet_repo = FakeWalletRepo()
         holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
+        audit_repo = FakeAuditRepo()
         renewal_repo = FakeRenewalRepo()
         notifier = _RecordingNotifier()
         registry = ProviderRegistry()
@@ -1186,20 +1303,23 @@ class TestReconcilerBranches:
             server_repo=server_repo,
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
+            operation_repo=FakeOperationRepo(),
             renewal_repo=renewal_repo,
             wallet_repo=wallet_repo,
             hold_repo=holds,
-            hold_service=FakeHoldService(holds),
-            audit_repo=FakeAuditRepo(),
+            hold_service=FakeHoldService(holds, ledger),
+            ledger_repo=ledger,
+            audit_repo=audit_repo,
             provider_registry=registry,
             delivery_notifier=notifier,
         )
         deps = {
             "orders": orders_repo,
             "servers": server_repo,
-            "audit": FakeAuditRepo(),
+            "audit": audit_repo,
             "ordering": ordering,
             "holds": holds,
+            "ledger": ledger,
         }
         return reconciler, deps
 
@@ -1218,14 +1338,18 @@ class TestReconcilerBranches:
         orders_repo = FakeOrdersRepo(order)
         registry = ProviderRegistry()
         registry.register(ordering)
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
         reconciler = OrderReconciler(
             server_repo=server_repo,
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
             renewal_repo=FakeRenewalRepo(),
             wallet_repo=FakeWalletRepo(),
-            hold_repo=FakeHoldRepo(),
-            hold_service=FakeHoldService(FakeHoldRepo()),
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds, ledger),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=ledger,
             audit_repo=FakeAuditRepo(),
             provider_registry=registry,
         )
@@ -1245,14 +1369,18 @@ class TestReconcilerBranches:
         order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
         server_repo = FakeServerRepo(_server(ServerLifecycleState.PROVISIONING))
         orders_repo = FakeOrdersRepo(order)
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
         reconciler = OrderReconciler(
             server_repo=server_repo,
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
             renewal_repo=FakeRenewalRepo(),
             wallet_repo=FakeWalletRepo(),
-            hold_repo=FakeHoldRepo(),
-            hold_service=FakeHoldService(FakeHoldRepo()),
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds, ledger),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=ledger,
             audit_repo=FakeAuditRepo(),
             provider_registry=ProviderRegistry(),  # empty: leaseweb unregistered
         )
@@ -1275,14 +1403,18 @@ class TestReconcilerBranches:
 
         ordering.get_order = _nf  # type: ignore[method-assign]
         registry.register(ordering)
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
         reconciler = OrderReconciler(
             server_repo=server_repo,
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
             renewal_repo=FakeRenewalRepo(),
             wallet_repo=FakeWalletRepo(),
-            hold_repo=FakeHoldRepo(),
-            hold_service=FakeHoldService(FakeHoldRepo()),
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds, ledger),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=ledger,
             audit_repo=audit,
             provider_registry=registry,
         )
@@ -1305,14 +1437,18 @@ class TestReconcilerBranches:
         orders_repo = FakeOrdersRepo(order)
         registry = ProviderRegistry()
         registry.register(ordering)
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
         reconciler = OrderReconciler(
             server_repo=server_repo,
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
             renewal_repo=FakeRenewalRepo(),
             wallet_repo=FakeWalletRepo(),
-            hold_repo=FakeHoldRepo(),
-            hold_service=FakeHoldService(FakeHoldRepo()),
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds, ledger),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=ledger,
             audit_repo=FakeAuditRepo(),
             provider_registry=registry,
         )
@@ -1353,14 +1489,18 @@ class TestReconcilerBranches:
         orders_repo = FakeOrdersRepo(order)
         registry = ProviderRegistry()
         registry.register(ordering)
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
         reconciler = OrderReconciler(
             server_repo=server_repo,
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
             renewal_repo=FakeRenewalRepo(),
             wallet_repo=FakeWalletRepo(),
-            hold_repo=FakeHoldRepo(),
-            hold_service=FakeHoldService(FakeHoldRepo()),
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds, ledger),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=ledger,
             audit_repo=FakeAuditRepo(),
             provider_registry=registry,
         )
@@ -1373,6 +1513,7 @@ class TestReconcilerBranches:
         server = _server(ServerLifecycleState.PROVISIONING)
         holds = FakeHoldRepo()
         holds.hold.capture()  # the hold was already captured on acceptance
+        ledger = FakeLedgerRepo()
         server_repo = FakeServerRepo(server)
         orders_repo = FakeOrdersRepo(order)
         wallet_repo = FakeWalletRepo()
@@ -1387,7 +1528,9 @@ class TestReconcilerBranches:
             renewal_repo=FakeRenewalRepo(),
             wallet_repo=wallet_repo,
             hold_repo=holds,
-            hold_service=FakeHoldService(holds),
+            hold_service=FakeHoldService(holds, ledger),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=ledger,
             audit_repo=audit,
             provider_registry=registry,
         )
@@ -1406,14 +1549,18 @@ class TestReconcilerBranches:
         orders_repo = FakeOrdersRepo(order)
         registry = ProviderRegistry()
         registry.register(FakeOrderingProvider())
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
         reconciler = OrderReconciler(
             server_repo=BrokenServerRepo(_server(ServerLifecycleState.PROVISIONING)),
             offers_repo=FakeOfferRepo(),
             orders_repo=orders_repo,
             renewal_repo=FakeRenewalRepo(),
             wallet_repo=FakeWalletRepo(),
-            hold_repo=FakeHoldRepo(),
-            hold_service=FakeHoldService(FakeHoldRepo()),
+            hold_repo=holds,
+            hold_service=FakeHoldService(holds, ledger),
+            operation_repo=FakeOperationRepo(),
+            ledger_repo=ledger,
             audit_repo=FakeAuditRepo(),
             provider_registry=registry,
         )
@@ -1597,3 +1744,551 @@ class TestActivatorBranches:
         assert dt == datetime(2026, 8, 1, tzinfo=UTC)
         naive = _parse_iso_datetime("2026-08-01T00:00:00")
         assert naive == datetime(2026, 8, 1, tzinfo=UTC)
+
+
+class _DebitingHoldRepo(FakeHoldRepo):
+    """Mirrors the real repo: capture debits the wallet inside the same
+    transition, so re-capturing a CAPTURED hold never debits again."""
+
+    def __init__(self, wallet: Wallet) -> None:
+        super().__init__()
+        self.wallet = wallet
+        self.capture_calls = 0
+
+    async def capture_hold(self, hold_id: UUID) -> Hold | None:
+        self.capture_calls += 1
+        if self.hold.status is HoldStatus.CREATED:
+            self.wallet.balance -= int(self.hold.amount)
+            self.hold.capture()
+            self.captured.append(self.hold)
+            return self.hold
+        return None
+
+
+class _TrackedWalletRepo(FakeWalletRepo):
+    def __init__(self, wallet: Wallet) -> None:
+        self.wallet = wallet
+
+    async def get(self, user_id: UUID) -> Wallet | None:
+        return self.wallet if user_id == USER_ID else None
+
+
+class _FlakyOperationRepo(FakeOperationRepo):
+    """Fails the FIRST save of a COMPLETED operation (crash window between
+    the provider-order-id save and the operation-complete save)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_completed = True
+
+    async def save(self, operation: Operation) -> Operation:
+        if self.fail_next_completed and operation.status is OperationStatus.COMPLETED:
+            self.fail_next_completed = False
+            raise RuntimeError("db down while completing operation")
+        return await super().save(operation)
+
+
+def _settlement_service(
+    *,
+    order: ProviderOrder,
+    server: CloudServer,
+    holds: FakeHoldRepo,
+    ledger: FakeLedgerRepo,
+    wallet_repo: FakeWalletRepo,
+    hold_service: FakeHoldService | None = None,
+    op_repo: FakeOperationRepo | None = None,
+) -> Any:
+    from cloud_platform.modules.orders.service import OrderSettlementService
+
+    return OrderSettlementService(
+        wallet_repo=wallet_repo,
+        hold_repo=holds,
+        hold_service=hold_service or FakeHoldService(holds, ledger),
+        ledger_repo=ledger,
+        orders_repo=FakeOrdersRepo(order),
+        operation_repo=op_repo or FakeOperationRepo(),
+        audit_repo=FakeAuditRepo(),
+    )
+
+
+class TestOrderSettlementBarrier:
+    """The payment settlement barrier (release hardening): provider
+    acceptance and local charge settlement are different facts; delivery is
+    blocked until the hold is CAPTURED with exactly one CHARGE, and a local
+    capture failure NEVER re-POSTs, NEVER releases the hold and NEVER marks
+    the provider order failed."""
+
+    async def test_acceptance_captures_once_charges_once_posts_once(self) -> None:
+        worker, deps = _worker()
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        assert len(deps["ordering"].posts) == 1
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        charges = [
+            e for e in deps["ledger"].entries.values() if e.entry_type is LedgerEntryType.CHARGE
+        ]
+        assert len(charges) == 1
+        assert deps["servers"].server.state is ServerLifecycleState.PROVISIONING
+        assert deps["op_repo"].op.status is OperationStatus.COMPLETED
+
+    async def test_capture_failure_blocks_delivery_and_never_reposts(self) -> None:
+        """Provider 201 + capture throws BEFORE the financial mutation: the
+        provider order id stays durably attached, settlement stays pending,
+        the server is NOT delivered — and no second provider POST ever
+        happens, on the worker or on the repair pass."""
+        worker, deps = _worker()
+        deps["hold_service"].capture_error = RuntimeError("wallet db down")
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        assert len(deps["ordering"].posts) == 1  # exactly one provider POST
+        order = deps["orders"].order
+        assert order.provider_order_id == "LS-ORD-1"  # provider id NEVER lost
+        assert order.status is OrderStatus.SUBMITTED  # NOT failed
+        assert deps["holds"].hold.status is HoldStatus.CREATED  # NOT released
+        assert deps["servers"].server.state is ServerLifecycleState.REQUESTED  # no delivery
+
+        # Repair pass (as the reconciler runs it): the LOCAL capture retries.
+        settlement = _settlement_service(
+            order=order,
+            server=deps["servers"].server,
+            holds=deps["holds"],
+            ledger=deps["ledger"],
+            wallet_repo=deps["wallet_repo"],
+        )
+        from cloud_platform.modules.orders.service import SettlementVerdict
+
+        assert await settlement.ensure_order_payment_settled(order, deps["servers"].server) is (
+            SettlementVerdict.SETTLED
+        )
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        assert len(deps["ordering"].posts) == 1  # zero additional provider POSTs
+        # A worker pass after repair still does NOT re-POST.
+        counts = await worker.process_pending()
+        assert counts.get("submitted", 0) + counts.get("skipped_state", 0) >= 1
+        assert len(deps["ordering"].posts) == 1
+
+    async def test_charge_ledger_failure_repaired_without_double_debit(self) -> None:
+        """Wallet debit + hold CAPTURED succeed but the CHARGE ledger insert
+        fails: settlement remains incomplete; the next retry inserts the
+        missing CHARGE WITHOUT a second wallet debit — exactly one CHARGE."""
+        wallet = Wallet(user_id=USER_ID, id=WALLET_ID, balance=10_000, currency="EUR")
+        holds = _DebitingHoldRepo(wallet)
+        ledger = FakeLedgerRepo()
+        ledger.fail_next_post = RuntimeError("ledger db down")
+        hold_service = FakeHoldService(holds, ledger)
+        worker, deps = _worker(holds=holds, ledger=ledger)
+        deps["hold_service"] = hold_service
+        worker._hold_service = hold_service  # type: ignore[attr-defined]
+        worker._settlement._hold_service = hold_service  # type: ignore[attr-defined]
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        assert wallet.balance == 10_000 - 1299  # debited ONCE
+        assert holds.hold.status is HoldStatus.CAPTURED
+        assert len(deps["ordering"].posts) == 1
+        # Settlement incomplete: no CHARGE entry yet.
+        charges = [e for e in ledger.entries.values() if e.entry_type is LedgerEntryType.CHARGE]
+        assert charges == []
+
+        # Retry: wallet balance unchanged, missing CHARGE repaired.
+        order = deps["orders"].order
+        settlement = _settlement_service(
+            order=order,
+            server=deps["servers"].server,
+            holds=holds,
+            ledger=ledger,
+            wallet_repo=_TrackedWalletRepo(wallet),
+            hold_service=FakeHoldService(holds, ledger),
+        )
+        from cloud_platform.modules.orders.service import SettlementVerdict
+
+        assert await settlement.ensure_order_payment_settled(order, deps["servers"].server) is (
+            SettlementVerdict.SETTLED
+        )
+        assert wallet.balance == 10_000 - 1299  # unchanged from the first debit
+        charges = [e for e in ledger.entries.values() if e.entry_type is LedgerEntryType.CHARGE]
+        assert len(charges) == 1  # exactly one CHARGE total
+        assert holds.capture_calls == 2  # second call was a no-op re-capture
+        assert len(deps["ordering"].posts) == 1
+
+    async def test_released_hold_after_acceptance_is_review(self) -> None:
+        worker, deps = _worker()
+        deps["holds"].hold.release()  # hold unexpectedly RELEASED
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        assert len(deps["ordering"].posts) == 1
+        order = deps["orders"].order
+        assert order.status is OrderStatus.NEEDS_REVIEW
+        assert order.settlement_status.value == "needs_review"
+        assert deps["servers"].server.state is ServerLifecycleState.REQUESTED  # no delivery
+        assert deps["notifier"].deliveries == []
+
+    async def test_missing_hold_after_acceptance_is_review(self) -> None:
+        worker, deps = _worker()
+        deps["holds"].hold.idempotency_key = "leaseweb-order:other-key"  # hold "missing"
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        assert len(deps["ordering"].posts) == 1
+        order = deps["orders"].order
+        assert order.status is OrderStatus.NEEDS_REVIEW
+        assert deps["servers"].server.state is ServerLifecycleState.REQUESTED
+        assert any(e.action == "orders.settlement_review" for e in deps["audit"].events)
+
+    async def test_repeated_settlement_execution_is_idempotent(self) -> None:
+        wallet = Wallet(user_id=USER_ID, id=WALLET_ID, balance=10_000, currency="EUR")
+        holds = _DebitingHoldRepo(wallet)
+        ledger = FakeLedgerRepo()
+        server = _server()
+        order = _order(OrderStatus.SUBMITTED, provider_order_id="LS-ORD-1")
+        settlement = _settlement_service(
+            order=order,
+            server=server,
+            holds=holds,
+            ledger=ledger,
+            wallet_repo=_TrackedWalletRepo(wallet),
+        )
+        from cloud_platform.modules.orders.service import SettlementVerdict
+
+        assert await settlement.ensure_order_payment_settled(order, server) is (
+            SettlementVerdict.SETTLED
+        )
+        assert await settlement.ensure_order_payment_settled(order, server) is (
+            SettlementVerdict.SETTLED
+        )
+        assert await settlement.ensure_order_payment_settled(order, server) is (
+            SettlementVerdict.SETTLED
+        )
+        assert wallet.balance == 10_000 - 1299  # debited exactly once
+        charges = [e for e in ledger.entries.values() if e.entry_type is LedgerEntryType.CHARGE]
+        assert len(charges) == 1
+
+    async def test_crash_after_provider_id_persist_repaired_without_repost(self) -> None:
+        """Worker dies after the provider order id save but before the
+        operation-complete save: the restart must NOT POST a second time;
+        the settlement repair completes the operation and the charge."""
+        op_repo = _FlakyOperationRepo()
+        worker, deps = _worker(op_repo=op_repo)
+        counts = await worker.process_pending()
+        assert counts.get("requeued") == 1
+        assert len(deps["ordering"].posts) == 1  # exactly ONE provider POST
+        order = deps["orders"].order
+        assert order.provider_order_id == "LS-ORD-1"  # provider order known
+        assert order.status is OrderStatus.SUBMITTED
+        assert deps["op_repo"].op.status is OperationStatus.IN_FLIGHT  # stuck mid-save
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+        assert deps["servers"].server.state is ServerLifecycleState.REQUESTED
+
+        # The repair path (reconciler) settles WITHOUT any provider POST.
+        settlement = _settlement_service(
+            order=order,
+            server=deps["servers"].server,
+            holds=deps["holds"],
+            ledger=deps["ledger"],
+            wallet_repo=deps["wallet_repo"],
+            op_repo=op_repo,
+        )
+        from cloud_platform.modules.orders.service import SettlementVerdict
+
+        assert await settlement.ensure_order_payment_settled(order, deps["servers"].server) is (
+            SettlementVerdict.SETTLED
+        )
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        assert deps["op_repo"].op.status is OperationStatus.COMPLETED  # repaired
+        assert len(deps["ordering"].posts) == 1  # still exactly one POST
+
+    async def test_settlement_retries_are_bounded_then_review(self) -> None:
+        server = _server()
+        order = _order(OrderStatus.SUBMITTED, provider_order_id="LS-ORD-1")
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
+        hold_service = FakeHoldService(holds, ledger)
+        hold_service.persistent_capture_error = RuntimeError("persistent wallet outage")
+        settlement = _settlement_service(
+            order=order,
+            server=server,
+            holds=holds,
+            ledger=ledger,
+            wallet_repo=FakeWalletRepo(),
+            hold_service=hold_service,
+        )
+        from cloud_platform.modules.orders.service import SettlementVerdict
+
+        verdicts = [await settlement.ensure_order_payment_settled(order, server) for _ in range(6)]
+        assert verdicts == [
+            SettlementVerdict.RETRY_LATER,
+            SettlementVerdict.RETRY_LATER,
+            SettlementVerdict.RETRY_LATER,
+            SettlementVerdict.RETRY_LATER,
+            SettlementVerdict.NEEDS_REVIEW,
+            SettlementVerdict.NEEDS_REVIEW,
+        ]
+        assert order.settlement_status.value == "needs_review"
+
+
+class TestReconcilerSettlementBarrier:
+    """The reconciler repairs accepted-but-unsettled orders LOCALLY (never a
+    provider POST) and never activates/delivers before settlement completes."""
+
+    def _reconciler(
+        self,
+        *,
+        order: ProviderOrder | None = None,
+        ticket: ProvisioningTicket | None = None,
+        match_error: Exception | None = None,
+        holds: FakeHoldRepo | None = None,
+        ledger: FakeLedgerRepo | None = None,
+        hold_service: FakeHoldService | None = None,
+        notifier: _RecordingNotifier | None = None,
+    ) -> tuple[OrderReconciler, dict[str, Any]]:
+        ordering = FakeOrderingProvider(
+            ticket=ticket or ProvisioningTicket(provider_order_id="LS-ORD-1", state="provisioned")
+        )
+        if match_error is not None:
+
+            async def _match(*args: Any, **kwargs: Any) -> str:
+                raise match_error
+
+            ordering.match_vps_for_order = _match  # type: ignore[method-assign]
+        order = order or _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        server = _server(ServerLifecycleState.PROVISIONING)
+        server_repo = FakeServerRepo(server)
+        orders_repo = FakeOrdersRepo(order)
+        holds = holds or FakeHoldRepo()
+        ledger = ledger or FakeLedgerRepo()
+        hold_service = hold_service or FakeHoldService(holds, ledger)
+        notifier = notifier or _RecordingNotifier()
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        reconciler = OrderReconciler(
+            server_repo=server_repo,
+            offers_repo=FakeOfferRepo(),
+            orders_repo=orders_repo,
+            operation_repo=FakeOperationRepo(),
+            renewal_repo=FakeRenewalRepo(),
+            wallet_repo=FakeWalletRepo(),
+            hold_repo=holds,
+            hold_service=hold_service,
+            ledger_repo=ledger,
+            audit_repo=FakeAuditRepo(),
+            provider_registry=registry,
+            delivery_notifier=notifier,
+        )
+        deps = {
+            "orders": orders_repo,
+            "servers": server_repo,
+            "holds": holds,
+            "ledger": ledger,
+            "hold_service": hold_service,
+            "notifier": notifier,
+            "ordering": ordering,
+        }
+        return reconciler, deps
+
+    async def test_repairs_settlement_then_activates(self) -> None:
+        """Transient capture failure -> LEFT_UNCHANGED (no delivery); the
+        next poll repairs the LOCAL capture and activates — zero provider
+        POSTs on the repair path."""
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
+        hold_service = FakeHoldService(holds, ledger)
+        hold_service.capture_error = RuntimeError("wallet db down")
+        reconciler, deps = self._reconciler(
+            order=order, holds=holds, ledger=ledger, hold_service=hold_service
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("left_unchanged") == 1  # settlement pending; no activation
+        assert deps["notifier"].deliveries == []
+        assert deps["orders"].order.status is OrderStatus.PROVISIONING
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+
+        counts = await reconciler.reconcile()  # repair pass
+        assert counts.get("provisioned") == 1
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        assert deps["servers"].server.state is ServerLifecycleState.RUNNING
+        assert len(deps["notifier"].deliveries) == 1  # delivered only after settlement
+        assert deps["ordering"].posts == []  # the reconciler NEVER POSTs
+
+    async def test_equipment_grace_expires_to_review(self) -> None:
+        from cloud_platform.providers.errors import ProviderNotFound
+
+        now = datetime.now(UTC)
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        order.post_attempted_at = now - timedelta(days=4)  # beyond the 72h wait
+        reconciler, deps = self._reconciler(
+            order=order, match_error=ProviderNotFound("no equipmentId yet")
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+        assert deps["orders"].order.status is OrderStatus.NEEDS_REVIEW
+        assert "equipmentId" in (deps["orders"].order.error or "")
+        assert deps["notifier"].deliveries == []
+
+    async def test_equipment_absent_within_grace_keeps_polling(self) -> None:
+        from cloud_platform.providers.errors import ProviderNotFound
+
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        order.post_attempted_at = datetime.now(UTC) - timedelta(hours=1)
+        reconciler, deps = self._reconciler(
+            order=order, match_error=ProviderNotFound("no equipmentId yet")
+        )
+        counts = await reconciler.reconcile()
+        assert counts.get("still_provisioning") == 1
+        assert deps["orders"].order.status is OrderStatus.PROVISIONING
+        assert deps["notifier"].deliveries == []
+
+    async def test_released_hold_blocks_activation(self) -> None:
+        holds = FakeHoldRepo()
+        holds.hold.release()
+        reconciler, deps = self._reconciler(holds=holds)
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+        assert deps["orders"].order.status is OrderStatus.NEEDS_REVIEW
+        assert deps["orders"].order.settlement_status.value == "needs_review"
+        assert deps["notifier"].deliveries == []  # no delivery before settlement
+
+    async def test_missing_hold_blocks_activation(self) -> None:
+        holds = FakeHoldRepo()
+        holds.hold.idempotency_key = "leaseweb-order:other-key"
+        reconciler, deps = self._reconciler(holds=holds)
+        counts = await reconciler.reconcile()
+        assert counts.get("marked_for_review") == 1
+        assert deps["notifier"].deliveries == []
+
+
+class TestManualVpsResolution:
+    """``orders resolve-vps``: read-only VPS validation, settlement gate,
+    activation through the normal activator, audit — never a provider POST."""
+
+    def _remote(self, *, datacenter: str = "AMS-01", pack: str = "VPS S") -> ProviderServer:
+        return ProviderServer(
+            id="vps-9",
+            name="vps-9",
+            status="running",
+            ipv4="1.2.3.4",
+            metadata={"datacenter": datacenter, "pack": pack},
+        )
+
+    async def test_resolve_vps_activates_and_delivers(self) -> None:
+
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        service, deps = _manual_worker(order=order)
+        deps["ordering"].get_server = AsyncMock(return_value=self._remote())  # type: ignore[method-assign]
+        resolved_order, _op = await service.resolve_vps(
+            ORDER_ID, "vps-9", reason="verified in portal"
+        )
+        assert resolved_order.status is OrderStatus.ACTIVE
+        assert resolved_order.provider_order_id == "LS-ORD-1"
+        assert deps["servers"].server.state is ServerLifecycleState.RUNNING
+        assert deps["servers"].server.provider_server_id == "vps-9"
+        assert deps["servers"].server.ipv4 == "1.2.3.4"
+        # Settlement completed through the barrier; hold captured once.
+        assert resolved_order.settlement_status is SettlementStatus.COMPLETE
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        assert len(deps["notifier"].deliveries) == 1
+        assert len(deps["renewals"].upserted) == 1
+        assert any(e.action == "order.resolve_vps" for e in deps["audit"].events)
+        assert deps["ordering"].posts == []  # NEVER a provider POST
+
+    async def test_resolve_vps_refuses_when_vps_missing(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        service, deps = _manual_worker(order=order)
+        deps["ordering"].get_server = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        with pytest.raises(OrderManualResolutionError, match="does not exist"):
+            await service.resolve_vps(ORDER_ID, "vps-9", reason="checked portal")
+        assert deps["orders"].order.status is OrderStatus.PROVISIONING  # unchanged
+        assert deps["notifier"].deliveries == []
+        assert deps["ordering"].posts == []
+
+    async def test_resolve_vps_refuses_datacenter_mismatch(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        service, deps = _manual_worker(order=order)
+        deps["ordering"].get_server = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._remote(datacenter="FRA-01")
+        )
+        with pytest.raises(OrderManualResolutionError, match="datacenter"):
+            await service.resolve_vps(ORDER_ID, "vps-9", reason="checked portal")
+        assert deps["notifier"].deliveries == []
+
+    async def test_resolve_vps_refuses_pack_mismatch(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        service, deps = _manual_worker(order=order)
+        deps["ordering"].get_server = AsyncMock(  # type: ignore[method-assign]
+            return_value=self._remote(pack="VPS M")
+        )
+        with pytest.raises(OrderManualResolutionError, match="pack"):
+            await service.resolve_vps(ORDER_ID, "vps-9", reason="checked portal")
+
+    async def test_resolve_vps_refuses_without_provider_order_id(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        order = _order(OrderStatus.OUTCOME_UNKNOWN)  # no provider order id yet
+        service, _deps = _manual_worker(order=order)
+        with pytest.raises(OrderManualResolutionError, match="resolve-existing"):
+            await service.resolve_vps(ORDER_ID, "vps-9", reason="x")
+
+    async def test_resolve_vps_refuses_when_settlement_pending(self) -> None:
+        from cloud_platform.modules.orders.service import OrderManualResolutionError
+
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
+        hold_service = FakeHoldService(holds, ledger)
+        hold_service.capture_error = RuntimeError("wallet db down")
+        service, deps = _manual_worker(order=order, holds=holds, ledger=ledger)
+        deps["hold_service"] = hold_service
+        service._settlement._hold_service = hold_service  # type: ignore[attr-defined]
+        deps["ordering"].get_server = AsyncMock(return_value=self._remote())  # type: ignore[method-assign]
+        with pytest.raises(OrderManualResolutionError, match="settlement is not COMPLETE"):
+            await service.resolve_vps(ORDER_ID, "vps-9", reason="checked portal")
+        # Provider id stays attached; no delivery; zero provider POSTs.
+        assert deps["orders"].order.provider_order_id == "LS-ORD-1"
+        assert deps["notifier"].deliveries == []
+        assert deps["ordering"].posts == []
+
+    async def test_resolve_existing_capture_failure_keeps_provider_id(self) -> None:
+        """``resolve-existing`` + capture failure: the provider id remains
+        durably attached, settlement stays pending, zero provider POSTs, no
+        delivery — and a later settlement pass captures exactly once."""
+        from cloud_platform.modules.orders.service import SettlementVerdict
+
+        order = _outcome_unknown_order()
+        holds = FakeHoldRepo()
+        ledger = FakeLedgerRepo()
+        hold_service = FakeHoldService(holds, ledger)
+        hold_service.capture_error = RuntimeError("wallet db down")
+        service, deps = _manual_worker(order=order, holds=holds, ledger=ledger)
+        deps["hold_service"] = hold_service
+        service._settlement._hold_service = hold_service  # type: ignore[attr-defined]
+        resolved_order, _op = await service.resolve_existing(
+            ORDER_ID, "LS-ORD-9", reason="verified in portal"
+        )
+        assert resolved_order.provider_order_id == "LS-ORD-9"  # attached durably
+        assert resolved_order.status is OrderStatus.SUBMITTED
+        assert resolved_order.settlement_status.value == "pending"  # NOT settled
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+        assert deps["ordering"].posts == []
+        assert deps["notifier"].deliveries == []
+
+        # Repair pass: capture succeeds exactly once, one CHARGE.
+        settlement = _settlement_service(
+            order=resolved_order,
+            server=deps["servers"].server,
+            holds=holds,
+            ledger=ledger,
+            wallet_repo=deps["wallet_repo"],
+            hold_service=FakeHoldService(holds, ledger),
+        )
+        assert (
+            await settlement.ensure_order_payment_settled(resolved_order, deps["servers"].server)
+            is SettlementVerdict.SETTLED
+        )
+        assert deps["holds"].hold.status is HoldStatus.CAPTURED
+        charges = [e for e in ledger.entries.values() if e.entry_type is LedgerEntryType.CHARGE]
+        assert len(charges) == 1
+        assert deps["ordering"].posts == []

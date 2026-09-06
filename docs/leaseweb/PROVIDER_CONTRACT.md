@@ -33,8 +33,9 @@ adapter is kept for the hourly contract and is described briefly in §7.
 The order body is `{location, operatingSystem, contractTerm, billingCycle}`
 (plus optional controlPanel/diskUpgrade/serviceLevelAgreement). The 201
 response is `{orderId}` — the order id is **never** treated as the final
-server id; reconciliation resolves the provisioned VPS via the order's
-`equipmentId` or a datacenter+pack+startedAt match against the VPS list.
+server id; reconciliation resolves the provisioned VPS only via the order's
+`equipmentId` (see §5). A datacenter+pack+startedAt match against the VPS
+list is diagnostic evidence only and is **never** used to attach a VPS.
 
 ## 3. What the Orders API exposes — and what it does NOT expose
 
@@ -124,12 +125,42 @@ considered INSUFFICIENT**:
 - several candidates → `AMBIGUOUS`.
 - scan failure → `SCAN_FAILED` — bounded retries, then manual review.
 
-An `equipmentId`-bearing candidate is still not auto-attached: the equipment
-chain proves the order's *spec* (another identical order has the same
-attributes), not its *ownership* by the local operation. The Leaseweb VPS
-Ordering adapter **never returns `MATCHED`**; `MATCHED` remains part of the
-port contract only for providers that can prove identity (a client reference
-or true idempotency key).
+An `equipmentId`-bearing candidate is still not auto-attached for the
+*account-order* recovery scan: the equipment chain proves the order's *spec*
+(another identical order has the same attributes), not its *ownership* by
+the local operation. The Leaseweb VPS Ordering adapter **never returns
+`MATCHED`** from account-order recovery; `MATCHED` remains part of the port
+contract only for providers that can prove identity (a client reference or
+true idempotency key).
+
+## 6. Provisioned-VPS correlation (equipmentId-only)
+
+Activation requires a provider-supported identity. The only automatic
+correlation the adapter performs is:
+
+1. the exact provider order (`GET /account/v1/orders/{Id}`) reports a
+   `service.equipmentId`, and
+2. `GET /publicCloud/v1/vps/{equipmentId}` resolves that exact VPS.
+
+Behavior while the identity is not yet usable:
+
+- ACTIVE order + `equipmentId` present + VPS exists → attach / activate.
+- ACTIVE order + `equipmentId` absent → `STILL_PROVISIONING`, keep polling.
+- `equipmentId` present but the VPS endpoint returns 404 temporarily →
+  `STILL_PROVISIONING`, keep polling — **no heuristic fallback attachment**.
+- bounded grace period expires without a usable `equipmentId` → `NEEDS_REVIEW`
+  (never a guessed resource id).
+
+The VPS-list scan (datacenter + pack + startedAt) exists only for operator
+diagnostics (`orders inspect` output) and **can never produce an automatic
+`provider_server_id`** — an unrelated customer's single recently-started VPS
+in the same location/pack satisfies the same facts.
+
+Manual resource resolution: `orders resolve-vps <order_id> <vps_id>`
+(read-only toward Leaseweb, audit-trailed, requires `--yes` and a reason).
+It validates the VPS exists, then attaches it under the same settlement
+gate (no delivery until the hold is captured and the CHARGE ledger entry
+exists).
 
 Manual review is the accepted cost for the rare ambiguous POST: incorrectly
 attaching another customer's order (and capturing the wrong wallet, or
@@ -138,7 +169,49 @@ operator runbook (`docs/operations/RUNBOOK.md`) documents the review flow,
 including the `APIGW-CORRELATION-ID` response header that can be quoted to
 Leaseweb support when asking whether a specific request created an order.
 
-## 6. Error mapping (VPS Ordering adapter)
+## 7. Payment settlement barrier
+
+A provider order being accepted and a customer charge being settled are two
+different facts:
+
+1. **Persist provider acceptance first** — the `provider_order_id` is saved
+   before any money movement and is never lost, and the provider POST is
+   never repeated.
+2. **Then settle locally** — an idempotent hold capture (deterministic
+   ledger key `capture-{operation_key}`). Only after the hold is CAPTURED
+   *and* the matching CHARGE ledger entry exists may the server enter
+   PROVISIONING and delivery occur.
+
+Local settlement outcomes (`ensure_order_payment_settled`):
+
+- `SETTLED` — hold CAPTURED + exactly one CHARGE entry; activation may
+  proceed.
+- `RETRY_LATER` — transient capture failure; the provider order id stays
+  attached, the hold stays reserved, **zero provider POSTs**, and the
+  periodic reconciler retries the LOCAL capture only (bounded attempts,
+  then `NEEDS_REVIEW`).
+- `NEEDS_REVIEW` — e.g. hold RELEASED or missing after provider acceptance,
+  or the bounded retry budget exhausted. No delivery, no provider POST; a
+  financial review audit event is written.
+
+Repair semantics:
+
+- If the hold was debited (CAPTURED) but the CHARGE ledger insert failed,
+  re-running the idempotent capture posts the missing CHARGE **without a
+  second wallet debit** — the wallet is debited exactly once and exactly
+  one CHARGE entry exists.
+- Capture failure is **never** treated as provider failure: the order is
+  not marked FAILED, the hold is not released, the POST is not retried, and
+  no second operation key is created.
+- Crash windows (provider-order-id saved but operation-complete save
+  failed, or capture failed after persistence) are repairable by the same
+  local settlement path on the next worker/reconciler pass.
+
+Manual `orders resolve-existing` and `orders resolve-vps` use the same
+settlement gate and never print "fully resolved / captured" when the
+capture actually failed.
+
+## 8. Error mapping (VPS Ordering adapter)
 
 | HTTP | Platform error |
 | --- | --- |
@@ -152,7 +225,7 @@ Leaseweb support when asking whether a specific request created an order.
 | transport error that proves non-transmission (connect refused/timeout, pool timeout) | `ProviderUnavailable` (retryable) |
 | any other transport error after transmission (read/write timeout, dropped connection) on a POST | `ProviderOutcomeUnknown` |
 
-## 7. Public Cloud adapter (hourly, non-MVP)
+## 9. Public Cloud adapter (hourly, non-MVP)
 
 - `GET/POST /cloud/v2/instances`, `GET/DELETE /cloud/v2/instances/{id}`,
   power/rebuild/network endpoints; capability set `LEASEWEB_CAPABILITIES`.
@@ -164,7 +237,7 @@ Leaseweb support when asking whether a specific request created an order.
   ArvanCloud; delete treats 404 as success. This is a different product and
   a different correlation mechanism; it does not apply to VPS ordering.
 
-## 8. Selling checklist (operator, LEASEWEB-MVP)
+## 10. Selling checklist (operator, LEASEWEB-MVP)
 
 1. Create a Leaseweb API key in the provider panel (invoice payment with no
    prepayment obligation is required for Ordering; otherwise the API returns

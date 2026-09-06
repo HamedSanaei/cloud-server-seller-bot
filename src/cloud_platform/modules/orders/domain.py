@@ -25,6 +25,14 @@ Status machine (coarse, reconciliation-driven):
         READ-ONLY recovery scan (or a human) resolves it)
     OUTCOME_UNKNOWN -> SUBMITTED (recovery attached exactly one order)
     OUTCOME_UNKNOWN -> NEEDS_REVIEW (recovery ambiguous / no proof)
+
+**Payment settlement** is a SEPARATE durable sub-state (``settlement_status``):
+provider acceptance and local charge settlement are different facts. The
+provider order id is persisted first and NEVER lost; the wallet hold is
+captured exactly once (idempotent, CHARGE-repairing) and must be COMPLETE
+before any activation/delivery. A capture failure never marks the provider
+order failed, never releases the hold and never re-POSTs — the local
+settlement is retried by the reconciler.
 """
 
 from __future__ import annotations
@@ -44,6 +52,20 @@ class OrderStatus(StrEnum):
     FAILED = "failed"  # definitive rejection before acceptance
     OUTCOME_UNKNOWN = "outcome_unknown"  # billable POST sent, result unknown
     NEEDS_REVIEW = "needs_review"  # ambiguous; human must decide
+
+
+class SettlementStatus(StrEnum):
+    """Durable local settlement state of an accepted provider order.
+
+    Kept separate from :class:`OrderStatus`: the provider purchase may be
+    fully accepted while the local wallet capture is still pending or in
+    need of financial review. Activation/delivery is only allowed from
+    COMPLETE.
+    """
+
+    PENDING = "pending"  # accepted but not yet locally settled
+    COMPLETE = "complete"  # hold CAPTURED and exactly one CHARGE ledger entry
+    NEEDS_REVIEW = "needs_review"  # hold missing/released/unsettleable
 
 
 #: Statuses the reconciler keeps polling.
@@ -92,6 +114,13 @@ class ProviderOrder:
     #: When the chargeable POST was sent (claim time); the recovery scan
     #: window starts here. Set before POSTing, persisted on any outcome.
     post_attempted_at: datetime | None = None
+    #: Local payment settlement (release hardening): the provider purchase
+    #: and the local charge are different facts. Delivery is blocked until
+    #: settlement is COMPLETE (hold CAPTURED + CHARGE ledger entry).
+    settlement_status: SettlementStatus = SettlementStatus.PENDING
+    settlement_attempted_at: datetime | None = None
+    settlement_attempts: int = 0
+    settlement_error: str | None = None
 
     def __post_init__(self) -> None:
         if not self.operation_key or not self.operation_key.strip():
@@ -100,6 +129,8 @@ class ProviderOrder:
             raise ValueError("provider_key must not be empty")
         if self.attempts < 0:
             raise ValueError("attempts must not be negative")
+        if self.settlement_attempts < 0:
+            raise ValueError("settlement_attempts must not be negative")
 
     @property
     def is_open(self) -> bool:
