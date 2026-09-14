@@ -637,7 +637,8 @@ class TestDeployStabilization:
         result = _stabilization_harness(tmp_path, crash_loop=True)
         assert result.returncode == 0, f"harness itself failed: {result.stderr}"
         assert "MAIN_RC=1" in result.stdout
-        assert "bot restarted during stabilization" in result.stdout
+        # fail() reports to stderr while the rollback summary goes to stdout.
+        assert "bot restarted during stabilization" in result.stderr
         assert "DEPLOYMENT SUCCEEDED" not in result.stdout
         assert result.stdout.count("ROLLBACK DONE") == 1
         env = tmp_path / "deploy" / "deploy.env"
