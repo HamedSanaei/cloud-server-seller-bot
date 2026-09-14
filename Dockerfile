@@ -60,7 +60,7 @@ COPY --chown=app:app src ./src
 # and the revision scripts; env.py reads DATABASE_URL from the environment.
 COPY --chown=app:app alembic.ini ./alembic.ini
 COPY --chown=app:app alembic ./alembic
-COPY --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh
+COPY --chmod=755 --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh
 
 USER app
 

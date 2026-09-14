@@ -183,7 +183,10 @@ class TestEntrypoint:
 
     def test_dockerfile_copies_the_entrypoint(self) -> None:
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-        assert "COPY --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh" in dockerfile
+        assert (
+            "COPY --chmod=755 --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh"
+            in dockerfile
+        )
 
     def test_dockerfile_copies_alembic_for_the_migrate_entrypoint(self) -> None:
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")

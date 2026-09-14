@@ -24,6 +24,9 @@ CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 DEPLOY_SCRIPT = REPO_ROOT / "scripts" / "deploy-production.sh"
 PROD_COMPOSE = REPO_ROOT / "deploy" / "production" / "docker-compose.yml"
 PROD_ENV_EXAMPLE = REPO_ROOT / "deploy" / "production" / ".env.example"
+DOCKERFILE = REPO_ROOT / "Dockerfile"
+ENTRYPOINT = REPO_ROOT / "docker-entrypoint.sh"
+GITATTRIBUTES = REPO_ROOT / ".gitattributes"
 
 
 def _workflow() -> dict:
@@ -351,3 +354,96 @@ class TestCiStillGatesDeploys:
     def test_ci_keeps_the_leaseweb_contract_gate(self) -> None:
         text = CI_WORKFLOW.read_text(encoding="utf-8")
         assert "scripts/gen_leaseweb_coverage.py --check" in text
+
+
+def _docker_available() -> bool:
+    """Whether this machine can build and run the production image."""
+    try:
+        result = subprocess.run(["docker", "info"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+needs_docker = pytest.mark.skipif(not _docker_available(), reason="docker is not available")
+
+
+def _git_index_mode(path: Path) -> str:
+    result = subprocess.run(
+        ["git", "ls-files", "-s", path.name],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=path.parent,
+    )
+    assert result.returncode == 0
+    return result.stdout.strip().split()[0]
+
+
+class TestEntrypointContract:
+    """The production image must exec through its real ENTRYPOINT.
+
+    Regression cover for the GHCR verify failure (`permission denied`,
+    exit 126): `docker build` succeeding never proved the entrypoint was
+    executable, so the contract is pinned at three levels — git mode,
+    Dockerfile COPY mode, and a real container run.
+    """
+
+    def test_entrypoint_is_tracked_executable(self) -> None:
+        assert ENTRYPOINT.is_file()
+        assert _git_index_mode(ENTRYPOINT) == "100755"
+
+    def test_dockerfile_enforces_executable_copy(self) -> None:
+        text = DOCKERFILE.read_text(encoding="utf-8")
+        assert (
+            "COPY --chmod=755 --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh"
+            in text
+        )
+
+    def test_shell_scripts_are_lf_pinned(self) -> None:
+        assert GITATTRIBUTES.is_file(), ".gitattributes must pin shell line endings"
+        assert "*.sh text eol=lf" in GITATTRIBUTES.read_text(encoding="utf-8")
+        raw = ENTRYPOINT.read_bytes()
+        assert b"\r\n" not in raw, "docker-entrypoint.sh must use LF line endings"
+        assert not raw.startswith(b"\xef\xbb\xbf"), "docker-entrypoint.sh must not have a BOM"
+
+    @needs_docker
+    def test_built_image_executes_through_the_real_entrypoint(self) -> None:
+        tag = "cloud-server-platform:entrypoint-regression"
+        build = subprocess.run(
+            ["docker", "build", "-t", tag, "."],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=REPO_ROOT,
+        )
+        assert build.returncode == 0, build.stderr[-2000:]
+        try:
+            # Through ENTRYPOINT ["/app/docker-entrypoint.sh"] -> exec "$@".
+            dispatched = subprocess.run(
+                ["docker", "run", "--rm", tag, "sh", "-c", "echo entrypoint-ok"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            assert dispatched.returncode == 0, dispatched.stderr[-2000:]
+            assert dispatched.stdout.strip() == "entrypoint-ok"
+            # The entrypoint file itself must be executable inside the image.
+            mode = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    "/bin/sh",
+                    tag,
+                    "-c",
+                    "test -x /app/docker-entrypoint.sh",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            assert mode.returncode == 0, mode.stderr[-2000:]
+        finally:
+            subprocess.run(["docker", "rmi", tag], capture_output=True, timeout=120)
