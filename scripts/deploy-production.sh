@@ -27,6 +27,13 @@
 # migrations stay forward-compatible so image rollback is always possible).
 # A successful rollback is still a FAILED deployment (exit 1).
 #
+# Fail-closed design: every validation and every deployment step propagates
+# failure with an EXPLICIT `return 1` (or an `if ! ...` block ending in
+# `return 1`). Nothing here relies on `set -e`, because `deploy()` callers
+# must be free to branch on its status without errexit being suppressed.
+# Preflight failures return before anything is mutated, so they never
+# trigger a rollback; only failures at/after the image switch roll back.
+#
 # This script never reads, prints, or rewrites secrets: deploy.env is only
 # touched on its PLATFORM_IMAGE line, configuration.toml is only checked for
 # existence, and GHCR authentication happens outside (GitHub Actions logs in
@@ -36,6 +43,7 @@ set -Eeuo pipefail
 IMAGE_RE='^ghcr\.io/[a-z0-9._-]+/[a-z0-9._-]+:[0-9a-f]{40}$'
 PREV_IMAGE=""
 ROLLED_BACK="no"
+MUTATED="no"
 
 load_config() {
     # Resolved here (not at file scope) so the functions below can be
@@ -77,15 +85,16 @@ dotenv_value() {
 
 set_platform_image() {
     local file="$1" image="$2" tmp
-    tmp="$(mktemp)"
+    tmp="$(mktemp)" || { fail "cannot create temp file"; return 1; }
     if grep -qE '^PLATFORM_IMAGE=' "${file}"; then
         awk -v img="${image}" '{ if ($0 ~ /^PLATFORM_IMAGE=/) print "PLATFORM_IMAGE=" img; else print }' \
-            "${file}" > "${tmp}"
+            "${file}" > "${tmp}" || { fail "cannot rewrite ${file}"; rm -f "${tmp}"; return 1; }
     else
-        cat "${file}" > "${tmp}"
-        printf 'PLATFORM_IMAGE=%s\n' "${image}" >> "${tmp}"
+        cat "${file}" > "${tmp}" || { fail "cannot read ${file}"; rm -f "${tmp}"; return 1; }
+        printf 'PLATFORM_IMAGE=%s\n' "${image}" >> "${tmp}" \
+            || { fail "cannot append to temp file"; rm -f "${tmp}"; return 1; }
     fi
-    cat "${tmp}" > "${file}"
+    cat "${tmp}" > "${file}" || { fail "cannot update ${file}"; rm -f "${tmp}"; return 1; }
     rm -f "${tmp}"
 }
 
@@ -128,38 +137,44 @@ rollback() {
         return 0
     fi
     log "ROLLBACK: restoring ${PREV_IMAGE}"
-    set_platform_image "${ENV_FILE}" "${PREV_IMAGE}"
-    compose up -d api worker bot >/dev/null
+    set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
+    compose up -d api worker bot >/dev/null \
+        || { fail "ROLLBACK: cannot restart the previous application image"; return 1; }
     ROLLED_BACK="yes"
     log "ROLLBACK: previous application image restarted (database left at the new migration revision)"
 }
 
 deploy() {
     load_config
-    command -v docker >/dev/null || fail "docker is not installed"
-    docker compose version >/dev/null || fail "docker compose plugin is not available"
-    command -v python3 >/dev/null || fail "python3 is not installed (needed for health probes)"
+    command -v docker >/dev/null || { fail "docker is not installed"; return 1; }
+    docker compose version >/dev/null || { fail "docker compose plugin is not available"; return 1; }
+    command -v python3 >/dev/null || { fail "python3 is not installed (needed for health probes)"; return 1; }
 
-    [ -f "${COMPOSE_FILE}" ] || fail "compose file missing: ${COMPOSE_FILE}"
-    [ -f "${ENV_FILE}" ] || fail "deployment env file missing: ${ENV_FILE}"
+    [ -f "${COMPOSE_FILE}" ] || { fail "compose file missing: ${COMPOSE_FILE}"; return 1; }
+    [ -f "${ENV_FILE}" ] || { fail "deployment env file missing: ${ENV_FILE}"; return 1; }
     # Server-owned configuration: required, but never created or modified here.
-    [ -f "${CONFIGURATION_PATH}" ] || fail "server configuration missing: ${CONFIGURATION_PATH} (bootstrap it once, deploys never touch it)"
+    [ -f "${CONFIGURATION_PATH}" ] || {
+        fail "server configuration missing: ${CONFIGURATION_PATH} (bootstrap it once, deploys never touch it)"
+        return 1
+    }
 
     case "${PLATFORM_IMAGE_NEW}" in
-        *[!a-z0-9.:/_-]*|'') fail "refusing malformed image reference" ;;
+        *[!a-z0-9.:/_-]*|'') fail "refusing malformed image reference"; return 1 ;;
     esac
     if ! printf '%s' "${PLATFORM_IMAGE_NEW}" | grep -Eq "${IMAGE_RE}"; then
         fail "PLATFORM_IMAGE_NEW must be ghcr.io/<org>/<repo>:<40-hex-sha>, got '${PLATFORM_IMAGE_NEW}'"
+        return 1
     fi
 
     if ! printf '%s' "${DEPLOY_PATH}" | grep -Eq '^/[A-Za-z0-9._/-]+$'; then
         fail "refusing suspicious DEPLOY_PATH: '${DEPLOY_PATH}'"
+        return 1
     fi
     case "${HEALTH_ATTEMPTS}" in
-        '' | *[!0-9]*) fail "HEALTH_ATTEMPTS must be a positive integer" ;;
+        '' | *[!0-9]*) fail "HEALTH_ATTEMPTS must be a positive integer"; return 1 ;;
     esac
     case "${HEALTH_INTERVAL}" in
-        '' | *[!0-9]*) fail "HEALTH_INTERVAL must be a positive integer" ;;
+        '' | *[!0-9]*) fail "HEALTH_INTERVAL must be a positive integer"; return 1 ;;
     esac
 
     PREV_IMAGE="$(dotenv_value "${ENV_FILE}" PLATFORM_IMAGE)"
@@ -177,7 +192,8 @@ deploy() {
     if [ "${PREV_IMAGE}" = "${PLATFORM_IMAGE_NEW}" ]; then
         log "same image already recorded — continuing idempotently"
     else
-        set_platform_image "${ENV_FILE}" "${PLATFORM_IMAGE_NEW}"
+        MUTATED="yes"
+        set_platform_image "${ENV_FILE}" "${PLATFORM_IMAGE_NEW}" || return 1
         log "PLATFORM_IMAGE updated in ${ENV_FILE} (only that line was touched)"
     fi
 
@@ -185,34 +201,34 @@ deploy() {
     if ! compose pull migrate api worker bot; then
         log "pull failed — restoring previous image reference"
         if [ -n "${PREV_IMAGE}" ]; then
-            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}"
+            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
         fi
         return 1
     fi
 
     log "starting postgres + redis"
-    compose up -d postgres redis >/dev/null
+    compose up -d postgres redis >/dev/null || { fail "cannot start postgres/redis"; return 1; }
 
     log "waiting for postgres/redis health"
     for service in postgres redis; do
         id="$(compose ps -q "${service}" | head -n 1)"
-        [ -n "${id}" ] || fail "no container id for ${service}"
+        [ -n "${id}" ] || { fail "no container id for ${service}"; return 1; }
         wait_healthy "${id}" 24 "${HEALTH_INTERVAL}" \
-            || fail "${service} did not become healthy"
+            || { fail "${service} did not become healthy"; return 1; }
     done
 
     log "running database migrations (alembic upgrade head)"
     if ! compose run --rm --no-deps migrate; then
         log "migration failed — restoring previous image reference (database left as-is)"
         if [ -n "${PREV_IMAGE}" ]; then
-            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}"
+            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
         fi
         return 1
     fi
     log "migrations applied"
 
     log "starting api + worker + bot (bot replicas = 1)"
-    compose up -d api worker bot >/dev/null
+    compose up -d api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
 
     local api_port
     api_port="$(dotenv_value "${ENV_FILE}" API_PORT)"
@@ -236,20 +252,23 @@ deploy() {
     local id
     for service in postgres redis; do
         id="$(compose ps -q "${service}" | head -n 1)"
-        container_healthy "${id}" || fail "${service} is not healthy"
+        container_healthy "${id}" || { fail "${service} is not healthy"; return 1; }
     done
     for service in worker; do
         id="$(compose ps -q "${service}" | head -n 1)"
-        [ -n "${id}" ] || fail "${service} has no container"
-        container_running "${id}" || fail "${service} is not running"
+        [ -n "${id}" ] || { fail "${service} has no container"; return 1; }
+        container_running "${id}" || { fail "${service} is not running"; return 1; }
     done
 
     # Telegram long polling is a single-consumer transport: exactly one bot.
     local bot_count bot_id
     bot_count="$(compose ps -q bot | grep -c . || true)"
-    [ "${bot_count}" = "1" ] || fail "bot replica invariant violated: ${bot_count} bot containers (want exactly 1)"
+    [ "${bot_count}" = "1" ] || {
+        fail "bot replica invariant violated: ${bot_count} bot containers (want exactly 1)"
+        return 1
+    }
     bot_id="$(compose ps -q bot | head -n 1)"
-    container_running "${bot_id}" || fail "bot container is not running"
+    container_running "${bot_id}" || { fail "bot container is not running"; return 1; }
     log "bot replicas: exactly 1, running"
 
     log "verifying migration revision"
@@ -265,19 +284,24 @@ deploy() {
                 ;;
         esac
     else
-        [ -n "${current}" ] || fail "alembic current is empty"
+        [ -n "${current}" ] || { fail "alembic current is empty"; return 1; }
         log "alembic current: ${current}"
     fi
 
     log "service status:"
-    compose ps
+    compose ps || { fail "cannot list service status"; return 1; }
     return 0
 }
 
 main() {
     load_config
-    cd "${DEPLOY_PATH}"
-    if deploy; then
+    cd "${DEPLOY_PATH}" || { fail "cannot enter deploy path: ${DEPLOY_PATH}"; return 1; }
+    # `deploy` is intentionally NOT run as an `if` condition: errexit is
+    # suppressed inside condition contexts, so its status is captured
+    # explicitly instead of relying on `set -e`.
+    local rc=0
+    deploy || rc=$?
+    if [ "${rc}" = "0" ]; then
         log "DEPLOYMENT SUCCEEDED: ${PLATFORM_IMAGE_NEW}"
         # Post-success cleanup only: keep the current and rollback images.
         if [ -n "${PREV_IMAGE}" ] && [ "${PREV_IMAGE}" != "${PLATFORM_IMAGE_NEW}" ]; then
@@ -290,12 +314,21 @@ main() {
         fi
         return 0
     fi
+    # Preflight failures return before anything is mutated: rolling back
+    # then would be a fake rollback, so it is skipped explicitly.
+    if [ "${MUTATED}" != "yes" ]; then
+        log "deployment failed before anything was mutated — no rollback needed"
+        return 1
+    fi
     log "deployment failed -- attempting application-image rollback"
-    rollback || true
-    if [ "${ROLLED_BACK}" = "yes" ]; then
-        log "RESULT: DEPLOYMENT FAILED, ROLLBACK DONE (previous image restored; database NOT downgraded)"
+    if rollback; then
+        if [ "${ROLLED_BACK}" = "yes" ]; then
+            log "RESULT: DEPLOYMENT FAILED, ROLLBACK DONE (previous image restored; database NOT downgraded)"
+        else
+            log "RESULT: DEPLOYMENT FAILED, NO ROLLBACK TARGET (first deploy or no previous image)"
+        fi
     else
-        log "RESULT: DEPLOYMENT FAILED, NO ROLLBACK TARGET (first deploy or no previous image)"
+        log "RESULT: DEPLOYMENT FAILED, ROLLBACK ATTEMPT FAILED"
     fi
     return 1
 }

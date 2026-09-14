@@ -300,6 +300,249 @@ class TestDeployScriptFunctions:
         )
 
 
+_OLD_SHA = "a" * 40
+_NEW_SHA = "b" * 40
+_OLD_IMAGE = f"ghcr.io/test/repo:{_OLD_SHA}"
+_NEW_IMAGE = f"ghcr.io/test/repo:{_NEW_SHA}"
+
+_STUB_DOCKER = """#!/bin/sh
+# Fake docker for fail-closed tests: records every invocation, never mutates.
+echo "$@" >> "$DOCKER_CALLS_LOG"
+case " $* " in
+    *" pull "*)
+        [ "$STUB_FAIL_PULL" = "1" ] && exit 1
+        ;;
+esac
+exit 0
+"""
+
+
+def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = False) -> str:
+    """Run deploy() with a stub docker and return its stdout plus RC marker.
+
+    `missing` is one of "configuration", "compose", "env", or "nothing".
+    The invocation mirrors production (`if deploy; then ... else ... fi`),
+    i.e. the errexit-suppressed context where the original bug continued.
+    """
+    assert missing in ("configuration", "compose", "env", "nothing")
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    if missing != "env":
+        (deploy_dir / "deploy.env").write_text(
+            f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
+        )
+    if missing != "compose":
+        (deploy_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    config = tmp_path / "configuration.toml"
+    if missing != "configuration":
+        config.write_text("[app]\n", encoding="utf-8")
+    stub_bin = tmp_path / "stubbin"
+    stub_bin.mkdir()
+    (stub_bin / "docker").write_text(_STUB_DOCKER, encoding="utf-8")
+    (stub_bin / "docker").chmod(0o755)
+    calls = tmp_path / "docker-calls.log"
+    script = (
+        f"export DEPLOY_PRODUCTION_SOURCED=1 PATH='{stub_bin.as_posix()}:$PATH' "
+        f"DOCKER_CALLS_LOG='{calls.as_posix()}' STUB_FAIL_PULL={'1' if fail_pull else '0'} "
+        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"COMPOSE_FILE='{(deploy_dir / 'docker-compose.yml').as_posix()}' "
+        f"ENV_FILE='{(deploy_dir / 'deploy.env').as_posix()}' "
+        f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='' "
+        f"HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
+        f"source '{DEPLOY_SCRIPT.as_posix()}'; "
+        "if deploy; then echo HARNESS_RC=0; else echo HARNESS_RC=$?; fi"
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+    return result.stdout
+
+
+def _docker_calls(tmp_path: Path) -> str:
+    calls = tmp_path / "docker-calls.log"
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+class TestDeployFailClosed:
+    """Preflight failures must stop deploy() before anything is mutated.
+
+    Regression cover for the production incident where a missing
+    configuration.toml printed FAIL yet deploy continued into pull,
+    postgres/redis startup, and migration.
+    """
+
+    @needs_bash
+    def test_missing_configuration_stops_before_any_mutation(self, tmp_path: Path) -> None:
+        out = _fail_closed_harness(tmp_path, missing="configuration")
+        assert "HARNESS_RC=0" not in out
+        calls = _docker_calls(tmp_path)
+        assert "pull" not in calls
+        assert " up " not in f" {calls} "
+        assert " run " not in f" {calls} "
+        env = tmp_path / "deploy" / "deploy.env"
+        assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
+        assert _NEW_SHA not in env.read_text(encoding="utf-8")
+
+    @needs_bash
+    def test_missing_compose_file_stops_before_any_mutation(self, tmp_path: Path) -> None:
+        out = _fail_closed_harness(tmp_path, missing="compose")
+        assert "HARNESS_RC=0" not in out
+        calls = _docker_calls(tmp_path)
+        assert "pull" not in calls
+        assert " up " not in f" {calls} "
+        assert " run " not in f" {calls} "
+        env = tmp_path / "deploy" / "deploy.env"
+        assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
+
+    @needs_bash
+    def test_missing_env_file_stops_before_any_mutation(self, tmp_path: Path) -> None:
+        out = _fail_closed_harness(tmp_path, missing="env")
+        assert "HARNESS_RC=0" not in out
+        calls = _docker_calls(tmp_path)
+        assert "pull" not in calls
+        assert " up " not in f" {calls} "
+        assert " run " not in f" {calls} "
+        assert not (tmp_path / "deploy" / "deploy.env").exists()
+
+    @needs_bash
+    def test_pull_failure_restores_reference_without_starting_services(
+        self, tmp_path: Path
+    ) -> None:
+        out = _fail_closed_harness(tmp_path, missing="nothing", fail_pull=True)
+        assert "HARNESS_RC=0" not in out
+        calls = _docker_calls(tmp_path)
+        assert "pull" in calls
+        assert " up " not in f" {calls} "
+        assert " run " not in f" {calls} "
+        env = tmp_path / "deploy" / "deploy.env"
+        assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
+
+
+_SERVICE_UP_STUB_DOCKER = """#!/bin/sh
+# Fake docker for the service-start failure test: healthy infra, a migrate
+# that succeeds, and an `up -d api worker bot` that fails ONCE with a
+# port-bind error (then succeeds, so the rollback restart works).
+echo "$@" >> "$DOCKER_CALLS_LOG"
+case " $* " in
+    *" inspect "*)
+        case "$*" in
+            *"Health"*) echo healthy ;;
+            *) echo running ;;
+        esac
+        exit 0
+        ;;
+    *" ps -q "*)
+        echo "cid123"
+        exit 0
+        ;;
+    *" up -d api worker bot "*)
+        n="$(cat "$UP_FAIL_COUNTER" 2>/dev/null || echo 0)"
+        n=$((n + 1))
+        printf '%s' "$n" > "$UP_FAIL_COUNTER"
+        if [ "$n" = "1" ]; then
+            echo "failed to set up container networking: failed to bind host"
+                "port 0.0.0.0:8000/tcp: address already in use" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+esac
+exit 0
+"""
+
+_STUB_SLEEP = """#!/bin/sh
+# Records waits instead of performing them: a fail-fast path must not wait.
+echo "$@" >> "$SLEEP_CALLS_LOG"
+exit 0
+"""
+
+_STUB_PYTHON = """#!/bin/sh
+# Records readiness probes instead of performing them.
+echo "$@" >> "$PYTHON_CALLS_LOG"
+exit 1
+"""
+
+
+def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run main() with stubbed docker/sleep/python3; the first app `up` fails.
+
+    Returns the completed harness process (stdout, stderr, returncode).
+    """
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    (deploy_dir / "deploy.env").write_text(
+        f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
+    )
+    (deploy_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    config = tmp_path / "configuration.toml"
+    config.write_text("[app]\n", encoding="utf-8")
+    stub_bin = tmp_path / "stubbin"
+    stub_bin.mkdir()
+    (stub_bin / "docker").write_text(_SERVICE_UP_STUB_DOCKER, encoding="utf-8")
+    (stub_bin / "docker").chmod(0o755)
+    (stub_bin / "sleep").write_text(_STUB_SLEEP, encoding="utf-8")
+    (stub_bin / "sleep").chmod(0o755)
+    (stub_bin / "python3").write_text(_STUB_PYTHON, encoding="utf-8")
+    (stub_bin / "python3").chmod(0o755)
+    script = (
+        f"export DEPLOY_PRODUCTION_SOURCED=1 PATH='{stub_bin.as_posix()}:$PATH' "
+        f"DOCKER_CALLS_LOG='{(tmp_path / 'docker-calls.log').as_posix()}' "
+        f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
+        f"PYTHON_CALLS_LOG='{(tmp_path / 'python-calls.log').as_posix()}' "
+        f"UP_FAIL_COUNTER='{(tmp_path / 'up-counter').as_posix()}' "
+        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"COMPOSE_FILE='{(deploy_dir / 'docker-compose.yml').as_posix()}' "
+        f"ENV_FILE='{(deploy_dir / 'deploy.env').as_posix()}' "
+        f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='' "
+        f"HEALTH_ATTEMPTS=36 HEALTH_INTERVAL=5; "
+        f"source '{DEPLOY_SCRIPT.as_posix()}'; "
+        "main; echo MAIN_RC=$?"
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+
+
+def _stub_calls(tmp_path: Path, name: str) -> str:
+    calls = tmp_path / name
+    return calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+class TestDeployServiceStartFailure:
+    """A failed `compose up -d api worker bot` must stop deploy immediately.
+
+    Regression cover for the production incident where a port-bind failure
+    (address already in use on 8000) fell through into the full API
+    readiness wait instead of failing fast into rollback.
+    """
+
+    @needs_bash
+    def test_app_start_failure_never_reaches_readiness(self, tmp_path: Path) -> None:
+        result = _service_start_failure_harness(tmp_path)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        # The deploy never continued past the failed start.
+        assert "waiting for API readiness" not in result.stdout
+        # Neither the readiness probe nor any wait ran.
+        assert _stub_calls(tmp_path, "python-calls.log") == ""
+        assert _stub_calls(tmp_path, "sleep-calls.log") == ""
+
+    @needs_bash
+    def test_app_start_failure_selects_rollback_exactly_once(self, tmp_path: Path) -> None:
+        result = _service_start_failure_harness(tmp_path)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        # One failed start attempt plus exactly one rollback restart.
+        assert calls.count("up -d api worker bot") == 2
+        assert result.stdout.count("attempting application-image rollback") == 1
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        env = tmp_path / "deploy" / "deploy.env"
+        assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
+
+    @needs_bash
+    def test_port_bind_error_is_reported_on_stderr(self, tmp_path: Path) -> None:
+        result = _service_start_failure_harness(tmp_path)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "address already in use" in result.stderr
+
+
 class TestProductionCompose:
     def _compose(self) -> dict:
         return yaml.safe_load(PROD_COMPOSE.read_text(encoding="utf-8"))
