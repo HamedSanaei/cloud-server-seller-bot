@@ -150,6 +150,9 @@ repository secrets are needed: application secrets live only in the server
    * `GET /health/ready` reports `{"status": "ok"}` (strongest readiness gate);
    * `postgres` + `redis` containers healthy; `worker` running;
    * exactly one `bot` container running (long-polling single consumer);
+   * `worker` + `bot` startup stability: same containers still running with
+     unchanged restart counts after a short bounded wait (a crash loop must
+     fail the deploy even if a container looks running for a moment);
    * `alembic current` inside `api` reports the expected head
      (`EXPECTED_HEAD`, resolved from the deployed commit in CI).
 10. Print service status; on success prune older local images (current +

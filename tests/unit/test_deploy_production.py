@@ -545,6 +545,105 @@ class TestDeployServiceStartFailure:
         assert "address already in use" in result.stderr
 
 
+_STABLE_STUB_DOCKER = """#!/bin/sh
+# Fake docker for the stabilization tests: healthy infra, a succeeding
+# migrate, and inspect answers driven by files the test prepares.
+echo "$@" >> "$DOCKER_CALLS_LOG"
+case " $* " in
+    *" inspect "*)
+        case "$*" in
+            *"Health"*) echo healthy ;;
+            *"RestartCount"*)
+                n="$(cat "$INSPECT_COUNTER" 2>/dev/null || echo 0)"
+                n=$((n + 1))
+                printf '%s' "$n" > "$INSPECT_COUNTER"
+                if [ "$CRASH_LOOP" = "1" ] && [ "$n" -ge 2 ]; then echo 2; else echo 0; fi
+                ;;
+            *) echo running ;;
+        esac
+        exit 0
+        ;;
+    *" ps -q "*)
+        echo "cid123"
+        exit 0
+        ;;
+    *" exec "*) echo "0034 (head)" ;;
+esac
+exit 0
+"""
+
+_STABLE_STUB_PYTHON = """#!/bin/sh
+# Readiness probe stub: the API answers healthy.
+echo '{"status": "ok"}'
+exit 0
+"""
+
+
+def _stabilization_harness(tmp_path: Path, *, crash_loop: bool) -> subprocess.CompletedProcess[str]:
+    """Run main() end to end with stubbed docker/sleep/python3.
+
+    With ``crash_loop`` the bot restart count changes mid-deploy; otherwise
+    every service stays stable and the deploy succeeds.
+    """
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    (deploy_dir / "deploy.env").write_text(
+        f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
+    )
+    (deploy_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    config = tmp_path / "configuration.toml"
+    config.write_text("[app]\n", encoding="utf-8")
+    stub_bin = tmp_path / "stubbin"
+    stub_bin.mkdir()
+    (stub_bin / "docker").write_text(_STABLE_STUB_DOCKER, encoding="utf-8")
+    (stub_bin / "docker").chmod(0o755)
+    (stub_bin / "sleep").write_text(_STUB_SLEEP, encoding="utf-8")
+    (stub_bin / "sleep").chmod(0o755)
+    (stub_bin / "python3").write_text(_STABLE_STUB_PYTHON, encoding="utf-8")
+    (stub_bin / "python3").chmod(0o755)
+    script = (
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
+        f"DOCKER_CALLS_LOG='{(tmp_path / 'docker-calls.log').as_posix()}' "
+        f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
+        f"INSPECT_COUNTER='{(tmp_path / 'inspect-counter').as_posix()}' "
+        f"CRASH_LOOP='{'1' if crash_loop else ''}' "
+        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"COMPOSE_FILE='{(deploy_dir / 'docker-compose.yml').as_posix()}' "
+        f"ENV_FILE='{(deploy_dir / 'deploy.env').as_posix()}' "
+        f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='0034' "
+        f"STABILIZE_SECONDS=1 HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
+        f"source '{DEPLOY_SCRIPT.as_posix()}'; "
+        "set +e; main; echo MAIN_RC=$?"
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+
+
+class TestDeployStabilization:
+    """Crash-looping worker/bot must fail the deploy despite looking running."""
+
+    @needs_bash
+    def test_stable_services_succeed(self, tmp_path: Path) -> None:
+        result = _stabilization_harness(tmp_path, crash_loop=False)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=0" in result.stdout
+        assert "API readiness: ok" in result.stdout
+        assert "stable (same containers" in result.stdout
+        assert "DEPLOYMENT SUCCEEDED" in result.stdout
+        env = tmp_path / "deploy" / "deploy.env"
+        assert f"PLATFORM_IMAGE={_NEW_IMAGE}" in env.read_text(encoding="utf-8")
+
+    @needs_bash
+    def test_bot_crash_loop_fails_the_deploy(self, tmp_path: Path) -> None:
+        result = _stabilization_harness(tmp_path, crash_loop=True)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "bot restarted during stabilization" in result.stdout
+        assert "DEPLOYMENT SUCCEEDED" not in result.stdout
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        env = tmp_path / "deploy" / "deploy.env"
+        assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
+
+
 class TestProductionCompose:
     def _compose(self) -> dict:
         return yaml.safe_load(PROD_COMPOSE.read_text(encoding="utf-8"))
@@ -587,6 +686,32 @@ class TestProductionCompose:
         example = PROD_ENV_EXAMPLE.read_text(encoding="utf-8")
         for var in ("PLATFORM_IMAGE=", "POSTGRES_PASSWORD=", "API_PORT=", "CONFIGURATION_PATH"):
             assert var in example, f"{var} missing from .env.example"
+
+
+class TestProductionHealthchecks:
+    """Only the API serves HTTP, so only the API keeps the image healthcheck.
+
+    Regression cover for worker/bot showing unhealthy (the image
+    HEALTHCHECK probes :8000) while actually processing jobs/polling.
+    """
+
+    def _compose(self) -> dict:
+        return yaml.safe_load(PROD_COMPOSE.read_text(encoding="utf-8"))
+
+    def test_api_inherits_the_image_http_healthcheck(self) -> None:
+        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        assert "/health/live" in dockerfile
+        assert "HEALTHCHECK" in dockerfile
+        api = self._compose()["services"]["api"]
+        assert "healthcheck" not in api, "api must keep the image HTTP healthcheck"
+
+    def test_non_http_services_disable_the_inherited_healthcheck(self) -> None:
+        services = self._compose()["services"]
+        for name in ("worker", "bot", "migrate", "backup"):
+            healthcheck = services[name].get("healthcheck")
+            assert healthcheck is not None and healthcheck.get("disable") is True, (
+                f"{name} must not inherit the API HTTP healthcheck"
+            )
 
 
 class TestCiStillGatesDeploys:

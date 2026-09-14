@@ -80,6 +80,9 @@ services:
   migrate:
     <<: *platform
     command: ["migrate"]
+    # One-shot job: the image HTTP healthcheck (port 8000) does not apply.
+    healthcheck:
+      disable: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,6 +91,8 @@ services:
   api:
     <<: *platform
     command: ["api"]
+    # The image HEALTHCHECK (GET /health/live on :8000) is kept exactly here:
+    # api is the only service that serves HTTP.
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -101,6 +106,11 @@ services:
   worker:
     <<: *platform
     command: ["worker"]
+    # ARQ job runner: no HTTP server. The inherited image HTTP healthcheck
+    # would wrongly mark a working job processor unhealthy, so it is off;
+    # liveness is the running container plus the deploy-time stability gate.
+    healthcheck:
+      disable: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,6 +129,10 @@ services:
   bot:
     <<: *platform
     command: ["bot"]
+    # No HTTP server here either: long-polling Telegram transport. Liveness
+    # is the running container plus the deploy-time restart-stability gate.
+    healthcheck:
+      disable: true
     deploy:
       replicas: 1
     depends_on:
@@ -142,6 +156,9 @@ services:
   backup:
     image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in deploy.env (ghcr.io/<org>/<repo>:<full-sha>)}
     command: ["backup"]
+    # One-shot job: the image HTTP healthcheck (port 8000) does not apply.
+    healthcheck:
+      disable: true
     environment:
       CLOUD_PLATFORM_CONFIG_FILE: /etc/cloud-server-seller/configuration.toml
       BACKUP_OUTPUT_DIR: /backups

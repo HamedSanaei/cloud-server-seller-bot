@@ -125,8 +125,10 @@ async def main() -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required to run the bot")
 
+    # get_container() returns the process-wide container fully initialized
+    # (providers registered); initializing again would register every
+    # adapter a second time and fail at the registry boundary.
     container = await get_container()
-    await container.initialize()  # register provider adapters (Hetzner...)
     bot = Bot(token=settings.telegram_bot_token)
     ui = BotUi(
         settings.callback_signing_key,

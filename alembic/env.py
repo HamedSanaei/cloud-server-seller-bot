@@ -28,12 +28,26 @@ _default_db_url = "postgresql://cloud:cloud@localhost:5432/cloud"
 
 
 def _settings_db_url() -> str:
-    """``database_url`` from the active TOML configuration (never a secret env)."""
-    try:
-        from cloud_platform.core.config import get_settings
+    """``database_url`` from the active TOML configuration (never a secret env).
 
+    Fail-closed rule: when the operator explicitly points at a configuration
+    file (``CLOUD_PLATFORM_CONFIG_FILE``) and that file cannot be loaded,
+    raise instead of silently falling back to localhost — a migration
+    running against the wrong database is worse than no migration at all.
+    Without an explicit file, an unreadable configuration keeps the
+    historical local/dev/test fallback chain below.
+    """
+    from cloud_platform.core.config import CONFIG_FILE_ENV, get_settings
+
+    try:
         return get_settings().database_url
-    except Exception:
+    except Exception as exc:
+        explicit = os.environ.get(CONFIG_FILE_ENV, "")
+        if explicit:
+            raise RuntimeError(
+                f"cannot load explicitly configured file {explicit!r}; "
+                "refusing to migrate with a fallback database"
+            ) from exc
         return ""
 
 

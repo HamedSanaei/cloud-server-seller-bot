@@ -111,6 +111,14 @@ class Container:
     # (Redis in production, in-memory for tests/development). Containers
     # built directly (tests) leave it ``None`` and get a lazily built one.
     bot_session_store: BotSessionStore | None = None
+    # Lifecycle guard: :meth:`initialize` registers provider adapters, and
+    # the registry rejects duplicates. The flag makes a second initialize a
+    # no-op instead of a double registration; it is set only after a fully
+    # successful registration, so a failed initialize can be retried.
+    # Initialized once per instance: after :meth:`close`, build a new
+    # container (what :func:`get_container`/:func:`close_container` do)
+    # rather than re-initializing a closed one.
+    _initialized: bool = field(default=False, init=False, repr=False, compare=False)
 
     def ssh_key_service(self) -> SshKeyService:
         """Ownership-scoped SSH-key service (M13-001), request-scoped."""
@@ -739,10 +747,20 @@ class Container:
             yield session
 
     async def initialize(self) -> None:
-        """Initialize container (create database tables, register providers)."""
+        """Register provider adapters (idempotent at the lifecycle level).
+
+        A second call is a no-op: the adapters are already registered and
+        the registry would reject them as duplicates. The initialized flag
+        is set only after registration fully succeeds, so a failed
+        initialize leaves the container uninitialized and retryable.
+        """
         # Database tables are created via Alembic migrations
         # Here we just register providers
+        if self._initialized:
+            return
         self._register_providers()
+        # Frozen dataclass: bypass the frozen __setattr__ for lifecycle state.
+        object.__setattr__(self, "_initialized", True)
 
     def _register_providers(self) -> None:
         """Register provider adapters.
@@ -944,6 +962,8 @@ def _configured_regions(region_setting: str) -> list[str]:
 
 async def get_container() -> Container:
     """Get the global container instance, creating it if needed.
+
+    The returned container is fully initialized (providers registered).
 
     Returns:
         The global Container instance.

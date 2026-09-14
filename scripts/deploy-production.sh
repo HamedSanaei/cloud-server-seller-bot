@@ -56,6 +56,7 @@ load_config() {
     EXPECTED_HEAD="${EXPECTED_HEAD:-}"
     HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-36}"
     HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"
+    STABILIZE_SECONDS="${STABILIZE_SECONDS:-15}"
 }
 
 log() {
@@ -108,6 +109,11 @@ container_running() {
     local id="$1" status
     status="$(docker inspect -f '{{.State.Status}}' "${id}" 2>/dev/null || true)"
     [ "${status}" = "running" ]
+}
+
+restart_count() {
+    local id="$1"
+    docker inspect -f '{{.RestartCount}}' "${id}" 2>/dev/null || true
 }
 
 wait_healthy() {
@@ -175,6 +181,9 @@ deploy() {
     esac
     case "${HEALTH_INTERVAL}" in
         '' | *[!0-9]*) fail "HEALTH_INTERVAL must be a positive integer"; return 1 ;;
+    esac
+    case "${STABILIZE_SECONDS}" in
+        '' | *[!0-9]*) fail "STABILIZE_SECONDS must be a non-negative integer"; return 1 ;;
     esac
 
     PREV_IMAGE="$(dotenv_value "${ENV_FILE}" PLATFORM_IMAGE)"
@@ -249,7 +258,7 @@ deploy() {
     log "API readiness: ok"
 
     log "verifying services"
-    local id
+    local id worker_id=""
     for service in postgres redis; do
         id="$(compose ps -q "${service}" | head -n 1)"
         container_healthy "${id}" || { fail "${service} is not healthy"; return 1; }
@@ -258,6 +267,7 @@ deploy() {
         id="$(compose ps -q "${service}" | head -n 1)"
         [ -n "${id}" ] || { fail "${service} has no container"; return 1; }
         container_running "${id}" || { fail "${service} is not running"; return 1; }
+        worker_id="${id}"
     done
 
     # Telegram long polling is a single-consumer transport: exactly one bot.
@@ -270,6 +280,40 @@ deploy() {
     bot_id="$(compose ps -q bot | head -n 1)"
     container_running "${bot_id}" || { fail "bot container is not running"; return 1; }
     log "bot replicas: exactly 1, running"
+
+    # Startup-stability gate: a crash-looping container can look "running"
+    # for a moment between restarts. Require the SAME worker/bot containers
+    # to still be running with unchanged restart counts after a short
+    # bounded wait. No HTTP probing: neither service serves HTTP.
+    local bot_restarts_before worker_restarts_before
+    bot_restarts_before="$(restart_count "${bot_id}")"
+    worker_restarts_before="$(restart_count "${worker_id}")"
+    log "waiting ${STABILIZE_SECONDS}s for worker/bot startup stabilization"
+    sleep "${STABILIZE_SECONDS}"
+    local bot_id_after worker_id_after
+    bot_id_after="$(compose ps -q bot | head -n 1)"
+    worker_id_after="$(compose ps -q worker | head -n 1)"
+    [ "${bot_id_after}" = "${bot_id}" ] || { fail "bot container changed during stabilization"; return 1; }
+    [ "${worker_id_after}" = "${worker_id}" ] || {
+        fail "worker container changed during stabilization"
+        return 1
+    }
+    container_running "${bot_id}" || { fail "bot container is not running after stabilization"; return 1; }
+    container_running "${worker_id}" || {
+        fail "worker container is not running after stabilization"
+        return 1
+    }
+    if [ "$(restart_count "${bot_id}")" != "${bot_restarts_before}" ]; then
+        compose logs --tail=20 bot 2>/dev/null || true
+        fail "bot restarted during stabilization (crash loop?)"
+        return 1
+    fi
+    if [ "$(restart_count "${worker_id}")" != "${worker_restarts_before}" ]; then
+        compose logs --tail=20 worker 2>/dev/null || true
+        fail "worker restarted during stabilization"
+        return 1
+    fi
+    log "worker + bot stable (same containers running, no restarts)"
 
     log "verifying migration revision"
     local current
