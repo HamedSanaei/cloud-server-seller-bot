@@ -115,15 +115,43 @@ class TestCatalogCompleteness:
 class TestBotHandlerUsesCatalog:
     """The Telegram start handler must render from the catalog (Persian)."""
 
-    async def test_start_handler_renders_persian_greeting(self) -> None:
-        from cloud_platform.bot import main as bot_main
+    async def test_start_handler_renders_persian_greeting_plus_menu(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock
 
-        message = AsyncMock()
-        await bot_main.start(message)  # type: ignore[arg-type]
+        from aiogram import Dispatcher
+        from aiogram.types import Chat, Message, Update
+        from aiogram.types import User as TelegramUser
 
-        message.answer.assert_awaited_once()
-        sent = message.answer.call_args.args[0]
-        assert sent == get_catalog(Locale.FA).table["greeting.start"]
+        from cloud_platform.bot.main import register_handlers
+
+        answer = AsyncMock()
+        monkeypatch.setattr(Message, "answer", answer)
+        message = Message(
+            message_id=1,
+            date=1,
+            chat=Chat(id=100, type="private"),
+            from_user=TelegramUser(id=10, is_bot=False, first_name="T"),
+            text="/start",
+        )
+        container = MagicMock()
+        container.user_repository = MagicMock(return_value=AsyncMock())
+        container.wallet_repository = MagicMock(return_value=AsyncMock())
+        monthly_ui = MagicMock()
+        monthly_ui.menu_screen = MagicMock(
+            return_value=MagicMock(
+                text=get_catalog(Locale.FA).table["menu.title"],
+                keyboard=MagicMock(),
+            )
+        )
+        dp = Dispatcher()
+        register_handlers(dp, MagicMock(), monthly_ui, container)
+        await dp.feed_update(MagicMock(), Update(update_id=1, message=message))
+        answer.assert_awaited_once()
+        sent = answer.call_args.args[0]
+        assert get_catalog(Locale.FA).table["greeting.start"] in sent
+        assert get_catalog(Locale.FA).table["menu.title"] in sent
         assert "starter is running" not in sent  # old scattered literal is gone
 
 

@@ -33,6 +33,7 @@ from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import close_container, get_container
 from cloud_platform.core.i18n import Translator
 from cloud_platform.core.session_store import SessionStoreUnavailable
+from cloud_platform.modules.navigation.domain import decode_callback
 from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.users.onboarding import handle_start
 
@@ -48,12 +49,6 @@ _t = Translator()
 dp = Dispatcher()
 
 
-@dp.message(CommandStart())
-async def start(message: Message) -> None:
-    """Greeting (M02-007): always from the message catalog, Persian first."""
-    await message.answer(_t.t("greeting.start"))
-
-
 async def _resolve_user(container: Container, from_user: TelegramUser | None) -> User | None:
     """Map a Telegram user to a platform user, creating one on first contact."""
     if from_user is None:
@@ -66,36 +61,83 @@ async def _resolve_user(container: Container, from_user: TelegramUser | None) ->
     )
 
 
+async def _show_main_menu(
+    message: Message,
+    *,
+    container: Container,
+    monthly_ui: MonthlyBotUi,
+    include_greeting: bool = False,
+) -> None:
+    """Resolve the user, then render the canonical storefront main menu.
+
+    The single shared helper behind /start, /menu and every fallback, so
+    the customer always lands on the same InlineKeyboard menu and no
+    parallel navigation system can drift from it.
+    """
+    await _resolve_user(container, message.from_user)
+    screen = monthly_ui.menu_screen()
+    text = f"{_t.t('greeting.start')}\n\n{screen.text}" if include_greeting else screen.text
+    await message.answer(text, reply_markup=screen.keyboard)
+
+
+def _is_foreign_callback(data: str) -> bool:
+    """True when no signature check can pass (tampered/foreign button data).
+
+    Signature validation itself is NOT weakened: undecodable data is still
+    rejected, it is only rendered as the main menu plus a safe notice
+    instead of a dead end. (CallbackError subclasses ValueError, so one
+    clause covers malformed data and a missing signing key alike.)
+    """
+    try:
+        decode_callback(data, get_settings().callback_signing_key)
+    except ValueError:
+        return True
+    return False
+
+
 def register_handlers(
     dp: Dispatcher, ui: BotUi, monthly_ui: MonthlyBotUi, container: Container
 ) -> None:
-    """Attach the menu and callback handlers to ``dp``."""
+    """Attach the menu and callback handlers to ``dp``.
+
+    Handler order is the priority order (aiogram stops at the first match):
+    specific commands first, then the active text flow, then the generic
+    fallback that lands every unmatched update on the main menu.
+    """
+
+    @dp.message(CommandStart())
+    async def _start(message: Message) -> None:
+        await _show_main_menu(
+            message, container=container, monthly_ui=monthly_ui, include_greeting=True
+        )
 
     @dp.message(Command("menu"))
     async def _menu(message: Message) -> None:
-        await _resolve_user(container, message.from_user)
-        # The customer menu is the monthly storefront's (market selector first).
-        screen = monthly_ui.menu_screen()
-        await message.answer(screen.text, reply_markup=screen.keyboard)
+        await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
         await message.answer(_t.t("greeting.help"))
 
     @dp.message()
-    async def _text(message: Message) -> None:
-        """Answer a pending prompt (server name, reverse DNS) or stay silent."""
-        if not message.text or message.text.startswith("/"):
-            return
-        user = await _resolve_user(container, message.from_user)
-        try:
-            screen = await monthly_ui.handle_text(message.text, user)
-        except SessionStoreUnavailable:
-            logger.error("telegram session store unavailable; refusing text input")
-            return
-        if screen is None:
-            return
-        await message.answer(screen.text, reply_markup=screen.keyboard)
+    async def _fallback(message: Message) -> None:
+        """Active prompt answers first; everything else lands on the menu.
+
+        Unknown slash commands, idle chat and unsupported media (photo,
+        sticker, voice, ...) all resolve to the canonical main menu instead
+        of being silently ignored.
+        """
+        if message.text and not message.text.startswith("/"):
+            user = await _resolve_user(container, message.from_user)
+            try:
+                screen = await monthly_ui.handle_text(message.text, user)
+            except SessionStoreUnavailable:
+                logger.error("telegram session store unavailable; refusing text input")
+                return
+            if screen is not None:
+                await message.answer(screen.text, reply_markup=screen.keyboard)
+                return
+        await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
 
     @dp.callback_query()
     async def _callback(query: CallbackQuery) -> None:
@@ -103,10 +145,20 @@ def register_handlers(
         chat_id = query.message.chat.id if isinstance(query.message, Message) else None
         data = query.data or ""
         # Monthly flows first (LEASEWEB-MVP), everything else -> legacy UI.
+        # Undecodable (tampered/foreign) button data is still rejected — it
+        # is only rendered as the main menu plus a safe notice instead of a
+        # dead end.
         try:
             screen = await monthly_ui.handle(data, user=user, chat_id=chat_id)
             if screen is None:
-                screen = await ui.handle(data, user=user, chat_id=chat_id)
+                if _is_foreign_callback(data):
+                    menu = monthly_ui.menu_screen()
+                    screen = BotScreen(
+                        f"{_t.t('nav.expired')}\n\n{menu.text}",
+                        menu.keyboard,
+                    )
+                else:
+                    screen = await ui.handle(data, user=user, chat_id=chat_id)
         except SessionStoreUnavailable:
             # Defence in depth: the shared session store is unreachable. Refuse
             # with a safe message; nothing is executed and nothing is queued.
