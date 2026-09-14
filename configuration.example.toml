@@ -83,6 +83,10 @@ market = "foreign"
 display_name = "Leaseweb"
 api_key = ""  # fill in production; empty means "not configured"
 base_url = "https://api.leaseweb.com"
+# Discovery seeds ONLY (may be empty): locations worth probing, never the
+# sellability authority. Account eligibility is decided per location by live
+# probes; newly enabled locations appear (and removed ones disappear)
+# automatically on the next catalog refresh.
 locations = ["AMS-01", "FRA-01"]
 os_allowlist = []
 order_os_only_free = true

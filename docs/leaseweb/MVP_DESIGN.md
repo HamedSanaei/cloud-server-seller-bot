@@ -72,10 +72,38 @@ Decisions:
   panels/SLA/disk upgrades are out of MVP scope so the displayed monthly price
   is always exact. Optional `LEASEWEB_OS_ALLOWLIST` narrows further.
 - Location display metadata (country/city) is a small operator-owned map in
-  the syncer (geography, not price); `LEASEWEB_LOCATIONS` (default
-  `AMS-01,FRA-01`) is the sync allowlist. A product is sellable only when it
+  the ordering adapter (geography, not price). `LEASEWEB_LOCATIONS`
+  (default `AMS-01,FRA-01`) provides DISCOVERY SEEDS ONLY — never an
+  authorization allowlist. A product is sellable only when it
   is **reported by Leaseweb for that location AND enabled by admin AND has an
   explicit selling price** — the `sellable_offers` row is the single gate.
+
+## 2b. Dynamic location eligibility discovery
+
+The ordering API exposes no location-list endpoint, and account eligibility
+is per sales organization (a location outside the account's scope answers
+`403`). Sellability therefore follows a probe pipeline, refreshed by the
+worker every 10 minutes (plus manual `leaseweb sync-offers`):
+
+    candidate locations (configured seeds + built-in datacenter seeds +
+      persisted locations + provider-response locations)
+        → read-only GET /ordering/v1/products/vps?location= per candidate
+        → verdict per location: ELIGIBLE_AVAILABLE / ELIGIBLE_EMPTY /
+          INELIGIBLE_ACCOUNT (403) / TRANSIENT (429, 5xx, timeout) /
+          FATAL_AUTHENTICATION (401)
+        → current products → enabled + operator-priced offers → storefront
+
+Rules:
+
+- Only definitive answers change what is sold (a 200 catalog, an account
+  403). Transient failures preserve last-known availability; a 401 aborts
+  the run without touching any flag.
+- Newly discovered locations are persisted and probed automatically; newly
+  enabled account locations appear without configuration changes, removed
+  ones disappear.
+- The storefront only ever shows locations with provider-available +
+  enabled + priced offers; the worker revalidates location/product/OS/price
+  read-only immediately before any billable POST.
 
 ## 3. Idempotency for chargeable POSTs
 

@@ -160,28 +160,81 @@ async def leaseweb_doctor() -> DoctorResult:
         mark = "OK " if passed else "FAIL"
         lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
 
+    def note(mark: str, name: str, detail: str = "") -> None:
+        lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+
     if not settings.leaseweb_api_key:
         report("LEASEWEB_API_KEY configured", False, "set it in .env or the environment")
         lines.append("\nAction: add LEASEWEB_API_KEY=<key> to .env (from your Leaseweb portal).")
         return DoctorResult(ok, lines)
     report("LEASEWEB_API_KEY configured", True, f"set ({_redact(settings.leaseweb_api_key)})")
 
-    from cloud_platform.providers.leaseweb.ordering import LeaseWebOrderingProvider
-
-    provider = LeaseWebOrderingProvider(
-        api_key=settings.leaseweb_api_key,
-        base_url=settings.leaseweb_api_base_url,
-        locations=tuple(
-            part.strip() for part in (settings.leaseweb_locations or "").split(",") if part.strip()
-        )
-        or ("AMS-01", "FRA-01"),
-        os_allowlist=_csv(settings.leaseweb_os_allowlist),
-        order_os_only_free=settings.leaseweb_order_os_only_free,
+    from cloud_platform.providers.leaseweb.errors import LeasewebAuthenticationError
+    from cloud_platform.providers.leaseweb.ordering import (
+        KNOWN_VPS_DATACENTERS,
+        LocationEligibility,
+        merge_candidates,
     )
+    from cloud_platform.providers.leaseweb.ordering_sync import ordering_provider_from_settings
+
+    provider = ordering_provider_from_settings(settings)
+    # Candidate discovery mirrors the catalog sync: configured seeds are
+    # hints only; eligibility is decided per location by live probes.
+    candidates = merge_candidates(tuple(provider.discovery_seeds), KNOWN_VPS_DATACENTERS)
+    unscoped_ok: bool | None = None
     try:
-        locations = await provider.list_locations()
+        unscoped = await provider.list_products_unscoped()
+        unscoped_ok = True
+        for product in unscoped:
+            if product.location and product.location not in candidates:
+                candidates += (product.location,)
+    except LeasewebAuthenticationError:
+        unscoped_ok = False
     except Exception as exc:
-        report("Ordering API reachable", False, str(exc))
+        note("INFO", "Unscoped catalog", f"unavailable ({type(exc).__name__})")
+
+    probes: dict[str, Any] = {}
+    queue = list(candidates)
+    while queue:
+        location = queue.pop(0)
+        if location in probes:
+            continue
+        try:
+            probe = await provider.probe_location(location)
+        except Exception as exc:
+            note("WARN", f"Products at {location}", f"probe failed ({type(exc).__name__})")
+            continue
+        probes[location] = probe
+        if probe.eligibility is LocationEligibility.FATAL_AUTHENTICATION:
+            break
+        for extra in probe.discovered_locations:
+            if extra not in probes and extra not in queue:
+                queue.append(extra)
+                candidates += (extra,)
+
+    definitive = [
+        probe
+        for probe in probes.values()
+        if probe.eligibility
+        in (
+            LocationEligibility.ELIGIBLE_AVAILABLE,
+            LocationEligibility.ELIGIBLE_EMPTY,
+            LocationEligibility.INELIGIBLE_ACCOUNT,
+        )
+    ]
+    fatal = [
+        probe
+        for probe in probes.values()
+        if probe.eligibility is LocationEligibility.FATAL_AUTHENTICATION
+    ]
+    if definitive:
+        report(
+            "Ordering API reachable",
+            True,
+            f"{len(definitive)} location(s) answered decisively",
+        )
+    elif fatal or unscoped_ok is False:
+        report("Ordering API reachable", False, "authentication rejected — check the API key")
         report(
             "Authentication works",
             False,
@@ -190,55 +243,65 @@ async def leaseweb_doctor() -> DoctorResult:
             "See docs/leaseweb/INTEGRATION_NOTES.md.",
         )
         return DoctorResult(ok, lines)
-    report(
-        "Ordering API reachable",
-        True,
-        f"{len(locations)} configured location(s): {', '.join(loc.id for loc in locations)}",
-    )
+    else:
+        report("Ordering API reachable", False, "no location answered decisively")
+        return DoctorResult(ok, lines)
     report("Authentication works", True, "products endpoint accepted X-LSW-Auth")
+
+    usable = 0
+    for location in candidates:
+        seen = probes.get(location)
+        if seen is None:
+            continue
+        if seen.eligibility is LocationEligibility.ELIGIBLE_AVAILABLE:
+            usable += 1
+            note("INFO", location, f"available, {len(seen.products)} product(s)")
+        elif seen.eligibility is LocationEligibility.ELIGIBLE_EMPTY:
+            note("INFO", location, "eligible, no products right now")
+        elif seen.eligibility is LocationEligibility.INELIGIBLE_ACCOUNT:
+            note("SKIP", location, "not enabled for this sales organization")
+        else:
+            note("WARN", location, f"catalog check inconclusive ({seen.note})")
+    if usable:
+        report("Eligible locations", True, f"{usable} usable location(s)")
+    else:
+        report(
+            "Eligible locations",
+            False,
+            "no usable ordering locations — the account may "
+            "not be eligible for the VPS Ordering API yet",
+        )
+        lines.append(
+            "\nAction: verify eligibility in the Leaseweb Customer Portal "
+            "(ordering/VPS must be post-payment enabled)."
+        )
 
     from cloud_platform.db.session import SessionFactory
     from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 
     offers_repo = SqlAlchemySellableOfferRepository(SessionFactory)
-    total_products = 0
-    for loc in locations:
-        try:
-            products = await provider.list_products(loc.id)
-        except Exception as exc:
-            report(f"Products at {loc.id}", False, str(exc))
+    for location in candidates:
+        cached = probes.get(location)
+        if cached is None or cached.eligibility is not LocationEligibility.ELIGIBLE_AVAILABLE:
             continue
-        total_products += len(products)
-        report(f"Products at {loc.id}", True, f"{len(products)} product(s) returned")
-        if not products:
+        if not cached.products:
             continue
-        first = products[0]
+        first = cached.products[0]
         try:
-            detail = await provider.get_product(loc.id, first.id)
+            detail = await provider.get_product(location, first.id)
         except Exception as exc:
             report(
-                f"Product detail {first.id}@{loc.id}",
+                f"Product detail {first.id}@{location}",
                 False,
                 f"price/options retrieval failed: {exc}",
             )
             continue
         free_os = len(detail.free_os_options())
         report(
-            f"Product detail {first.id}@{loc.id}",
+            f"Product detail {first.id}@{location}",
             True,
             f"monthly {detail.product.monthly_price_minor} {detail.product.currency}; "
             f"{len(detail.os_options)} OS option(s), {free_os} free",
-        )
-    if total_products == 0:
-        report(
-            "Products reported by the ordering API",
-            False,
-            "no products returned for the configured locations — the account may "
-            "not be eligible for the VPS Ordering API yet",
-        )
-        lines.append(
-            "\nAction: verify eligibility in the Leaseweb Customer Portal "
-            "(ordering/VPS must be post-payment enabled)."
         )
 
     try:
@@ -287,23 +350,16 @@ async def leaseweb_doctor() -> DoctorResult:
 
 async def leaseweb_sync_offers() -> int:
     from cloud_platform.db.session import SessionFactory
-    from cloud_platform.providers.leaseweb.ordering import LeaseWebOrderingProvider
-    from cloud_platform.providers.leaseweb.ordering_sync import LeaseWebOrderingCatalogSyncer
+    from cloud_platform.providers.leaseweb.ordering_sync import (
+        LeaseWebOrderingCatalogSyncer,
+        ordering_provider_from_settings,
+    )
 
     settings = get_settings()
     if not settings.leaseweb_api_key:
         print("LEASEWEB_API_KEY is not set; cannot sync.")
         return 1
-    provider = LeaseWebOrderingProvider(
-        api_key=settings.leaseweb_api_key,
-        base_url=settings.leaseweb_api_base_url,
-        locations=tuple(
-            part.strip() for part in (settings.leaseweb_locations or "").split(",") if part.strip()
-        )
-        or ("AMS-01", "FRA-01"),
-        os_allowlist=_csv(settings.leaseweb_os_allowlist),
-        order_os_only_free=settings.leaseweb_order_os_only_free,
-    )
+    provider = ordering_provider_from_settings(settings)
     syncer = LeaseWebOrderingCatalogSyncer(SessionFactory, provider)
     result = await syncer.sync_all()
     for name, step in result.items():

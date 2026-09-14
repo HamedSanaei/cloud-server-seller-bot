@@ -153,8 +153,12 @@ class FakeAuditRepo:
 
 
 class FakeOfferRepo:
+    def __init__(self, offer: SellableOffer | None = None) -> None:
+        self._offer = offer
+
     async def get(self, offer_id: UUID) -> SellableOffer | None:
-        return _offer() if offer_id == OFFER_ID else None
+        offer = self._offer if self._offer is not None else _offer()
+        return offer if offer_id == OFFER_ID else None
 
 
 class FakeServerRepo:
@@ -377,6 +381,9 @@ class FakeOrderingProvider:
         ticket: ProvisioningTicket | None = None,
         error: Exception | None = None,
         recovery: OrderRecoveryResult | None = None,
+        detail: Any | None = None,
+        detail_error: Exception | None = None,
+        os_allowed: bool = True,
     ) -> None:
         self._ticket = ticket or ProvisioningTicket(
             provider_order_id="LS-ORD-1",
@@ -393,6 +400,9 @@ class FakeOrderingProvider:
         self._recovery = recovery or OrderRecoveryResult(
             verdict=OrderRecoveryVerdict.NO_MATCH, reason="no candidates"
         )
+        self._detail = detail
+        self._detail_error = detail_error
+        self._os_allowed = os_allowed
         self.posts: list[IdempotencyKey] = []
         self.recovery_calls: list[dict[str, Any]] = []
 
@@ -412,10 +422,17 @@ class FakeOrderingProvider:
         return self._ticket
 
     async def get_product(self, location_id: str, product_id: str) -> Any:
-        return None
+        if self._detail_error is not None:
+            raise self._detail_error
+        if self._detail is not None:
+            return self._detail
+        # Fresh catalog read matching the standard offer fixture
+        # (provider cost 999 EUR): revalidation passes by default.
+        product = MagicMock(monthly_price_minor=999, currency="EUR")
+        return MagicMock(product=product)
 
     def os_name_allowed(self, detail: Any, os_name: str) -> bool:
-        return True
+        return self._os_allowed
 
     async def match_vps_for_order(
         self, provider_order_id: str, *, location: str, product_name: str, since: datetime
@@ -448,6 +465,7 @@ def _worker(
     clock: Any = None,
     event_sink: Any | None = None,
     user_repo: Any | None = None,
+    offer: SellableOffer | None = None,
 ) -> tuple[OrderWorker, dict[str, Any]]:
     ordering = ordering or FakeOrderingProvider()
     op_repo = op_repo or FakeOperationRepo()
@@ -464,7 +482,7 @@ def _worker(
     registry.register(ordering)
     worker = OrderWorker(
         server_repo=server_repo,
-        offers_repo=FakeOfferRepo(),
+        offers_repo=FakeOfferRepo(offer),
         orders_repo=orders_repo,
         operation_repo=op_repo,
         wallet_repo=wallet_repo,
@@ -555,6 +573,65 @@ class TestOrderWorker:
         assert deps["op_repo"].op.status is OperationStatus.FAILED
         assert deps["holds"].hold.status is HoldStatus.RELEASED
         assert len(deps["hold_service"].releases) == 1
+
+    async def test_stale_offer_fails_before_post(self) -> None:
+        """An offer hidden since checkout never reaches the provider."""
+        from dataclasses import replace
+
+        stale = replace(_offer(), provider_available=False)
+        worker, deps = _worker(offer=stale)
+        counts = await worker.process_pending()
+        assert counts.get("failed") == 1
+        assert deps["ordering"].posts == []
+        assert deps["orders"].order.status is OrderStatus.FAILED
+        assert deps["holds"].hold.status is HoldStatus.RELEASED
+
+    async def test_ineligible_location_fails_before_post(self) -> None:
+        from cloud_platform.providers.leaseweb.errors import (
+            LeasewebErrorPayload,
+            LeasewebForbiddenError,
+        )
+
+        ordering = FakeOrderingProvider(
+            detail_error=LeasewebForbiddenError(
+                "not enabled for this sales organization",
+                payload=LeasewebErrorPayload(http_status=403),
+            )
+        )
+        worker, deps = _worker(ordering=ordering)
+        counts = await worker.process_pending()
+        assert counts.get("failed") == 1
+        assert deps["ordering"].posts == []
+        assert deps["orders"].order.status is OrderStatus.FAILED
+        assert "availability changed" in (deps["orders"].order.error or "")
+        assert deps["holds"].hold.status is HoldStatus.RELEASED
+
+    async def test_transient_revalidation_requeues_without_post(self) -> None:
+        ordering = FakeOrderingProvider(detail_error=ProviderUnavailable("timeout"))
+        worker, deps = _worker(ordering=ordering)
+        counts = await worker.process_pending()
+        assert counts.get("requeued") == 1
+        assert deps["ordering"].posts == []
+        assert deps["orders"].order.status is OrderStatus.PENDING_SUBMIT
+        assert deps["holds"].hold.status is HoldStatus.CREATED
+
+    async def test_price_drift_fails_before_post(self) -> None:
+        product = MagicMock(monthly_price_minor=1199, currency="EUR")
+        ordering = FakeOrderingProvider(detail=MagicMock(product=product))
+        worker, deps = _worker(ordering=ordering)
+        counts = await worker.process_pending()
+        assert counts.get("failed") == 1
+        assert deps["ordering"].posts == []
+        assert deps["orders"].order.status is OrderStatus.FAILED
+        assert deps["holds"].hold.status is HoldStatus.RELEASED
+
+    async def test_os_gone_fails_before_post(self) -> None:
+        ordering = FakeOrderingProvider(os_allowed=False)
+        worker, deps = _worker(ordering=ordering)
+        counts = await worker.process_pending()
+        assert counts.get("failed") == 1
+        assert deps["ordering"].posts == []
+        assert deps["orders"].order.status is OrderStatus.FAILED
 
     async def test_racing_workers_do_not_double_post(self) -> None:
         worker_a, deps_a = _worker()

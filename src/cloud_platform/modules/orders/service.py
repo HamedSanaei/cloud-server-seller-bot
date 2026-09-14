@@ -127,7 +127,14 @@ from cloud_platform.providers.base import (
     ProvisioningTicket,
     ordering_support_of,
 )
-from cloud_platform.providers.errors import ProviderError, ProviderNotFound, ProviderOutcomeUnknown
+from cloud_platform.providers.errors import (
+    ProviderAuthError,
+    ProviderError,
+    ProviderNotFound,
+    ProviderOutcomeUnknown,
+    ProviderRateLimited,
+    ProviderUnavailable,
+)
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
 
@@ -742,6 +749,60 @@ class OrderWorker:
         if ordering is None:
             return await self._fail_permanent(
                 server, order, f"provider {server.provider_key!r} has no ordering port"
+            )
+
+        # Pre-POST availability revalidation (READ-ONLY): the catalog may
+        # have changed between checkout and this worker pass. A stale
+        # selection fails here — no POST, the hold is released, and the
+        # customer is told availability changed. Transient read failures
+        # requeue instead (bounded by the existing attempt recording).
+        if not offer.sellable:
+            return await self._fail_permanent(
+                server, order, f"offer {offer.ref} is no longer sellable (availability changed)"
+            )
+        try:
+            detail = await ordering.get_product(offer.location_id, offer.product_id)
+        except (ProviderNotFound, ProviderAuthError) as exc:
+            return await self._fail_permanent(
+                server,
+                order,
+                f"product {offer.product_id} no longer available at {offer.location_id} "
+                f"(availability changed: {type(exc).__name__})",
+            )
+        except (ProviderRateLimited, ProviderUnavailable) as exc:
+            claimed.requeue(f"catalog revalidation transient: {exc}")
+            await self._ops.save(claimed)
+            order.attempts += 1
+            order.error = str(exc)
+            await self._orders.save(order)
+            logger.warning("order %s revalidation requeued (retryable): %s", order.id, exc)
+            return OrderWorkerOutcome.REQUEUED
+        except ProviderError as exc:
+            return await self._fail_permanent(
+                server,
+                order,
+                f"product {offer.product_id} no longer available at {offer.location_id} "
+                f"(availability changed: {type(exc).__name__})",
+            )
+        if not ordering.os_name_allowed(detail, server.os or ""):
+            return await self._fail_permanent(
+                server,
+                order,
+                f"OS {server.os!r} no longer available for {offer.ref} (availability changed)",
+            )
+        snapshot_price = order.provider_cost_minor or offer.provider_cost_minor
+        snapshot_currency = order.provider_cost_currency or offer.provider_cost_currency
+        if abs(detail.product.monthly_price_minor - snapshot_price) > 1:
+            return await self._fail_permanent(
+                server,
+                order,
+                f"provider price changed since catalog sync for {offer.ref} (availability changed)",
+            )
+        if detail.product.currency != snapshot_currency:
+            return await self._fail_permanent(
+                server,
+                order,
+                f"provider currency changed for {offer.ref} (availability changed)",
             )
 
         # The request carries PROVIDER-side facts only (provider cost

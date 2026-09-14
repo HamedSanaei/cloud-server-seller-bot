@@ -197,7 +197,8 @@ class TestWorkerLifecycleAndNotifiers:
         assert len(by_name) == 5
         assert by_name["process_leaseweb_orders"].minute == set(range(0, 60, 2))
         assert by_name["reconcile_leaseweb_orders"].minute == set(range(0, 60, 3))
-        assert by_name["sync_leaseweb_offers"].hour == {3}
+        # Dynamic eligibility discovery needs a short freshness bound.
+        assert by_name["sync_leaseweb_offers"].minute == set(range(0, 60, 10))
         assert by_name["check_renewals"].hour == {3}
         # The business-log delivery pass runs every minute (bounded retries).
         assert by_name["deliver_business_log_events"].minute == set(range(0, 60))

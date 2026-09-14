@@ -76,6 +76,12 @@ logger = logging.getLogger(__name__)
 #: provider-neutral and carry the provider key from the offer itself.
 MVP_PROVIDER_KEY = "leaseweb"
 
+#: Provider-price drift tolerance (minor units) between the catalog snapshot
+#: and a live revalidation read. Mirrors the settlement tolerance used when
+#: the worker reconciles provider charges: a cent of rounding is noise, more
+#: is a changed product.
+_PROVIDER_PRICE_TOLERANCE_MINOR = 1
+
 RESOURCE_TYPE_SERVER_ORDER = "server_order"
 
 
@@ -214,12 +220,27 @@ class MonthlyCheckoutService:
 
         # 3. OS validation SERVER-SIDE against the live product API (free
         #    options only by default — the price shown is the price charged).
+        #    The successful detail fetch doubles as the location-accessibility
+        #    proof (an account 403 surfaces here); the price comparison below
+        #    additionally guards the race between catalog sync and checkout.
         ordering = await self._ordering_provider(offer.provider_key)
         try:
             detail = await ordering.get_product(offer.location_id, offer.product_id)
         except Exception as exc:
             logger.warning("offer %s: product detail unavailable: %s", offer.ref, exc)
             raise OfferUnavailableError("product details currently unavailable") from exc
+        current_price = detail.product.monthly_price_minor
+        if abs(current_price - offer.provider_cost_minor) > _PROVIDER_PRICE_TOLERANCE_MINOR:
+            logger.warning(
+                "offer %s: provider price moved %s -> %s since catalog sync",
+                offer.ref,
+                offer.provider_cost_minor,
+                current_price,
+            )
+            raise OfferUnavailableError("provider price changed since catalog sync")
+        if detail.product.currency != offer.provider_cost_currency:
+            logger.warning("offer %s: provider currency moved since catalog sync", offer.ref)
+            raise OfferUnavailableError("provider price changed since catalog sync")
         if not ordering.os_name_allowed(detail, os_name):
             raise OsUnavailableError(f"OS {os_name!r} is not available for {offer.ref}")
 

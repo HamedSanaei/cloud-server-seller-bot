@@ -58,9 +58,12 @@ outcome is always persisted and recoverable.
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from enum import StrEnum
 from typing import Any
 
 from cloud_platform.core.idempotency import IdempotencyKey
@@ -80,6 +83,8 @@ from cloud_platform.providers.credentials import CredentialSource
 from cloud_platform.providers.errors import (
     ProviderError,
     ProviderNotFound,
+    ProviderRateLimited,
+    ProviderUnavailable,
 )
 from cloud_platform.providers.leaseweb.client import (
     _as_list,
@@ -87,6 +92,8 @@ from cloud_platform.providers.leaseweb.client import (
 )
 from cloud_platform.providers.leaseweb.errors import (
     LeasewebAmbiguousMutationError,
+    LeasewebAuthenticationError,
+    LeasewebForbiddenError,
     error_for_response,
     parse_error_payload,
 )
@@ -109,6 +116,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_BILLING_CYCLE",
     "DEFAULT_CONTRACT_TERM",
+    "KNOWN_VPS_DATACENTERS",
     "LEASEWEB_ORDERING_CAPABILITIES",
     "LOCATION_DISPLAY",
     "LeaseWebOrderingProvider",
@@ -116,7 +124,12 @@ __all__ = [
     "LeasewebProduct",
     "LeasewebProductDetail",
     "LeasewebProductOption",
+    "LocationEligibility",
+    "LocationProbe",
     "VpsMatchAmbiguous",
+    "classify_location_error",
+    "extract_location_codes",
+    "merge_candidates",
     "to_minor_units",
 ]
 
@@ -142,6 +155,132 @@ ORDER_SCAN_PAGE = 100
 #: Price tolerance (minor units) when comparing provider price snapshots to
 #: the order's ``pricePerFrequency`` (the API returns major-unit floats).
 PRICE_TOLERANCE_MINOR = 1
+
+#: Well-known Leaseweb VPS datacenter codes. DISCOVERY SEEDS ONLY: every
+#: code listed here is worth probing, but the probe result alone decides
+#: whether the account may sell there. An ineligible seed simply yields
+#: ``INELIGIBLE_ACCOUNT`` and stays out of sale; a location Leaseweb
+#: enables tomorrow is picked up as soon as its probe succeeds — no
+#: configuration change required. These are public geography facts, never
+#: account scope and never prices.
+KNOWN_VPS_DATACENTERS: tuple[str, ...] = (
+    "AMS-01",
+    "FRA-01",
+    "FRA-10",
+    "FRA-14",
+    "LAX-12",
+    "LON-01",
+    "MTL-02",
+    "SFO-12",
+    "SIN-01",
+    "SYD-12",
+    "TYO-11",
+    "WDC-02",
+)
+
+
+class LocationEligibility(StrEnum):
+    """The verdict of one read-only location eligibility probe.
+
+    Only the ``ELIGIBLE_*`` and ``INELIGIBLE_ACCOUNT`` verdicts are
+    definitive (they prove current availability or its absence). The
+    ``TRANSIENT_*`` verdicts preserve last-known provider availability;
+    ``FATAL_AUTHENTICATION`` aborts the whole sync run.
+    """
+
+    #: 200 with one or more valid products: sellable (subject to the
+    #: operator enabled/priced gate downstream).
+    ELIGIBLE_AVAILABLE = "eligible_available"
+    #: 200 with zero products: eligible but no current stock; hidden until
+    #: products exist.
+    ELIGIBLE_EMPTY = "eligible_empty"
+    #: 403 on the ordering catalog: this account may not order here.
+    INELIGIBLE_ACCOUNT = "ineligible_account"
+    #: 429: throttled; retry the probe on the next refresh.
+    TRANSIENT_THROTTLED = "transient_throttled"
+    #: 5xx, timeouts and transport failures: unknown, preserve last-known.
+    TRANSIENT_UNKNOWN = "transient_unknown"
+    #: 401: the key itself is rejected; the whole run must stop.
+    FATAL_AUTHENTICATION = "fatal_authentication"
+
+
+@dataclass(frozen=True, slots=True)
+class LocationProbe:
+    """The outcome of probing one candidate location (read-only)."""
+
+    location: str
+    eligibility: LocationEligibility
+    #: Products seen on a successful probe (empty otherwise).
+    products: tuple[LeasewebProduct, ...] = ()
+    #: Extra location codes worth probing, harvested from provider
+    #: responses (detail ``location`` arrays, 403 messages).
+    discovered_locations: tuple[str, ...] = ()
+    #: Short human-safe summary (no secrets; safe to log and show).
+    note: str = ""
+
+
+#: Location codes look like ``FRA-01``: uppercase alpha, dash, digits.
+_LOCATION_CODE_RE = re.compile(r"\b([A-Z]{2,5}-\d{1,3})\b")
+
+
+def extract_location_codes(text: str) -> tuple[str, ...]:
+    """Harvest datacenter codes from provider text (403 messages, payloads).
+
+    Used only to grow the discovery candidate set; a harvested code still
+    has to pass its own eligibility probe before anything is sold there.
+    """
+    if not text:
+        return ()
+    return tuple(sorted(set(_LOCATION_CODE_RE.findall(text))))
+
+
+def _is_sales_organization_denial(message: str) -> bool:
+    """Secondary discriminator for account-scope 403s.
+
+    Matches both English spellings (``organization``/``organisation``).
+    Isolated here (and unit-tested) so the wording can evolve without
+    touching the classifier.
+    """
+    return "sales organi" in (message or "").lower()
+
+
+def classify_location_error(exc: BaseException) -> tuple[LocationEligibility, str]:
+    """Map a probe failure onto an eligibility verdict plus a safe note.
+
+    The primary contract is the exception taxonomy (HTTP status mapped by
+    the transport); the English message is only a secondary discriminator
+    inside the 403 branch. The note never carries secrets: transport errors
+    are redacted at construction.
+    """
+    if isinstance(exc, LeasewebAuthenticationError):
+        return LocationEligibility.FATAL_AUTHENTICATION, "authentication rejected (401)"
+    if isinstance(exc, LeasewebForbiddenError):
+        if _is_sales_organization_denial(str(exc)):
+            return LocationEligibility.INELIGIBLE_ACCOUNT, "not enabled for this sales organization"
+        return LocationEligibility.INELIGIBLE_ACCOUNT, "forbidden for this account"
+    if isinstance(exc, ProviderRateLimited):
+        return LocationEligibility.TRANSIENT_THROTTLED, "throttled (429)"
+    if isinstance(exc, ProviderUnavailable):
+        return LocationEligibility.TRANSIENT_UNKNOWN, f"transient ({type(exc).__name__})"
+    return LocationEligibility.TRANSIENT_UNKNOWN, f"transient ({type(exc).__name__})"
+
+
+def merge_candidates(*sources: Iterable[str]) -> tuple[str, ...]:
+    """Ordered, de-duplicated union of candidate location codes.
+
+    Normalizes to stripped upper-case and drops empties. Order is
+    deterministic: earlier sources win.
+    """
+    seen: set[str] = set()
+    merged: list[str] = []
+    for source in sources:
+        for raw in source:
+            code = (raw or "").strip().upper()
+            if code and code not in seen:
+                seen.add(code)
+                merged.append(code)
+    return tuple(merged)
+
 
 #: Order service statuses (orders API) -> coarse ticket state.
 _ORDER_STATUS_MAP: dict[str, str] = {
@@ -325,7 +464,7 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
         self,
         api_key: str,
         base_url: str = DEFAULT_BASE_URL,
-        locations: tuple[str, ...] = ("AMS-01", "FRA-01"),
+        locations: tuple[str, ...] = (),
         contract_term: str = DEFAULT_CONTRACT_TERM,
         billing_cycle: str = DEFAULT_BILLING_CYCLE,
         os_allowlist: tuple[str, ...] = (),
@@ -337,8 +476,6 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
-        if not locations:
-            raise ValueError("locations must not be empty")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
         # ONE shared transport for the whole Leaseweb integration (ordering,
@@ -401,19 +538,43 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
     # CloudProvider read port (ordering catalog)
     # ------------------------------------------------------------------
 
+    @property
+    def discovery_seeds(self) -> tuple[str, ...]:
+        """Configured location codes as DISCOVERY SEEDS (never an allowlist).
+
+        Seeds are only "locations worth probing": every seed still has to
+        pass its own live eligibility probe before anything is sold there,
+        and locations discovered elsewhere (provider payloads, persisted
+        state) are probed too. An empty tuple is valid — discovery then
+        relies on built-in seeds, persisted state and provider responses.
+        """
+        return self._locations
+
+    def describe_location(self, code: str) -> ProviderLocation:
+        """Display metadata for a location code without authorizing it.
+
+        Unknown codes are retained verbatim (empty country, no city) so a
+        newly enabled datacenter keeps working the moment it appears in a
+        provider response.
+        """
+        normalized = (code or "").strip().upper()
+        country, city = LOCATION_DISPLAY.get(normalized, ("", normalized))
+        return ProviderLocation(
+            id=normalized,
+            name=normalized,
+            country_code=country,
+            city=city or None,
+            metadata={"source": "leaseweb-ordering-discovery"},
+        )
+
     async def list_locations(self) -> list[ProviderLocation]:
-        """The configured ordering locations (the ordering API has no
-        location-list endpoint; the allowlist IS the sync scope)."""
-        return [
-            ProviderLocation(
-                id=code,
-                name=code,
-                country_code=LOCATION_DISPLAY.get(code, ("NL", code))[0],
-                city=LOCATION_DISPLAY.get(code, ("NL", ""))[1] or None,
-                metadata={"source": "leaseweb-ordering-config"},
-            )
-            for code in self._locations
-        ]
+        """The configured discovery seeds (NOT the sellability authority).
+
+        The ordering API exposes no location-list endpoint; sellability is
+        decided per location by the live eligibility probe
+        (:meth:`probe_location`), never by this list.
+        """
+        return [self.describe_location(code) for code in self._locations]
 
     async def list_plans(self) -> list[ProviderPlan]:
         """Union of ordering products across the configured locations."""
@@ -471,23 +632,91 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
     # Ordering catalog (location-scoped)
     # ------------------------------------------------------------------
 
-    async def list_products(self, location: str) -> list[LeasewebProduct]:
-        """``GET /ordering/v1/products/vps?location=`` (paginated)."""
+    async def _list_products(
+        self, params: dict[str, Any], default_location: str
+    ) -> list[LeasewebProduct]:
+        """One paginated ``GET /ordering/v1/products/vps`` read.
+
+        Items that carry their own ``location`` string keep it (unscoped
+        reads); otherwise the caller-supplied location is stamped.
+        """
         products: list[LeasewebProduct] = []
         offset = 0
         while True:
+            page_params = dict(params)
+            page_params.update({"limit": 100, "offset": offset})
             payload = await self._request(
                 "GET",
                 "/ordering/v1/products/vps",
-                params={"location": location, "limit": 100, "offset": offset},
+                params=page_params,
             )
             items = _as_list(payload, "vpss", "products", "data", "items")
-            products.extend(p for p in (_parse_product(i, location) for i in items) if p)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                raw_location = item.get("location")
+                if isinstance(raw_location, str) and raw_location.strip():
+                    code = raw_location.strip().upper()
+                else:
+                    code = default_location
+                parsed = _parse_product(item, code)
+                if parsed is not None:
+                    products.append(parsed)
             meta = payload.get("_metadata", {}) if isinstance(payload, dict) else {}
             total = meta.get("totalCount")
             if not isinstance(total, int) or len(products) >= total or not items:
                 return products
             offset += len(items)
+
+    async def list_products(self, location: str) -> list[LeasewebProduct]:
+        """``GET /ordering/v1/products/vps?location=`` (paginated)."""
+        return await self._list_products({"location": location}, location)
+
+    async def list_products_unscoped(self) -> list[LeasewebProduct]:
+        """``GET /ordering/v1/products/vps`` WITHOUT a location.
+
+        The official OpenAPI marks ``location`` optional. Best-effort
+        discovery helper: whatever the account may see unscoped is
+        harvested for candidate locations and doubles as an authentication
+        liveness signal. Callers must still probe each location —
+        eligibility is only ever decided per location.
+        """
+        return await self._list_products({}, "")
+
+    async def probe_location(self, location: str) -> LocationProbe:
+        """Read-only eligibility probe for one candidate location.
+
+        Performs exactly one catalog read and classifies the outcome.
+        Expected account exclusions (403) are reported at INFO level;
+        only authentication failures and unexpected errors escalate.
+        This method never POSTs anything.
+        """
+        code = (location or "").strip().upper()
+        if not code:
+            return LocationProbe("", LocationEligibility.TRANSIENT_UNKNOWN, (), (), "empty code")
+        try:
+            products = await self.list_products(code)
+        except Exception as exc:
+            eligibility, note = classify_location_error(exc)
+            discovered: tuple[str, ...] = ()
+            if isinstance(exc, LeasewebForbiddenError):
+                discovered = extract_location_codes(str(exc))
+            if eligibility is LocationEligibility.FATAL_AUTHENTICATION:
+                logger.error("leaseweb ordering authentication failed while probing %s", code)
+            elif eligibility is LocationEligibility.INELIGIBLE_ACCOUNT:
+                logger.info("leaseweb location %s not eligible for this account (%s)", code, note)
+            else:
+                logger.warning("leaseweb location %s probe inconclusive: %s", code, note)
+            return LocationProbe(code, eligibility, (), discovered, note)
+        if not products:
+            return LocationProbe(code, LocationEligibility.ELIGIBLE_EMPTY, (), (), "catalog empty")
+        return LocationProbe(
+            code,
+            LocationEligibility.ELIGIBLE_AVAILABLE,
+            tuple(products),
+            (),
+            f"{len(products)} products",
+        )
 
     async def get_product(
         self,
@@ -996,12 +1225,13 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
 
         The candidate is sent only for this one request through the shared
         transport; the live credential is untouched and neither value is
-        ever logged.
+        ever logged. Uses the unscoped catalog read (``location`` is
+        optional), so verification never depends on configured locations.
         """
         response = await self._transport.request_raw(
             "GET",
             "/ordering/v1/products/vps",
-            params={"location": self._locations[0], "limit": 1},
+            params={"limit": 1},
             headers={"X-LSW-Auth": candidate},
         )
         self._raise_for_status(response)

@@ -459,6 +459,24 @@ class TestProviderListing:
         screen = await _press(bot, bot._callback("store", "providers", "iran"))
         assert "فروش فعال نشده" in screen.text
 
+    async def test_location_without_sellable_offers_is_hidden(self) -> None:
+        """A merely known location (ineligible/empty at the provider) with
+        no sellable offer must not appear; an unknown code with a sellable
+        offer must appear verbatim."""
+        from dataclasses import replace
+
+        offers = [
+            _offer(provider_key=FOREIGN_PROVIDER, location_id="FRA-01", name="EU Big"),
+            replace(
+                _offer(provider_key=FOREIGN_PROVIDER, location_id="FRA-10", name="EU Gone"),
+                provider_available=False,
+            ),
+            _offer(provider_key=FOREIGN_PROVIDER, location_id="NEW-99", name="EU New"),
+        ]
+        service = _view_service(offers=offers)
+        locations, _, _ = await service.locations_screen(FOREIGN_PROVIDER)
+        assert {view.location_id for view in locations} == {"FRA-01", "NEW-99"}
+
     def test_handlers_never_contain_a_concrete_provider_name(self) -> None:
         # Provider neutrality: the storefront CODE must not branch on a
         # provider key. Documentation may name the shipped providers; the

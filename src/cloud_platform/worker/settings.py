@@ -319,38 +319,24 @@ def _telegram_notifiers() -> tuple[Any, Any] | None:
 async def sync_leaseweb_offers(ctx: dict[str, object]) -> None:
     """Refresh the sellable-offer price book from the Leaseweb ordering API.
 
-    Scheduled daily (arq cron). Never touches operator-owned fields
-    (enabled, selling price). Skipped when LEASEWEB_API_KEY is unset.
+    Runs every 10 minutes (arq cron): dynamic eligibility discovery needs a
+    short freshness bound so newly enabled locations appear (and removed
+    ones disappear) without operator action. Never touches operator-owned
+    fields (enabled, selling price). Skipped when LEASEWEB_API_KEY is unset.
     """
     del ctx
     async with metrics.job("sync_leaseweb_offers"):
         from cloud_platform.core.config import get_settings
         from cloud_platform.db.session import SessionFactory
-        from cloud_platform.providers.leaseweb.ordering import LeaseWebOrderingProvider
-        from cloud_platform.providers.leaseweb.ordering_sync import LeaseWebOrderingCatalogSyncer
+        from cloud_platform.providers.leaseweb.ordering_sync import (
+            LeaseWebOrderingCatalogSyncer,
+            ordering_provider_from_settings,
+        )
 
         settings = get_settings()
         if not settings.leaseweb_api_key:
             return
-        provider = LeaseWebOrderingProvider(
-            api_key=settings.leaseweb_api_key,
-            base_url=settings.leaseweb_api_base_url,
-            locations=tuple(
-                part.strip()
-                for part in (settings.leaseweb_locations or "").split(",")
-                if part.strip()
-            )
-            or ("AMS-01", "FRA-01"),
-            os_allowlist=tuple(
-                part.strip()
-                for part in (settings.leaseweb_os_allowlist or "").split(",")
-                if part.strip()
-            ),
-            order_os_only_free=settings.leaseweb_order_os_only_free,
-            contract_term=settings.leaseweb_contract_term,
-            billing_cycle=settings.leaseweb_billing_cycle,
-            timeout_seconds=settings.leaseweb_timeout_seconds,
-        )
+        provider = ordering_provider_from_settings(settings)
         syncer = LeaseWebOrderingCatalogSyncer(SessionFactory, provider)
         result = await syncer.sync_all()
         for name, step in result.items():
@@ -527,16 +513,19 @@ async def deliver_business_log_events(ctx: dict[str, object]) -> None:
 
 
 def _cron_jobs() -> list[Any]:
-    """Cron schedule for the LEASEWEB-MVP jobs (daily sync/renewal, periodic
-    order worker/reconciler). Overlapping runs are safe: the order worker
-    claims through the operation ledger and the reconciler never mutates."""
+    """Cron schedule for the LEASEWEB-MVP jobs (periodic catalog discovery,
+    order worker/reconciler, daily renewal). Overlapping runs are safe: the
+    order worker claims through the operation ledger and the reconciler
+    never mutates. The catalog refresh runs every 10 minutes so account
+    eligibility changes surface without operator action."""
     from arq.cron import cron
 
     every_minute = set(range(0, 60))
     every_two_minutes = set(range(0, 60, 2))
     every_three_minutes = set(range(0, 60, 3))
+    every_ten_minutes = set(range(0, 60, 10))
     return [
-        cron(sync_leaseweb_offers, hour={3}, minute={17}, run_at_startup=True),
+        cron(sync_leaseweb_offers, minute=every_ten_minutes, run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),

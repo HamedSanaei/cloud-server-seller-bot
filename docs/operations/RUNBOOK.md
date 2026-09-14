@@ -188,7 +188,7 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
 1. **Config** — fill in `configuration.toml` (production:
    `/etc/cloud-server-seller/configuration.toml`; see
    `configuration.example.toml`): `[providers.leaseweb].api_key`,
-   `[providers.leaseweb].locations = ["AMS-01","FRA-01"]`,
+   `[providers.leaseweb].locations` (optional discovery seeds; eligibility is probed live),
    `[telegram].bot_token`, `[telegram].callback_signing_key`,
    `[telegram].admin_chat_id` and the `[telegram.logger]` channel. `.env`
    still works for bootstrap/tests but is no longer the production source.

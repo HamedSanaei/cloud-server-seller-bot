@@ -896,25 +896,9 @@ def create_container() -> Container:
     leaseweb_ordering_provider = None
     leaseweb_ordering_syncer = None
     if settings.leaseweb_api_key:
-        leaseweb_ordering_provider = LeaseWebOrderingProvider(
-            api_key=settings.leaseweb_api_key,
-            base_url=settings.leaseweb_api_base_url,
-            locations=tuple(
-                part.strip()
-                for part in (settings.leaseweb_locations or "").split(",")
-                if part.strip()
-            )
-            or ("AMS-01", "FRA-01"),
-            os_allowlist=tuple(
-                part.strip()
-                for part in (settings.leaseweb_os_allowlist or "").split(",")
-                if part.strip()
-            ),
-            order_os_only_free=settings.leaseweb_order_os_only_free,
-            contract_term=settings.leaseweb_contract_term,
-            billing_cycle=settings.leaseweb_billing_cycle,
-            timeout_seconds=settings.leaseweb_timeout_seconds,
-        )
+        from cloud_platform.providers.leaseweb.ordering_sync import ordering_provider_from_settings
+
+        leaseweb_ordering_provider = ordering_provider_from_settings(settings)
         leaseweb_ordering_syncer = LeaseWebOrderingCatalogSyncer(
             session_factory=session_factory,
             provider=leaseweb_ordering_provider,

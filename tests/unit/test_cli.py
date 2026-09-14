@@ -23,6 +23,7 @@ from cloud_platform.modules.orders.service import OrderManualResolutionError
 from cloud_platform.modules.renewals.domain import RenewalRecord, RenewalStatus
 from cloud_platform.modules.users.domain import Role, User, UserStatus
 from cloud_platform.modules.wallet.domain import Wallet
+from cloud_platform.providers.leaseweb.ordering import LocationEligibility, LocationProbe
 
 OFFER_ID = uuid4()
 SERVER_ID = uuid4()
@@ -117,6 +118,9 @@ class TestLeasewebDoctor:
         settings.leaseweb_locations = "AMS-01"
         settings.leaseweb_os_allowlist = ""
         settings.leaseweb_order_os_only_free = True
+        settings.leaseweb_contract_term = "1_MONTH"
+        settings.leaseweb_billing_cycle = "1_MONTH"
+        settings.leaseweb_timeout_seconds = 30.0
         settings.redis_url = "redis://localhost:6379/0"
         settings.database_url = "postgresql+asyncpg://x"
         settings.telegram_sessions_backend = "redis"
@@ -137,14 +141,22 @@ class TestLeasewebDoctor:
                 return [_FakeOption()]
 
         class _FakeProvider:
+            discovery_seeds = ("AMS-01",)
+
             def __init__(self, **kw: Any) -> None:
                 pass
 
-            async def list_locations(self) -> list[Any]:
-                return [MagicMock(id="AMS-01")]
+            async def list_products_unscoped(self) -> list[Any]:
+                return []
 
-            async def list_products(self, location: str) -> list[Any]:
-                return [_FakeProduct()]
+            async def probe_location(self, location: str) -> Any:
+                return LocationProbe(
+                    location,
+                    LocationEligibility.ELIGIBLE_AVAILABLE,
+                    (_FakeProduct(),),
+                    (),
+                    "1 products",
+                )
 
             async def get_product(self, location: str, product_id: str) -> Any:
                 return _FakeDetail()
@@ -155,9 +167,15 @@ class TestLeasewebDoctor:
             async def close(self) -> None:
                 return None
 
+        def _fake_provider_from_settings(settings: Any) -> Any:
+            return _FakeProvider()
+
+        # Patch the seam the doctor actually uses: the shared provider
+        # factory (patching the adapter class itself would not affect the
+        # already-bound factory reference).
         monkeypatch.setattr(
-            "cloud_platform.providers.leaseweb.ordering.LeaseWebOrderingProvider",
-            _FakeProvider,
+            "cloud_platform.providers.leaseweb.ordering_sync.ordering_provider_from_settings",
+            _fake_provider_from_settings,
         )
         offers_repo = AsyncMock()
         offers_repo.list_all = AsyncMock(return_value=[_offer()])
@@ -177,6 +195,149 @@ class TestLeasewebDoctor:
         assert "lsw-secret-key-1234" not in text
         assert "1234" in text  # redacted tail only
 
+    async def test_ineligible_locations_are_informational_not_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sales-organization 403 must not fail the doctor by itself."""
+        settings = MagicMock()
+        settings.leaseweb_api_key = "lsw-secret-key-1234"
+        settings.leaseweb_api_base_url = "https://api.test"
+        settings.leaseweb_locations = "AMS-01,FRA-01"
+        settings.leaseweb_os_allowlist = ""
+        settings.leaseweb_order_os_only_free = True
+        settings.leaseweb_contract_term = "1_MONTH"
+        settings.leaseweb_billing_cycle = "1_MONTH"
+        settings.leaseweb_timeout_seconds = 30.0
+        settings.redis_url = "redis://localhost:6379/0"
+        settings.database_url = "postgresql+asyncpg://x"
+        settings.telegram_sessions_backend = "redis"
+        settings.telegram_sessions_namespace = "cloud-platform:bot"
+        monkeypatch.setattr(cli, "get_settings", lambda: settings)
+
+        class _P:
+            id = "VPS02_1"
+
+        class _O:
+            name = "Ubuntu 24.04"
+
+        class _D:
+            product = MagicMock(monthly_price_minor=1299, currency="EUR")
+            os_options: ClassVar[list[Any]] = [_O()]
+
+            def free_os_options(self) -> list[Any]:
+                return [_O()]
+
+        class _FakeProvider:
+            discovery_seeds = ("AMS-01", "FRA-01")
+
+            def __init__(self, **kw: Any) -> None:
+                pass
+
+            async def list_products_unscoped(self) -> list[Any]:
+                return []
+
+            async def probe_location(self, location: str) -> Any:
+                if location == "AMS-01":
+                    return LocationProbe(
+                        location,
+                        LocationEligibility.INELIGIBLE_ACCOUNT,
+                        (),
+                        (),
+                        "not enabled for this sales organization",
+                    )
+                return LocationProbe(
+                    location,
+                    LocationEligibility.ELIGIBLE_AVAILABLE,
+                    (_P(),),
+                    (),
+                    "1 products",
+                )
+
+            async def get_product(self, location: str, product_id: str) -> Any:
+                return _D()
+
+        def _fake_provider_from_settings(settings: Any) -> Any:
+            return _FakeProvider()
+
+        monkeypatch.setattr(
+            "cloud_platform.providers.leaseweb.ordering_sync.ordering_provider_from_settings",
+            _fake_provider_from_settings,
+        )
+        offers_repo = AsyncMock()
+        offers_repo.list_all = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            _fake_repo_class(offers_repo),
+        )
+        monkeypatch.setattr(cli, "_check_db", AsyncMock(return_value=(True, "ok")))
+        monkeypatch.setattr(cli, "_check_redis", AsyncMock(return_value=(True, "ok")))
+        monkeypatch.setattr(
+            cli, "_check_session_store", AsyncMock(return_value=(True, "redis read/write ok"))
+        )
+        result = await cli.leaseweb_doctor()
+        assert result.ok
+        text = "\n".join(result.lines)
+        assert "[SKIP] AMS-01" in text
+        assert "Eligible locations" in text
+
+    async def test_zero_usable_locations_fails_doctor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = MagicMock()
+        settings.leaseweb_api_key = "lsw-secret-key-1234"
+        settings.leaseweb_api_base_url = "https://api.test"
+        settings.leaseweb_locations = "AMS-01"
+        settings.leaseweb_os_allowlist = ""
+        settings.leaseweb_order_os_only_free = True
+        settings.leaseweb_contract_term = "1_MONTH"
+        settings.leaseweb_billing_cycle = "1_MONTH"
+        settings.leaseweb_timeout_seconds = 30.0
+        settings.redis_url = "redis://localhost:6379/0"
+        settings.database_url = "postgresql+asyncpg://x"
+        settings.telegram_sessions_backend = "redis"
+        settings.telegram_sessions_namespace = "cloud-platform:bot"
+        monkeypatch.setattr(cli, "get_settings", lambda: settings)
+
+        class _FakeProvider:
+            discovery_seeds = ("AMS-01",)
+
+            def __init__(self, **kw: Any) -> None:
+                pass
+
+            async def list_products_unscoped(self) -> list[Any]:
+                return []
+
+            async def probe_location(self, location: str) -> Any:
+                return LocationProbe(
+                    location,
+                    LocationEligibility.INELIGIBLE_ACCOUNT,
+                    (),
+                    (),
+                    "not enabled for this sales organization",
+                )
+
+        def _fake_provider_from_settings(settings: Any) -> Any:
+            return _FakeProvider()
+
+        monkeypatch.setattr(
+            "cloud_platform.providers.leaseweb.ordering_sync.ordering_provider_from_settings",
+            _fake_provider_from_settings,
+        )
+        offers_repo = AsyncMock()
+        offers_repo.list_all = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            _fake_repo_class(offers_repo),
+        )
+        monkeypatch.setattr(cli, "_check_db", AsyncMock(return_value=(True, "ok")))
+        monkeypatch.setattr(cli, "_check_redis", AsyncMock(return_value=(True, "ok")))
+        monkeypatch.setattr(
+            cli, "_check_session_store", AsyncMock(return_value=(True, "redis read/write ok"))
+        )
+        result = await cli.leaseweb_doctor()
+        assert not result.ok
+        assert any("Eligible locations" in line for line in result.lines)
+
     async def test_failing_auth_marks_doctor_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = MagicMock()
         settings.leaseweb_api_key = "lsw-secret-key-1234"
@@ -184,18 +345,35 @@ class TestLeasewebDoctor:
         settings.leaseweb_locations = "AMS-01"
         settings.leaseweb_os_allowlist = ""
         settings.leaseweb_order_os_only_free = True
+        settings.leaseweb_contract_term = "1_MONTH"
+        settings.leaseweb_billing_cycle = "1_MONTH"
+        settings.leaseweb_timeout_seconds = 30.0
         monkeypatch.setattr(cli, "get_settings", lambda: settings)
 
         class _FakeProvider:
+            discovery_seeds = ("AMS-01",)
+
             def __init__(self, **kw: Any) -> None:
                 pass
 
-            async def list_locations(self) -> list[Any]:
-                raise RuntimeError("403 Forbidden")
+            async def list_products_unscoped(self) -> list[Any]:
+                return []
+
+            async def probe_location(self, location: str) -> Any:
+                return LocationProbe(
+                    location,
+                    LocationEligibility.FATAL_AUTHENTICATION,
+                    (),
+                    (),
+                    "authentication rejected (401)",
+                )
+
+        def _fake_provider_from_settings(settings: Any) -> Any:
+            return _FakeProvider()
 
         monkeypatch.setattr(
-            "cloud_platform.providers.leaseweb.ordering.LeaseWebOrderingProvider",
-            _FakeProvider,
+            "cloud_platform.providers.leaseweb.ordering_sync.ordering_provider_from_settings",
+            _fake_provider_from_settings,
         )
         result = await cli.leaseweb_doctor()
         assert not result.ok

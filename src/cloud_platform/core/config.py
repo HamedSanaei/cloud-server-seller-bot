@@ -374,8 +374,12 @@ class Settings(BaseSettings):
     # Connect/read/write/pool timeout for every Leaseweb request (the ONE
     # shared transport owns it; nothing else in the codebase sets a timeout).
     leaseweb_timeout_seconds: float = Field(default=30.0, gt=0)
-    # LEASEWEB-MVP: ordering-VPS catalog scope (comma-separated allowlist).
-    # Only these locations are ever synced or sold.
+    # LEASEWEB-MVP: ordering-VPS discovery seeds (comma-separated).
+    # These are HINTS ONLY ("locations worth probing"), never an
+    # authorization allowlist: every candidate still has to pass its own
+    # live eligibility probe, and locations discovered elsewhere (provider
+    # payloads, persisted state, built-in datacenter seeds) are probed too.
+    # Empty is valid — discovery then relies on the other sources.
     leaseweb_locations: str = "AMS-01,FRA-01"
     # Optional comma-separated OS allowlist; empty = every free OS option.
     leaseweb_os_allowlist: str = ""

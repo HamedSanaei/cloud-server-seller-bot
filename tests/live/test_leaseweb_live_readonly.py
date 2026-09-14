@@ -136,6 +136,24 @@ class TestLiveReadOnly:
         finally:
             await api.aclose()
 
+    async def test_unscoped_ordering_catalogue_shape(self) -> None:
+        """Experiment: what does the catalog return WITHOUT a location?
+
+        The official OpenAPI marks ``location`` optional. Whatever shape
+        comes back (products with/without per-item locations, empty list,
+        or a documented error) is recorded, never ordered from. This is the
+        empirical basis for unscoped discovery in the sync pipeline.
+        """
+        transport = _transport()
+        api = LeaseWebOrderingApi(transport)
+        try:
+            page = await api.list_products(limit=5)
+        finally:
+            await api.aclose()
+        assert page.items is not None
+        for item in page.items:
+            assert item.id, "every listed product must expose its id"
+
     async def test_account_orders_are_readable(self) -> None:
         transport = _transport()
         api = LeaseWebAccountOrdersApi(transport)

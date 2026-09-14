@@ -230,9 +230,12 @@ class FakeOperationRepo:
 class FakeOrderingProvider:
     key = "leaseweb"
 
-    def __init__(self, *, os_allowed: set[str] | None = None, product_ok: bool = True) -> None:
+    def __init__(
+        self, *, os_allowed: set[str] | None = None, product_ok: bool = True, price_minor: int = 999
+    ) -> None:
         self._os_allowed = os_allowed or {"Ubuntu 24.04"}
         self._product_ok = product_ok
+        self._price_minor = price_minor
         self.place_order_calls = 0
 
     async def get_product(self, location_id: str, product_id: str) -> Any:
@@ -240,7 +243,13 @@ class FakeOrderingProvider:
             from cloud_platform.providers.errors import ProviderUnavailable
 
             raise ProviderUnavailable("product endpoint down")
-        return type("Detail", (), {})()  # os_name_allowed decides
+        # Fresh catalog read matching the offer fixture (999 EUR) unless a
+        # drifted price was requested: the checkout price revalidation
+        # passes by default.
+        product = type(
+            "Product", (), {"monthly_price_minor": self._price_minor, "currency": "EUR"}
+        )()
+        return type("Detail", (), {"product": product})()  # os_name_allowed decides
 
     def os_name_allowed(self, detail: Any, os_name: str) -> bool:
         return os_name in self._os_allowed
@@ -363,6 +372,44 @@ class TestCheckoutSafety:
         assert op.status is OperationStatus.PENDING
         # The provider was never called.
         assert deps["ordering"].place_order_calls == 0
+
+    async def test_provider_price_drift_blocks_before_hold(self) -> None:
+        """A catalog price that moved since sync fails before any hold."""
+        from cloud_platform.modules.checkout.service import OfferUnavailableError
+
+        service, deps = _make_service(
+            offer=_offer(), ordering=FakeOrderingProvider(price_minor=1199)
+        )
+        with pytest.raises(OfferUnavailableError, match="price changed"):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k9"
+            )
+        assert deps["servers"].servers == []  # no intent persisted
+        assert deps["orders"].by_server == {}
+        assert deps["holds"].holds == {}  # no wallet hold created
+
+    async def test_ineligible_location_blocks_before_hold(self) -> None:
+        """A location the account lost access to fails before any hold."""
+        from cloud_platform.modules.checkout.service import OfferUnavailableError
+        from cloud_platform.providers.leaseweb.errors import (
+            LeasewebErrorPayload,
+            LeasewebForbiddenError,
+        )
+
+        class _DeniedOrdering(FakeOrderingProvider):
+            async def get_product(self, location_id: str, product_id: str) -> Any:
+                raise LeasewebForbiddenError(
+                    "not enabled for this sales organization",
+                    payload=LeasewebErrorPayload(http_status=403),
+                )
+
+        service, deps = _make_service(offer=_offer(), ordering=_DeniedOrdering())
+        with pytest.raises(OfferUnavailableError):
+            await service.create_order(
+                user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="k10"
+            )
+        assert deps["servers"].servers == []
+        assert deps["holds"].holds == {}
 
     async def test_repeated_callback_replays_original_intent(self) -> None:
         service, deps = _make_service(offer=_offer())
