@@ -19,6 +19,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
+from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.events import (
+    recharge_failed_event,
+    recharge_succeeded_event,
+)
 from cloud_platform.modules.payments.domain import (
     InvalidPaymentSessionTransition,
     PaymentSession,
@@ -58,10 +63,25 @@ class PaymentWebhookService:
         payments_repo: PaymentSessionRepository,
         wallet_repo: WalletRepository,
         ledger_repo: LedgerRepository,
+        event_sink: BusinessEventSink | None = None,
+        user_repo: object | None = None,
     ) -> None:
         self._payments = payments_repo
         self._wallet = wallet_repo
         self._ledger = ledger_repo
+        self._events = event_sink
+        self._users = user_repo
+
+    async def _load_user(self, user_id: UUID) -> object | None:
+        """Best-effort user lookup for the operator-channel payload."""
+        if self._users is None:
+            return None
+        try:
+            found: object = await self._users.get(user_id)  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("user lookup for recharge log failed", exc_info=True)
+            return None
+        return found
 
     async def process_callback(
         self,
@@ -107,6 +127,20 @@ class PaymentWebhookService:
                 saved = await self._payments.save(
                     session.mark_failed(gateway_payment_id=external_id)
                 )
+                # Operator channel: the gateway reported a failure. Logged
+                # only for the FIRST failure transition (a replayed callback
+                # hits DUPLICATE_IGNORED below and logs nothing new).
+                await emit_safe(
+                    self._events,
+                    recharge_failed_event(
+                        user=await self._load_user(session.user_id),
+                        payment_session_id=session.id or external_id,
+                        amount_minor=session.amount_minor,
+                        currency=session.currency,
+                        gateway=gateway_key,
+                        state=PaymentSessionStatus.FAILED.value,
+                    ),
+                )
                 return WebhookOutcome(WebhookAction.FAILED_RECORDED, saved)
             if session.status is PaymentSessionStatus.FAILED:
                 return WebhookOutcome(WebhookAction.DUPLICATE_IGNORED, session)
@@ -136,8 +170,11 @@ class PaymentWebhookService:
         deposit_key = f"deposit-{session.gateway_key}-{session.gateway_payment_id}"
 
         existing = await self._ledger.get_entry_by_idempotency(session.id, deposit_key)
+        wallet = None
         if existing is None:
-            await self._wallet.add_funds(session.user_id, session.amount_minor, deposit_key)
+            wallet = await self._wallet.add_funds(
+                session.user_id, session.amount_minor, deposit_key
+            )
             ext_id = session.gateway_payment_id
             try:
                 await self._ledger.post_entry(
@@ -155,5 +192,20 @@ class PaymentWebhookService:
                 # the ledger's unique constraint is the arbiter.
                 logger.warning("deposit %s was already posted concurrently", deposit_key)
 
-        credited = session.mark_credited(at=datetime.now(UTC))
-        return await self._payments.save(credited)
+        credited = await self._payments.save(session.mark_credited(at=datetime.now(UTC)))
+        # Operator channel: emitted only AFTER the wallet was actually
+        # credited (the session is persisted as credited above).
+        balance_after = getattr(wallet, "balance", None)
+        await emit_safe(
+            self._events,
+            recharge_succeeded_event(
+                user=await self._load_user(session.user_id),
+                payment_session_id=session.id,
+                amount_minor=session.amount_minor,
+                currency=session.currency,
+                gateway=session.gateway_key,
+                gateway_reference=session.gateway_payment_id,
+                balance_after_minor=(balance_after if isinstance(balance_after, int) else None),
+            ),
+        )
+        return credited

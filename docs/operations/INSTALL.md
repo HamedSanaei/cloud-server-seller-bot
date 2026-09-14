@@ -56,3 +56,35 @@ cd /opt/cloud-platform && ./platform.sh
 Production notes: `.env` is `chmod 600`; provider keys live in
 `CredentialHolder` at runtime and rotate without downtime (M10-008);
 backups are encrypted (`BACKUP_ENCRYPTION_KEY`); never commit `.env`.
+
+## Configuration sources (TOML first)
+
+The installer keeps generating `.env` for backward compatibility, and that
+still works because environment values win over the TOML file. The supported
+production model, however, is a single operator-managed TOML file:
+
+```bash
+sudo install -d -m 0750 -o root -g 999 /etc/cloud-server-seller
+sudo install -m 0640 -o root -g 999 \
+    deploy/production/configuration.example.toml \
+    /etc/cloud-server-seller/configuration.toml
+sudo "$EDITOR" /etc/cloud-server-seller/configuration.toml    # fill in secrets
+export CLOUD_PLATFORM_CONFIG_FILE=/etc/cloud-server-seller/configuration.toml
+cd deploy/production && docker compose up -d
+```
+
+`deploy/production/docker-compose.yml` mounts the file read-only into every
+container and sets only that one non-secret bootstrap variable — no provider
+key, bot token, payment secret or encryption key is placed in the environment.
+
+Lookup order for the file: `CLOUD_PLATFORM_CONFIG_FILE` → `./configuration.toml`
+→ `/etc/cloud-server-seller/configuration.toml`. Value precedence is
+**explicit arguments → environment → TOML → `.env` → defaults**.
+Reload after an edit: `docker compose restart api worker bot` (no rebuild).
+
+Pre-flight checks (read-only, secrets are never printed):
+
+```bash
+uv run python -c "from cloud_platform.core.config import get_settings as g; s=g(); print(s.app_env, s.database_url.split('@')[-1], bool(s.telegram_bot_token))"
+uv run python -m cloud_platform.cli leaseweb doctor
+```

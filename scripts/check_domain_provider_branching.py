@@ -33,8 +33,21 @@ PROVIDER_KEYS: frozenset[str] = frozenset({"hetzner", "arvancloud"})
 #: the port definitions, shared error hierarchy, retry policy, the registry
 #: of ports, the action waiter, health types, the contract suite, and the
 #: runtime credential holder (M10-008 - port-level, no provider-specific code).
+#: ``vps_ports`` belongs to the same category: it is the provider-neutral VPS
+#: capability port (records + protocols only, no adapter import, no provider
+#: name), and application services are *supposed* to depend on it.
 ALLOWED_PROVIDER_PACKAGES: frozenset[str] = frozenset(
-    {"base", "errors", "retry", "registry", "waiter", "health", "contract", "credentials"}
+    {
+        "base",
+        "errors",
+        "retry",
+        "registry",
+        "waiter",
+        "health",
+        "contract",
+        "credentials",
+        "vps_ports",
+    }
 )
 
 #: The domain root: everything under modules/ is core domain.

@@ -79,6 +79,12 @@ from uuid import UUID
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.events import (
+    provider_accepted_event,
+    purchase_failed_event,
+    vps_provisioned_event,
+)
 from cloud_platform.modules.compute.domain import (
     CloudServer,
     ServerLifecycleState,
@@ -151,6 +157,21 @@ MAX_SETTLEMENT_ATTEMPTS = 5
 MAX_EQUIPMENT_WAIT = timedelta(hours=72)
 
 MONTHLY_ESTIMATE_DAYS = 30
+
+
+async def _load_user(user_repo: Any | None, user_id: UUID) -> Any | None:
+    """Best-effort user lookup for business-event payloads.
+
+    Business logging is observational: a lookup failure degrades the event to
+    "no customer identity attached" and must never affect the order itself.
+    """
+    if user_repo is None:
+        return None
+    try:
+        return await user_repo.get(user_id)
+    except Exception:
+        logger.warning("user lookup for business log failed", exc_info=True)
+        return None
 
 
 class OrderWorkerOutcome(StrEnum):
@@ -238,6 +259,8 @@ class OrderActivator:
         audit_trail: AuditTrail,
         provider_registry: ProviderRegistry,
         delivery_notifier: OrderDeliveryNotifier,
+        event_sink: BusinessEventSink | None = None,
+        user_repo: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -246,6 +269,8 @@ class OrderActivator:
         self._audit = audit_trail
         self._registry = provider_registry
         self._delivery = delivery_notifier
+        self._events = event_sink
+        self._users = user_repo
 
     async def activate(
         self,
@@ -309,6 +334,20 @@ class OrderActivator:
             },
         )
         await self._delivery.deliver(server=server, offer=offer, renewal=renewal)
+        await emit_safe(
+            self._events,
+            vps_provisioned_event(
+                user=await _load_user(self._users, server.user_id),
+                server_id=server.id,
+                provider_key=server.provider_key,
+                provider_order_id=order.provider_order_id,
+                location_id=offer.location_id,
+                plan_name=offer.name,
+                state=server.state.value,
+                ipv4=server.ipv4,
+                ipv6=server.ipv6,
+            ),
+        )
         return renewal
 
     async def _upsert_renewal(
@@ -589,6 +628,8 @@ class OrderWorker:
         delivery_notifier: OrderDeliveryNotifier | None = None,
         settlement: OrderSettlementService | None = None,
         clock: Callable[[], datetime] | None = None,
+        event_sink: BusinessEventSink | None = None,
+        user_repo: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -601,6 +642,8 @@ class OrderWorker:
         self._registry = provider_registry
         self._renewals = renewal_repo
         self._delivery = delivery_notifier or _LoggingOrderDeliveryNotifier()
+        self._events = event_sink
+        self._users = user_repo
         self._settlement = settlement or OrderSettlementService(
             wallet_repo=wallet_repo,
             hold_repo=hold_repo,
@@ -622,6 +665,8 @@ class OrderWorker:
             audit_trail=self._audit,
             provider_registry=self._registry,
             delivery_notifier=self._delivery,
+            event_sink=self._events,
+            user_repo=self._users,
         )
 
     async def process_pending(self, limit: int = 10) -> dict[OrderWorkerOutcome, int]:
@@ -753,6 +798,26 @@ class OrderWorker:
         )
         await self._ops.save(claimed)
 
+        # Operator channel: the provider accepted the order. Emitted here —
+        # BEFORE the local settlement step — because acceptance is a fact
+        # even when the wallet capture still needs a repair retry.
+        await emit_safe(
+            self._events,
+            provider_accepted_event(
+                user=await _load_user(self._users, server.user_id),
+                server_id=server.id,
+                order_id=order.id,
+                provider_key=server.provider_key,
+                provider_order_id=ticket.provider_order_id,
+                product_id=order.product_id or offer.product_id,
+                location_id=order.location_id or offer.location_id,
+                plan_name=offer.name,
+                provider_cost_minor=offer.provider_cost_minor,
+                currency=offer.provider_cost_currency,
+                operation_key=claimed.operation_key,
+            ),
+        )
+
         # Payment settlement barrier: the provider purchase EXISTS — only
         # the LOCAL charge may still be pending. NEVER re-POST, NEVER
         # release the hold; repair the settlement locally only. Delivery is
@@ -779,6 +844,19 @@ class OrderWorker:
                 "leaseweb order %s accepted but settlement NEEDS_REVIEW: %s",
                 order.id,
                 order.settlement_error,
+            )
+            await emit_safe(
+                self._events,
+                purchase_failed_event(
+                    user=await _load_user(self._users, server.user_id),
+                    server_id=server.id,
+                    order_id=order.id,
+                    provider_key=server.provider_key,
+                    provider_order_id=ticket.provider_order_id,
+                    operation_key=claimed.operation_key,
+                    category="settlement_review",
+                    reason=order.settlement_error or "payment settlement needs review",
+                ),
             )
             return OrderWorkerOutcome.SUBMITTED
         if verdict is SettlementVerdict.RETRY_LATER:
@@ -863,6 +941,19 @@ class OrderWorker:
             server.id,
             reason,
         )
+        await emit_safe(
+            self._events,
+            purchase_failed_event(
+                user=await _load_user(self._users, server.user_id),
+                server_id=server.id,
+                order_id=order.id,
+                provider_key=server.provider_key,
+                provider_order_id=order.provider_order_id,
+                operation_key=operation.operation_key,
+                category="outcome_unknown",
+                reason=reason,
+            ),
+        )
 
     async def _recover_active(
         self, server: CloudServer, order: ProviderOrder
@@ -925,6 +1016,19 @@ class OrderWorker:
             metadata={"order_id": str(order.id) if order is not None else ""},
         )
         logger.error("leaseweb order permanently failed for server %s: %s", server.id, reason)
+        await emit_safe(
+            self._events,
+            purchase_failed_event(
+                user=await _load_user(self._users, server.user_id),
+                server_id=server.id,
+                order_id=order.id if order is not None else None,
+                provider_key=server.provider_key,
+                provider_order_id=order.provider_order_id if order is not None else None,
+                operation_key=order.operation_key if order is not None else None,
+                category="provider_rejected",
+                reason=reason,
+            ),
+        )
         return OrderWorkerOutcome.FAILED
 
     async def _release_hold(self, server: CloudServer) -> None:
@@ -966,6 +1070,8 @@ class OrderReconciler:
         delivery_notifier: OrderDeliveryNotifier | None = None,
         settlement: OrderSettlementService | None = None,
         clock: Callable[[], datetime] | None = None,
+        event_sink: BusinessEventSink | None = None,
+        user_repo: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -977,6 +1083,8 @@ class OrderReconciler:
         self._audit = AuditTrail(audit_repo)
         self._registry = provider_registry
         self._delivery = delivery_notifier or _LoggingOrderDeliveryNotifier()
+        self._events = event_sink
+        self._users = user_repo
         self._settlement = settlement or OrderSettlementService(
             wallet_repo=wallet_repo,
             hold_repo=hold_repo,
@@ -1184,6 +1292,8 @@ class OrderReconciler:
             audit_trail=self._audit,
             provider_registry=self._registry,
             delivery_notifier=self._delivery,
+            event_sink=self._events,
+            user_repo=self._users,
         )
         await activator.activate(
             server=server, order=order, offer=offer, vps_id=vps_id, ordering=ordering
@@ -1194,6 +1304,19 @@ class OrderReconciler:
         order.mark_failed("provider cancelled the order before provisioning")
         await self._orders.save(order)
         metrics.record_provisioning_failure("order_reconciler")
+        await emit_safe(
+            self._events,
+            purchase_failed_event(
+                user=await _load_user(self._users, server.user_id),
+                server_id=server.id,
+                order_id=order.id,
+                provider_key=server.provider_key,
+                provider_order_id=order.provider_order_id,
+                operation_key=order.operation_key,
+                category="provider_cancelled",
+                reason="provider cancelled the order before provisioning",
+            ),
+        )
         if server.state in (
             ServerLifecycleState.REQUESTED,
             ServerLifecycleState.PROVISIONING,
@@ -1275,6 +1398,8 @@ class OrderRecoveryService:
         audit_repo: AuditRepository,
         provider_registry: ProviderRegistry,
         clock: Callable[[], datetime] | None = None,
+        event_sink: BusinessEventSink | None = None,
+        user_repo: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -1286,6 +1411,8 @@ class OrderRecoveryService:
         self._audit = AuditTrail(audit_repo)
         self._registry = provider_registry
         self._now = clock or (lambda: datetime.now(UTC))
+        self._events = event_sink
+        self._users = user_repo
 
     async def recover(
         self, provider_key: str = "leaseweb", limit: int = 50
@@ -1421,6 +1548,20 @@ class OrderRecoveryService:
             metadata={"server_id": str(order.server_id)},
         )
         logger.error("leaseweb order %s escalated for manual review: %s", order.id, reason)
+        server = await self._servers.get(order.server_id)
+        await emit_safe(
+            self._events,
+            purchase_failed_event(
+                user=await _load_user(self._users, server.user_id) if server else None,
+                server_id=order.server_id,
+                order_id=order.id,
+                provider_key=server.provider_key if server else "",
+                provider_order_id=order.provider_order_id,
+                operation_key=order.operation_key,
+                category="recovery_escalated",
+                reason=reason,
+            ),
+        )
         return RecoveryOutcome.MARKED_FOR_REVIEW
 
     async def _capture_hold(self, order: ProviderOrder) -> None:
@@ -1496,6 +1637,8 @@ class OrderManualResolutionService:
         delivery_notifier: OrderDeliveryNotifier | None = None,
         settlement: OrderSettlementService | None = None,
         clock: Callable[[], datetime] | None = None,
+        event_sink: BusinessEventSink | None = None,
+        user_repo: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -1508,6 +1651,8 @@ class OrderManualResolutionService:
         self._audit = AuditTrail(audit_repo)
         self._registry = provider_registry
         self._delivery = delivery_notifier or _LoggingOrderDeliveryNotifier()
+        self._events = event_sink
+        self._users = user_repo
         self._settlement = settlement or OrderSettlementService(
             wallet_repo=wallet_repo,
             hold_repo=hold_repo,
@@ -1852,6 +1997,8 @@ class OrderManualResolutionService:
             audit_trail=self._audit,
             provider_registry=self._registry,
             delivery_notifier=self._delivery,
+            event_sink=self._events,
+            user_repo=self._users,
         )
         await activator.activate(
             server=server, order=order, offer=offer, vps_id=vps_id, ordering=ordering

@@ -41,6 +41,7 @@ from cloud_platform.modules.operations.domain import (
 )
 from cloud_platform.modules.orders.domain import OrderStatus, ProviderOrder, SettlementStatus
 from cloud_platform.modules.orders.service import (
+    OrderActivator,
     OrderReconciler,
     OrderRecoveryService,
     OrderWorker,
@@ -445,6 +446,8 @@ def _worker(
     ledger: FakeLedgerRepo | None = None,
     notifier: _RecordingNotifier | None = None,
     clock: Any = None,
+    event_sink: Any | None = None,
+    user_repo: Any | None = None,
 ) -> tuple[OrderWorker, dict[str, Any]]:
     ordering = ordering or FakeOrderingProvider()
     op_repo = op_repo or FakeOperationRepo()
@@ -473,6 +476,8 @@ def _worker(
         renewal_repo=renewal_repo,
         delivery_notifier=notifier,
         clock=clock,
+        event_sink=event_sink,
+        user_repo=user_repo,
     )
     deps = {
         "op_repo": op_repo,
@@ -486,6 +491,7 @@ def _worker(
         "ordering": ordering,
         "audit": audit_repo,
         "wallet_repo": wallet_repo,
+        "event_sink": event_sink,
     }
     return worker, deps
 
@@ -2292,3 +2298,173 @@ class TestManualVpsResolution:
         charges = [e for e in ledger.entries.values() if e.entry_type is LedgerEntryType.CHARGE]
         assert len(charges) == 1
         assert deps["ordering"].posts == []
+
+
+class _RecordingSink:
+    """Records enqueued business events (protocol-compatible sink double)."""
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.events: list[Any] = []
+        self._explode = explode
+
+    async def emit(self, event: Any) -> bool:
+        if self._explode:
+            raise RuntimeError("outbox is down")
+        self.events.append(event)
+        return True
+
+    def types(self) -> list[Any]:
+        return [e.event_type for e in self.events]
+
+    def of(self, event_type: Any) -> Any:
+        return next(e for e in self.events if e.event_type is event_type)
+
+
+class TestBusinessLogEmission:
+    """The order lifecycle is mirrored to the operator channel.
+
+    Acceptance, definitive failure, ambiguous outcome and provisioning are
+    all enqueued — never sent inline — so a Telegram outage cannot affect the
+    provider POST, the wallet capture or the reconciliation.
+    """
+
+    async def test_ambiguous_outcome_path_still_emits_failure(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        sink = _RecordingSink()
+        worker, deps = _worker(event_sink=sink)
+        # A provider error that cannot prove the POST was not transmitted.
+        deps["ordering"]._error = ProviderOutcomeUnknown("read timeout after send")
+        counts = await worker.process_pending()
+        assert counts.get("outcome_unknown") == 1
+        assert len(deps["ordering"].posts) == 1  # exactly ONE provider POST
+        payload = sink.of(BusinessEventType.PURCHASE_FAILED).payload
+        assert payload["category"] == "outcome_unknown"
+
+    async def test_accepted_order_enqueues_provider_accepted(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        sink = _RecordingSink()
+        worker, deps = _worker(event_sink=sink)
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        assert sink.types() == [BusinessEventType.PROVIDER_ACCEPTED]
+        assert len(deps["ordering"].posts) == 1  # emission changed nothing
+        payload = sink.of(BusinessEventType.PROVIDER_ACCEPTED).payload
+        # Provider cost, never the customer selling price.
+        assert payload["provider_cost"] == "9.99 EUR"
+        assert "selling_price" not in payload
+        assert payload["operation_key"].startswith("order-create:")
+
+    async def test_definitive_failure_enqueues_purchase_failed(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        sink = _RecordingSink()
+        worker, deps = _worker(event_sink=sink)
+        # No ordering port for the server's provider -> definitive failure
+        # BEFORE any provider call.
+        worker._registry = ProviderRegistry()
+        counts = await worker.process_pending()
+        assert counts.get("failed") == 1
+        assert deps["ordering"].posts == []
+        payload = sink.of(BusinessEventType.PURCHASE_FAILED).payload
+        assert payload["category"] == "provider_rejected"
+        assert payload["server_id"] == str(SERVER_ID)
+
+    async def test_provisioned_server_enqueues_vps_provisioned(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        sink = _RecordingSink()
+        ordering = FakeOrderingProvider(
+            ticket=ProvisioningTicket(provider_order_id="LS-ORD-1", state="active")
+        )
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        server = _server(ServerLifecycleState.PROVISIONING)
+        server.provider_server_id = "vps-1"
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        activator = OrderActivator(
+            server_repo=FakeServerRepo(server),
+            offers_repo=FakeOfferRepo(),
+            orders_repo=FakeOrdersRepo(order),
+            renewal_repo=FakeRenewalRepo(),
+            audit_trail=AuditTrail(FakeAuditRepo()),
+            provider_registry=registry,
+            delivery_notifier=_RecordingNotifier(),
+            event_sink=sink,
+            user_repo=None,
+        )
+        await activator.activate(
+            server=server,
+            order=order,
+            offer=_offer(),
+            vps_id="vps-1",
+            ordering=ordering,
+        )
+        payload = sink.of(BusinessEventType.VPS_PROVISIONED).payload
+        assert payload["server_id"] == str(SERVER_ID)
+        assert payload["state"] == "running"
+        assert "password" not in str(payload)
+        assert order.status is OrderStatus.ACTIVE
+
+    async def test_broken_sink_does_not_block_activation(self) -> None:
+        ordering = FakeOrderingProvider(
+            ticket=ProvisioningTicket(provider_order_id="LS-ORD-1", state="active")
+        )
+        registry = ProviderRegistry()
+        registry.register(ordering)
+        server = _server(ServerLifecycleState.PROVISIONING)
+        order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        notifier = _RecordingNotifier()
+        activator = OrderActivator(
+            server_repo=FakeServerRepo(server),
+            offers_repo=FakeOfferRepo(),
+            orders_repo=FakeOrdersRepo(order),
+            renewal_repo=FakeRenewalRepo(),
+            audit_trail=AuditTrail(FakeAuditRepo()),
+            provider_registry=registry,
+            delivery_notifier=notifier,
+            event_sink=_RecordingSink(explode=True),
+            user_repo=None,
+        )
+        await activator.activate(
+            server=server, order=order, offer=_offer(), vps_id="vps-1", ordering=ordering
+        )
+        assert order.status is OrderStatus.ACTIVE
+        assert notifier.deliveries  # the customer still got the details
+
+    async def test_broken_sink_never_changes_the_outcome(self) -> None:
+        worker, deps = _worker(event_sink=_RecordingSink(explode=True))
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        assert len(deps["ordering"].posts) == 1
+
+    async def test_worker_uses_the_user_repo_for_identity(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        sink = _RecordingSink()
+
+        class _Users:
+            async def get(self, user_id: UUID) -> Any:
+                return type("U", (), {"id": user_id, "telegram_user_id": 99, "username": "cust"})()
+
+        worker, _deps = _worker(event_sink=sink, user_repo=_Users())
+        await worker.process_pending()
+        payload = sink.of(BusinessEventType.PROVIDER_ACCEPTED).payload
+        assert payload["telegram_user_id"] == 99
+        assert payload["username"] == "cust"
+
+    async def test_failing_user_lookup_still_emits(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        sink = _RecordingSink()
+
+        class _BrokenUsers:
+            async def get(self, user_id: UUID) -> Any:
+                raise RuntimeError("user store down")
+
+        worker, _deps = _worker(event_sink=sink, user_repo=_BrokenUsers())
+        counts = await worker.process_pending()
+        assert counts.get("submitted") == 1
+        payload = sink.of(BusinessEventType.PROVIDER_ACCEPTED).payload
+        assert "telegram_user_id" not in payload

@@ -50,6 +50,7 @@ def fakes() -> dict[str, Any]:
     ui.handle = AsyncMock(return_value=SCREEN)
     monthly_ui = MagicMock(spec=MonthlyBotUi)
     monthly_ui.handle = AsyncMock(return_value=None)
+    monthly_ui.menu_screen = MagicMock(return_value=SCREEN)
     return {"container": container, "ui": ui, "monthly_ui": monthly_ui}
 
 
@@ -88,7 +89,8 @@ def test_menu_command_renders_menu(
     _dispatch(dp, Update(update_id=2, message=_message("/menu", user_id=42)))
     _patch_outgoing["answer"].assert_awaited_once()
     assert _patch_outgoing["answer"].await_args.args[0] == "screen"
-    fakes["ui"].menu_screen.assert_called_once()
+    # The customer menu is the storefront's (market selector first).
+    fakes["monthly_ui"].menu_screen.assert_called_once()
 
 
 def test_help_command_answers(

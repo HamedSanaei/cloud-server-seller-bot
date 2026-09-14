@@ -23,6 +23,7 @@ marked ERROR — a failed command never leaves an orphaned reservation.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -30,6 +31,8 @@ from uuid import UUID, uuid4
 from cloud_platform.core.config import get_settings
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.events import purchase_requested_event
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_PREPAID_MONTHLY,
     CloudServer,
@@ -37,6 +40,12 @@ from cloud_platform.modules.compute.domain import (
     ServerCreateIntent,
     ServerLifecycleState,
     ServerRepository,
+)
+from cloud_platform.modules.markets.domain import (
+    MARKET_ORDER,
+    ProviderCatalog,
+    UnknownMarketError,
+    parse_market,
 )
 from cloud_platform.modules.offers.domain import (
     SellableOffer,
@@ -62,7 +71,9 @@ from cloud_platform.providers.registry import ProviderRegistry
 
 logger = logging.getLogger(__name__)
 
-#: Provider key the MVP sells through (single-provider vertical slice).
+#: Provider key of the monthly VPS vertical slice. It is only a DEFAULT for
+#: legacy single-provider call sites — the storefront and checkout are
+#: provider-neutral and carry the provider key from the offer itself.
 MVP_PROVIDER_KEY = "leaseweb"
 
 RESOURCE_TYPE_SERVER_ORDER = "server_order"
@@ -132,6 +143,8 @@ class MonthlyCheckoutService:
         operation_repo: OperationRepository,
         audit_repo: AuditRepository,
         provider_registry: ProviderRegistry,
+        event_sink: BusinessEventSink | None = None,
+        event_market_lookup: Callable[[str], str] | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -142,6 +155,8 @@ class MonthlyCheckoutService:
         self._ops = operation_repo
         self._audit = AuditTrail(audit_repo)
         self._registry = provider_registry
+        self._events = event_sink
+        self._market_of = event_market_lookup or (lambda _key: "")
 
     async def _ordering_provider(self, provider_key: str) -> OrderingProvider:
         try:
@@ -326,6 +341,25 @@ class MonthlyCheckoutService:
             os_name,
             hold.id,
         )
+        # Operator channel: the customer confirmed a purchase and a durable
+        # intent exists (server + order + operation + hold). Enqueued only —
+        # delivery happens in the worker, never inline.
+        await emit_safe(
+            self._events,
+            purchase_requested_event(
+                user=user,
+                server_id=created.id,
+                order_id=order.id,
+                provider_key=offer.provider_key,
+                market=self._market_of(offer.provider_key),
+                location_id=offer.location_id,
+                plan_name=offer.name,
+                product_id=offer.product_id,
+                os_name=os_name,
+                selling_price_minor=offer.selling_price_minor,
+                currency=offer.selling_currency,
+            ),
+        )
         return MonthlyCheckoutResult(
             server=created, order=order, hold=hold, offer=offer, replayed=False
         )
@@ -400,11 +434,53 @@ class OfferConfirmView:
     cancel_callback: str
 
 
+@dataclass(frozen=True, slots=True)
+class MarketOptionView:
+    """One market button (``🇮🇷 سرور ایران`` / ``🌍 سرور خارج``)."""
+
+    market: str
+    label_key: str
+    title_key: str
+    select_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderOptionView:
+    """One provider row of the storefront (customer-facing name only)."""
+
+    provider_key: str
+    market: str
+    display_name: str
+    buyable: bool
+    offer_count: int
+    select_callback: str | None  # None when the provider cannot sell yet
+
+
+@dataclass(frozen=True, slots=True)
+class LocationOptionView:
+    """One location button of a provider."""
+
+    location_id: str
+    offer_count: int
+    select_callback: str
+
+
 class OfferCatalogViewService:
     """Builds the customer screens of the monthly purchase flow.
 
     Every screen re-reads the offer price book — an offer that stops being
     sellable between screens simply disappears/errors instead of being sold.
+
+    Navigation is provider-neutral and market-first::
+
+        store.market -> store.providers:{market} -> store.locations:{provider}
+        -> store.plans:{provider}:{location} -> store.os:{offer}
+        -> store.confirm:{offer}:{os_index} -> store.buy:{offer}:{os_index}
+
+    Which providers appear under a market comes from the operator
+    configuration (``ProviderCatalog``); whether one can actually SELL comes
+    from the provider port itself (``ordering_support_of``). Neither the
+    domain nor this service contains a concrete provider name.
     """
 
     def __init__(
@@ -413,6 +489,7 @@ class OfferCatalogViewService:
         provider_registry: ProviderRegistry,
         wallet_repo: WalletRepository,
         signing_key: str,
+        market_catalog: ProviderCatalog | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
@@ -420,6 +497,95 @@ class OfferCatalogViewService:
         self._registry = provider_registry
         self._wallets = wallet_repo
         self._signing_key = signing_key
+        self._markets = market_catalog or ProviderCatalog()
+
+    # -- storefront: markets / providers / locations -----------------------
+
+    def _store_callback(self, screen: str, *args: str) -> str:
+        from cloud_platform.modules.navigation.domain import Callback, encode_callback
+
+        return encode_callback(Callback(flow="store", screen=screen, args=args), self._signing_key)
+
+    def markets_screen(self) -> list[MarketOptionView]:
+        """The two markets the customer chooses between (always both)."""
+        return [
+            MarketOptionView(
+                market=market.value,
+                label_key=market.label_key,
+                title_key=market.title_key,
+                select_callback=self._store_callback("providers", market.value),
+            )
+            for market in MARKET_ORDER
+        ]
+
+    def provider_display_name(self, provider_key: str) -> str:
+        """Customer-facing provider name from configuration (never the key)."""
+        return self._markets.display_name_of(provider_key)
+
+    def _ordering_capable(self, provider_key: str) -> bool:
+        """Whether the provider currently implements the ordering port."""
+        try:
+            provider = self._registry.get(provider_key)
+        except KeyError:
+            return False
+        return ordering_support_of(provider) is not None
+
+    async def providers_screen(self, market: str) -> tuple[list[ProviderOptionView], str]:
+        """Providers of one market that have sellable offers (+ back callback)."""
+        try:
+            wanted = parse_market(market)
+        except UnknownMarketError as exc:
+            raise OfferUnavailableError(str(exc)) from exc
+        counts: dict[str, int] = {}
+        order: list[str] = []
+        for offer in await self._offers.list_sellable():
+            provider_key = offer.provider_key
+            if not offer.sellable:
+                continue
+            if self._markets.market_of(provider_key) is not wanted:
+                continue
+            if not self._markets.is_enabled(provider_key):
+                continue
+            counts[provider_key] = counts.get(provider_key, 0) + 1
+            order.append(provider_key)
+        views: list[ProviderOptionView] = []
+        for provider_key in dict.fromkeys(order):
+            capable = self._ordering_capable(provider_key)
+            views.append(
+                ProviderOptionView(
+                    provider_key=provider_key,
+                    market=wanted.value,
+                    display_name=self._markets.display_name_of(provider_key),
+                    buyable=capable,
+                    offer_count=counts[provider_key],
+                    select_callback=(
+                        self._store_callback("locations", provider_key) if capable else None
+                    ),
+                )
+            )
+        return views, self._store_callback("market")
+
+    async def locations_screen(
+        self, provider_key: str
+    ) -> tuple[list[LocationOptionView], str, str]:
+        """Locations of one provider with sellable offers (+ back, cancel)."""
+        counts: dict[str, int] = {}
+        for offer in await self._offers.list_sellable(provider_key):
+            counts[offer.location_id] = counts.get(offer.location_id, 0) + 1
+        if not counts:
+            raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
+        views = [
+            LocationOptionView(
+                location_id=location_id,
+                offer_count=count,
+                select_callback=self._store_callback("plans", provider_key, location_id),
+            )
+            for location_id, count in sorted(counts.items())
+        ]
+        market = self._markets.market_of(provider_key)
+        back = self._store_callback("providers", market.value if market else "")
+        cancel = self._store_callback("market")
+        return views, back, cancel
 
     @staticmethod
     def _view(offer: SellableOffer) -> OfferCatalogView:
@@ -463,12 +629,8 @@ class OfferCatalogViewService:
         ]
 
     def _os_select_callback(self, offer_id: UUID, index: int) -> str:
-        from cloud_platform.modules.navigation.domain import Callback, encode_callback
-
-        return encode_callback(
-            Callback(flow="offers", screen="os", args=(str(offer_id), str(index))),
-            self._signing_key,
-        )
+        """The signed callback that SELECTING this OS leads to (confirm)."""
+        return self._store_callback("confirm", str(offer_id), str(index))
 
     async def os_by_index(self, offer: SellableOffer, index: int) -> str:
         """Resolve a callback-encoded OS index back to its name (re-validated)."""
@@ -497,16 +659,9 @@ class OfferCatalogViewService:
         wallet = await self._wallets.get(user_id)
         balance = wallet.balance if wallet is not None else 0
 
-        from cloud_platform.modules.navigation.domain import Callback, encode_callback
-
-        args = (str(offer_id), str(os_index))
-        confirm_callback = encode_callback(
-            Callback(flow="offers", screen="confirm", args=args), self._signing_key
-        )
-        back_callback = encode_callback(
-            Callback(flow="offers", screen="os", args=args), self._signing_key
-        )
-        cancel_callback = encode_callback(Callback(flow="main", screen="menu"), self._signing_key)
+        confirm_callback = self._store_callback("buy", str(offer_id), str(os_index))
+        back_callback = self._store_callback("os", str(offer_id))
+        cancel_callback = self._store_callback("market")
         return OfferConfirmView(
             offer=self._view(offer),
             os_name=os_name,
@@ -531,37 +686,31 @@ class OfferCatalogViewService:
         if not options:
             raise OsUnavailableError(f"no free OS options for {offer.ref}")
 
-        from cloud_platform.modules.navigation.domain import Callback, encode_callback
-
-        back_callback = encode_callback(
-            Callback(flow="offers", screen="plans", args=(str(offer_id),)),
-            self._signing_key,
-        )
-        cancel_callback = encode_callback(Callback(flow="main", screen="menu"), self._signing_key)
+        back_callback = self._store_callback("plans", offer.provider_key, offer.location_id)
+        cancel_callback = self._store_callback("market")
         return self._view(offer), options, back_callback, cancel_callback
 
-    async def plans_screen(self, location_id: str) -> tuple[list[OfferCatalogView], str, str]:
-        """The plans screen data for one location (sellable offers only)."""
+    async def plans_screen(
+        self, location_id: str, provider_key: str | None = None
+    ) -> tuple[list[OfferCatalogView], str, str]:
+        """The plans screen data for one location (sellable offers only).
+
+        ``provider_key`` scopes the location to one provider (the storefront
+        always passes it); omitting it keeps the legacy single-location
+        behaviour for callers that predate the market selector.
+        """
         offers = [
             o
-            for o in await self._offers.list_sellable(MVP_PROVIDER_KEY)
-            if o.location_id == location_id
+            for o in await self._offers.list_sellable(provider_key)
+            if o.location_id == location_id and o.sellable
         ]
         if not offers:
             raise OfferUnavailableError(f"no sellable offers at {location_id}")
-        from cloud_platform.modules.navigation.domain import Callback, encode_callback
-
-        back_callback = encode_callback(
-            Callback(flow="offers", screen="locations", args=(location_id,)),
-            self._signing_key,
-        )
-        cancel_callback = encode_callback(Callback(flow="main", screen="menu"), self._signing_key)
+        resolved_provider = provider_key or offers[0].provider_key
+        back_callback = self._store_callback("locations", resolved_provider)
+        cancel_callback = self._store_callback("market")
         views = [self._view(o) for o in sorted(offers, key=lambda o: o.name)]
         return views, back_callback, cancel_callback
 
     def plan_callback(self, offer_id: UUID) -> str:
-        from cloud_platform.modules.navigation.domain import Callback, encode_callback
-
-        return encode_callback(
-            Callback(flow="offers", screen="plans", args=(str(offer_id),)), self._signing_key
-        )
+        return self._store_callback("os", str(offer_id))

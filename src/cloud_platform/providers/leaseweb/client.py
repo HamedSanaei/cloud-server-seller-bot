@@ -14,23 +14,27 @@ Public Cloud v1 API (``https://api.leaseweb.com``), per
   the deterministic server name; delete treats 404 as success.
 - Errors map onto the platform error hierarchy with the
   ``{errorCode, errorMessage, correlationId}`` shape parsed defensively.
-- A conservative client-side throttle (default 10 rps, configurable) plus
-  ``Retry-After`` handling on 429.
+- The HTTP transport is the ONE shared
+  :class:`~cloud_platform.providers.leaseweb.transport.LeasewebTransport`
+  (LEASEWEB-VPS-API §5): it owns the base URL, auth header, timeouts,
+  429/``Retry-After`` handling, structured error mapping, redaction and the
+  conservative client-side throttle (default 10 rps, configurable).
 - The key never appears in errors, logs, or metric labels; error text passes
   through the shared redaction discipline.
+
+The mapping from Public Cloud JSON to ``ProviderServer`` stays deliberately
+tolerant (dict-based): this is a provider-neutral read path that must keep
+working across provider schema variance. The strict, typed Leaseweb contract
+lives in the ordering/orders/VPS API clients.
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from cloud_platform.core.idempotency import IdempotencyKey
-from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
     Capability,
     CreateServerRequest,
@@ -40,14 +44,28 @@ from cloud_platform.providers.base import (
     ProviderServer,
 )
 from cloud_platform.providers.credentials import CredentialSource
-from cloud_platform.providers.errors import (
-    ProviderAuthError,
-    ProviderConflict,
-    ProviderError,
-    ProviderNotFound,
-    ProviderRateLimited,
-    ProviderUnavailable,
+from cloud_platform.providers.errors import ProviderError, ProviderNotFound
+from cloud_platform.providers.leaseweb.errors import (
+    error_for_response,
+    parse_error_payload,
+    redact_sensitive,
 )
+from cloud_platform.providers.leaseweb.transport import (
+    DEFAULT_BASE_URL,
+    DEFAULT_TIMEOUT_SECONDS,
+    LeasewebTransport,
+    Throttle,
+    operation_label,
+    parse_retry_after,
+)
+
+__all__ = [
+    "LEASEWEBCLOUD_CAPABILITIES",
+    "LeaseWebProvider",
+    "LeasewebCloudProvider",
+    "Throttle",
+    "normalize_provider_status",
+]
 
 #: Phase-1 advertised capabilities (docs/leaseweb/INTEGRATION_NOTES.md).
 #: COMPUTE + POWER is the sellable minimum (create/delete/power + catalog +
@@ -93,44 +111,24 @@ def normalize_provider_status(status: str) -> str:
     return _STATUS_MAP.get(status.strip().lower(), status.strip().lower())
 
 
-@dataclass(slots=False)
-class Throttle:
-    """A conservative client-side request throttle (max requests/second).
-
-    Leaseweb documents no numeric limits at capture time, so the client
-    enforces its own ceiling by construction. ``wait`` is injectable for
-    tests (no real sleeping).
-    """
-
-    max_rps: float = 10.0
-    wait: Any = asyncio.sleep
-
-    def __post_init__(self) -> None:
-        if self.max_rps <= 0:
-            raise ValueError("max_rps must be > 0")
-        self._last = 0.0
-        self._lock = asyncio.Lock()
-
-    async def acquire(self, now: Any = time.monotonic) -> None:
-        async with self._lock:
-            interval = 1.0 / self.max_rps
-            wait_time = self._last + interval - now()
-            if wait_time > 0:
-                await self.wait(wait_time)
-            self._last = now()
-
-
 def _error_payload(response: httpx.Response) -> str:
-    """The ``errorMessage`` (then ``errorCode``), parsed defensively."""
+    """The ``errorMessage`` (then ``errorCode``), parsed defensively.
+
+    Legacy public entry point kept for back-compat (imported by other
+    Leaseweb modules and tests). The text is scrubbed through the shared
+    redaction discipline: a provider payload may echo a request body.
+    """
     try:
         payload = response.json()
     except Exception:
-        return response.text[:200] or f"HTTP {response.status_code}"
+        text = redact_sensitive((response.text or "").strip())[:200]
+        return text or f"HTTP {response.status_code}"
     if not isinstance(payload, dict):
-        return response.text[:200] or f"HTTP {response.status_code}"
+        text = redact_sensitive((response.text or "").strip())[:200]
+        return text or f"HTTP {response.status_code}"
     message = payload.get("errorMessage")
     if isinstance(message, str) and message.strip():
-        return message.strip()[:200]
+        return redact_sensitive(message.strip())[:200]
     code = payload.get("errorCode")
     if code is not None and str(code).strip():
         return f"leaseweb error {code}".strip()[:200]
@@ -138,7 +136,7 @@ def _error_payload(response: httpx.Response) -> str:
     if isinstance(errors, list):
         for row in errors:
             if isinstance(row, str) and row.strip():
-                return row.strip()[:200]
+                return redact_sensitive(row.strip())[:200]
     return f"HTTP {response.status_code}"
 
 
@@ -154,6 +152,16 @@ def _as_list(payload: Any, *keys: str) -> list[Any]:
     return []
 
 
+def _operation_label(method: str, path: str) -> str:
+    """Bounded endpoint-shape label for metrics (see the transport)."""
+    return operation_label(method, path)
+
+
+def _parse_retry_after(value: str | None) -> int | None:
+    """Parse a ``Retry-After`` header (back-compat alias)."""
+    return parse_retry_after(value)
+
+
 class LeaseWebProvider:
     """Leaseweb Public Cloud adapter (provider-neutral ``CloudProvider`` port)."""
 
@@ -163,39 +171,38 @@ class LeaseWebProvider:
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://api.leaseweb.com",
+        base_url: str = DEFAULT_BASE_URL,
         region: str = "",
         throttle: Throttle | None = None,
         max_retries: int = 3,
         credential_source: CredentialSource | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        if not api_key:
-            raise ValueError("api_key must not be empty")
-        if max_retries < 0:
-            raise ValueError("max_retries must be >= 0")
-        if credential_source is not None:
-            # Runtime-rotatable (M10-008): the auth header is set per
-            # request from the source; api_key is only the initial value.
-            default_headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        else:
-            # Contract: plain key in the X-LSW-Auth header - NO Bearer prefix.
-            default_headers = {
-                "X-LSW-Auth": api_key,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-        self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            headers=default_headers,
-            timeout=httpx.Timeout(30.0),
+        self._transport = LeasewebTransport(
+            api_key,
+            base_url,
+            timeout_seconds=timeout_seconds,
+            throttle=throttle,
+            max_retries=max_retries,
+            credential_source=credential_source,
+            provider_key=self.key,
         )
         self._credential_source = credential_source
         self._region = region
-        self._throttle = throttle or Throttle()
+        self._throttle = self._transport.throttle
         self._max_retries = max_retries
 
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        """The ONE transport's HTTP client (patched by tests)."""
+        return self._transport.client
+
+    @_client.setter
+    def _client(self, client: httpx.AsyncClient) -> None:
+        self._transport.set_client(client)
+
     async def close(self) -> None:
-        await self._client.aclose()
+        await self._transport.aclose()
 
     # ------------------------------------------------------------------
     # Catalog reads
@@ -341,7 +348,7 @@ class LeaseWebProvider:
         The candidate is sent only for this one request; the live key (if
         any) is untouched.
         """
-        response = await self._client.request(
+        response = await self._transport.request_raw(
             "GET", "/publicCloud/v1/regions", headers={"X-LSW-Auth": candidate}
         )
         self._raise_for_status(response)
@@ -418,53 +425,23 @@ class LeaseWebProvider:
     # ------------------------------------------------------------------
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        operation = _operation_label(method, path)
-        async with metrics.provider_call(self.key, operation):
-            return await self._perform_request(method, path, **kwargs)
+        """Perform one request through the shared Leaseweb transport.
 
-    async def _perform_request(self, method: str, path: str, **kwargs: Any) -> Any:
-        if self._credential_source is not None and "headers" not in kwargs:
-            credential = await self._credential_source.get()
-            kwargs["headers"] = {"X-LSW-Auth": credential.value}
-        attempt = 0
-        while True:
-            await self._throttle.acquire()
-            try:
-                response = await self._client.request(method, path, **kwargs)
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                raise ProviderUnavailable(str(exc)) from exc
-
-            if response.status_code != 429 or attempt >= self._max_retries:
-                break
-            retry_after = response.headers.get("Retry-After")
-            delay = _parse_retry_after(retry_after)
-            if delay is None:
-                delay = 0.5 * (2**attempt)
-            await self._throttle.wait(min(delay, 30.0))
-            attempt += 1
-
-        assert response is not None
-        return self._raise_for_status(response)
+        Public Cloud calls keep the historical read classification (this
+        adapter's create path is guarded by a get-before-create match on a
+        client-chosen name, so a transport failure stays retryable).
+        """
+        return await self._transport.request(method, path, **kwargs)
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> Any:
-        message = _error_payload(response)
-        if response.status_code in (401, 403):
-            raise ProviderAuthError(message)
-        if response.status_code == 404:
-            raise ProviderNotFound(message)
-        if response.status_code in (409, 423) or "already" in message.lower():
-            raise ProviderConflict(message)
-        if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            raise ProviderRateLimited(message, _parse_retry_after(retry_after))
-        if response.status_code >= 500:
-            raise ProviderUnavailable(message)
-        if response.is_error:
-            raise ProviderError(message)
-        if response.status_code == 204 or not response.content:
-            return {}
-        return response.json()
+        """Map a raw response onto the Leaseweb error hierarchy (read path)."""
+        if response.is_success:
+            if response.status_code == 204 or not response.content:
+                return {}
+            return response.json()
+        payload = parse_error_payload(response)
+        raise error_for_response(payload)
 
     def _map_server(self, item: dict[str, Any]) -> ProviderServer:
         raw_id = str(item.get("id") or "")
@@ -520,32 +497,6 @@ def _memory_mb(item: dict[str, Any], resources: dict[str, Any]) -> int:
             except ValueError:
                 continue
     return 0
-
-
-def _operation_label(method: str, path: str) -> str:
-    """Bounded endpoint-shape label for metrics: UUID segments become ``{id}``."""
-    shaped = []
-    for segment in path.split("?")[0].strip("/").split("/"):
-        if len(segment) > 20 or _looks_like_uuid(segment):
-            shaped.append("{id}")
-        else:
-            shaped.append(segment)
-    return f"{method} /{'/'.join(shaped)}"
-
-
-def _looks_like_uuid(segment: str) -> bool:
-    parts = segment.split("-")
-    hexdigits = set("0123456789abcdefABCDEF")
-    return len(parts) == 5 and all(p and all(c in hexdigits for c in p) for p in parts)
-
-
-def _parse_retry_after(value: str | None) -> int | None:
-    if not value:
-        return None
-    try:
-        return max(0, int(float(value)))
-    except ValueError:
-        return None
 
 
 # Back-compat alias: both spellings resolve to the same adapter so callers

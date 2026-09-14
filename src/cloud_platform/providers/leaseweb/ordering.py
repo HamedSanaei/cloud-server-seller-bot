@@ -60,13 +60,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-import httpx
-
 from cloud_platform.core.idempotency import IdempotencyKey
-from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
     Capability,
     CreateServerRequest,
@@ -81,24 +78,47 @@ from cloud_platform.providers.base import (
 )
 from cloud_platform.providers.credentials import CredentialSource
 from cloud_platform.providers.errors import (
-    ProviderAuthError,
-    ProviderConflict,
     ProviderError,
     ProviderNotFound,
-    ProviderOutcomeUnknown,
-    ProviderRateLimited,
-    ProviderUnavailable,
 )
 from cloud_platform.providers.leaseweb.client import (
-    Throttle,
     _as_list,
-    _error_payload,
-    _operation_label,
-    _parse_retry_after,
     normalize_provider_status,
 )
+from cloud_platform.providers.leaseweb.errors import (
+    LeasewebAmbiguousMutationError,
+    error_for_response,
+    parse_error_payload,
+)
+from cloud_platform.providers.leaseweb.models import to_minor_units
+from cloud_platform.providers.leaseweb.ordering_api import LeaseWebOrderingApi
+from cloud_platform.providers.leaseweb.orders_api import LeaseWebAccountOrdersApi
+from cloud_platform.providers.leaseweb.transport import (
+    DEFAULT_BASE_URL,
+    DEFAULT_TIMEOUT_SECONDS,
+    LeasewebTransport,
+    MutationOutcome,
+    Throttle,
+    classify_transport_error,
+)
+from cloud_platform.providers.leaseweb.vps.client import LeaseWebVpsApi
+from cloud_platform.providers.leaseweb.vps.management import LeaseWebVpsManagementMixin
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "DEFAULT_BILLING_CYCLE",
+    "DEFAULT_CONTRACT_TERM",
+    "LEASEWEB_ORDERING_CAPABILITIES",
+    "LOCATION_DISPLAY",
+    "LeaseWebOrderingProvider",
+    "LeasewebOrderingProvider",
+    "LeasewebProduct",
+    "LeasewebProductDetail",
+    "LeasewebProductOption",
+    "VpsMatchAmbiguous",
+    "to_minor_units",
+]
 
 #: Advertised capabilities: COMPUTE (order + manage) and POWER (start/stop/
 #: reboot). Delete/rebuild/snapshot are NOT advertised: the current VPS API
@@ -162,11 +182,6 @@ def _decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
         return None
-
-
-def to_minor_units(value: Decimal) -> int:
-    """Decimal major units -> integer minor units, half-up."""
-    return int((value * Decimal(100)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _minor(value: Any) -> int:
@@ -292,8 +307,16 @@ def _term_totals(price: dict[str, Any]) -> dict[str, int]:
     return out
 
 
-class LeaseWebOrderingProvider(OrderingProvider):
-    """Leaseweb ordering-VPS adapter (provider key ``leaseweb``)."""
+class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
+    """Leaseweb ordering-VPS adapter (provider key ``leaseweb``).
+
+    Implements the provider-neutral ``OrderingProvider`` port plus the
+    provider-neutral VPS management ports from
+    :mod:`cloud_platform.providers.vps_ports` (inventory, power, console, ISO,
+    reinstall, IPs, snapshots, metrics, monitoring, credentials,
+    notifications) by delegating to the typed modern-VPS client. Application
+    code therefore never constructs a Leaseweb URL.
+    """
 
     key = "leaseweb"
     capabilities = LEASEWEB_ORDERING_CAPABILITIES
@@ -301,7 +324,7 @@ class LeaseWebOrderingProvider(OrderingProvider):
     def __init__(
         self,
         api_key: str,
-        base_url: str = "https://api.leaseweb.com",
+        base_url: str = DEFAULT_BASE_URL,
         locations: tuple[str, ...] = ("AMS-01", "FRA-01"),
         contract_term: str = DEFAULT_CONTRACT_TERM,
         billing_cycle: str = DEFAULT_BILLING_CYCLE,
@@ -310,6 +333,7 @@ class LeaseWebOrderingProvider(OrderingProvider):
         throttle: Throttle | None = None,
         max_retries: int = 3,
         credential_source: CredentialSource | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
@@ -317,18 +341,16 @@ class LeaseWebOrderingProvider(OrderingProvider):
             raise ValueError("locations must not be empty")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
-        if credential_source is not None:
-            default_headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        else:
-            default_headers = {
-                "X-LSW-Auth": api_key,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-        self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            headers=default_headers,
-            timeout=httpx.Timeout(30.0),
+        # ONE shared transport for the whole Leaseweb integration (ordering,
+        # account orders and the VPS API all speak through it).
+        self._transport = LeasewebTransport(
+            api_key,
+            base_url,
+            timeout_seconds=timeout_seconds,
+            throttle=throttle,
+            max_retries=max_retries,
+            credential_source=credential_source,
+            provider_key=self.key,
         )
         self._credential_source = credential_source
         self._locations = tuple(locations)
@@ -336,11 +358,44 @@ class LeaseWebOrderingProvider(OrderingProvider):
         self._billing_cycle = billing_cycle
         self._os_allowlist = tuple(os_allowlist)
         self._order_os_only_free = order_os_only_free
-        self._throttle = throttle or Throttle()
+        self._throttle = self._transport.throttle
         self._max_retries = max_retries
+        #: Typed API surfaces built on the same transport (LEASEWEB-VPS-API):
+        #: application/CLI code uses these instead of building URLs.
+        self._ordering_api = LeaseWebOrderingApi(self._transport)
+        self._orders_api = LeaseWebAccountOrdersApi(self._transport)
+        self._vps_api = LeaseWebVpsApi(self._transport)
+
+    @property
+    def _client(self) -> Any:
+        """The ONE transport's HTTP client (patched by tests)."""
+        return self._transport.client
+
+    @_client.setter
+    def _client(self, client: Any) -> None:
+        self._transport.set_client(client)
+
+    # ------------------------------------------------------------------
+    # Typed API surfaces (URLs never leave this provider package)
+    # ------------------------------------------------------------------
+
+    @property
+    def ordering_api(self) -> LeaseWebOrderingApi:
+        """Typed ordering-catalog client (list/detail/billable order)."""
+        return self._ordering_api
+
+    @property
+    def orders_api(self) -> LeaseWebAccountOrdersApi:
+        """Typed READ-ONLY account-orders client."""
+        return self._orders_api
+
+    @property
+    def vps_api(self) -> LeaseWebVpsApi:
+        """Typed modern-VPS API client (38 documented operations)."""
+        return self._vps_api
 
     async def close(self) -> None:
-        await self._client.aclose()
+        await self._transport.aclose()
 
     # ------------------------------------------------------------------
     # CloudProvider read port (ordering catalog)
@@ -566,12 +621,12 @@ class LeaseWebOrderingProvider(OrderingProvider):
             mutating=True,
         )
         if not isinstance(payload, dict):
-            raise ProviderOutcomeUnknown(
+            raise LeasewebAmbiguousMutationError(
                 "leaseweb order POST returned an unexpected payload; outcome unknown"
             )
         order_id = payload.get("orderId")
         if order_id is None:
-            raise ProviderOutcomeUnknown(
+            raise LeasewebAmbiguousMutationError(
                 "leaseweb order POST response is missing orderId; outcome unknown"
             )
         return ProvisioningTicket(
@@ -937,8 +992,13 @@ class LeaseWebOrderingProvider(OrderingProvider):
         await self._request("POST", f"/publicCloud/v1/vps/{provider_server_id}/reboot")
 
     async def verify_credential(self, candidate: str) -> None:
-        """Read-only connectivity check with a CANDIDATE key."""
-        response = await self._client.request(
+        """Read-only connectivity check with a CANDIDATE key.
+
+        The candidate is sent only for this one request through the shared
+        transport; the live credential is untouched and neither value is
+        ever logged.
+        """
+        response = await self._transport.request_raw(
             "GET",
             "/ordering/v1/products/vps",
             params={"location": self._locations[0], "limit": 1},
@@ -953,81 +1013,43 @@ class LeaseWebOrderingProvider(OrderingProvider):
     async def _request(
         self, method: str, path: str, *, mutating: bool = False, **kwargs: Any
     ) -> Any:
-        operation = _operation_label(method, path)
-        async with metrics.provider_call(self.key, operation):
-            return await self._perform_request(method, path, mutating=mutating, **kwargs)
+        """One request through the ONE shared Leaseweb transport.
 
-    async def _perform_request(
-        self, method: str, path: str, *, mutating: bool = False, **kwargs: Any
-    ) -> Any:
-        if self._credential_source is not None and "headers" not in kwargs:
-            credential = await self._credential_source.get()
-            kwargs["headers"] = {"X-LSW-Auth": credential.value}
-        attempt = 0
-        while True:
-            await self._throttle.acquire()
-            try:
-                response = await self._client.request(method, path, **kwargs)
-            except httpx.TransportError as exc:
-                # TransportError covers TimeoutException, NetworkError AND
-                # RemoteProtocolError (connection dropped mid-stream).
-                if mutating and _ambiguous_transport_error(exc):
-                    # The request may have reached Leaseweb: the outcome of
-                    # a billable POST is UNKNOWN. Never re-send blindly.
-                    raise ProviderOutcomeUnknown(
-                        f"leaseweb POST outcome unknown after transport error: {exc}"
-                    ) from exc
-                raise ProviderUnavailable(str(exc)) from exc
-            if response.status_code != 429 or attempt >= self._max_retries or mutating:
-                break
-            # Read-only requests may honor the rate-limit pause in-adapter;
-            # a billable POST is never re-sent inside the adapter: a mutating
-            # 429 is classified conservatively as an unknown outcome (the
-            # Leaseweb contract does not state that a 429 guarantees the
-            # request was NOT processed).
-            retry_after = response.headers.get("Retry-After")
-            delay = _parse_retry_after(retry_after)
-            if delay is None:
-                delay = 0.5 * (2**attempt)
-            await self._throttle.wait(min(delay, 30.0))
-            attempt += 1
-        return self._raise_for_status(response, mutating=mutating)
+        The transport owns metrics instrumentation, throttling, credential
+        resolution, bounded read retries, structured error mapping and the
+        conservative mutation-outcome classification (see
+        :class:`~cloud_platform.providers.leaseweb.transport.LeasewebTransport`).
+
+        Read-only requests may be retried on a 429 after the documented
+        pause. A MUTATING request is never re-sent here: a mutating 429, a
+        5xx after transmission or a mid-flight transport failure all raise
+        ``ProviderOutcomeUnknown`` (this adapter only ever mutates the
+        billable order POST).
+        """
+        return await self._transport.request(method, path, mutating=mutating, **kwargs)
 
     @staticmethod
-    def _raise_for_status(response: httpx.Response, *, mutating: bool = False) -> Any:
-        message = _error_payload(response)
-        if response.status_code in (401, 403):
-            raise ProviderAuthError(message)
-        if response.status_code == 404:
-            raise ProviderNotFound(message)
-        if response.status_code in (409, 423) or "already" in message.lower():
-            raise ProviderConflict(message)
-        if response.status_code == 429:
-            if mutating:
-                # Conservative classification (release hardening): the
-                # Leaseweb contract does NOT state that a 429 guarantees the
-                # request was not processed — the order may exist. The
-                # outcome of a billable POST is UNKNOWN and is never
-                # automatically re-sent.
-                raise ProviderOutcomeUnknown(
-                    f"leaseweb order POST returned HTTP 429: outcome unknown; {message}"
-                )
-            retry_after = response.headers.get("Retry-After")
-            raise ProviderRateLimited(message, _parse_retry_after(retry_after))
-        if response.status_code >= 500:
-            if mutating:
-                # The order may have been accepted server-side even though
-                # the response failed; the outcome is UNKNOWN, not "retry".
-                raise ProviderOutcomeUnknown(
-                    f"leaseweb order POST returned HTTP {response.status_code}: "
-                    f"outcome unknown; {message}"
-                )
-            raise ProviderUnavailable(message)
-        if response.is_error:
-            raise ProviderError(message)
-        if response.status_code == 204 or not response.content:
-            return {}
-        return response.json()
+    def _raise_for_status(response: Any, *, mutating: bool = False) -> Any:
+        """Map a raw response onto the Leaseweb error hierarchy.
+
+        Kept as a public-ish helper for credential verification and for
+        callers that already hold a response. The transport path uses
+        :func:`~cloud_platform.providers.leaseweb.errors.error_for_response`
+        (same mapping, including the conservative mutating classification:
+        a mutating 429/5xx is an UNKNOWN outcome, never a retry).
+        """
+        if response.is_success:
+            if response.status_code == 204 or not response.content:
+                return {}
+            return response.json()
+        payload = parse_error_payload(response)
+        if mutating and (payload.http_status == 429 or payload.http_status >= 500):
+            raise LeasewebAmbiguousMutationError(
+                f"leaseweb mutating request returned HTTP {payload.http_status}: "
+                f"outcome unknown; {payload.summary}",
+                payload=payload,
+            )
+        raise error_for_response(payload)
 
     def _map_vps(self, item: dict[str, Any]) -> ProviderServer:
         raw_id = str(item.get("id") or "")
@@ -1086,14 +1108,11 @@ def _normalize_term(value: Any) -> str:
 def _ambiguous_transport_error(exc: Exception) -> bool:
     """Whether a transport error proves the request was NEVER transmitted.
 
-    ``ConnectError``/``ConnectTimeout``/``PoolTimeout`` fail before any
-    bytes reach the server (no connection was established) — the mutation
-    was definitely not applied, so a retry is safe. Every other transport
-    failure (``ReadTimeout``, ``WriteTimeout``, ``RemoteProtocolError``,
-    generic timeouts) may have occurred AFTER the request was transmitted:
-    a billable POST's outcome is then unknown and must NOT be re-sent.
+    Back-compat delegate to the shared transport classifier: a billable
+    POST's outcome is UNKNOWN unless the failure provably happened before
+    transmission (connect refused/timeout, pool timeout).
     """
-    return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+    return classify_transport_error(exc) is MutationOutcome.AMBIGUOUS
 
 
 def _parse_datetime(value: Any) -> datetime | None:

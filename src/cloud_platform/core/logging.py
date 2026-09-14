@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 
 import structlog
 from structlog.types import EventDict
@@ -39,10 +40,14 @@ _REDACTED_KEYS: frozenset[str] = frozenset(
         "password",
         "passwd",
         "credential",
-        # Provider credentials
+        # Provider credentials and provider auth headers
         "hetzner_api_token",
         "provider_token",
         "provider_credential_encryption_key",
+        "x-lsw-auth",
+        "lsw-auth",
+        "authorization_header",
+        "auth_header",
         # Cloud-init and sensitive data
         "cloud_init",
         "user_data",
@@ -58,15 +63,18 @@ _REDACTED_KEYS: frozenset[str] = frozenset(
 _REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Bearer tokens in Authorization headers
     re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]+", re.IGNORECASE),
-    # Generic "key=value" patterns containing token-like strings
-    re.compile(r"(password|secret|token|api_key|apikey|credential\s*=\s*)\S+", re.IGNORECASE),
+    # Generic "key=value" / "key: value" patterns containing token-like
+    # strings. The separator is preserved so the redacted text stays readable.
+    re.compile(r"(?i)\b(password|secret|token|api_key|apikey|credential)(\s*[=:]\s*)\S+"),
 )
 
 _REDACTED_PLACEHOLDER = "***REDACTED***"
 
-# Match sensitive terms as whole words (bounded by underscores, dashes, or start/end)
+# Match sensitive terms as whole words (bounded by underscores, dashes, or
+# start/end). ``auth`` covers provider auth headers such as ``X-LSW-Auth`` and
+# any ``*_auth`` field; exact key names are listed in ``_REDACTED_KEYS``.
 _SENSITIVE_KEY_PATTERN = re.compile(
-    r"(^|[_\-])(token|secret|password|credential|apikey)($|[_\-])", re.IGNORECASE
+    r"(^|[_\-])(token|secret|password|credential|apikey|auth)($|[_\-])", re.IGNORECASE
 )
 
 
@@ -97,6 +105,41 @@ def _redact_value(value: object) -> object:
     if isinstance(value, list | tuple):
         return [_redact_value(v) for v in value]
     return value
+
+
+#: Maximum length of one string value kept in a sanitized payload. Long
+#: blobs (raw HTTP bodies, provider error dumps) are truncated so a business
+#: event can never leak a credential inside free text.
+_MAX_VALUE_CHARS = 300
+
+
+def _json_safe(value: object) -> object:
+    """Recursively make ``value`` JSON-safe, dropping/limiting unknown types."""
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        return value[:_MAX_VALUE_CHARS]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "isoformat") and callable(value.isoformat):
+        return str(value.isoformat())[:_MAX_VALUE_CHARS]
+    return str(value)[:_MAX_VALUE_CHARS]
+
+
+def sanitize_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """JSON-safe, redacted, size-bounded copy of an outbound payload.
+
+    Used by the business-log outbox before anything is persisted or sent to
+    an operator channel: secrets are replaced by ``***REDACTED***``, values
+    are truncated and the whole payload is bounded, so a provider error body
+    cannot carry a token into an external chat.
+    """
+    safe = _json_safe(_redact_value(dict(payload)))
+    if not isinstance(safe, dict):  # pragma: no cover - dict input always yields a dict
+        return {}
+    return {str(k): v for k, v in safe.items() if v is not None and v != ""}
 
 
 def redact_sensitive_fields(

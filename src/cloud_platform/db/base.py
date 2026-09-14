@@ -510,12 +510,17 @@ class ProviderOrder(Base):
 class RenewalRecord(Base):
     """Renewal state of one prepaid monthly server (LEASEWEB-MVP).
 
-    1:1 with ``servers`` (``server_id`` is the primary key). ``status`` is
-    one of active | insufficient_funds | manual_cancellation_required |
-    cancelled. ``provider_renewal_at`` is the estimated/actual provider
-    renewal instant (from the provider contract when available); the daily
-    renewal checker uses it for the 7/3/1-day warnings and the single
-    monthly charge (``auto_charge_enabled``).
+    1:1 with ``servers`` (``server_id`` is the primary key). ``provider_renewal_at``
+    is the estimated/actual provider renewal instant (from the provider contract
+    when available); the daily renewal checker uses it for the warnings, the
+    single monthly charge (``auto_charge_enabled``) and the payable deadline.
+
+    ``status`` is the COMMERCIAL state of the service, not the provider's
+    infrastructure state: active | payment_due | grace_period | suspended |
+    expired (plus the legacy insufficient_funds | manual_cancellation_required
+    | cancelled). ``grace_until`` is the end of the payable window once the
+    period expired unpaid, so "pay by" is a durable local fact rather than
+    something inferred from a provider UI string.
     """
 
     __tablename__ = "renewals"
@@ -530,6 +535,9 @@ class RenewalRecord(Base):
     currency = Column(String(3), nullable=False)
     status = Column(String(32), nullable=False, server_default="active")
     auto_charge_enabled = Column(Boolean, nullable=False, server_default="true")
+    #: End of the payable window once the period expired unpaid (NULL while the
+    #: service is not in a grace period). Never a provider fact.
+    grace_until = Column(DateTime(timezone=True), nullable=True)
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
@@ -1144,3 +1152,32 @@ class NetworkRow(Base):
     server_ids = Column(JSONB, nullable=False, server_default="[]")
     location_id = Column(String(32), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
+
+
+class BusinessLogEvent(Base):
+    """Durable outbox for the private operator business-logger channel.
+
+    Business events (purchases, provider acceptances, provisioning results,
+    recharges, admin wallet adjustments) are recorded here and delivered to
+    the Telegram logger channel by a worker — never inline. ``event_key`` is
+    UNIQUE, which makes both emission and delivery idempotent: a retried
+    checkout or a re-run worker cannot duplicate a channel message.
+
+    Statuses: PENDING -> SENDING -> SENT, or SENDING -> RETRY (backoff) and
+    RETRY -> ABANDONED once ``attempts`` exceeds the configured cap.
+    """
+
+    __tablename__ = "business_log_events"
+    __table_args__ = (sa.Index("ix_business_log_events_due", "status", "next_attempt_at"),)
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    event_key = Column(String(200), nullable=False, unique=True)
+    event_type = Column(String(64), nullable=False)
+    payload = Column(JSONB, nullable=False, server_default="'{}'::jsonb")
+    status = Column(String(16), nullable=False, server_default="PENDING")
+    created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", nullable=False)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+    attempts = Column(Integer, nullable=False, server_default="0")
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String(500), nullable=True)

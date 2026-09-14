@@ -54,8 +54,9 @@ uv run python -m cloud_platform.cli offers enable <id>
 uv run python -m cloud_platform.bot.main                    # start the Telegram bot
 ```
 
-Flow: `/menu` → خرید سرور → location → plan → OS → exact monthly price →
-confirm (wallet hold) → worker POSTs the Leaseweb order exactly once →
+Flow: `/menu` → خرید سرور → market (🇮🇷 سرور ایران / 🌍 سرور خارج) →
+provider → location → plan → OS → exact monthly price → confirm (wallet
+hold) → worker POSTs the Leaseweb order exactly once →
 read-only reconciler delivers the server to سرورهای من. Renewals are
 charged exactly once monthly with 7/3/1-day reminders; unpaid services are
 flagged `MANUAL_CANCELLATION_REQUIRED` (portal cancellation runbook in
@@ -65,6 +66,44 @@ POST flows through the durable checkout → worker pipeline (there is
 intentionally no live-order escape hatch).
 Design decisions: `docs/leaseweb/MVP_DESIGN.md`; roadmap: `LEASEWEB-MVP`
 tasks in `docs/roadmap/TASKS.yaml`.
+
+### Markets and providers
+
+The storefront is market-first: the customer picks **🇮🇷 سرور ایران** or
+**🌍 سرور خارج** before any location or plan is shown. Which provider appears
+under which market is configuration (`market` / `display_name` per provider in
+`configuration.toml`), so a second Iranian provider or a second foreign
+provider appears by configuration alone — no domain code branches on a
+provider name, and internal provider keys/ids are never shown to customers.
+
+### Private business-logger channel
+
+Purchases, recharges, payment failures, provisioning failures and admin wallet
+adjustments are mirrored to a private Telegram channel (`[telegram.logger]`).
+Events are enqueued durably in the `business_log_events` outbox and delivered
+by a worker with bounded retries, so a Telegram outage can never block
+checkout, wallet settlement or reconciliation. Payloads are sanitized: no
+API keys, tokens, headers, passwords or root credentials are ever sent.
+
+## Configuration (`configuration.toml`)
+
+Runtime configuration lives in ONE operator-managed TOML file:
+
+| Environment | File |
+| --- | --- |
+| production | `/etc/cloud-server-seller/configuration.toml` |
+| development / tests | `./configuration.toml` |
+| anywhere | `$CLOUD_PLATFORM_CONFIG_FILE` (bootstrap: only says *where*) |
+
+`configuration.example.toml` (committed) documents every section with safe
+fake values; `deploy/production/configuration.example.toml` is the production
+flavoured copy. The real `configuration.toml` is git-ignored.
+
+Value precedence (highest first): **explicit arguments → environment variables
+→ `configuration.toml` → `.env` → field defaults**. Environment variables and
+`.env` remain supported for bootstrap and tests only; production containers set
+no application secrets in the environment — they mount the TOML file and export
+`CLOUD_PLATFORM_CONFIG_FILE`.
 
 ## One-line VPS install + bash menu
 
@@ -86,8 +125,9 @@ enable offers → `/menu` → ZarinPal top-up → order): same file.
 
 ## Local development
 
-1. Copy `.env.example` to `.env`.
-2. Put a Hetzner test/project token in `HETZNER_API_TOKEN` only for local testing.
+1. Copy `configuration.example.toml` to `configuration.toml` and fill it in
+   (it replaces `.env` entirely; `.env` still works for bootstrap and tests).
+2. Put a Hetzner test/project token in `[providers.hetzner].api_token` only for local testing.
 3. Install dependencies:
 
 ```bash

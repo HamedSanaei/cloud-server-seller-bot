@@ -7,6 +7,15 @@ Run with::
 Commands::
 
     leaseweb doctor              Pre-flight diagnostics (read-only; never
+    leaseweb auth-check          Read-only API key check
+    leaseweb coverage            Print the VPS API endpoint coverage matrix
+    leaseweb products list       Read-only ordering catalogue
+    leaseweb products show ID    Read-only product configuration + prices
+    leaseweb orders list|show    Read-only account order inspection
+    leaseweb vps list|show       Read-only VPS inventory
+    leaseweb vps ips|metrics     Read-only VPS IPs / data-traffic metrics
+    leaseweb vps snapshots       Read-only VPS snapshot list
+    leaseweb vps monitoring      Read-only VPS monitoring status
                                  prints the API key, never orders anything)
     leaseweb sync-offers         Refresh the sellable-offer price book from
                                  the Leaseweb ordering API
@@ -90,15 +99,46 @@ async def _check_db() -> tuple[bool, str]:
 
 async def _check_redis() -> tuple[bool, str]:
     try:
-        from redis.asyncio import from_url
+        from cloud_platform.core.redis import close_redis_client, create_redis_client
 
-        client = from_url(get_settings().redis_url)  # type: ignore[no-untyped-call]
+        client = create_redis_client(get_settings().redis_url)
         try:
             await client.ping()
         finally:
-            await client.aclose()
+            await close_redis_client(client)
         return True, "ok"
     except Exception as exc:
+        return False, str(exc)
+
+
+async def _check_session_store() -> tuple[bool, str]:
+    """Round-trip the Telegram transient-state backend (never a secret)."""
+    from cloud_platform.core.session_store import (
+        NS_REFERENCE,
+        build_session_store,
+    )
+
+    settings = get_settings()
+    try:
+        store = build_session_store(
+            backend=settings.telegram_sessions_backend,
+            prefix=settings.telegram_sessions_namespace,
+            redis_url=settings.redis_url,
+        )
+        await store.put(NS_REFERENCE, "doctor-probe", {"ref": "probe"}, ttl_seconds=30)
+        value = await store.get(NS_REFERENCE, "doctor-probe")
+        await store.delete(NS_REFERENCE, "doctor-probe")
+        client = getattr(store, "client", None)
+        if client is not None:
+            from cloud_platform.core.redis import close_redis_client
+
+            await close_redis_client(client)
+        if value is None:
+            return False, "write succeeded but the read returned nothing"
+        return True, f"{settings.telegram_sessions_backend} read/write ok"
+    except Exception as exc:
+        # The backend refuses `memory` outside development; that refusal is
+        # itself the diagnostic, and it must stay readable.
         return False, str(exc)
 
 
@@ -219,6 +259,18 @@ async def leaseweb_doctor() -> DoctorResult:
     report("Database query", db_ok, db_detail)
     redis_ok, redis_detail = await _check_redis()
     report("Redis reachable", redis_ok, redis_detail)
+    # PROD-HARDENING §10: the bot's shared transient state must be the durable
+    # backend in production, because a restart or a second replica otherwise
+    # loses the buttons a customer is holding (and confirmations with them).
+    sessions_ok, sessions_detail = await _check_session_store()
+    report("Telegram sessions", sessions_ok, sessions_detail)
+    if settings.telegram_sessions_backend.strip().lower() != "redis":
+        report(
+            "Telegram sessions shared",
+            False,
+            f"backend={settings.telegram_sessions_backend!r} — a production "
+            "deployment needs `redis` ([telegram.sessions] backend)",
+        )
 
     if not ok:
         lines.append(
@@ -261,6 +313,122 @@ async def leaseweb_sync_offers() -> int:
         )
         for error in step.errors:
             print(f"  error: {error}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# leaseweb — read-only VPS API diagnostics (LEASEWEB-VPS-API)
+# ---------------------------------------------------------------------------
+#
+# IMPORTANT: none of these commands can place an order, reinstall, reset a
+# password, delete a credential or mutate a snapshot. Billable/destructive
+# provider calls only ever flow through the durable checkout -> wallet hold ->
+# operation ledger -> worker pipeline (see docs/leaseweb/VPS_API_COVERAGE.md).
+
+
+def _leaseweb_readonly() -> Any:
+    """Import the read-only diagnostics module lazily (keeps CLI start-up fast)."""
+    from cloud_platform.providers.leaseweb import diagnostics
+
+    return diagnostics
+
+
+async def leaseweb_auth_check() -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.auth_check_lines():
+        print(line)
+    return 0
+
+
+async def leaseweb_products_list(location: str | None) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.products_list_lines(location):
+        print(line)
+    return 0
+
+
+async def leaseweb_product_show(args: argparse.Namespace) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.product_show_lines(
+        args.product_id,
+        location=args.location,
+        operating_system=args.os,
+        control_panel=args.control_panel,
+        disk_upgrade=args.disk_upgrade,
+        contract_term=args.contract_term,
+        billing_cycle=args.billing_cycle,
+        service_level_agreement=args.sla,
+    ):
+        print(line)
+    return 0
+
+
+async def leaseweb_orders_list(limit: int) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.orders_list_lines(limit=limit):
+        print(line)
+    return 0
+
+
+async def leaseweb_order_show(order_id: str) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.order_show_lines(order_id):
+        print(line)
+    return 0
+
+
+async def leaseweb_vps_list() -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.vps_list_lines():
+        print(line)
+    return 0
+
+
+async def leaseweb_vps_show(vps_id: str) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.vps_show_lines(vps_id):
+        print(line)
+    return 0
+
+
+async def leaseweb_vps_ips(vps_id: str) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.vps_ips_lines(vps_id):
+        print(line)
+    return 0
+
+
+async def leaseweb_vps_metrics(args: argparse.Namespace) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.vps_metrics_lines(
+        args.vps_id,
+        from_=args.date_from,
+        to=args.date_to,
+        granularity=args.granularity,
+        aggregation=args.aggregation,
+    ):
+        print(line)
+    return 0
+
+
+async def leaseweb_vps_snapshots(vps_id: str) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.vps_snapshots_lines(vps_id):
+        print(line)
+    return 0
+
+
+async def leaseweb_vps_monitoring(vps_id: str) -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in await diagnostics.vps_monitoring_lines(vps_id):
+        print(line)
+    return 0
+
+
+def leaseweb_coverage() -> int:
+    diagnostics = _leaseweb_readonly()
+    for line in diagnostics.coverage_lines():
+        print(line)
     return 0
 
 
@@ -677,6 +845,47 @@ def _parser() -> argparse.ArgumentParser:
     lsw_sub = lsw.add_subparsers(dest="subcommand", required=True)
     lsw_sub.add_parser("doctor", help="read-only pre-flight diagnostics")
     lsw_sub.add_parser("sync-offers", help="refresh the sellable-offer price book")
+    lsw_sub.add_parser("auth-check", help="read-only API key check")
+    lsw_sub.add_parser("coverage", help="print the VPS API coverage matrix")
+
+    products = lsw_sub.add_parser("products", help="read-only ordering catalogue")
+    products_sub = products.add_subparsers(dest="leaseweb_products", required=True)
+    products_list = products_sub.add_parser("list")
+    products_list.add_argument("--location", default=None)
+    product_show = products_sub.add_parser("show")
+    product_show.add_argument("product_id")
+    product_show.add_argument("--location", required=True)
+    product_show.add_argument("--os", default=None)
+    product_show.add_argument("--control-panel", dest="control_panel", default=None)
+    product_show.add_argument("--disk-upgrade", dest="disk_upgrade", default=None)
+    product_show.add_argument("--contract-term", dest="contract_term", default=None)
+    product_show.add_argument("--billing-cycle", dest="billing_cycle", default=None)
+    product_show.add_argument("--sla", default=None)
+
+    lsw_orders = lsw_sub.add_parser("orders", help="read-only account orders")
+    lsw_orders_sub = lsw_orders.add_subparsers(dest="leaseweb_orders", required=True)
+    lsw_orders_list = lsw_orders_sub.add_parser("list")
+    lsw_orders_list.add_argument("--limit", type=int, default=20)
+    lsw_order_show = lsw_orders_sub.add_parser("show")
+    lsw_order_show.add_argument("order_id")
+
+    lsw_vps = lsw_sub.add_parser("vps", help="read-only VPS inspection")
+    lsw_vps_sub = lsw_vps.add_subparsers(dest="leaseweb_vps", required=True)
+    lsw_vps_sub.add_parser("list")
+    lsw_vps_show = lsw_vps_sub.add_parser("show")
+    lsw_vps_show.add_argument("vps_id")
+    lsw_vps_ips = lsw_vps_sub.add_parser("ips")
+    lsw_vps_ips.add_argument("vps_id")
+    lsw_vps_metrics = lsw_vps_sub.add_parser("metrics")
+    lsw_vps_metrics.add_argument("vps_id")
+    lsw_vps_metrics.add_argument("--from", dest="date_from", required=True)
+    lsw_vps_metrics.add_argument("--to", dest="date_to", required=True)
+    lsw_vps_metrics.add_argument("--granularity", default="DAY")
+    lsw_vps_metrics.add_argument("--aggregation", default="SUM")
+    lsw_vps_snapshots = lsw_vps_sub.add_parser("snapshots")
+    lsw_vps_snapshots.add_argument("vps_id")
+    lsw_vps_monitoring = lsw_vps_sub.add_parser("monitoring")
+    lsw_vps_monitoring.add_argument("vps_id")
 
     offers = sub.add_parser("offers", help="sellable-offer management")
     offers_sub = offers.add_subparsers(dest="subcommand", required=True)
@@ -753,6 +962,30 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return 0 if result.ok else 1
         if args.subcommand == "sync-offers":
             return await leaseweb_sync_offers()
+        if args.subcommand == "auth-check":
+            return await leaseweb_auth_check()
+        if args.subcommand == "coverage":
+            return leaseweb_coverage()
+        if args.subcommand == "products":
+            if args.leaseweb_products == "list":
+                return await leaseweb_products_list(args.location)
+            return await leaseweb_product_show(args)
+        if args.subcommand == "orders":
+            if args.leaseweb_orders == "list":
+                return await leaseweb_orders_list(args.limit)
+            return await leaseweb_order_show(args.order_id)
+        if args.subcommand == "vps":
+            if args.leaseweb_vps == "list":
+                return await leaseweb_vps_list()
+            if args.leaseweb_vps == "show":
+                return await leaseweb_vps_show(args.vps_id)
+            if args.leaseweb_vps == "ips":
+                return await leaseweb_vps_ips(args.vps_id)
+            if args.leaseweb_vps == "metrics":
+                return await leaseweb_vps_metrics(args)
+            if args.leaseweb_vps == "snapshots":
+                return await leaseweb_vps_snapshots(args.vps_id)
+            return await leaseweb_vps_monitoring(args.vps_id)
         print(f"unknown leaseweb subcommand {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "offers":

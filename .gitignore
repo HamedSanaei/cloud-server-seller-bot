@@ -5,6 +5,12 @@
 !.env.example
 .envrc
 
+# --- Runtime configuration (the real TOML holds secrets; the example ships) ---
+configuration.toml
+config/configuration.toml
+!configuration.example.toml
+!deploy/**/configuration.example.toml
+
 # --- Python ---
 __pycache__/
 *.py[cod]
@@ -52,3 +58,6 @@ tmp/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+
+api_docs/leaseweb

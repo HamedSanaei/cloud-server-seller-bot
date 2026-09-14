@@ -270,6 +270,8 @@ def _make_service(
     ordering: FakeOrderingProvider | None = None,
     server_repo: FakeServerRepo | None = None,
     hold_repo: FakeHoldRepo | None = None,
+    event_sink: Any | None = None,
+    market_lookup: Any | None = None,
 ) -> tuple[MonthlyCheckoutService, dict[str, Any]]:
     wallet_repo = FakeWalletRepo(balance)
     if hold_repo is None:
@@ -297,6 +299,8 @@ def _make_service(
         operation_repo=ops_repo,
         audit_repo=FakeAuditRepo(),
         provider_registry=registry,
+        event_sink=event_sink,
+        event_market_lookup=market_lookup,
     )
     deps = {
         "wallet": wallet_repo,
@@ -305,6 +309,7 @@ def _make_service(
         "orders": orders_repo,
         "ops": ops_repo,
         "ordering": ordering,
+        "event_sink": event_sink,
     }
     return service, deps
 
@@ -822,7 +827,100 @@ class TestOfferCatalogViews:
         assert [v.name for v in views] == ["VPS L", "VPS S"]
         assert back and cancel
 
-    async def test_plan_callback_returns_signed(self) -> None:
+    async def test_plan_callback_returns_signed_store_callback(self) -> None:
         service = _view_service()
         callback = service.plan_callback(OFFER_ID)
-        assert "offers:plans" in callback
+        # The storefront callback goes to the OS picker of the store flow.
+        assert "store:os" in callback
+
+
+class _RecordingSink:
+    """Records enqueued business events (protocol-compatible sink double)."""
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.events: list[Any] = []
+        self._explode = explode
+
+    async def emit(self, event: Any) -> bool:
+        if self._explode:
+            raise RuntimeError("outbox is down")
+        self.events.append(event)
+        return True
+
+    def types(self) -> list[Any]:
+        return [e.event_type for e in self.events]
+
+    def of(self, event_type: Any) -> Any:
+        return next(e for e in self.events if e.event_type is event_type)
+
+
+class TestBusinessLogEmission:
+    """The purchase request reaches the operator channel, enqueued only."""
+
+    async def test_checkout_enqueues_purchase_requested(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        sink = _RecordingSink()
+        service, deps = _make_service(
+            offer=_offer(), event_sink=sink, market_lookup=lambda key: "foreign"
+        )
+        result = await service.create_order(
+            user=_user(),
+            offer_id=OFFER_ID,
+            os_name="Ubuntu 24.04",
+            idempotency_key="cb-1",
+        )
+
+        assert sink.types() == [BusinessEventType.PURCHASE_REQUESTED]
+        event = sink.of(BusinessEventType.PURCHASE_REQUESTED)
+        assert event.event_key == f"purchase.requested:{result.server.id}"
+        assert event.payload["market"] == "foreign"
+        assert event.payload["provider"] == "leaseweb"
+        assert event.payload["location"] == "AMS-01"
+        assert event.payload["plan"] == "VPS S"
+        assert event.payload["os"] == "Ubuntu 24.04"
+        assert event.payload["selling_price"] == "12.99 EUR"
+        assert event.payload["server_id"] == str(result.server.id)
+        assert event.payload["order_id"] == str(result.order.id)
+        # No secrets and no provider cost leaking into the sale-price field.
+        assert "api_key" not in str(event.payload)
+        assert deps["holds"].holds  # the hold is untouched by logging
+
+    async def test_replayed_checkout_collapses_to_one_event(self) -> None:
+        sink = _RecordingSink()
+        service, _deps = _make_service(offer=_offer(), event_sink=sink)
+        for _ in range(3):
+            await service.create_order(
+                user=_user(),
+                offer_id=OFFER_ID,
+                os_name="Ubuntu 24.04",
+                idempotency_key="cb-same",
+            )
+        # The event key is the server id, so a repeated callback can never
+        # produce a second business event.
+        assert len({e.event_key for e in sink.events}) == 1
+
+    async def test_broken_logger_never_fails_the_checkout(self) -> None:
+        service, deps = _make_service(offer=_offer(), event_sink=_RecordingSink(explode=True))
+        result = await service.create_order(
+            user=_user(),
+            offer_id=OFFER_ID,
+            os_name="Ubuntu 24.04",
+            idempotency_key="cb-explode",
+        )
+        assert result.replayed is False
+        assert result.hold is not None and result.hold.id is not None
+        # Checkout never calls the provider (place_order raises if it does).
+        assert deps["ordering"].place_order_calls == 0
+
+    async def test_insufficient_balance_emits_nothing(self) -> None:
+        sink = _RecordingSink()
+        service, _deps = _make_service(offer=_offer(price=50_000), event_sink=sink)
+        with pytest.raises(InsufficientHoldBalanceError):
+            await service.create_order(
+                user=_user(),
+                offer_id=OFFER_ID,
+                os_name="Ubuntu 24.04",
+                idempotency_key="cb-broke",
+            )
+        assert sink.events == []

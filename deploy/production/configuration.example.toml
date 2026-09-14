@@ -1,0 +1,164 @@
+# Cloud Server Seller — PRODUCTION runtime configuration (EXAMPLE).
+#
+# Deploy it as:
+#   sudo install -d -m 0750 -o root -g 999 /etc/cloud-server-seller
+#   sudo install -m 0640 -o root -g 999 \
+#       configuration.example.toml /etc/cloud-server-seller/configuration.toml
+#   sudo "$EDITOR" /etc/cloud-server-seller/configuration.toml
+#
+# The containers mount this file read-only at the path below and are told
+# where it is with the non-secret bootstrap variable:
+#
+#   CLOUD_PLATFORM_CONFIG_FILE=/etc/cloud-server-seller/configuration.toml
+#
+# Precedence of values (highest first):
+#   explicit constructor arguments > environment variables > this file > .env
+# Production sets NO application secrets in the environment: everything lives
+# in this file, which is git-ignored. NEVER commit a real configuration.toml.
+
+[app]
+environment = "production"
+log_level = "INFO"
+default_currency = "EUR"
+
+[database]
+# Same credentials as POSTGRES_PASSWORD in the deployment .env file.
+url = "postgresql+asyncpg://cloud:CHANGE_ME_DB_PASSWORD@postgres:5432/cloud"
+
+[redis]
+url = "redis://redis:6379/0"
+
+[telegram]
+bot_token = "CHANGE_ME"
+callback_signing_key = "CHANGE_ME"
+
+# Telegram transient state. `redis` is REQUIRED in production: the bot must
+# share callback references, pending confirmations and prompts across restarts
+# and replicas. `memory` is refused outside development/test.
+[telegram.sessions]
+backend = "redis"
+namespace = "cloud-platform:bot"
+reference_ttl_seconds = 1800
+prompt_ttl_seconds = 900
+confirmation_ttl_seconds = 300
+replay_ttl_seconds = 1800
+admin_chat_id = -1000000000000     # renewals / attention alerts (0 = unset)
+support_contact = "@your_support"
+
+# Private business-logger channel. Add the bot to the channel as an
+# administrator, then put the channel id here (negative, starts with -100).
+# Events reach it through a durable outbox with bounded retries, so a Telegram
+# outage can never affect checkout, wallet settlement or provisioning.
+[telegram.logger]
+enabled = true
+chat_id = -1000000000000
+log_purchases = true
+log_recharges = true
+log_payment_failures = true
+log_order_failures = true
+log_admin_wallet_adjustments = true
+
+# ---------------------------------------------------------------------------
+# Providers
+#
+# `market` places a provider in the storefront: "iran" or "foreign".
+# `display_name` is the customer-facing name; internal keys are never shown.
+# `enabled = false` hides a configured provider from the store immediately.
+# ---------------------------------------------------------------------------
+
+[providers.leaseweb]
+enabled = true
+market = "foreign"
+display_name = "Leaseweb"
+api_key = "CHANGE_ME"
+base_url = "https://api.leaseweb.com"
+# Locations that may be synced AND sold (allowlist, not a wish list).
+locations = ["AMS-01", "FRA-01"]
+# Optional OS allowlist; empty = every free OS option the API offers.
+os_allowlist = []
+order_os_only_free = true
+contract_term = "1_MONTH"
+billing_cycle = "1_MONTH"
+
+[providers.arvancloud]
+# Iranian market provider. Add another Iranian provider later by adding a
+# section here — the storefront reads the market map, never a provider name.
+enabled = true
+market = "iran"
+display_name = "ArvanCloud"
+api_key = "CHANGE_ME"
+base_url = "https://napi.arvancloud.ir/ecc/v1"
+region = "CHANGE_ME"
+
+[providers.hetzner]
+enabled = false
+market = "foreign"
+display_name = "Hetzner"
+api_token = "CHANGE_ME"
+base_url = "https://api.hetzner.cloud/v1"
+
+[payments.zarinpal]
+enabled = true
+merchant_id = "CHANGE_ME"
+base_url = "https://api.zarinpal.com/pg/v4/payment"
+sandbox = false
+callback_url = "https://your-domain.example/api/v1/payments/zarinpal/callback"
+
+[security]
+# 32-byte url-safe base64 keys. Generate with:
+#   python -c "import base64; from cloud_platform.core.secrets import MasterKey; print(base64.urlsafe_b64encode(MasterKey.generate().material).decode())"
+provider_credential_encryption_key = "CHANGE_ME"
+backup_encryption_key = "CHANGE_ME"
+
+[billing]
+price_book_name = "retail-eur"
+customer_billing_quantum_seconds = 3600
+low_balance_threshold_minor = 5000
+low_balance_grace_hours = 24
+
+[backup]
+output_dir = "/var/backups/cloud-server-seller"
+retention_days = 14
+
+[observability]
+otel_exporter_endpoint = ""        # e.g. http://otel-collector:4317
+otel_sample_ratio = 1.0
+
+[api]
+allow_header_identity = false      # dev/test only; never in production
+rate_limit_per_minute = 240
+
+# What a paying customer may do from Telegram ("My servers").
+# Capability groups combine with what the provider adapter actually supports
+# and what the server's state allows; a group set to false simply hides its
+# buttons. Destructive actions stay behind a one-time confirmation whatever
+# the flags say.
+[features.server_management]
+enabled = true                     # the whole section
+manager = true                     # details, refresh, rename
+power = true                       # start / stop / reboot
+console = true                     # temporary console link
+traffic = true                     # data-traffic usage
+snapshots = true                   # list / create / restore / delete
+reinstall = true                   # OS reinstall (destructive)
+password_reset = true              # OS password reset (destructive)
+iso = false                        # attach/detach ISO (advanced, off by default)
+ip_management = true               # list IPs, reverse DNS, null route
+monitoring = true                  # monitoring status + enable
+billing = true                     # renew-now + auto-renew toggle (local only)
+page_size = 5                      # servers per Telegram page
+traffic_window_days = 30           # trailing window for the traffic screen
+confirmation_ttl_seconds = 900     # lifetime of a one-time confirmation
+
+# Customer billing lifecycle (separate from provider infrastructure state).
+# Never makes a provider API call; the renewal price always comes from the
+# local commercial price on the service.
+[commerce.renewal]
+enabled = true
+charge_before_expiry_hours = 72
+warning_before_expiry_hours = [168, 72, 24]
+grace_period_hours = 48
+auto_renew_default = true
+
+[commerce.suspension]
+stop_server_after_grace = false

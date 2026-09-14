@@ -180,13 +180,17 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
 
 ### Launch sequence (monthly track)
 
-1. **Env** — set in `.env` (or `deploy/staging/.env` with the `STAGING_`
-   prefix): `LEASEWEB_API_KEY`, `LEASEWEB_LOCATIONS=AMS-01,FRA-01`,
-   `TELEGRAM_BOT_TOKEN`, `CALLBACK_SIGNING_KEY`, `TELEGRAM_ADMIN_CHAT_ID`.
+1. **Config** — fill in `configuration.toml` (production:
+   `/etc/cloud-server-seller/configuration.toml`; see
+   `configuration.example.toml`): `[providers.leaseweb].api_key`,
+   `[providers.leaseweb].locations = ["AMS-01","FRA-01"]`,
+   `[telegram].bot_token`, `[telegram].callback_signing_key`,
+   `[telegram].admin_chat_id` and the `[telegram.logger]` channel. `.env`
+   still works for bootstrap/tests but is no longer the production source.
    There is NO live-order env switch and NO CLI command that can place a
    billable order: every POST flows through the durable checkout → worker
    pipeline (see the controlled first-order procedure below).
-2. **Schema** — `uv run alembic upgrade head` (head `0030`).
+2. **Schema** — `uv run alembic upgrade head` (head `0033`).
 3. **Doctor** (read-only pre-flight, never prints the key):
    `uv run python -m cloud_platform.cli leaseweb doctor`
 4. **Sync the price book**:
@@ -198,10 +202,13 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
    - `uv run python -m cloud_platform.cli offers price <offer_id> 1299 EUR`
    - `uv run python -m cloud_platform.cli offers enable <offer_id>`
    The offer is sellable only when provider-reported AND enabled AND priced.
-6. **Bot** — `/menu` → خرید سرور (location → plan → OS → exact monthly
-   price → confirm). `سرورهای من` shows only the user's own servers with
-   power controls behind explicit confirmation; `کیف پول` shows balance +
-   ledger history; `پشتیبانی` shows the support contact.
+6. **Bot** — `/menu` → خرید سرور → **market** (🇮🇷 سرور ایران / 🌍 سرور خارج)
+   → provider → location → plan → OS → exact monthly price → confirm.
+   `سرورهای من` shows only the user's own servers with power controls
+   behind explicit confirmation; `کیف پول` shows balance + ledger history and
+   a top-up action when the wallet is short; `پشتیبانی` shows the support
+   contact. A market or provider with no enabled+priced offer is hidden, so
+   an empty Iranian catalogue simply does not appear.
 7. **Wallet funding** — manual for the MVP:
    `uv run python -m cloud_platform.cli users find <telegram_id>` then
    `uv run python -m cloud_platform.cli wallet credit <user_id> <minor> "<reason>"`
@@ -328,3 +335,46 @@ Leaseweb renews services automatically at ITS billing cycle; the daily
 Attention queue summary at any time:
 `uv run python -m cloud_platform.cli orders attention` (failed/needs-review
 orders) and `renewals list --attention` (unpaid-risk services).
+
+### Operator business-logger channel
+
+Business events are mirrored to a private Telegram channel configured by
+`[telegram.logger]` in `configuration.toml` (`enabled`, `chat_id`, and the
+`log_*` switches). Setup:
+
+1. Create a private channel; add the platform bot as an **administrator**
+   (it only needs to post). Posting a test message to the channel once makes
+   the bot able to reach it.
+2. Put the channel id (negative, `-100…`) in `[telegram.logger].chat_id` and
+   set `enabled = true`.
+3. Restart the worker: `docker compose restart worker`.
+
+The events land in the `business_log_events` outbox first and are delivered
+by the `deliver_business_log_events` cron (every minute, bounded retries,
+unique event key), so the channel may lag but can never delay or fail a
+checkout, settlement or provisioning run. If the channel shows
+`abandoned` events in the worker log, inspect them directly:
+
+```sql
+SELECT event_type, status, attempts, last_error, payload
+FROM business_log_events WHERE status <> 'SENT' ORDER BY created_at DESC LIMIT 50;
+```
+
+Payloads are sanitized (no tokens, API keys, headers, passwords or root
+credentials). Never paste raw provider HTTP bodies into the channel.
+
+### Configuration change and reload
+
+Runtime configuration lives in one file per environment (see
+`docs/operations/INSTALL.md` for the lookup order and value precedence):
+
+```bash
+sudo "$EDITOR" /etc/cloud-server-seller/configuration.toml
+docker compose restart api worker bot       # no rebuild required
+```
+
+An offer/price/config change never needs a migration; append a new
+`configuration.toml` value and restart the affected service only. A malformed
+file fails fast at startup (`ConfigFileError` names the file), and a
+`CLOUD_PLATFORM_CONFIG_FILE` pointing at a missing file is a hard error rather
+than a silent fall-back to defaults.

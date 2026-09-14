@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -340,3 +341,79 @@ class TestForceRelease:
                 idempotency_key="fr-2",
             )
         audit_repo.append.assert_not_awaited()
+
+
+class _RecordingSink:
+    """Records enqueued business events (protocol-compatible sink double)."""
+
+    def __init__(self, *, explode: bool = False) -> None:
+        self.events: list[Any] = []
+        self._explode = explode
+
+    async def emit(self, event: Any) -> bool:
+        if self._explode:
+            raise RuntimeError("outbox is down")
+        self.events.append(event)
+        return True
+
+    def types(self) -> list[Any]:
+        return [e.event_type for e in self.events]
+
+    def of(self, event_type: Any) -> Any:
+        return next(e for e in self.events if e.event_type is event_type)
+
+
+class TestBusinessLogEmission:
+    """Manual wallet adjustments are logged to the operator channel.
+
+    An admin crediting or debiting a wallet is financially sensitive, so the
+    adjustment is enqueued (never sent inline) with actor, amount and reason.
+    A broken logger must never block the adjustment itself.
+    """
+
+    def _service_with_sink(self, wallet_repo: AsyncMock, sink: object) -> WalletAdminService:
+        ledger_repo = AsyncMock()
+        ledger_repo.get_entry_by_idempotency = AsyncMock(return_value=None)
+        ledger_repo.post_entry = AsyncMock(return_value=_entry())
+        audit_repo = AsyncMock()
+        return WalletAdminService(wallet_repo, ledger_repo, audit_repo, event_sink=sink)  # type: ignore[arg-type]
+
+    async def test_adjustment_enqueues_the_event(self) -> None:
+        from cloud_platform.modules.businesslog.domain import BusinessEventType
+
+        wallet_repo = AsyncMock()
+        wallet_repo.get = AsyncMock(return_value=_wallet())
+        wallet_repo.add_funds = AsyncMock(return_value=_wallet(1_500))
+        sink = _RecordingSink()
+        service = self._service_with_sink(wallet_repo, sink)
+
+        await service.adjust_balance(
+            admin=_admin(),
+            user_id=USER_ID,
+            amount=500,
+            reason="goodwill credit",
+            idempotency_key="adj-log-1",
+        )
+
+        assert sink.types() == [BusinessEventType.ADMIN_WALLET_ADJUSTMENT]
+        payload = sink.of(BusinessEventType.ADMIN_WALLET_ADJUSTMENT).payload
+        assert payload["amount"] == "5.00 EUR"
+        assert payload["balance_after"] == "15.00 EUR"
+        assert payload["reason"] == "goodwill credit"
+        assert payload["entry_type"] == "adjustment"
+        assert payload["actor"] == "boss"
+
+    async def test_broken_logger_never_blocks_the_adjustment(self) -> None:
+        wallet_repo = AsyncMock()
+        wallet_repo.get = AsyncMock(return_value=_wallet())
+        wallet_repo.add_funds = AsyncMock(return_value=_wallet(2_000))
+        service = self._service_with_sink(wallet_repo, _RecordingSink(explode=True))
+
+        updated, _entry = await service.adjust_balance(
+            admin=_admin(),
+            user_id=USER_ID,
+            amount=500,
+            reason="still applied",
+            idempotency_key="adj-log-2",
+        )
+        assert updated.balance == 2_000

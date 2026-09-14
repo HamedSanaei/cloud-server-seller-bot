@@ -1,0 +1,153 @@
+# Production deployment for the cloud platform.
+#
+# Configuration model (one source of truth):
+#
+#   * ALL application configuration and secrets live in
+#     /etc/cloud-server-seller/configuration.toml, mounted read-only into
+#     every container. Copy deploy/production/configuration.example.toml there
+#     and fill it in.
+#   * The only environment variable the platform needs is the NON-SECRET
+#     bootstrap path CLOUD_PLATFORM_CONFIG_FILE.
+#   * The deployment .env file holds infrastructure values only: the image
+#     tag and the PostgreSQL password (which also appears in the TOML
+#     database.url for the same database).
+#
+#   cp deploy/production/configuration.example.toml ./configuration.toml   # then edit
+#   cp deploy/production/.env.example .env                                 # then edit
+#   docker compose up -d
+#   docker compose up -d backup        # one encrypted backup run, then exits
+#   docker compose down
+#
+# The migrate job (alembic upgrade head) completes BEFORE api/worker/bot
+# start, so the first deploy into an empty database and every later deploy
+# run the same sequence.
+
+name: cloud-platform-production
+
+x-platform: &platform
+  image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+  environment:
+    # Bootstrap only: names the file, contains no secret.
+    CLOUD_PLATFORM_CONFIG_FILE: /etc/cloud-server-seller/configuration.toml
+  volumes:
+    - ./configuration.toml:/etc/cloud-server-seller/configuration.toml:ro
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: cloud
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: cloud
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloud -d cloud"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    # no published ports: only the platform services reach the database
+
+  # Telegram transient state (callback references, pending confirmations,
+  # prompts). Never published to the host: only the platform services on this
+  # private compose network can reach it. AOF persistence keeps a one-time
+  # destructive confirmation alive across an ordinary Redis restart; if the
+  # data is lost anyway the platform fails CLOSED (it refuses mutations rather
+  # than guessing), so data loss can never authorise an operation.
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    <<: *platform
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *platform
+    command: ["api"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *platform
+    command: ["worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # Telegram storefront + operator notifications. Long polling, so no ports.
+  #
+  # REPLICAS = 1. Telegram long polling is a single-consumer transport: two
+  # processes polling the SAME bot token contend for updates and `getUpdates`
+  # conflicts. Sharing Redis makes bot-managed state safe across a RESTART, a
+  # container replacement and a rolling deploy - it does NOT make two pollers
+  # safe. Scale the api/worker instead, or move to a webhook first.
+  bot:
+    <<: *platform
+    command: ["bot"]
+    deploy:
+      replicas: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # One encrypted pg_dump per run; run explicitly:
+  #   docker compose --profile backup run --rm backup
+  volume-init:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+    user: root
+    command: ["/bin/sh", "-c", "chown -R 999:999 /backups"]
+    volumes:
+      - backups:/backups
+    restart: "no"
+
+  backup:
+    image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in .env (registry/repo:<full-sha>)}
+    command: ["backup"]
+    environment:
+      CLOUD_PLATFORM_CONFIG_FILE: /etc/cloud-server-seller/configuration.toml
+      BACKUP_OUTPUT_DIR: /backups
+    volumes:
+      - ./configuration.toml:/etc/cloud-server-seller/configuration.toml:ro
+      - backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+      volume-init:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles: ["backup"]
+
+volumes:
+  pgdata:
+  redisdata:
+  backups:

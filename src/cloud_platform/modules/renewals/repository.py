@@ -44,10 +44,20 @@ def _to_domain(row: _RenewalRecordModel) -> RenewalRecord:
         renewal_date_estimated=bool(_attr(row, "renewal_date_estimated")),
         customer_price_minor=int(_attr(row, "customer_price_minor")),
         currency=str(_attr(row, "currency")),
-        status=RenewalStatus(str(_attr(row, "status"))),
+        status=_status_of(row),
         auto_charge_enabled=bool(_attr(row, "auto_charge_enabled")),
+        grace_until=_aware_or_none(_attr(row, "grace_until")),
         last_checked_at=_aware_or_none(_attr(row, "last_checked_at")),
     )
+
+
+def _status_of(row: _RenewalRecordModel) -> RenewalStatus:
+    """Read the commercial status, tolerating a value from a newer release."""
+    raw = str(_attr(row, "status"))
+    try:
+        return RenewalStatus(raw)
+    except ValueError:  # pragma: no cover - forward compatibility
+        return RenewalStatus.PAYMENT_DUE
 
 
 class SqlAlchemyRenewalRepository:
@@ -92,10 +102,40 @@ class SqlAlchemyRenewalRepository:
                 cast_any.currency = record.currency
                 cast_any.status = record.status.value
                 cast_any.auto_charge_enabled = record.auto_charge_enabled
+                cast_any.grace_until = record.grace_until
                 cast_any.last_checked_at = record.last_checked_at
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)
+
+    async def set_auto_renew(self, server_id: UUID, enabled: bool) -> RenewalRecord:
+        """Persist the customer's automatic-renewal preference durably."""
+        async with self._session_factory() as session:
+            row = await session.get(_RenewalRecordModel, server_id)
+            if row is None:
+                raise LookupError(f"no renewal record for server {server_id}")
+            cast_any: Any = row
+            cast_any.auto_charge_enabled = bool(enabled)
+            await session.commit()
+            await session.refresh(row)
+            return _to_domain(row)
+
+    async def lock_for_update(self, server_id: UUID) -> RenewalRecord | None:
+        """Read one record under ``SELECT ... FOR UPDATE``.
+
+        Financial concurrency lives in PostgreSQL: two workers renewing the
+        same service contend on this row (and then on the wallet hold's unique
+        idempotency key) rather than racing on shared Redis state.
+        """
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_RenewalRecordModel)
+                    .where(_RenewalRecordModel.server_id == server_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            return _to_domain(row) if row is not None else None
 
     async def list_active(self) -> list[RenewalRecord]:
         async with self._session_factory() as session:

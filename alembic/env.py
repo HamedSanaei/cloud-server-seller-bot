@@ -20,11 +20,27 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.pa
 # Import the application's metadata after sys.path is set up
 from cloud_platform.db.base import Base
 
-# Use environment variable for DB URL, falling back to the config value.
-# Alembic runs synchronously, so we strip the asyncpg prefix if present.
+# Configuration precedence mirrors the application: the environment first
+# (bootstrap/CI), then ``configuration.toml`` — the alembic.ini value is only
+# a placeholder for `alembic init`-style usage. Alembic runs synchronously,
+# so we strip the asyncpg prefix if present.
 _default_db_url = "postgresql://cloud:cloud@localhost:5432/cloud"
-_raw_db_url = os.environ.get("DATABASE_URL") or (
-    context.config.get_main_option("sqlalchemy.url") if context.config else _default_db_url
+
+
+def _settings_db_url() -> str:
+    """``database_url`` from the active TOML configuration (never a secret env)."""
+    try:
+        from cloud_platform.core.config import get_settings
+
+        return get_settings().database_url
+    except Exception:
+        return ""
+
+
+_raw_db_url = (
+    os.environ.get("DATABASE_URL")
+    or _settings_db_url()
+    or (context.config.get_main_option("sqlalchemy.url") if context.config else _default_db_url)
 )
 # If the config URL is a placeholder like "driver://user:pass@..." use default
 if not _raw_db_url or _raw_db_url.startswith("driver://"):

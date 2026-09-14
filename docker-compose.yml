@@ -15,6 +15,10 @@ services:
       timeout: 3s
       retries: 20
 
+  # DEVELOPMENT compose: Redis is published to the host so local tooling can
+  # inspect the Telegram transient state (callback references, confirmations).
+  # Production uses deploy/production/docker-compose.yml, which publishes no
+  # Redis port at all - see docs/operations/PRODUCTION_HARDENING.md.
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]

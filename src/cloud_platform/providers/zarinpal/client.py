@@ -95,6 +95,11 @@ class ZarinPalGateway(CapabilityGatedGateway):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds))
 
     @property
+    def supported_currency(self) -> str:
+        """The only currency this gateway can charge in (see ``CURRENCY``)."""
+        return CURRENCY
+
+    @property
     def startpay_url(self) -> str:
         return SANDBOX_STARTPAY_URL if self._sandbox else PRODUCTION_STARTPAY_URL
 

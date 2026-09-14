@@ -271,13 +271,34 @@ async def reconcile_deletes(ctx: dict[str, object]) -> None:
         await reconciler.reconcile()
 
 
+def _telegram_bot_token() -> str | None:
+    """The configured bot token when it is *shaped* like a Telegram token.
+
+    A placeholder or malformed token (``CHANGE_ME`` in a not-yet-edited
+    ``configuration.toml``) must never crash a financial worker job:
+    renewals, reconciliation and business-log delivery then simply run
+    without Telegram. Availability of the chat channel is never allowed to
+    break money movement.
+    """
+    from cloud_platform.core.config import get_settings
+
+    token = (get_settings().telegram_bot_token or "").strip()
+    prefix, sep, rest = token.partition(":")
+    if not sep or not prefix.isdigit() or not rest or any(ch.isspace() for ch in token):
+        if token:
+            logger.warning("telegram bot token is unusable; Telegram is disabled")
+        return None
+    return token
+
+
 def _telegram_notifiers() -> tuple[Any, Any] | None:
     """(delivery_notifier, renewal_notifier) when Telegram is configured."""
+    token = _telegram_bot_token()
+    if token is None:
+        return None
     from cloud_platform.core.config import get_settings
 
     settings = get_settings()
-    if not settings.telegram_bot_token:
-        return None
     from aiogram import Bot
 
     from cloud_platform.bot.notifier import (
@@ -287,7 +308,7 @@ def _telegram_notifiers() -> tuple[Any, Any] | None:
     from cloud_platform.db.session import SessionFactory
     from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
 
-    bot = Bot(token=settings.telegram_bot_token)
+    bot = Bot(token=token)
     users = SqlAlchemyUserRepository(SessionFactory)
     return (
         TelegramOrderDeliveryNotifier(bot, users),
@@ -326,6 +347,9 @@ async def sync_leaseweb_offers(ctx: dict[str, object]) -> None:
                 if part.strip()
             ),
             order_os_only_free=settings.leaseweb_order_os_only_free,
+            contract_term=settings.leaseweb_contract_term,
+            billing_cycle=settings.leaseweb_billing_cycle,
+            timeout_seconds=settings.leaseweb_timeout_seconds,
         )
         syncer = LeaseWebOrderingCatalogSyncer(SessionFactory, provider)
         result = await syncer.sync_all()
@@ -463,12 +487,52 @@ async def reconcile_payments(ctx: dict[str, object]) -> None:
             await gateway.close()
 
 
+async def deliver_business_log_events(ctx: dict[str, object]) -> None:
+    """Deliver queued operator-channel business events (release hardening).
+
+    The ONLY place a business event reaches Telegram. Events were enqueued
+    durably by the application services, so this job can fail, retry or lag
+    without ever affecting checkout, settlement, ordering or reconciliation.
+    Claiming is atomic and retries are bounded, so a re-run cannot flood the
+    channel. Skipped entirely when the logger channel is not configured.
+    """
+    del ctx
+    async with metrics.job("deliver_business_log_events"):
+        from cloud_platform.core.config import get_settings
+
+        settings = get_settings()
+        if not settings.telegram_logger_enabled or not settings.telegram_logger_chat_id:
+            return
+        token = _telegram_bot_token()
+        if token is None:
+            return
+        from aiogram import Bot
+
+        from cloud_platform.core.container import create_container
+
+        bot = Bot(token=token)
+        container = create_container()
+        try:
+            dispatcher = container.business_log_dispatcher(bot)
+            report = await dispatcher.deliver()
+            logger.info(
+                "business log delivery: sent=%s retried=%s abandoned=%s",
+                report.sent,
+                report.retried,
+                report.abandoned,
+            )
+        finally:
+            await container.close()
+            await bot.session.close()
+
+
 def _cron_jobs() -> list[Any]:
     """Cron schedule for the LEASEWEB-MVP jobs (daily sync/renewal, periodic
     order worker/reconciler). Overlapping runs are safe: the order worker
     claims through the operation ledger and the reconciler never mutates."""
     from arq.cron import cron
 
+    every_minute = set(range(0, 60))
     every_two_minutes = set(range(0, 60, 2))
     every_three_minutes = set(range(0, 60, 3))
     return [
@@ -476,6 +540,7 @@ def _cron_jobs() -> list[Any]:
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
+        cron(deliver_business_log_events, minute=every_minute, run_at_startup=True),
     ]
 
 
@@ -493,6 +558,7 @@ class WorkerSettings:
         process_leaseweb_orders,
         reconcile_leaseweb_orders,
         check_renewals,
+        deliver_business_log_events,
     ]
     cron_jobs: ClassVar[list[Any]] = _cron_jobs()
     on_startup = startup

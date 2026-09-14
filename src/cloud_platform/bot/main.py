@@ -25,13 +25,14 @@ from typing import TYPE_CHECKING
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
-from cloud_platform.bot.ui import BotUi
+from cloud_platform.bot.ui import BotScreen, BotUi
 from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import close_container, get_container
 from cloud_platform.core.i18n import Translator
+from cloud_platform.core.session_store import SessionStoreUnavailable
 from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.users.onboarding import handle_start
 
@@ -73,12 +74,28 @@ def register_handlers(
     @dp.message(Command("menu"))
     async def _menu(message: Message) -> None:
         await _resolve_user(container, message.from_user)
-        screen = ui.menu_screen()
+        # The customer menu is the monthly storefront's (market selector first).
+        screen = monthly_ui.menu_screen()
         await message.answer(screen.text, reply_markup=screen.keyboard)
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
         await message.answer(_t.t("greeting.help"))
+
+    @dp.message()
+    async def _text(message: Message) -> None:
+        """Answer a pending prompt (server name, reverse DNS) or stay silent."""
+        if not message.text or message.text.startswith("/"):
+            return
+        user = await _resolve_user(container, message.from_user)
+        try:
+            screen = await monthly_ui.handle_text(message.text, user)
+        except SessionStoreUnavailable:
+            logger.error("telegram session store unavailable; refusing text input")
+            return
+        if screen is None:
+            return
+        await message.answer(screen.text, reply_markup=screen.keyboard)
 
     @dp.callback_query()
     async def _callback(query: CallbackQuery) -> None:
@@ -86,9 +103,15 @@ def register_handlers(
         chat_id = query.message.chat.id if isinstance(query.message, Message) else None
         data = query.data or ""
         # Monthly flows first (LEASEWEB-MVP), everything else -> legacy UI.
-        screen = await monthly_ui.handle(data, user=user, chat_id=chat_id)
-        if screen is None:
-            screen = await ui.handle(data, user=user, chat_id=chat_id)
+        try:
+            screen = await monthly_ui.handle(data, user=user, chat_id=chat_id)
+            if screen is None:
+                screen = await ui.handle(data, user=user, chat_id=chat_id)
+        except SessionStoreUnavailable:
+            # Defence in depth: the shared session store is unreachable. Refuse
+            # with a safe message; nothing is executed and nothing is queued.
+            logger.error("telegram session store unavailable; refusing callback")
+            screen = BotScreen(_t.t("servers.err_retry"), InlineKeyboardMarkup(inline_keyboard=[]))
         if isinstance(query.message, Message):
             try:
                 await query.message.edit_text(screen.text, reply_markup=screen.keyboard)
@@ -113,6 +136,7 @@ async def main() -> None:
         catalog=container.catalog_repository(),
         create=container.create_server_service(),
     )
+    gateway = container.payment_gateway()  # one HTTP client per bot process
     monthly_ui = MonthlyBotUi(
         settings.callback_signing_key,
         offers_view=container.offer_catalog_view_service(),
@@ -124,6 +148,15 @@ async def main() -> None:
         wallet_history=container.wallet_history_service(),
         power=container.power_command_service(),
         support_contact=settings.support_contact,
+        recharge=container.wallet_recharge_service(gateway),
+        # My Servers: the application service owns ownership, policy,
+        # confirmations, idempotency and audit; the UI only renders.
+        server_management=container.server_management_service(),
+        server_page_size=settings.server_management_page_size,
+        # PROD-HARDENING §2: callback references, pending confirmations and
+        # prompts live in the SHARED store, so a restart or a second replica
+        # does not lose the buttons the customer is holding.
+        sessions=container.server_sessions(),
     )
     register_handlers(dp, ui, monthly_ui, container)
 
@@ -131,6 +164,8 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        if gateway is not None:
+            await gateway.close()
         await close_container()
 
 

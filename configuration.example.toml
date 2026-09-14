@@ -1,0 +1,184 @@
+# Cloud Server Seller — runtime configuration (EXAMPLE).
+#
+# Copy to `configuration.toml` and fill in the real values:
+#
+#   cp configuration.example.toml configuration.toml
+#
+# Production path (mounted into the containers):
+#   /etc/cloud-server-seller/configuration.toml
+#
+# The application finds the file in this order:
+#   1. $CLOUD_PLATFORM_CONFIG_FILE   (bootstrap: only says WHERE the file is)
+#   2. ./configuration.toml          (development)
+#   3. /etc/cloud-server-seller/configuration.toml  (production default)
+#
+# Precedence of values (highest first):
+#   explicit constructor arguments > environment variables > this file > .env
+# Environment variables exist for bootstrap and tests only. Production keeps
+# every secret in this file, which is why `configuration.toml` is git-ignored.
+#
+# NEVER commit a real configuration.toml. Every value below is a fake example.
+
+[app]
+environment = "development"        # development | staging | production
+log_level = "INFO"
+default_currency = "EUR"
+
+[database]
+url = "postgresql+asyncpg://cloud:CHANGE_ME@localhost:5432/cloud"
+
+[redis]
+url = "redis://localhost:6379/0"
+
+[telegram]
+bot_token = "CHANGE_ME"
+callback_signing_key = "CHANGE_ME"
+admin_chat_id = 0                  # renewals / attention alerts (0 = unset)
+support_contact = "@support"
+
+# Telegram TRANSIENT state: callback references, remembered selections,
+# one-time destructive confirmations and free-text prompts.
+#
+# `redis` is REQUIRED in production. This state is disposable (it only ever
+# expires), but it must be SHARED: with `memory` a bot restart loses the
+# buttons a customer is holding, and a second replica would resolve the same
+# reference differently. The factory refuses `memory` outside development.
+#
+# Safety note: losing Redis blocks mutations (fail closed), it never permits
+# one. Nothing here is a secret: no API key, password, credential or console
+# URL is ever stored or embedded in a key name.
+[telegram.sessions]
+backend = "redis"                  # redis | memory (development/test only)
+namespace = "cloud-platform:bot"  # key prefix; change to isolate environments
+reference_ttl_seconds = 1800       # how long a button's reference resolves
+prompt_ttl_seconds = 900           # how long a text prompt waits for an answer
+confirmation_ttl_seconds = 300     # how long a destructive confirmation is valid
+replay_ttl_seconds = 1800          # how long a consumed token is remembered
+
+# Private business-logger channel. The bot must be a member/administrator of
+# this channel. Events are delivered through a durable outbox, so a Telegram
+# outage never affects checkout, payment or reconciliation.
+[telegram.logger]
+enabled = true
+chat_id = -1000000000000
+log_purchases = true
+log_recharges = true
+log_payment_failures = true
+log_order_failures = true
+log_admin_wallet_adjustments = true
+
+# ---------------------------------------------------------------------------
+# Providers
+#
+# `market` places the provider in the storefront: "iran" or "foreign".
+# `display_name` is the customer-facing name (internal provider keys are
+# never shown). `enabled = false` hides a configured provider from the store.
+# ---------------------------------------------------------------------------
+
+[providers.leaseweb]
+enabled = true
+market = "foreign"
+display_name = "Leaseweb"
+api_key = "CHANGE_ME"
+base_url = "https://api.leaseweb.com"
+locations = ["AMS-01", "FRA-01"]
+os_allowlist = []
+order_os_only_free = true
+contract_term = "1_MONTH"
+billing_cycle = "1_MONTH"
+
+[providers.arvancloud]
+enabled = true
+market = "iran"
+display_name = "ArvanCloud"
+api_key = "CHANGE_ME"
+base_url = "https://napi.arvancloud.ir/ecc/v1"
+region = "CHANGE_ME"
+
+[providers.hetzner]
+enabled = false
+market = "foreign"
+display_name = "Hetzner"
+api_token = "CHANGE_ME"
+base_url = "https://api.hetzner.cloud/v1"
+
+[payments.zarinpal]
+enabled = true
+merchant_id = "CHANGE_ME"
+base_url = "https://api.zarinpal.com/pg/v4/payment"
+sandbox = false
+callback_url = "https://example.com/api/v1/payments/zarinpal/callback"
+
+[security]
+provider_credential_encryption_key = "CHANGE_ME"
+backup_encryption_key = "CHANGE_ME"
+
+[billing]
+price_book_name = "retail-eur"
+customer_billing_quantum_seconds = 3600
+low_balance_threshold_minor = 5000
+low_balance_grace_hours = 24
+
+[backup]
+output_dir = "/var/backups/cloud-server-seller"
+retention_days = 14
+
+[observability]
+otel_exporter_endpoint = ""        # e.g. http://otel-collector:4317
+otel_sample_ratio = 1.0
+
+[api]
+allow_header_identity = false      # dev/test only; never in production
+rate_limit_per_minute = 240
+
+# What a paying customer may do from Telegram ("My servers").
+# Capability groups combine with what the provider adapter actually supports
+# and what the server's state allows; a group set to false simply hides its
+# buttons. Destructive actions stay behind a one-time confirmation whatever
+# the flags say.
+[features.server_management]
+enabled = true                     # the whole section
+manager = true                     # details, refresh, rename
+power = true                       # start / stop / reboot
+console = true                     # temporary console link
+traffic = true                     # data-traffic usage
+snapshots = true                   # list / create / restore / delete
+reinstall = true                   # OS reinstall (destructive)
+password_reset = true              # OS password reset (destructive)
+iso = false                        # attach/detach ISO (advanced, off by default)
+ip_management = true               # list IPs, reverse DNS, null route
+monitoring = true                  # monitoring status + enable
+billing = true                     # renew-now + auto-renew toggle (local only)
+page_size = 5                      # servers per Telegram page
+traffic_window_days = 30           # trailing window for the traffic screen
+confirmation_ttl_seconds = 900     # lifetime of a one-time confirmation
+
+# ---------------------------------------------------------------------------
+# Commercial service lifecycle
+#
+# This is the CUSTOMER billing lifecycle, deliberately separate from the
+# provider's infrastructure state (a VPS can be RUNNING while its commercial
+# state is PAYMENT_DUE). These settings never make a provider API call: they
+# only drive local wallet collection, warnings and grace/suspension policy.
+#
+# The renewal amount always comes from the LOCAL commercial price stored on
+# the service (its order/sale price snapshot) — never from a current provider
+# quote. The provider renews its own contract at its own billing cycle; there
+# is no provider renewal or cancellation endpoint in the VPS API, so nothing
+# here can invent one.
+# ---------------------------------------------------------------------------
+
+[commerce.renewal]
+enabled = true                     # run automatic wallet collection
+charge_before_expiry_hours = 72    # earliest automatic charge attempt
+warning_before_expiry_hours = [168, 72, 24]   # customer warnings, per period
+grace_period_hours = 48            # payable window after expiry
+# Default for a NEWLY provisioned service. Set false only if the product is
+# explicitly opt-in; an existing service keeps its own stored setting.
+auto_renew_default = true
+
+[commerce.suspension]
+# Suspension NEVER terminates, reinstalls or deletes a provider server. This
+# flag only decides whether the application stops the VPS after grace expires;
+# it stays off unless the operator deliberately opts in.
+stop_server_after_grace = false

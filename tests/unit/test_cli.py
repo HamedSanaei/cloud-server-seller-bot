@@ -119,6 +119,8 @@ class TestLeasewebDoctor:
         settings.leaseweb_order_os_only_free = True
         settings.redis_url = "redis://localhost:6379/0"
         settings.database_url = "postgresql+asyncpg://x"
+        settings.telegram_sessions_backend = "redis"
+        settings.telegram_sessions_namespace = "cloud-platform:bot"
         monkeypatch.setattr(cli, "get_settings", lambda: settings)
 
         class _FakeProduct:
@@ -165,6 +167,9 @@ class TestLeasewebDoctor:
         )
         monkeypatch.setattr(cli, "_check_db", AsyncMock(return_value=(True, "ok")))
         monkeypatch.setattr(cli, "_check_redis", AsyncMock(return_value=(True, "ok")))
+        monkeypatch.setattr(
+            cli, "_check_session_store", AsyncMock(return_value=(True, "redis read/write ok"))
+        )
         result = await cli.leaseweb_doctor()
         assert result.ok
         text = "\n".join(result.lines)

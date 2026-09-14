@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from cloud_platform.core.config import get_settings
+from cloud_platform.core.session_store import BotSessionStore, build_session_store
 from cloud_platform.db.session import SessionFactory, get_session
 from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
@@ -41,6 +42,7 @@ from cloud_platform.modules.networking.ip_service import IpService
 from cloud_platform.modules.networking.network_service import NetworkService
 from cloud_platform.modules.networking.volume_service import VolumeService
 from cloud_platform.modules.operations.service import PowerCommandService
+from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.modules.pricing.service import PriceBookService, ServerPriceSnapshotService
 from cloud_platform.modules.sshkeys.repository import SqlAlchemySshKeyRepository
@@ -104,6 +106,11 @@ class Container:
     leaseweb_ordering_provider: LeaseWebOrderingProvider | None = None
     credential_holders: _CredentialHolderRegistry | None = None
     credential_rotation_service: CredentialRotationService | None = None
+    # PROD-HARDENING §2: the process-wide Telegram transient-state backend.
+    # Selected once in :func:`create_container` from ``[telegram.sessions]``
+    # (Redis in production, in-memory for tests/development). Containers
+    # built directly (tests) leave it ``None`` and get a lazily built one.
+    bot_session_store: BotSessionStore | None = None
 
     def ssh_key_service(self) -> SshKeyService:
         """Ownership-scoped SSH-key service (M13-001), request-scoped."""
@@ -355,6 +362,8 @@ class Container:
             operation_repo=SqlAlchemyOperationRepository(self.session_factory),
             audit_repo=_audit_repository(self.session_factory),
             provider_registry=self.provider_registry,
+            event_sink=self.business_event_sink(),
+            event_market_lookup=self.provider_market,
         )
 
     def offer_catalog_view_service(self) -> Any:
@@ -367,6 +376,7 @@ class Container:
             provider_registry=self.provider_registry,
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
             signing_key=get_settings().callback_signing_key,
+            market_catalog=self.market_catalog(),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:
@@ -392,6 +402,8 @@ class Container:
             provider_registry=self.provider_registry,
             renewal_repo=self.renewal_repository(),
             delivery_notifier=delivery_notifier,
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
         )
 
     def order_reconciler(self, delivery_notifier: Any | None = None) -> Any:
@@ -417,6 +429,8 @@ class Container:
             audit_repo=_audit_repository(self.session_factory),
             provider_registry=self.provider_registry,
             delivery_notifier=delivery_notifier,
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
         )
 
     def order_recovery(self) -> Any:
@@ -439,6 +453,8 @@ class Container:
             hold_service=self.hold_service(),
             audit_repo=_audit_repository(self.session_factory),
             provider_registry=self.provider_registry,
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
         )
 
     def order_manual_resolution(self) -> Any:
@@ -468,6 +484,8 @@ class Container:
             ledger_repo=self.ledger_repository(),
             audit_repo=_audit_repository(self.session_factory),
             provider_registry=self.provider_registry,
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
         )
 
     def renewal_checker(
@@ -491,6 +509,10 @@ class Container:
             audit_repo=_audit_repository(self.session_factory),
             user_notifier=user_notifier,
             admin_notifier=admin_notifier,
+            # Commercial notices ride the same durable outbox as every other
+            # business event, so the operator channel and the money never
+            # depend on each other's availability.
+            event_sink=self.business_event_sink(),
         )
 
     def wallet_admin_service(self) -> Any:
@@ -502,6 +524,99 @@ class Container:
             SqlAlchemyWalletRepository(self.session_factory),
             self.ledger_repository(),
             _audit_repository(self.session_factory),
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
+        )
+
+    # -- storefront markets ------------------------------------------------
+
+    def market_catalog(self) -> Any:
+        """Provider metadata for the Iran/Foreign storefront (from the TOML)."""
+        from cloud_platform.modules.markets.domain import ProviderCatalog
+
+        settings = get_settings()
+        return ProviderCatalog(
+            markets=settings.provider_markets,
+            display_names=settings.provider_display_names,
+            enabled=settings.providers_enabled,
+        )
+
+    def provider_market(self, provider_key: str) -> str:
+        """The configured market of a provider (``iran``/``foreign``/``""``)."""
+        market = self.market_catalog().market_of(provider_key)
+        return market.value if market is not None else ""
+
+    # -- business log (private operator Telegram channel) -------------------
+
+    def business_log_policy(self) -> Any:
+        """The operator logger-channel policy (TOML ``[telegram.logger]``)."""
+        from cloud_platform.modules.businesslog.domain import BusinessLogPolicy
+
+        return BusinessLogPolicy.from_settings(get_settings())
+
+    def business_log_repository(self) -> Any:
+        """Durable business-log outbox storage."""
+        from cloud_platform.modules.businesslog.repository import (
+            SqlAlchemyBusinessLogRepository,
+        )
+
+        return SqlAlchemyBusinessLogRepository(self.session_factory)
+
+    def business_event_sink(self) -> Any:
+        """The business-event sink to inject into application services.
+
+        Disabled configuration yields the null sink, so call sites stay
+        unconditional and no financial path gains a Telegram dependency.
+        """
+        from cloud_platform.modules.businesslog.domain import (
+            NullBusinessEventSink,
+            OutboxBusinessEventSink,
+        )
+
+        policy = self.business_log_policy()
+        if not policy.active:
+            return NullBusinessEventSink()
+        return OutboxBusinessEventSink(self.business_log_repository(), policy)
+
+    def business_log_dispatcher(self, bot: Any) -> Any:
+        """The delivery worker for the operator channel (worker process only)."""
+        from cloud_platform.modules.businesslog.domain import BusinessLogDispatcher
+        from cloud_platform.modules.businesslog.telegram import TelegramBusinessLogChannel
+
+        policy = self.business_log_policy()
+        return BusinessLogDispatcher(
+            self.business_log_repository(),
+            TelegramBusinessLogChannel(bot, policy.chat_id),
+            policy,
+        )
+
+    def payment_gateway(self) -> Any:
+        """The configured payment gateway, or None when disabled/unconfigured.
+
+        Built once per process (it owns an HTTP client): the bot creates it
+        at startup and hands it to the recharge service.
+        """
+        settings = get_settings()
+        if not settings.zarinpal_enabled or not settings.zarinpal_merchant_id:
+            return None
+        from cloud_platform.providers.zarinpal.client import ZarinPalGateway
+
+        return ZarinPalGateway(
+            merchant_id=settings.zarinpal_merchant_id,
+            base_url=settings.zarinpal_base_url,
+            sandbox=settings.zarinpal_sandbox,
+            callback_url=settings.zarinpal_callback_url,
+        )
+
+    def wallet_recharge_service(self, gateway: Any | None = None) -> Any:
+        """Creates pending top-up sessions (and logs ``recharge.created``)."""
+        from cloud_platform.modules.payments.recharge import WalletRechargeService
+
+        return WalletRechargeService(
+            payments_repo=SqlAlchemyPaymentSessionRepository(self.session_factory),
+            gateway=gateway,
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
         )
 
     def wallet_history_service(self) -> Any:
@@ -530,6 +645,91 @@ class Container:
             operation_repo=SqlAlchemyOperationRepository(self.session_factory),
             provider_registry=self.provider_registry,
             audit_repo=_audit_repository(self.session_factory),
+        )
+
+    def session_store(self) -> BotSessionStore:
+        """The Telegram transient-state backend (Redis in production).
+
+        Callback references, pending confirmations and text prompts live here
+        so they survive a bot restart and mean the same thing on every replica.
+        """
+        if self.bot_session_store is not None:
+            return self.bot_session_store
+        from cloud_platform.core.session_store import build_session_store
+
+        settings = get_settings()
+        return build_session_store(
+            backend=settings.telegram_sessions_backend,
+            prefix=settings.telegram_sessions_namespace,
+            redis_url=settings.redis_url,
+        )
+
+    def server_sessions(self) -> Any:
+        """Shared presentation state for the My Servers flow."""
+        from cloud_platform.bot.sessions import ServerSessions
+
+        settings = get_settings()
+        return ServerSessions(
+            self.session_store(),
+            reference_ttl_seconds=settings.telegram_sessions_reference_ttl_seconds,
+            prompt_ttl_seconds=settings.telegram_sessions_prompt_ttl_seconds,
+        )
+
+    def confirmation_verifier(self) -> Any:
+        """One-time confirmation tokens for destructive customer operations.
+
+        Consumption is atomic in the SHARED store, so a token survives a bot
+        restart and two replicas cannot both consume it. When the store cannot
+        be reached the verifier reports ``UNAVAILABLE`` and the caller refuses
+        the operation (fail closed) rather than falling back to local state.
+        """
+        from cloud_platform.modules.servers.confirmations import (
+            ConfirmationVerifier,
+            SharedConfirmationStore,
+        )
+
+        settings = get_settings()
+        policy = self.server_management_policy()
+        return ConfirmationVerifier(
+            settings.callback_signing_key or "unset-callback-key",
+            store=SharedConfirmationStore(
+                self.session_store(),
+                replay_ttl_seconds=settings.telegram_sessions_replay_ttl_seconds,
+            ),
+            # The operator's server-management TTL stays authoritative for the
+            # token itself; the telegram session TTL only bounds the replay
+            # marker, so an unrelated setting can never shorten a confirmation.
+            ttl_seconds=policy.confirmation_ttl_seconds,
+        )
+
+    def server_management_policy(self) -> Any:
+        """The customer capability policy for the deployment."""
+        from cloud_platform.modules.servers.policies import ServerManagementPolicy
+
+        return ServerManagementPolicy.from_settings(get_settings())
+
+    def server_management_service(self) -> Any:
+        """Customer-facing, ownership-safe server management (Telegram).
+
+        Power keeps flowing through :class:`PowerCommandService` (the existing
+        operation ledger), while every other provider call goes through the
+        provider-neutral VPS ports.
+        """
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.servers.service import ServerManagementService
+
+        return ServerManagementService(
+            servers=SqlAlchemyServerRepository(self.session_factory),
+            registry=self.provider_registry,
+            policy=self.server_management_policy(),
+            confirmations=self.confirmation_verifier(),
+            audit_repo=_audit_repository(self.session_factory),
+            power=self.power_command_service(),
+            event_sink=self.business_event_sink(),
+            # Commercial status + manual renewal come from the SAME checker the
+            # worker runs, so the customer's "renew now" and the automatic pass
+            # can never disagree about the price or the idempotency key.
+            renewal_collector=self.renewal_checker(),
         )
 
     @asynccontextmanager
@@ -603,6 +803,14 @@ class Container:
         for provider in self.provider_registry._providers.values():
             if hasattr(provider, "close"):
                 await provider.close()
+        # Release the shared Telegram session/confirmation connection too, so a
+        # graceful shutdown leaves no half-open Redis client behind.
+        store = self.bot_session_store
+        client = getattr(store, "client", None)
+        if client is not None:
+            from cloud_platform.core.redis import close_redis_client
+
+            await close_redis_client(client)
 
 
 _container: Container | None = None
@@ -685,6 +893,9 @@ def create_container() -> Container:
                 if part.strip()
             ),
             order_os_only_free=settings.leaseweb_order_os_only_free,
+            contract_term=settings.leaseweb_contract_term,
+            billing_cycle=settings.leaseweb_billing_cycle,
+            timeout_seconds=settings.leaseweb_timeout_seconds,
         )
         leaseweb_ordering_syncer = LeaseWebOrderingCatalogSyncer(
             session_factory=session_factory,
@@ -708,6 +919,11 @@ def create_container() -> Container:
             holders,
             registry,
             _audit_repository(session_factory),
+        ),
+        bot_session_store=build_session_store(
+            backend=settings.telegram_sessions_backend,
+            prefix=settings.telegram_sessions_namespace,
+            redis_url=settings.redis_url,
         ),
     )
 

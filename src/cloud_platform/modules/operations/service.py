@@ -69,7 +69,11 @@ from cloud_platform.providers.base import (
     rebuild_support_of,
     rescue_support_of,
 )
-from cloud_platform.providers.errors import ProviderError, ProviderNotFound
+from cloud_platform.providers.errors import (
+    ProviderError,
+    ProviderNotFound,
+    ProviderOutcomeUnknown,
+)
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
 from cloud_platform.providers.waiter import (
@@ -1050,6 +1054,18 @@ class PowerOperationFailedError(PowerCommandError):
     """The power operation permanently failed (error recorded in the ledger)."""
 
 
+class PowerOutcomeUnknownError(PowerOperationFailedError):
+    """The power mutation may or may not have been applied.
+
+    Raised when the provider answered ambiguously (a read/write timeout, a
+    dropped connection or a 5xx after the request was transmitted), so the
+    platform cannot prove whether the action took effect. It is a
+    ``PowerOperationFailedError`` for every existing caller, but a
+    customer-facing layer MUST NOT report it as a definitive rejection (and
+    must never simply re-send it): the honest answer is "outcome unknown, do
+    not repeat"."""
+
+
 class PowerAction(StrEnum):
     POWER_ON = "power_on"
     POWER_OFF = "power_off"
@@ -1356,7 +1372,13 @@ class PowerOperationExecutor:
                     metadata={"operation_id": str(operation.id)},
                 )
                 return False
-            await self._fail(operation, actor_type, actor_id, str(exc))
+            await self._fail(
+                operation,
+                actor_type,
+                actor_id,
+                str(exc),
+                ambiguous=isinstance(exc, ProviderOutcomeUnknown),
+            )
         return True
 
     async def _finish_power(
@@ -1449,8 +1471,14 @@ class PowerOperationExecutor:
         actor_type: ActorType,
         actor_id: UUID | None,
         reason: str,
+        *,
+        ambiguous: bool = False,
     ) -> NoReturn:
         operation.fail(reason)
+        if ambiguous:
+            # Remember WHY it failed: a later replay of the same idempotency
+            # key must not report an unprovable outcome as a rejection.
+            operation.provider_response = {"outcome": "unknown"}
         await self._ops.save(operation)
         await self._audit.record_mutation(
             actor_type=actor_type,
@@ -1459,8 +1487,13 @@ class PowerOperationExecutor:
             resource_id=str(operation.resource_id),
             actor_id=actor_id,
             reason=reason,
-            metadata={"operation_id": str(operation.id)},
+            metadata={
+                "operation_id": str(operation.id),
+                **({"outcome": "unknown"} if ambiguous else {}),
+            },
         )
+        if ambiguous:
+            raise PowerOutcomeUnknownError(reason)
         raise PowerOperationFailedError(reason)
 
 
@@ -1540,6 +1573,10 @@ class PowerCommandService:
                     server=await self._servers.get(server_id) or server, replayed=True
                 )
             if op.status is OperationStatus.FAILED:
+                if (op.provider_response or {}).get("outcome") == "unknown":
+                    raise PowerOutcomeUnknownError(
+                        op.error or "power outcome is unknown; not re-sent"
+                    )
                 raise PowerOperationFailedError(op.error or "power operation failed")
             if op.status is OperationStatus.IN_FLIGHT:
                 raise PowerOperationInProgressError("power operation is in progress")

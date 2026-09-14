@@ -28,6 +28,19 @@ from cloud_platform.modules.compute.domain import (
 from cloud_platform.modules.navigation.domain import Callback, decode_callback, encode_callback
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.renewals.domain import RenewalRecord, RenewalStatus
+from cloud_platform.modules.servers.confirmations import ConfirmationStatus
+from cloud_platform.modules.servers.models import (
+    CustomerServerPage,
+    CustomerServerState,
+    CustomerServerView,
+    ServerActionOutcome,
+    ServerOperation,
+)
+from cloud_platform.modules.servers.policies import ServerManagementPolicy
+from cloud_platform.modules.servers.service import (
+    ServerConfirmationError,
+    ServerNotFoundError,
+)
 from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.wallet.domain import Hold, Wallet
 
@@ -255,12 +268,102 @@ class FakePower:
         return None
 
 
+class FakeManagement:
+    """The slice of ``ServerManagementService`` the storefront's UI uses.
+
+    Ownership is enforced exactly like the real service (a foreign row is
+    indistinguishable from a missing one) so the delegation seam keeps the
+    same guarantees. The full action surface is covered in
+    ``test_servers_management_ui.py``.
+    """
+
+    def __init__(self, servers: list[CloudServer] | None = None) -> None:
+        rows = servers if servers is not None else [_server()]
+        self.servers = {server.id: server for server in rows}
+        self.policy = ServerManagementPolicy()
+        self.calls: list[tuple[str, UUID, UUID]] = []
+        self.tokens: list[str] = []
+        self.consumed: set[str] = set()
+
+    def _owned(self, customer_id: UUID, server_id: UUID) -> CloudServer:
+        server = self.servers.get(server_id)
+        if server is None or server.user_id != customer_id:
+            raise ServerNotFoundError("server not found")
+        return server
+
+    @staticmethod
+    def _view(server: CloudServer) -> CustomerServerView:
+        return CustomerServerView(
+            server_id=server.id,
+            state=CustomerServerState.RUNNING,
+            ip=server.ipv4,
+            operating_system=server.os,
+        )
+
+    async def list_servers(self, customer_id: UUID, *, page: int = 1) -> CustomerServerPage:
+        rows = sorted(
+            (s for s in self.servers.values() if s.user_id == customer_id),
+            key=lambda s: str(s.id),
+        )
+        items = tuple(self._view(server) for server in rows)
+        return CustomerServerPage(items=items, page=page, page_size=5, total=len(items))
+
+    async def get_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
+        self.calls.append(("get_server", customer_id, server_id))
+        return self._view(self._owned(customer_id, server_id))
+
+    async def refresh_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
+        return self._view(self._owned(customer_id, server_id))
+
+    async def issue_confirmation(
+        self, customer_id: UUID, server_id: UUID, operation: ServerOperation, **_: Any
+    ) -> str:
+        self._owned(customer_id, server_id)
+        token = f"tok-{len(self.tokens)}"
+        self.tokens.append(token)
+        return token
+
+    async def start_server(
+        self, customer_id: UUID, server_id: UUID, **_kwargs: Any
+    ) -> ServerActionOutcome:
+        self._owned(customer_id, server_id)
+        self.calls.append(("start_server", customer_id, server_id))
+        return ServerActionOutcome(operation=ServerOperation.START, accepted=True)
+
+    async def reboot_server(
+        self, customer_id: UUID, server_id: UUID, **_kwargs: Any
+    ) -> ServerActionOutcome:
+        self._owned(customer_id, server_id)
+        self.calls.append(("reboot_server", customer_id, server_id))
+        return ServerActionOutcome(operation=ServerOperation.REBOOT, accepted=True)
+
+    async def stop_server(
+        self,
+        customer_id: UUID,
+        server_id: UUID,
+        *,
+        confirmation_token: str | None = None,
+        **_kwargs: Any,
+    ) -> ServerActionOutcome:
+        if not confirmation_token:
+            raise ServerConfirmationError(
+                "confirmation required", status=ConfirmationStatus.INVALID
+            )
+        if confirmation_token in self.consumed:
+            raise ServerConfirmationError("replayed", status=ConfirmationStatus.REPLAYED)
+        self.consumed.add(confirmation_token)
+        self._owned(customer_id, server_id)
+        self.calls.append(("stop_server", customer_id, server_id))
+        return ServerActionOutcome(operation=ServerOperation.STOP, accepted=True)
+
+
 def _ui(
     *,
     checkout: FakeCheckout | None = None,
     servers: FakeServers | None = None,
     power: FakePower | None = None,
     offers: FakeOffersRepo | None = None,
+    management: FakeManagement | None = None,
 ) -> tuple[MonthlyBotUi, dict[str, Any]]:
     checkout = checkout or FakeCheckout()
     servers = servers or FakeServers()
@@ -277,8 +380,15 @@ def _ui(
         wallet_history=FakeWalletHistory(),
         power=power,
         translator=Translator(Locale.EN),
+        server_management=management,  # type: ignore[arg-type]
     )
-    deps = {"checkout": checkout, "servers": servers, "power": power, "offers": offers}
+    deps = {
+        "checkout": checkout,
+        "servers": servers,
+        "power": power,
+        "offers": offers,
+        "management": management,
+    }
     return ui, deps
 
 
@@ -330,50 +440,82 @@ class TestBuyFlow:
         assert screen is None  # caller renders the tamper notice
 
 
-class TestServersOwnership:
+class TestServersFlowDelegation:
+    """The storefront owns the MARKET/store path; My Servers is delegated.
+
+    The detailed flows (actions, confirmations, snapshots, IPs...) live in
+    ``test_servers_management_ui.py``; what matters here is the seam: the
+    storefront routes ``servers.*`` to the management UI, adds its own plan
+    and renewal lines to the details screen, and stays honest when the
+    management service is not configured at all.
+    """
+
     async def test_list_shows_only_own_servers(self) -> None:
-        alice_server = _server(USER_A.id or uuid4())
-        bob_server = _server(USER_B.id or uuid4())
-        ui, _deps = _ui(servers=FakeServers([alice_server, bob_server]))
-        cb = ui._callback("servers", "list")
-        screen = await ui.handle(cb, user=USER_A)
-        assert "My servers" in screen.text
-        buttons = screen.keyboard.inline_keyboard
-        assert len(buttons) == 2  # one server row + menu
-        detail_button = buttons[0][0]
-        _assert_callback_target(detail_button.callback_data, "servers", "detail")
+        management = FakeManagement([_server(USER_A.id or uuid4())])
+        ui, _deps = _ui(management=management)
+
+        mine = await ui.handle(ui._callback("servers", "list"), user=USER_A)
+        theirs = await ui.handle(ui._callback("servers", "list"), user=USER_B)
+
+        assert "My servers" in mine.text
+        assert "1.2.3.4" in mine.text
+        manage = [b for row in mine.keyboard.inline_keyboard for b in row if "Manage" in b.text]
+        assert len(manage) == 1
+        # The button carries an opaque reference, never the local UUID.
+        assert str(SERVER_ID) not in manage[0].callback_data
+        assert "no servers yet" in theirs.text.lower()
+
+    async def test_empty_list_when_the_customer_has_no_servers(self) -> None:
+        ui, _ = _ui(management=FakeManagement([]))
+        screen = await ui.handle(ui._callback("servers", "list"), user=USER_A)
+        assert "no servers yet" in screen.text.lower()
 
     async def test_user_b_cannot_view_user_a_server(self) -> None:
-        ui, _ = _ui()
-        cb = ui._callback("servers", "detail", str(SERVER_ID))
-        screen = await ui.handle(cb, user=USER_B)
-        assert "Server not found" in screen.text
+        ui, deps = _ui(management=FakeManagement([_server(USER_A.id)]))
+        # USER_B can only ever hold a reference minted for USER_B, and the
+        # service refuses the row anyway.
+        screen = await ui.handle(ui._callback("servers", "view", "deadbeef"), user=USER_B)
+        assert "expired" in screen.text.lower()
+        assert deps["management"].calls == []
 
-    async def test_detail_shows_ips_and_renewal(self) -> None:
-        ui, _ = _ui()
-        cb = ui._callback("servers", "detail", str(SERVER_ID))
-        screen = await ui.handle(cb, user=USER_A)
+    async def test_detail_combines_provider_view_with_storefront_facts(self) -> None:
+        ui, _ = _ui(management=FakeManagement([_server(USER_A.id)]))
+        ref = await ui._servers_ui.ref_for(USER_A, SERVER_ID)
+        screen = await ui.handle(ui._callback("servers", "view", str(ref)), user=USER_A)
         assert "Server details" in screen.text
-        assert "1.2.3.4" in screen.text
-        assert "2026-09-30" in screen.text
+        assert "1.2.3.4" in screen.text  # provider-neutral view
+        assert "VPS S" in screen.text  # the local offer
+        assert "2026-09-30" in screen.text  # the local renewal
 
-    async def test_power_off_requires_confirmation_then_executes(self) -> None:
-        ui, deps = _ui()
-        confirm_cb = ui._callback("servers", "power_confirm", str(SERVER_ID), "power_off")
-        screen = await ui.handle(confirm_cb, user=USER_A)
-        assert "Confirm operation" in screen.text
-        exec_button = screen.keyboard.inline_keyboard[0][0]
-        _assert_callback_target(exec_button.callback_data, "servers", "power")
+    async def test_power_off_requires_confirmation_then_executes_once(self) -> None:
+        ui, deps = _ui(management=FakeManagement([_server(USER_A.id)]))
+        management = deps["management"]
+        ref = await ui._servers_ui.ref_for(USER_A, SERVER_ID)
+
+        confirm = await ui.handle(ui._callback("servers", "pwr", str(ref), "off"), user=USER_A)
+        assert "Confirm operation" in confirm.text
+        assert management.calls == []
+
+        exec_button = next(
+            b for row in confirm.keyboard.inline_keyboard for b in row if "Do it" in b.text
+        )
         screen = await ui.handle(exec_button.callback_data, user=USER_A)
-        assert "completed on your server" in screen.text
-        assert deps["power"].calls == [(USER_A.id, SERVER_ID, "power_off")]
+        again = await ui.handle(exec_button.callback_data, user=USER_A)
+
+        assert "Power off" in screen.text
+        assert [call[0] for call in management.calls] == ["stop_server"]
+        assert "already running" in again.text
 
     async def test_power_on_user_b_blocked(self) -> None:
-        ui, deps = _ui()
-        cb = ui._callback("servers", "power", str(SERVER_ID), "power_on")
-        screen = await ui.handle(cb, user=USER_B)
-        assert "Server not found" in screen.text
-        assert deps["power"].calls == []
+        ui, deps = _ui(management=FakeManagement([_server(USER_A.id)]))
+        screen = await ui.handle(ui._callback("servers", "pwr", "deadbeef", "on"), user=USER_B)
+        assert "expired" in screen.text.lower()
+        assert deps["management"].calls == []
+
+    async def test_without_the_management_service_the_flow_is_disabled(self) -> None:
+        ui, _deps = _ui()
+        screen = await ui.handle(ui._callback("servers", "list"), user=USER_A)
+        assert "not enabled" in screen.text.lower()
 
 
 class TestWalletAndSupport:

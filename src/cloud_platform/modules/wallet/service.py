@@ -16,6 +16,8 @@ from uuid import UUID
 
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.events import admin_adjustment_event
 from cloud_platform.modules.users.domain import Permission, PermissionChecker, User
 from cloud_platform.modules.wallet.domain import (
     Hold,
@@ -48,10 +50,14 @@ class WalletAdminService:
         wallet_repo: WalletRepository,
         ledger_repo: LedgerRepository,
         audit_repo: AuditRepository,
+        event_sink: BusinessEventSink | None = None,
+        user_repo: object | None = None,
     ) -> None:
         self._wallet_repo = wallet_repo
         self._ledger_repo = ledger_repo
         self._audit = AuditTrail(audit_repo)
+        self._events = event_sink
+        self._users = user_repo
 
     async def adjust_balance(
         self,
@@ -122,7 +128,33 @@ class WalletAdminService:
             reason=reason,
             metadata={"amount": str(amount), "currency": updated.currency},
         )
+        # Operator channel: manual balance adjustments are financially
+        # sensitive, so they are always logged with actor, amount and reason.
+        await emit_safe(
+            self._events,
+            admin_adjustment_event(
+                admin=admin,
+                user=await self._load_user(user_id),
+                amount_minor=amount,
+                currency=updated.currency,
+                entry_type=LedgerEntryType.ADJUSTMENT.value,
+                reason=reason,
+                balance_after_minor=updated.balance,
+                idempotency_key=idempotency_key,
+            ),
+        )
         return updated, entry
+
+    async def _load_user(self, user_id: UUID) -> User | None:
+        """Best-effort user lookup for the business-log payload."""
+        if self._users is None:
+            return None
+        try:
+            found: User | None = await self._users.get(user_id)  # type: ignore[attr-defined]
+        except Exception:
+            logger.warning("user lookup for admin adjustment log failed", exc_info=True)
+            return None
+        return found
 
 
 class HoldAdminService:

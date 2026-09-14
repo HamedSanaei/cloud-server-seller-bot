@@ -172,7 +172,7 @@ class TestWorkerLifecycleAndNotifiers:
     def test_telegram_notifiers_built_with_token(
         self, settings: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        settings.telegram_bot_token = "t:ok"
+        settings.telegram_bot_token = "123456:ok"
         settings.telegram_admin_chat_id = 42
         delivery = MagicMock()
         renewal = MagicMock()
@@ -194,15 +194,17 @@ class TestWorkerLifecycleAndNotifiers:
         by_name = {
             getattr(job, "coroutine", getattr(job, "func", None)).__name__: job for job in jobs
         }
-        assert len(by_name) == 4
+        assert len(by_name) == 5
         assert by_name["process_leaseweb_orders"].minute == set(range(0, 60, 2))
         assert by_name["reconcile_leaseweb_orders"].minute == set(range(0, 60, 3))
         assert by_name["sync_leaseweb_offers"].hour == {3}
         assert by_name["check_renewals"].hour == {3}
+        # The business-log delivery pass runs every minute (bounded retries).
+        assert by_name["deliver_business_log_events"].minute == set(range(0, 60))
         for job in jobs:
             assert getattr(job, "run_at_startup", False) is True
 
     def test_worker_settings_cron_jobs_match(self) -> None:
-        assert len(ws.WorkerSettings.cron_jobs) == 4
+        assert len(ws.WorkerSettings.cron_jobs) == 5
         assert ws.WorkerSettings.on_startup is ws.startup
         assert ws.WorkerSettings.on_shutdown is ws.shutdown
