@@ -261,16 +261,25 @@ class TestFailClosed:
 
 
 class TestBackendSelection:
+    @pytest.mark.parametrize(
+        ("environment", "match"),
+        [
+            # Production fails closed at the Settings boundary itself.
+            ("production", "must be 'redis'"),
+            # Any other non-development environment fails at the factory.
+            ("staging", "in-memory"),
+        ],
+    )
     def test_memory_backend_is_refused_outside_development(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, environment: str, match: str
     ) -> None:
         """A production deployment must never silently run on process-local state."""
         from cloud_platform.core.config import get_settings, reset_settings_cache
 
-        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("APP_ENV", environment)
         reset_settings_cache()
         try:
-            with pytest.raises(ValueError, match="in-memory"):
+            with pytest.raises(ValueError, match=match):
                 build_session_store(
                     backend="memory", prefix="cloud-platform:bot", redis_url="redis://x/0"
                 )

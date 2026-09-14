@@ -37,6 +37,12 @@ x-platform: &platform
   environment:
     # Bootstrap only: names the file, contains no secret.
     CLOUD_PLATFORM_CONFIG_FILE: /etc/cloud-server-seller/configuration.toml
+    # Production topology invariant (NON-SECRET): Telegram transient state
+    # must live in shared Redis. Environment beats configuration.toml by
+    # documented precedence, so this safely overrides a stale historical
+    # `[telegram.sessions] backend = "memory"` without touching the
+    # server-owned file. Api, worker, bot and migrate all resolve redis.
+    TELEGRAM_SESSIONS_BACKEND: redis
   volumes:
     # Server-owned configuration: never committed, never overwritten by a
     # deploy. CONFIGURATION_PATH may point elsewhere; the default is the

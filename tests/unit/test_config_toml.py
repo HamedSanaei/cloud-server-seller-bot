@@ -166,7 +166,12 @@ class TestFileResolution:
     def test_bootstrap_env_var_points_at_the_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        path = _write(tmp_path, '[app]\nenvironment = "production"\n')
+        # Production requires the redis session backend (fail-closed
+        # Settings contract), so the fixture file carries it explicitly.
+        path = _write(
+            tmp_path,
+            '[app]\nenvironment = "production"\n[telegram.sessions]\nbackend = "redis"\n',
+        )
         monkeypatch.setenv(CONFIG_FILE_ENV, str(path))
         assert resolve_config_file() == path
         assert load_settings(None).app_env == "production"

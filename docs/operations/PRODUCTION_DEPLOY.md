@@ -40,9 +40,15 @@ RELEASE-OWNED (promoted automatically on every successful deploy):
     Docker image (ghcr.io/<org>/<repo>:<full-sha>)
     /opt/cloud-server-seller/docker-compose.yml   (canonical release contract)
 
+RELEASE/TOPOLOGY INVARIANT (non-secret, enforced from release-owned compose):
+    production Telegram transient-state backend = redis
+    (TELEGRAM_SESSIONS_BACKEND=redis in the shared compose block; wins over
+    a stale server TOML by documented precedence — no manual TOML edit needed)
+
 SERVER-OWNED (never delivered from Git, never overwritten by a deploy):
     /opt/cloud-server-seller/deploy.env           (infrastructure values only, mode 600)
-    /etc/cloud-server-seller/configuration.toml   (ALL application config + secrets, mode 640 or 600)
+    /etc/cloud-server-seller/configuration.toml   (bot token, callback key,
+      provider/payment credentials, database URL, encryption keys, mode 640 or 600)
     persistent Docker volumes/data, host credentials
 ```
 

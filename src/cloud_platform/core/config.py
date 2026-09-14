@@ -37,7 +37,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 #: Bootstrap variable naming the configuration file. Never a secret.
@@ -484,7 +484,13 @@ class Settings(BaseSettings):
     # `redis` is the only production-safe backend: callback references, pending
     # confirmations and prompts must survive a restart and be visible to every
     # replica. `memory` exists for tests and an explicitly configured
-    # development environment only (the factory refuses it elsewhere).
+    # development environment only (the factory refuses it elsewhere, and a
+    # production process resolving to it fails closed at Settings level).
+    # Ownership: the VALUE stays server-owned (bot token, keys and URLs are
+    # secrets and live only in configuration.toml), but the production
+    # topology invariant (backend = redis) is enforced release-side: the
+    # release-owned production compose sets TELEGRAM_SESSIONS_BACKEND=redis,
+    # which wins over a stale historical TOML value by documented precedence.
     telegram_sessions_backend: str = "memory"
     telegram_sessions_namespace: str = "cloud-platform:bot"
     # How long a server reference / remembered selection stays resolvable.
@@ -515,6 +521,29 @@ class Settings(BaseSettings):
 
     #: Flat values read from ``configuration.toml`` (introspection/tests).
     toml_values: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @model_validator(mode="after")
+    def _enforce_production_session_backend(self) -> Settings:
+        """Production must use the shared Redis transient-state backend.
+
+        Backend names are accepted case-insensitively (the factory
+        convention) and normalized to the canonical value. After all
+        precedence has been applied, a production process that still
+        resolves to ``memory`` fails closed: the release-owned production
+        compose injects ``TELEGRAM_SESSIONS_BACKEND=redis`` (environment
+        beats a stale TOML), so reaching this error means the deployment
+        topology itself is wrong. Development/test may keep ``memory``.
+        """
+        backend = (self.telegram_sessions_backend or "").strip().lower()
+        if backend in ("redis", "memory"):
+            self.telegram_sessions_backend = backend
+        if (self.app_env or "").strip().lower() == "production" and backend == "memory":
+            raise ValueError(
+                "telegram_sessions_backend must be 'redis' when app_env is "
+                "'production' (production compose sets "
+                "TELEGRAM_SESSIONS_BACKEND=redis)"
+            )
+        return self
 
     @classmethod
     def settings_customise_sources(

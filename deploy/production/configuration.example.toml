@@ -36,6 +36,9 @@ callback_signing_key = "CHANGE_ME"
 # Telegram transient state. `redis` is REQUIRED in production: the bot must
 # share callback references, pending confirmations and prompts across restarts
 # and replicas. `memory` is refused outside development/test.
+# (The release-owned production compose also enforces
+# TELEGRAM_SESSIONS_BACKEND=redis, so even an older server file that still
+# says `memory` resolves to redis at runtime — but keep this value correct.)
 [telegram.sessions]
 backend = "redis"
 namespace = "cloud-platform:bot"
