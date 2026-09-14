@@ -342,7 +342,7 @@ def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = Fals
     (stub_bin / "docker").chmod(0o755)
     calls = tmp_path / "docker-calls.log"
     script = (
-        f"export DEPLOY_PRODUCTION_SOURCED=1 PATH='{stub_bin.as_posix()}:$PATH' "
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
         f"DOCKER_CALLS_LOG='{calls.as_posix()}' STUB_FAIL_PULL={'1' if fail_pull else '0'} "
         f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
         f"COMPOSE_FILE='{(deploy_dir / 'docker-compose.yml').as_posix()}' "
@@ -484,7 +484,7 @@ def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProces
     (stub_bin / "python3").write_text(_STUB_PYTHON, encoding="utf-8")
     (stub_bin / "python3").chmod(0o755)
     script = (
-        f"export DEPLOY_PRODUCTION_SOURCED=1 PATH='{stub_bin.as_posix()}:$PATH' "
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
         f"DOCKER_CALLS_LOG='{(tmp_path / 'docker-calls.log').as_posix()}' "
         f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
         f"PYTHON_CALLS_LOG='{(tmp_path / 'python-calls.log').as_posix()}' "
@@ -495,7 +495,9 @@ def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProces
         f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='' "
         f"HEALTH_ATTEMPTS=36 HEALTH_INTERVAL=5; "
         f"source '{DEPLOY_SCRIPT.as_posix()}'; "
-        "main; echo MAIN_RC=$?"
+        # Sourcing the script leaks its `set -e` into this shell; disable it
+        # explicitly so MAIN_RC is always reported instead of aborting early.
+        "set +e; main; echo MAIN_RC=$?"
     )
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
 
