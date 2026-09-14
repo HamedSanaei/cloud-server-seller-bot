@@ -1,30 +1,35 @@
 """Honesty checks for the Leaseweb VPS coverage matrix.
 
 ``docs/leaseweb/VPS_API_COVERAGE.md`` is only useful if it cannot drift away
-from the code or from the local Leaseweb documentation. This module enforces
-that with three independent comparisons:
+from the code or from the Leaseweb documentation. This module enforces that
+with three independent comparisons:
 
-1. **Documentation -> inventory**: the paths and operationIds that exist in
-   the local OpenAPI capture (``api_docs/leaseweb/...html``) for the modern
-   VPS / Ordering-VPS / Account-Orders surface must be EXACTLY the ones the
-   machine-readable inventory claims (no invented endpoint, no forgotten
-   one).
+1. **Documentation -> inventory**: the paths and operationIds documented for
+   the modern VPS / Ordering-VPS / Account-Orders surface must be EXACTLY the
+   ones the machine-readable inventory claims (no invented endpoint, no
+   forgotten one).
 2. **Inventory -> code**: every listed client class and method exists and is
    callable, and the destructive classification matches the code's
    ``DESTRUCTIVE_OPERATIONS`` plus the billable ``order_vps``.
 3. **Inventory -> document**: the matrix mentions every operationId, endpoint
    and test, and its summary numbers equal the inventory counts.
 
-The doc capture is a ReDoc page whose state object uses unquoted JS keys, so
-it is checked with targeted patterns (documented paths, ``operationId:"x"``,
-``tags:["VPS"]``) rather than by JSON parsing.
+The documentation facts come from the local OpenAPI capture
+(``api_docs/leaseweb/...html``) when it is present. That capture is a ReDoc
+page whose state object uses unquoted JS keys, so it is checked with targeted
+patterns (documented paths, ``operationId:"x"``, ``tags:["VPS"]``) rather than
+by JSON parsing. The capture is git-ignored, so on a clean clone (CI) the
+same facts are read from the committed deterministic snapshot
+(``docs/leaseweb/leaseweb_vps_api_snapshot.json``) instead — every assertion
+below still runs; only the source of the documentation facts changes. The
+snapshot itself is verified byte-identical against the capture by
+``python scripts/gen_leaseweb_coverage.py --check`` whenever the capture is
+available.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -33,6 +38,14 @@ from cloud_platform.providers.leaseweb.orders_api import LeaseWebAccountOrdersAp
 from cloud_platform.providers.leaseweb.vps.client import (
     DESTRUCTIVE_OPERATIONS,
     LeaseWebVpsApi,
+)
+from cloud_platform.providers.leaseweb.vps.doc_snapshot import (
+    DocOperation,
+    build_snapshot,
+    extract_legacy_virtual_servers,
+    extract_operations,
+    load_snapshot,
+    snapshot_mismatches,
 )
 from cloud_platform.providers.leaseweb.vps.inventory import (
     ALL_OPERATIONS,
@@ -53,7 +66,7 @@ DOCS_CAPTURE = (
     / "Leaseweb Developer Portal __ API _ Github _ Terraform.html"
 )
 
-CLIENTS: dict[str, type[Any]] = {
+CLIENTS = {
     "LeaseWebVpsApi": LeaseWebVpsApi,
     "LeaseWebOrderingApi": LeaseWebOrderingApi,
     "LeaseWebAccountOrdersApi": LeaseWebAccountOrdersApi,
@@ -68,11 +81,38 @@ IMPLEMENTATION_MODULES = (
 )
 
 
+def _inventory_claims() -> tuple[tuple[str, str, str, str], ...]:
+    return tuple(
+        (operation.operation_id, operation.method.lower(), operation.path, operation.category)
+        for operation in ALL_OPERATIONS
+    )
+
+
 @pytest.fixture(scope="module")
-def documentation() -> str:
-    """The local Leaseweb documentation capture, read once per module."""
-    assert DOCS_CAPTURE.exists(), f"missing documentation capture: {DOCS_CAPTURE}"
-    return DOCS_CAPTURE.read_text(encoding="utf-8", errors="replace")
+def doc_operations() -> list[DocOperation]:
+    """Documented operation facts: raw capture when present, snapshot otherwise."""
+    if DOCS_CAPTURE.exists():
+        documentation = DOCS_CAPTURE.read_text(encoding="utf-8", errors="replace")
+        return list(extract_operations(documentation))
+    snapshot = load_snapshot(REPO_ROOT)
+    return [
+        DocOperation(
+            operation_id=operation["operationId"],
+            method=operation["method"],
+            path=operation["path"],
+            tag=operation["tag"],
+        )
+        for operation in snapshot["operations"]
+    ]
+
+
+@pytest.fixture(scope="module")
+def legacy_observed() -> list[str]:
+    """Legacy Virtual Servers operations visible in the documentation."""
+    if DOCS_CAPTURE.exists():
+        documentation = DOCS_CAPTURE.read_text(encoding="utf-8", errors="replace")
+        return list(extract_legacy_virtual_servers(documentation))
+    return list(load_snapshot(REPO_ROOT)["legacy_virtual_servers_observed"])
 
 
 @pytest.fixture(scope="module")
@@ -80,80 +120,88 @@ def coverage_doc() -> str:
     return (REPO_ROOT / COVERAGE_DOC).read_text(encoding="utf-8")
 
 
-def _documented_paths(documentation: str, prefix: str) -> set[str]:
-    pattern = re.compile(rf'"({re.escape(prefix)}[^"]*)":\{{')
-    return {match.group(1) for match in pattern.finditer(documentation)}
-
-
-def _path_object(documentation: str, path: str) -> str:
-    """The balanced-brace object literal of one documented path.
-
-    The capture is a JS object (unquoted keys), so the substring is found by
-    matching braces while skipping over string literals.
-    """
-    marker = f'"{path}":{{'
-    start = documentation.index(marker)
-    index = start + len(marker) - 1  # positioned on the opening brace
-    depth = 0
-    while index < len(documentation):
-        char = documentation[index]
-        if char == '"':
-            end = index + 1
-            while documentation[end] != '"' or documentation[end - 1] == "\\":
-                end += 1
-            index = end
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                break
-        index += 1
-    return documentation[start : index + 1]
-
-
-def _documented_methods(documentation: str, path: str) -> set[str]:
-    """The HTTP methods the documentation defines for one path."""
-    body = _path_object(documentation, path)
-    return set(re.findall(r"(?:^|[,{ ])(get|post|put|delete|patch):\{", body))
-
-
 class TestDocumentationAgreement:
     """The inventory covers every documented operation — and invents none."""
 
-    def test_vps_paths_match_the_documentation_exactly(self, documentation: str) -> None:
-        documented = _documented_paths(documentation, "/publicCloud/v1/vps")
+    def test_vps_paths_match_the_documentation_exactly(
+        self, doc_operations: list[DocOperation]
+    ) -> None:
+        documented = {operation.path for operation in doc_operations if operation.tag == "VPS"}
         claimed = {operation.path for operation in VPS_OPERATIONS}
         assert documented == claimed
 
-    def test_ordering_vps_paths_match_the_documentation_exactly(self, documentation: str) -> None:
-        documented = _documented_paths(documentation, "/ordering/v1/products/vps")
+    def test_ordering_vps_paths_match_the_documentation_exactly(
+        self, doc_operations: list[DocOperation]
+    ) -> None:
+        documented = {operation.path for operation in doc_operations if operation.tag == "Ordering"}
         claimed = {operation.path for operation in ORDERING_OPERATIONS}
         assert documented == claimed
 
-    def test_account_order_paths_match_the_documentation_exactly(self, documentation: str) -> None:
-        documented = _documented_paths(documentation, "/account/v1/orders")
+    def test_account_order_paths_match_the_documentation_exactly(
+        self, doc_operations: list[DocOperation]
+    ) -> None:
+        documented = {operation.path for operation in doc_operations if operation.tag == "Orders"}
         claimed = {operation.path for operation in ORDERS_OPERATIONS}
         assert documented == claimed
 
-    def test_documented_operation_count_matches_the_inventory(self, documentation: str) -> None:
-        # ``tags:["VPS"]`` appears exactly once per VPS operation in the doc.
-        assert documentation.count('tags:["VPS"]') == len(VPS_OPERATIONS) == 38
+    def test_documented_operation_count_matches_the_inventory(
+        self, doc_operations: list[DocOperation]
+    ) -> None:
+        assert (
+            sum(1 for operation in doc_operations if operation.tag == "VPS")
+            == len(VPS_OPERATIONS)
+            == 38
+        )
 
-    def test_every_operation_id_exists_in_the_documentation(self, documentation: str) -> None:
+    def test_every_operation_id_exists_in_the_documentation(
+        self, doc_operations: list[DocOperation]
+    ) -> None:
+        documented_ids = {operation.operation_id for operation in doc_operations}
         for operation in ALL_OPERATIONS:
-            assert f'operationId:"{operation.operation_id}"' in documentation, operation
+            assert operation.operation_id in documented_ids, operation
 
-    def test_every_method_and_path_pair_is_documented(self, documentation: str) -> None:
+    def test_every_method_and_path_pair_is_documented(
+        self, doc_operations: list[DocOperation]
+    ) -> None:
+        by_path: dict[str, dict[str, set[str]]] = {}
+        for operation in doc_operations:
+            by_path.setdefault(operation.path, {}).setdefault(operation.method, set()).add(
+                operation.operation_id
+            )
         for path in {operation.path for operation in ALL_OPERATIONS}:
             claimed = {
                 operation.method.lower() for operation in ALL_OPERATIONS if operation.path == path
             }
-            assert _documented_methods(documentation, path) == claimed, path
-            body = _path_object(documentation, path)
+            assert set(by_path[path]) == claimed, path
+            documented_ids = {
+                operation_id for ids in by_path[path].values() for operation_id in ids
+            }
             for operation in ALL_OPERATIONS:
                 if operation.path == path:
-                    assert f'operationId:"{operation.operation_id}"' in body, operation
+                    assert operation.operation_id in documented_ids, operation
+
+    def test_inventory_matches_the_snapshot_exactly(self) -> None:
+        snapshot = load_snapshot(REPO_ROOT)
+        assert snapshot_mismatches(snapshot, _inventory_claims()) == []
+
+    def test_snapshot_counts_are_exact(self) -> None:
+        counts = load_snapshot(REPO_ROOT)["_provenance"]["counts"]
+        assert counts == {"VPS": 38, "Ordering": 3, "Orders": 2, "total": 43}
+
+    def test_committed_snapshot_matches_the_capture_when_present(self) -> None:
+        if not DOCS_CAPTURE.exists():
+            pytest.skip("raw documentation capture is absent (clean clone)")
+        documentation = DOCS_CAPTURE.read_text(encoding="utf-8", errors="replace")
+        assert build_snapshot(documentation) == load_snapshot(REPO_ROOT)
+
+    def test_legacy_family_is_observed_but_not_claimed(
+        self, legacy_observed: list[str], doc_operations: list[DocOperation]
+    ) -> None:
+        # The legacy family exists in the documentation (exclusion is deliberate).
+        assert len(legacy_observed) > 0
+        # ... and nothing in the inventory belongs to it.
+        assert all(not operation.path.startswith("/virtualServers") for operation in ALL_OPERATIONS)
+        assert all("virtualServers" not in operation.path for operation in doc_operations)
 
 
 class TestInventoryIntegrity:

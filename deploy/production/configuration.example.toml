@@ -23,7 +23,8 @@ default_currency = "EUR"
 
 [database]
 # Same credentials as POSTGRES_PASSWORD in the deployment .env file.
-url = "postgresql+asyncpg://cloud:CHANGE_ME_DB_PASSWORD@postgres:5432/cloud"
+# Production inserts the password after "cloud" (percent-encoded as needed).
+url = "postgresql+asyncpg://cloud@postgres:5432/cloud"
 
 [redis]
 url = "redis://redis:6379/0"
@@ -70,7 +71,7 @@ log_admin_wallet_adjustments = true
 enabled = true
 market = "foreign"
 display_name = "Leaseweb"
-api_key = "CHANGE_ME"
+api_key = ""  # fill in production; empty means "not configured"
 base_url = "https://api.leaseweb.com"
 # Locations that may be synced AND sold (allowlist, not a wish list).
 locations = ["AMS-01", "FRA-01"]
@@ -86,7 +87,7 @@ billing_cycle = "1_MONTH"
 enabled = true
 market = "iran"
 display_name = "ArvanCloud"
-api_key = "CHANGE_ME"
+api_key = ""  # fill in production; empty means "not configured"
 base_url = "https://napi.arvancloud.ir/ecc/v1"
 region = "CHANGE_ME"
 
@@ -141,7 +142,7 @@ console = true                     # temporary console link
 traffic = true                     # data-traffic usage
 snapshots = true                   # list / create / restore / delete
 reinstall = true                   # OS reinstall (destructive)
-password_reset = true              # OS password reset (destructive)
+password_reset = true              # OS password reset (destructive)  # pragma: allowlist secret
 iso = false                        # attach/detach ISO (advanced, off by default)
 ip_management = true               # list IPs, reverse DNS, null route
 monitoring = true                  # monitoring status + enable

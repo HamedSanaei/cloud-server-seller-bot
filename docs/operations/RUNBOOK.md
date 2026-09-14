@@ -1,5 +1,10 @@
 # Operations runbook starter
 
+Automated production delivery (GHCR image + SSH deploy + health gates +
+rollback) is documented in
+[`PRODUCTION_DEPLOY.md`](PRODUCTION_DEPLOY.md); the sections below cover the
+steady-state signals, kill switches and drills that apply on top of it.
+
 ## Golden signals
 - API error rate/latency
 - Telegram update processing delay

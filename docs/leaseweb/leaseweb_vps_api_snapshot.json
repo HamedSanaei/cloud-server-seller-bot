@@ -1,0 +1,293 @@
+{
+  "_provenance": {
+    "generated_by": "python scripts/gen_leaseweb_coverage.py --write-snapshot",
+    "source_capture": "api_docs/leaseweb/Leaseweb Developer Portal __ API _ Github _ Terraform.html",
+    "source_note": "Local-only raw ReDoc capture (~12 MB, git-ignored). This small snapshot is the tracked, deterministic CI source of truth derived from it \u2014 operationId, HTTP method, path and tag per operation, nothing invented.",
+    "openapi": "3.0.3",
+    "counts": {
+      "VPS": 38,
+      "Ordering": 3,
+      "Orders": 2,
+      "total": 43
+    }
+  },
+  "operations": [
+    {
+      "operationId": "getOrders",
+      "method": "get",
+      "path": "/account/v1/orders",
+      "tag": "Orders"
+    },
+    {
+      "operationId": "getOrder",
+      "method": "get",
+      "path": "/account/v1/orders/{Id}",
+      "tag": "Orders"
+    },
+    {
+      "operationId": "getVpsList1",
+      "method": "get",
+      "path": "/ordering/v1/products/vps",
+      "tag": "Ordering"
+    },
+    {
+      "operationId": "getVps1",
+      "method": "get",
+      "path": "/ordering/v1/products/vps/{vpsId}",
+      "tag": "Ordering"
+    },
+    {
+      "operationId": "orderVps",
+      "method": "post",
+      "path": "/ordering/v1/products/vps/{vpsId}/order",
+      "tag": "Ordering"
+    },
+    {
+      "operationId": "getVpsList",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getIsoList1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/isos",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getVps",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "updateVps",
+      "method": "put",
+      "path": "/publicCloud/v1/vps/{vpsId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "attachIso1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/attachIso",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getConsoleAccess1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/console",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "deleteCredentials1",
+      "method": "delete",
+      "path": "/publicCloud/v1/vps/{vpsId}/credentials",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getCredentialList1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/credentials",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "storeCredential1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/credentials",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getCredentialListByType1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/credentials/{type}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "deleteCredential1",
+      "method": "delete",
+      "path": "/publicCloud/v1/vps/{vpsId}/credentials/{type}/{username}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getCredential1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/credentials/{type}/{username}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "updateCredential1",
+      "method": "put",
+      "path": "/publicCloud/v1/vps/{vpsId}/credentials/{type}/{username}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "detachIso1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/detachIso",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getIPList1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/ips",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getIP",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/ips/{ip}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "updateIP1",
+      "method": "put",
+      "path": "/publicCloud/v1/vps/{vpsId}/ips/{ip}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "nullRouteIP1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/ips/{ip}/null",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "removeIPNullRoute1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/ips/{ip}/unnull",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getDataTrafficMetrics",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/metrics/datatraffic",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "enableVpsMonitoring",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/monitoring/enable",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getVpsMonitoringStatus",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/monitoring/status",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getNotificationSettingList1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/notificationSettings/dataTraffic",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "deleteNotificationSetting1",
+      "method": "delete",
+      "path": "/publicCloud/v1/vps/{vpsId}/notificationSettings/dataTraffic/{notificationSettingId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getNotificationSetting1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/notificationSettings/dataTraffic/{notificationSettingId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "createNotificationSetting1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/notificationSettings/dataTraffic/{notificationSettingId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "updateNotificationSetting1",
+      "method": "put",
+      "path": "/publicCloud/v1/vps/{vpsId}/notificationSettings/dataTraffic/{notificationSettingId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "reboot",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/reboot",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "reinstall",
+      "method": "put",
+      "path": "/publicCloud/v1/vps/{vpsId}/reinstall",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getReinstallImageList1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/reinstall/images",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "resetPassword1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/resetPassword",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getSnapshotList1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/snapshots",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "createSnapshot1",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/snapshots",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "deleteSnapshot1",
+      "method": "delete",
+      "path": "/publicCloud/v1/vps/{vpsId}/snapshots/{snapshotId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "getSnapshot1",
+      "method": "get",
+      "path": "/publicCloud/v1/vps/{vpsId}/snapshots/{snapshotId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "restoreSnapshot1",
+      "method": "put",
+      "path": "/publicCloud/v1/vps/{vpsId}/snapshots/{snapshotId}",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "start",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/start",
+      "tag": "VPS"
+    },
+    {
+      "operationId": "stop",
+      "method": "post",
+      "path": "/publicCloud/v1/vps/{vpsId}/stop",
+      "tag": "VPS"
+    }
+  ],
+  "legacy_virtual_servers_observed": [
+    "delete virtualServers/{id}/snapshots/{snapshotId}",
+    "get virtualServers",
+    "get virtualServers/{id}",
+    "get virtualServers/{id}/credentials/{credentialType}",
+    "get virtualServers/{id}/credentials/{credentialType}/{username}",
+    "get virtualServers/{id}/metrics/datatraffic",
+    "get virtualServers/{id}/snapshots",
+    "get virtualServers/{id}/snapshots/{snapshotId}",
+    "post virtualServers/{id}/powerOff",
+    "post virtualServers/{id}/powerOn",
+    "post virtualServers/{id}/reboot",
+    "post virtualServers/{id}/reinstall",
+    "post virtualServers/{id}/snapshots",
+    "post virtualServers/{id}/snapshots/{snapshotId}",
+    "put virtualServers/{id}",
+    "put virtualServers/{id}/credentials"
+  ],
+  "legacy_note": "The legacy Virtual Servers family is present in the documentation and deliberately NOT implemented here: a separate, older product family with different models, paths and power semantics."
+}

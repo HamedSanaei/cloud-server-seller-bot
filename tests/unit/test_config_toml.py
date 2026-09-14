@@ -110,7 +110,7 @@ class TestMapping:
                         "enabled": True,
                         "market": "Foreign",
                         "display_name": "Leaseweb",
-                        "api_key": "lsw",
+                        "api_key": "lsw",  # pragma: allowlist secret
                         "locations": ["AMS-01", "FRA-01"],
                         "os_allowlist": [],
                         "order_os_only_free": True,
@@ -119,17 +119,17 @@ class TestMapping:
                         "enabled": False,
                         "market": "iran",
                         "display_name": "ArvanCloud",
-                        "api_key": "arv",
+                        "api_key": "arv",  # pragma: allowlist secret
                         "region": "ir-thr-c1",
                     },
                 }
             }
         )
-        assert mapped["leaseweb_api_key"] == "lsw"
+        assert mapped["leaseweb_api_key"] == "lsw"  # pragma: allowlist secret
         assert mapped["leaseweb_locations"] == "AMS-01,FRA-01"
         assert mapped["leaseweb_os_allowlist"] == ""
         assert mapped["leaseweb_order_os_only_free"] is True
-        assert mapped["arvancloud_api_key"] == "arv"
+        assert mapped["arvancloud_api_key"] == "arv"  # pragma: allowlist secret
         assert mapped["arvancloud_region"] == "ir-thr-c1"
         # market metadata is normalized and provider-neutral (no branching)
         assert mapped["provider_markets"] == {"leaseweb": "foreign", "arvancloud": "iran"}
@@ -197,14 +197,14 @@ class TestPrecedence:
 
     def test_toml_is_used_when_no_env_override_exists(self, tmp_path: Path) -> None:
         path = _write(tmp_path, '[providers.leaseweb]\napi_key = "from-toml"\n')
-        assert load_settings(path).leaseweb_api_key == "from-toml"
+        assert load_settings(path).leaseweb_api_key == "from-toml"  # pragma: allowlist secret
 
     def test_environment_overrides_the_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         path = _write(tmp_path, '[providers.leaseweb]\napi_key = "from-toml"\n')
         monkeypatch.setenv("LEASEWEB_API_KEY", "from-env")
-        assert load_settings(path).leaseweb_api_key == "from-env"
+        assert load_settings(path).leaseweb_api_key == "from-env"  # pragma: allowlist secret
 
     def test_file_overrides_defaults_but_not_other_fields(self, tmp_path: Path) -> None:
         path = _write(tmp_path, '[app]\ndefault_currency = "USD"\n')
@@ -244,7 +244,8 @@ class TestCommittedExample:
             if stripped.startswith("#") or "=" not in stripped:
                 continue
             key, _, value = stripped.partition("=")
-            raw = value.strip().strip('"')
+            # An inline "# ..." comment is documentation, not part of the value.
+            raw = value.split("#", 1)[0].strip().strip('"')
             if key.strip() in {
                 "api_key",
                 "api_token",

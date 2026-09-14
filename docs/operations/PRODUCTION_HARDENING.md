@@ -69,6 +69,11 @@ PLATFORM_IMAGE=registry/repo:<full-sha> POSTGRES_PASSWORD=… \
   docker compose -f deploy/production/docker-compose.yml config
 ```
 
+Automated deployments are described in
+[`PRODUCTION_DEPLOY.md`](PRODUCTION_DEPLOY.md): every green `main` commit is
+built into an immutable GHCR image and deployed over SSH with
+migrations-first ordering, health gates and image rollback.
+
 ---
 
 ## 3. Scaling rules (which service, and why)

@@ -77,6 +77,12 @@ jobs:
       # provider must be addable without touching src/cloud_platform/modules.
       - name: Provider-branching gate
         run: uv run python scripts/check_domain_provider_branching.py
+      # LEASEWEB-VPS-API honesty gate - the generated coverage matrix and the
+      # documentation snapshot must be current. On a clean clone (no raw
+      # capture) this verifies the inventory against the committed snapshot;
+      # with the capture present it also demands a byte-identical snapshot.
+      - name: Leaseweb generated-contract gate
+        run: uv run python scripts/gen_leaseweb_coverage.py --check
       - name: Validate task backlog
         if: always()
         run: uv run python scripts/validate_tasks.py

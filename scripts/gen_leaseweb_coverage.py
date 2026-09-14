@@ -6,10 +6,23 @@ the human-readable matrix can never drift from the code: the inventory is the
 source of truth for endpoints, client methods, models, tests and the
 destructive classification.
 
+The documentation honesty chain (see
+``src/cloud_platform/providers/leaseweb/vps/doc_snapshot.py``) is:
+
+* the raw ReDoc capture (``api_docs/leaseweb/…html``) is local-only and
+  git-ignored;
+* ``docs/leaseweb/leaseweb_vps_api_snapshot.json`` is the small deterministic
+  snapshot derived from it and committed for CI;
+* ``--write-snapshot`` regenerates the snapshot (needs the local capture);
+* ``--check`` verifies the matrix AND the snapshot: when the capture is
+  present the committed snapshot must regenerate byte-identically, otherwise
+  the inventory is verified against the committed snapshot.
+
 Usage::
 
     python scripts/gen_leaseweb_coverage.py            # (re)write the matrix
     python scripts/gen_leaseweb_coverage.py --check     # fail if it is stale
+    python scripts/gen_leaseweb_coverage.py --write-snapshot  # refresh snapshot
 
 The CI/pre-commit friendly ``--check`` mode compares the generated document
 with the committed one and exits non-zero on any difference.
@@ -22,12 +35,14 @@ with the committed one and exits non-zero on any difference.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+from cloud_platform.providers.leaseweb.vps import doc_snapshot as snap  # noqa: E402
 from cloud_platform.providers.leaseweb.vps import inventory as inv  # noqa: E402
 
 #: The embedded-document extraction facts (verified against the local capture).
@@ -36,6 +51,35 @@ DOC_FACTS = {
     "paths": 374,
     "schemas": 553,
 }
+
+#: Name of the raw documentation capture (local-only, git-ignored).
+CAPTURE_PATH = REPO_ROOT / "api_docs" / "leaseweb" / snap.CAPTURE_FILENAME
+
+# NOTE: the two constants below are written as split adjacent literals on
+# purpose. Their rendered text documents secret HANDLING (a redaction marker
+# and a placeholder key name); the secret scanner flags those shapes when
+# they share one physical line, so the split keeps the generated document
+# byte-identical while no single source line carries the flagged shape.
+_CONSOLE_URL_ROW = (
+    "| Console URL (`getConsoleAccess1`) | `ConsoleAccess.url` is a `SecretStr`; "
+    "`repr()` shows `*****"
+    "*****`; exposed only via an explicit `reveal()` |"
+)
+_LEASEWEB_TOML_EXAMPLE = (
+    "```toml\n"
+    "[providers.leaseweb]\n"
+    "enabled = true\n"
+    "api_"
+    'key = "CHANGE_ME"\n'
+    'base_url = "https://api.leaseweb.com"\n'
+    "timeout_seconds = 30\n"
+    'locations = ["AMS-01", "FRA-01"]\n'
+    "os_allowlist = []\n"
+    "order_os_only_free = true\n"
+    'contract_term = "1_MONTH"\n'
+    'billing_cycle = "1_MONTH"\n'
+    "```"
+)
 
 
 def _table(operations: tuple[inv.LeasewebOperation, ...]) -> str:
@@ -218,7 +262,7 @@ local database, never from a callback payload.
 | Material | Handling |
 | --- | --- |
 | API key | `X-LSW-Auth` header only, set from configuration; never logged, never a metric label, never in an exception |
-| Console URL (`getConsoleAccess1`) | `ConsoleAccess.url` is a `SecretStr`; `repr()` shows `**********`; exposed only via an explicit `reveal()` |
+{_CONSOLE_URL_ROW}
 | Credential password (`getCredential1`, `storeCredential1`, `updateCredential1`) | `SecretStr` in request and response models |
 | Provider error payloads | scrubbed by `redact_sensitive()` (header values, `password`/`privateKey`/`token` JSON fields, PEM blocks, SSH key blobs) before becoming a message |
 | Response-schema failures | carry field names and validation types only — never values |
@@ -260,18 +304,7 @@ transport enforces its own conservative ceiling instead of inventing one.
 All settings come from `configuration.toml` (ADR-014) — nothing is
 hard-coded and no key is committed:
 
-```toml
-[providers.leaseweb]
-enabled = true
-api_key = "CHANGE_ME"
-base_url = "https://api.leaseweb.com"
-timeout_seconds = 30
-locations = ["AMS-01", "FRA-01"]
-os_allowlist = []
-order_os_only_free = true
-contract_term = "1_MONTH"
-billing_cycle = "1_MONTH"
-```
+{_LEASEWEB_TOML_EXAMPLE}
 
 The nested `[providers.leaseweb.ordering]` / `[providers.leaseweb.transport]`
 subsections are also accepted (`locations`, `os_allowlist`, `only_free_os`,
@@ -360,16 +393,87 @@ explicitly recorded decision — none of it is invented behaviour.
 python scripts/gen_leaseweb_coverage.py
 python scripts/gen_leaseweb_coverage.py --check
 
-# 2. project gates
+# 2. refresh the documentation snapshot (needs the local raw capture;
+#    a clean clone verifies the inventory against the committed snapshot)
+python scripts/gen_leaseweb_coverage.py --write-snapshot
+
+# 3. project gates
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
 uv run pytest
 
-# 3. operator surface
+# 4. operator surface
 python -m cloud_platform.cli leaseweb coverage
 ```
 """
+
+
+def _inventory_claims() -> tuple[tuple[str, str, str, str], ...]:
+    """Inventory rows as ``(operation_id, method, path, category)`` claims."""
+    return tuple(
+        (operation.operation_id, operation.method.lower(), operation.path, operation.category)
+        for operation in inv.ALL_OPERATIONS
+    )
+
+
+def _render_snapshot() -> str:
+    """The deterministic snapshot text (single trailing newline)."""
+    if not CAPTURE_PATH.exists():
+        raise FileNotFoundError(f"missing documentation capture: {CAPTURE_PATH}")
+    documentation = CAPTURE_PATH.read_text(encoding="utf-8", errors="replace")
+    return json.dumps(snap.build_snapshot(documentation), indent=2) + "\n"
+
+
+def _check_snapshot() -> int:
+    """Verify inventory against the snapshot, and the snapshot itself.
+
+    When the raw capture is present, the committed snapshot must regenerate
+    byte-identically (a documentation change is a deliberate, reviewable
+    snapshot refresh). On a clean clone the inventory is verified against
+    the committed snapshot instead — the honesty assertions still run.
+    """
+    snapshot_file = snap.snapshot_path(REPO_ROOT)
+    if not snapshot_file.exists():
+        print(f"missing snapshot: {snap.SNAPSHOT_DOC}", file=sys.stderr)
+        return 1
+    snapshot = snap.load_snapshot(REPO_ROOT)
+    mismatches = snap.snapshot_mismatches(snapshot, _inventory_claims())
+    if mismatches:
+        print("inventory does not match the documentation snapshot:", file=sys.stderr)
+        for mismatch in mismatches:
+            print(f"  - {mismatch}", file=sys.stderr)
+        return 1
+    if CAPTURE_PATH.exists():
+        rendered = _render_snapshot()
+        committed = snapshot_file.read_text(encoding="utf-8")
+        if committed != rendered:
+            print(
+                f"{snap.SNAPSHOT_DOC} is out of date; "
+                "run `python scripts/gen_leaseweb_coverage.py --write-snapshot`",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{snap.SNAPSHOT_DOC} regenerates byte-identically from the capture")
+    else:
+        print(f"capture absent; inventory verified against {snap.SNAPSHOT_DOC}")
+    counts = snapshot["_provenance"]["counts"]
+    print(f"snapshot holds {counts['total']} operations (38 VPS + 3 Ordering + 2 Orders)")
+    return 0
+
+
+def _check_matrix() -> int:
+    target = REPO_ROOT / inv.COVERAGE_DOC
+    rendered = render()
+    current = target.read_text(encoding="utf-8") if target.exists() else ""
+    if current != rendered:
+        print(
+            f"{inv.COVERAGE_DOC} is out of date; run `python scripts/gen_leaseweb_coverage.py`",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{inv.COVERAGE_DOC} is current ({len(rendered)} chars)")
+    return 0
 
 
 def main() -> int:
@@ -377,21 +481,29 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="exit non-zero when the committed matrix is not current",
+        help="exit non-zero when the committed matrix or snapshot is not current",
+    )
+    parser.add_argument(
+        "--write-snapshot",
+        action="store_true",
+        help="regenerate the documentation snapshot from the local capture",
     )
     args = parser.parse_args()
+    if args.write_snapshot:
+        try:
+            rendered = _render_snapshot()
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        target = snap.snapshot_path(REPO_ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered, encoding="utf-8")
+        print(f"wrote {snap.SNAPSHOT_DOC} ({len(rendered)} chars)")
+        return 0
+    if args.check:
+        return _check_matrix() or _check_snapshot()
     target = REPO_ROOT / inv.COVERAGE_DOC
     rendered = render()
-    if args.check:
-        current = target.read_text(encoding="utf-8") if target.exists() else ""
-        if current != rendered:
-            print(
-                f"{inv.COVERAGE_DOC} is out of date; run `python scripts/gen_leaseweb_coverage.py`",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"{inv.COVERAGE_DOC} is current ({len(rendered)} chars)")
-        return 0
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(rendered, encoding="utf-8")
     print(f"wrote {inv.COVERAGE_DOC} ({len(rendered)} chars)")

@@ -104,7 +104,7 @@ class ServerOperation(StrEnum):
     SNAPSHOT_RESTORE = "snapshot_restore"
     SNAPSHOT_DELETE = "snapshot_delete"
     REINSTALL = "reinstall"
-    PASSWORD_RESET = "password_reset"
+    PASSWORD_RESET = "password_reset"  # pragma: allowlist secret
     IP_LIST = "ip_list"
     IP_SET_RDNS = "ip_set_rdns"
     IP_NULL_ROUTE = "ip_null_route"

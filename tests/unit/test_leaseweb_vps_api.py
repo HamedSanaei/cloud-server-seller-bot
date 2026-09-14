@@ -71,10 +71,15 @@ BASE = "https://api.test"
 VPS = "VPS02_1"
 SNAPSHOT_ID = "3a042956-0689-45dc-8322-8b8325464182"
 NOTIFICATION_ID = "3a042956-0689-45dc-8322-8b8325464183"
-PASSWORD = "super-secret-root-password"
+PASSWORD = "super-secret-root-password"  # pragma: allowlist secret
 
-API_KEY_SENTINEL = "test-api-key-should-never-leak"
-PRIVATE_KEY = "PRIVATE-SSH-KEY-CONTENT"
+API_KEY_SENTINEL = "test-api-key-should-never-leak"  # pragma: allowlist secret
+PRIVATE_KEY = "PRIVATE-SSH-KEY-CONTENT"  # pragma: allowlist secret
+# Deliberate fake PEM block for the redaction tests (never a real key).
+PEM_BLOCK = (
+    "-----BEGIN RSA PRIVATE KEY-----\n"  # pragma: allowlist secret
+    f"{PRIVATE_KEY}\n-----END RSA PRIVATE KEY-----"
+)
 
 
 def _no_sleep() -> Throttle:
@@ -1481,9 +1486,7 @@ class TestSecretHygiene:
         assert API_KEY_SENTINEL not in redact_sensitive(f"X-LSW-Auth: {API_KEY_SENTINEL}")
         assert API_KEY_SENTINEL not in redact_sensitive(f"Authorization: Bearer {API_KEY_SENTINEL}")
         assert PASSWORD not in redact_sensitive(f'body {{"password": "{PASSWORD}"}}')
-        assert PRIVATE_KEY not in redact_sensitive(
-            f"-----BEGIN RSA PRIVATE KEY-----\n{PRIVATE_KEY}\n-----END RSA PRIVATE KEY-----"
-        )
+        assert PRIVATE_KEY not in redact_sensitive(PEM_BLOCK)
         assert "ssh-rsa" not in redact_sensitive("ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAtest")
 
     def test_error_payload_parser_keeps_safe_fields_only(self) -> None:

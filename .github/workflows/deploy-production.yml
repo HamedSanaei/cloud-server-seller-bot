@@ -1,0 +1,233 @@
+name: deploy-production
+
+# Continuous delivery: every green push to `main` is built into an immutable
+# image and deployed to production. Failed CI never deploys anything.
+#
+# Gate chain: push to main -> `ci` workflow (lint/types/secrets/tests/gates)
+# -> this workflow (only when that CI run concluded `success`) -> GHCR build
+# of the EXACT tested SHA -> SSH deploy of that exact image -> migrations ->
+# api/worker/single-bot -> health checks (rollback on failure).
+#
+# Manual redeploys use `workflow_dispatch` with an explicit full SHA. The
+# manual path builds/verifies/deploys/health-checks exactly like the
+# automatic one; there is no second, less-safe path.
+#
+# Concurrency: deployments are serialized (`production-deploy`,
+# cancel-in-progress: false). A newer green commit waits for the running
+# deploy to finish and then deploys afterwards — a deploy is never cancelled
+# halfway because a newer commit appeared.
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full 40-char commit SHA to deploy (must be an ancestor of main)"
+        required: true
+        type: string
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build immutable image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Never deploy PR executions: only a successful PUSH run of `ci` on main,
+    # or an explicit manual dispatch with a pinned SHA.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      image: ${{ steps.resolve.outputs.image }}
+      head: ${{ steps.revision.outputs.head }}
+    steps:
+      - name: Resolve deployment SHA
+        id: resolve
+        run: |
+          set -Eeuo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            sha="${{ inputs.sha }}"
+          else
+            [ "${{ github.event.workflow_run.conclusion }}" = "success" ] \
+              || { echo "CI did not succeed; refusing to deploy"; exit 1; }
+            [ "${{ github.event.workflow_run.event }}" = "push" ] \
+              || { echo "source was not a push; refusing to deploy"; exit 1; }
+            [ "${{ github.event.workflow_run.head_branch }}" = "main" ] \
+              || { echo "source was not main; refusing to deploy"; exit 1; }
+            sha="${{ github.event.workflow_run.head_sha }}"
+          fi
+          if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "deployment SHA must be a full 40-char hex commit, got '${sha}'"
+            exit 1
+          fi
+          repo_lower="$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          image="${{ env.REGISTRY }}/${repo_lower}"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "deploying commit ${sha} as ${image}:${sha}"
+
+      - name: Check out the exact tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Refuse SHAs outside main (manual path only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -Eeuo pipefail
+          git merge-base --is-ancestor \
+            "${{ steps.resolve.outputs.sha }}" origin/main \
+            || { echo "SHA is not an ancestor of origin/main; refusing to deploy"; exit 1; }
+          echo "SHA is on main; continuing"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether the immutable tag already exists
+        id: exists
+        run: |
+          set -Eeuo pipefail
+          if docker manifest inspect \
+            "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}" >/dev/null 2>&1; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+            echo "immutable tag already exists; it will NOT be rebuilt or overwritten"
+          else
+            echo "present=false" >> "${GITHUB_OUTPUT}"
+            echo "immutable tag absent; building"
+          fi
+
+      - name: Build and push the immutable image
+        if: steps.exists.outputs.present != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}
+            ${{ steps.resolve.outputs.image }}:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify the pushed image and production compose
+        run: |
+          set -Eeuo pipefail
+          ref="${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}"
+          docker pull "${ref}"
+          # Entrypoint smoke: proves the image starts and the entrypoint is
+          # intact (alembic --help needs no database).
+          docker run --rm "${ref}" migrate --help >/dev/null
+          echo "image entrypoint smoke: ok"
+          # Production compose must interpolate with the release image.
+          # POSTGRES_PASSWORD here is a local validation placeholder, never a
+          # credential; the real value lives only in the server deploy.env.
+          PLATFORM_IMAGE="${ref}"
+          POSTGRES_PASSWORD=ci-validation-only  # pragma: allowlist secret
+          export PLATFORM_IMAGE POSTGRES_PASSWORD
+          docker compose -f deploy/production/docker-compose.yml config >/dev/null
+          echo "production compose config: ok"
+
+      - name: Resolve expected migration head
+        id: revision
+        run: |
+          set -Eeuo pipefail
+          head="$(python3 -c "import sys; sys.path.insert(0, 'scripts'); import post_deploy_smoke; print(post_deploy_smoke.repo_head_revision())")"
+          [ -n "${head}" ] || { echo "could not resolve the alembic head"; exit 1; }
+          echo "head=${head}" >> "${GITHUB_OUTPUT}"
+          echo "expected alembic head: ${head}"
+
+  deploy:
+    name: Deploy to production
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - name: Check out the exact tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Open SSH (ephemeral key file, verified host key)
+        run: |
+          set -Eeuo pipefail
+          install -m 700 -d "${HOME}/.ssh"
+          printf '%s\n' "${{ secrets.PROD_SSH_KEY }}" > "${HOME}/.ssh/prod_key"
+          chmod 600 "${HOME}/.ssh/prod_key"
+          printf '%s\n' "${{ secrets.PROD_KNOWN_HOSTS }}" > "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/known_hosts"
+          [ -s "${HOME}/.ssh/prod_key" ] || { echo "PROD_SSH_KEY is empty"; exit 1; }
+          [ -s "${HOME}/.ssh/known_hosts" ] || { echo "PROD_KNOWN_HOSTS is empty"; exit 1; }
+          [ -n "${{ vars.PROD_HOST }}" ] || { echo "PROD_HOST variable is not set"; exit 1; }
+          [ -n "${{ vars.PROD_USER }}" ] || { echo "PROD_USER variable is not set"; exit 1; }
+          [ -n "${{ vars.PROD_DEPLOY_PATH }}" ] || { echo "PROD_DEPLOY_PATH variable is not set"; exit 1; }
+          echo "ssh material ready (key never printed)"
+
+      - name: Authenticate the server to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          # Short-lived token only; travels over the encrypted SSH session on
+          # stdin and is never printed, stored, or committed.
+          printf '%s' "${GHCR_TOKEN}" | ssh -i "${HOME}/.ssh/prod_key" \
+            -p "${{ vars.PROD_PORT || 22 }}" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
+            "docker login ${{ env.REGISTRY }} -u '${{ github.actor }}' --password-stdin"
+          echo "server GHCR authentication: ok"
+
+      - name: Deploy the exact image over SSH
+        run: |
+          set -Eeuo pipefail
+          # Values below are format-constrained (full hex SHA, lowercase
+          # image path, alembic revision, absolute deploy path) and are
+          # re-validated inside the deploy script before anything runs.
+          ssh -i "${HOME}/.ssh/prod_key" \
+            -p "${{ vars.PROD_PORT || 22 }}" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
+            "DEPLOY_PATH='${{ vars.PROD_DEPLOY_PATH }}' PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}' EXPECTED_HEAD='${{ needs.build.outputs.head }}' bash -s" \
+            < scripts/deploy-production.sh
+
+      - name: Report deployment
+        if: always()
+        run: |
+          echo "commit: ${{ needs.build.outputs.sha }}"
+          echo "image: ${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}"
+          echo "environment: production"
+          echo "expected alembic head: ${{ needs.build.outputs.head }}"
+          echo "target: ${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}:${{ vars.PROD_DEPLOY_PATH }}"
+
+      - name: Remove ephemeral SSH key
+        if: always()
+        run: rm -f "${HOME}/.ssh/prod_key"

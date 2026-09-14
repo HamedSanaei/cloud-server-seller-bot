@@ -114,7 +114,7 @@ _OPERATION_CAPABILITY: dict[ServerOperation, str | None] = {
     ServerOperation.SNAPSHOT_RESTORE: "snapshots",
     ServerOperation.SNAPSHOT_DELETE: "snapshots",
     ServerOperation.REINSTALL: "reinstall",
-    ServerOperation.PASSWORD_RESET: "credentials",
+    ServerOperation.PASSWORD_RESET: "credentials",  # pragma: allowlist secret
     ServerOperation.IP_LIST: "ips",
     ServerOperation.IP_SET_RDNS: "ips",
     ServerOperation.IP_NULL_ROUTE: "ips",

@@ -342,12 +342,16 @@ explicitly recorded decision — none of it is invented behaviour.
 python scripts/gen_leaseweb_coverage.py
 python scripts/gen_leaseweb_coverage.py --check
 
-# 2. project gates
+# 2. refresh the documentation snapshot (needs the local raw capture;
+#    a clean clone verifies the inventory against the committed snapshot)
+python scripts/gen_leaseweb_coverage.py --write-snapshot
+
+# 3. project gates
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
 uv run pytest
 
-# 3. operator surface
+# 4. operator surface
 python -m cloud_platform.cli leaseweb coverage
 ```

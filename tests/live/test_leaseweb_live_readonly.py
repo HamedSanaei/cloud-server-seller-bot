@@ -186,7 +186,7 @@ class TestLiveSuiteGuardRails:
 def test_live_suite_never_uses_a_private_key_or_password() -> None:
     # Assembled from pieces so this assertion does not trip on its own source.
     pem_marker = "BEGIN RSA " + "PRIVATE KEY"
-    password_marker = "super" + "-secret-root-password"
+    password_marker = "super" + "-secret-root-password"  # pragma: allowlist secret
     ssh_marker = "PRIVATE-SSH-KEY" + "-CONTENT"
     with open(__file__, encoding="utf-8") as handle:
         text = handle.read()
