@@ -5,8 +5,10 @@ name: deploy-production
 #
 # Gate chain: push to main -> `ci` workflow (lint/types/secrets/tests/gates)
 # -> this workflow (only when that CI run concluded `success`) -> GHCR build
-# of the EXACT tested SHA -> SSH deploy of that exact image -> migrations ->
-# api/worker/single-bot -> health checks (rollback on failure).
+# of the EXACT tested SHA -> compose candidate delivery from the exact
+# checkout (SHA-256 verified on the server) -> SSH deploy of that exact
+# image with that exact compose -> migrations -> api/worker/single-bot ->
+# health checks -> atomic compose promotion (rollback on failure).
 #
 # Manual redeploys use `workflow_dispatch` with an explicit full SHA. The
 # manual path builds/verifies/deploys/health-checks exactly like the
@@ -204,19 +206,45 @@ jobs:
             "docker login ${{ env.REGISTRY }} -u '${{ github.actor }}' --password-stdin"
           echo "server GHCR authentication: ok"
 
-      - name: Deploy the exact image over SSH
+      - name: Deliver release compose candidate
+        id: compose
         run: |
           set -Eeuo pipefail
-          # Values below are format-constrained (full hex SHA, lowercase
-          # image path, alembic revision, absolute deploy path) and are
-          # re-validated inside the deploy script before anything runs.
+          # The exact compose file from the exact tested checkout travels
+          # with the release: image, compose contract, and migration
+          # expectation always share one SHA. A manual dispatch of an older
+          # approved SHA therefore ships THAT SHA's compose, never the
+          # current main file — a mixed image/compose release is impossible.
+          sha="${{ needs.build.outputs.sha }}"
+          candidate=".docker-compose.${sha}.candidate.yml"
+          compose_sha="$(sha256sum deploy/production/docker-compose.yml | awk '{print $1}')"
+          echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=${compose_sha}" >> "${GITHUB_OUTPUT}"
+          echo "release compose candidate ${candidate}: ${compose_sha}"
           ssh -i "${HOME}/.ssh/prod_key" \
             -p "${{ vars.PROD_PORT || 22 }}" \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
             -o ConnectTimeout=15 \
             "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
-            "DEPLOY_PATH='${{ vars.PROD_DEPLOY_PATH }}' PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}' EXPECTED_HEAD='${{ needs.build.outputs.head }}' bash -s" \
+            "cat > '${{ vars.PROD_DEPLOY_PATH }}/${candidate}'" \
+            < deploy/production/docker-compose.yml
+
+      - name: Deploy the exact image over SSH
+        run: |
+          set -Eeuo pipefail
+          # Values below are format-constrained (full hex SHA, lowercase
+          # image path, alembic revision, absolute deploy path, compose
+          # SHA-256) and are re-validated inside the deploy script before
+          # anything runs. The compose candidate travels from the same
+          # exact checkout as the image: image and contract share one SHA.
+          ssh -i "${HOME}/.ssh/prod_key" \
+            -p "${{ vars.PROD_PORT || 22 }}" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
+            "DEPLOY_PATH='${{ vars.PROD_DEPLOY_PATH }}' PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}' EXPECTED_HEAD='${{ needs.build.outputs.head }}' CANDIDATE_COMPOSE_FILE='${{ vars.PROD_DEPLOY_PATH }}/${{ steps.compose.outputs.candidate }}' EXPECTED_COMPOSE_SHA256='${{ steps.compose.outputs.sha256 }}' bash -s" \
             < scripts/deploy-production.sh
 
       - name: Report deployment

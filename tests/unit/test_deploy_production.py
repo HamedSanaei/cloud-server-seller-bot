@@ -11,6 +11,7 @@ deployment, contacts GHCR, or opens an SSH session.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -233,7 +234,7 @@ class TestDeployScriptStatic:
 
     def test_single_bot_polling_is_enforced(self) -> None:
         script = _script()
-        assert 'bot_count="$(compose ps -q bot | grep -c . || true)"' in script
+        assert 'bot_count="$(compose_candidate ps -q bot | grep -c . || true)"' in script
         assert '"${bot_count}" = "1"' in script
 
     def test_rollback_restores_the_previous_image(self) -> None:
@@ -257,6 +258,42 @@ class TestDeployScriptStatic:
         script = _script()
         assert "never reads, prints, or rewrites secrets" in script
         assert "set -x" not in script
+
+    def test_forward_and_rollback_use_explicit_compose_contracts(self) -> None:
+        script = _script()
+        assert "compose_candidate() {" in script
+        assert "compose_current() {" in script
+        for operation in (
+            "compose_candidate pull",
+            "compose_candidate up -d postgres redis",
+            "compose_candidate run --rm --no-deps migrate",
+            "compose_candidate up -d api worker bot",
+            "compose_candidate exec -T api alembic current",
+        ):
+            assert operation in script, operation
+        assert "compose_current up -d api worker bot" in script
+        assert "\ncompose() {" not in script
+
+    def test_candidate_integrity_is_verified_before_mutation(self) -> None:
+        script = _script()
+        for token in (
+            "EXPECTED_COMPOSE_SHA256",
+            "must not be a symlink",
+            "SHA-256 mismatch",
+            "compose_candidate config",
+            "release candidate compose verified",
+        ):
+            assert token in script, token
+        assert "[0-9a-f]{64}" in script
+
+    def test_promotion_happens_only_after_verification(self) -> None:
+        script = _script()
+        assert 'mv "${CANDIDATE_COMPOSE_FILE}" "${CURRENT_COMPOSE_FILE}"' in script
+        assert 'chmod 0644 "${CURRENT_COMPOSE_FILE}"' in script
+        assert "release compose promoted:" in script
+        assert script.index("release compose promoted:") > script.index(
+            "verifying migration revision"
+        )
 
 
 class TestDeployScriptFunctions:
@@ -317,10 +354,32 @@ exit 0
 """
 
 
+def _write_compose_files(
+    deploy_dir: Path, *, missing_current: bool = False, missing_candidate: bool = False
+) -> tuple[str, str, str]:
+    """Write canonical + candidate compose files.
+
+    Returns (current path, candidate path, candidate SHA-256). The contents
+    differ deliberately so tests can prove which contract was used where.
+    """
+    current = deploy_dir / "docker-compose.yml"
+    candidate = deploy_dir / ".docker-compose.abc123.candidate.yml"
+    if not missing_current:
+        current.write_text("# canonical release contract\nservices: {}\n", encoding="utf-8")
+    if not missing_candidate:
+        candidate.write_text("# release candidate contract\nservices: {}\n", encoding="utf-8")
+        sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    else:
+        sha = "0" * 64
+    return current.as_posix(), candidate.as_posix(), sha
+
+
 def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = False) -> str:
     """Run deploy() with a stub docker and return its stdout plus RC marker.
 
-    `missing` is one of "configuration", "compose", "env", or "nothing".
+    `missing` is one of "configuration", "compose", "env", or "nothing"
+    ("compose" means the release candidate is missing; the canonical file
+    may legitimately be absent on a first deploy).
     The invocation mirrors production (`if deploy; then ... else ... fi`),
     i.e. the errexit-suppressed context where the original bug continued.
     """
@@ -331,8 +390,10 @@ def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = Fals
         (deploy_dir / "deploy.env").write_text(
             f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
         )
-    if missing != "compose":
-        (deploy_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    current, candidate, candidate_sha = _write_compose_files(
+        deploy_dir,
+        missing_candidate=(missing == "compose"),
+    )
     config = tmp_path / "configuration.toml"
     if missing != "configuration":
         config.write_text("[app]\n", encoding="utf-8")
@@ -345,7 +406,9 @@ def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = Fals
         f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
         f"DOCKER_CALLS_LOG='{calls.as_posix()}' STUB_FAIL_PULL={'1' if fail_pull else '0'} "
         f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
-        f"COMPOSE_FILE='{(deploy_dir / 'docker-compose.yml').as_posix()}' "
+        f"CURRENT_COMPOSE_FILE='{current}' "
+        f"CANDIDATE_COMPOSE_FILE='{candidate}' "
+        f"EXPECTED_COMPOSE_SHA256='{candidate_sha}' "
         f"ENV_FILE='{(deploy_dir / 'deploy.env').as_posix()}' "
         f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='' "
         f"HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
@@ -472,7 +535,7 @@ def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProces
     (deploy_dir / "deploy.env").write_text(
         f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
     )
-    (deploy_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    current, candidate, candidate_sha = _write_compose_files(deploy_dir)
     config = tmp_path / "configuration.toml"
     config.write_text("[app]\n", encoding="utf-8")
     stub_bin = tmp_path / "stubbin"
@@ -490,7 +553,9 @@ def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProces
         f"PYTHON_CALLS_LOG='{(tmp_path / 'python-calls.log').as_posix()}' "
         f"UP_FAIL_COUNTER='{(tmp_path / 'up-counter').as_posix()}' "
         f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
-        f"COMPOSE_FILE='{(deploy_dir / 'docker-compose.yml').as_posix()}' "
+        f"CURRENT_COMPOSE_FILE='{current}' "
+        f"CANDIDATE_COMPOSE_FILE='{candidate}' "
+        f"EXPECTED_COMPOSE_SHA256='{candidate_sha}' "
         f"ENV_FILE='{(deploy_dir / 'deploy.env').as_posix()}' "
         f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='' "
         f"HEALTH_ATTEMPTS=36 HEALTH_INTERVAL=5; "
@@ -532,7 +597,12 @@ class TestDeployServiceStartFailure:
         assert result.returncode == 0, f"harness itself failed: {result.stderr}"
         calls = _stub_calls(tmp_path, "docker-calls.log")
         # One failed start attempt plus exactly one rollback restart.
-        assert calls.count("up -d api worker bot") == 2
+        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
+        assert len(up_lines) == 2
+        # The failed attempt uses the release candidate; the rollback
+        # restarts with the previous canonical contract, never the candidate.
+        assert "candidate" in up_lines[0]
+        assert "candidate" not in up_lines[1]
         assert result.stdout.count("attempting application-image rollback") == 1
         assert result.stdout.count("ROLLBACK DONE") == 1
         env = tmp_path / "deploy" / "deploy.env"
@@ -590,7 +660,7 @@ def _stabilization_harness(tmp_path: Path, *, crash_loop: bool) -> subprocess.Co
     (deploy_dir / "deploy.env").write_text(
         f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
     )
-    (deploy_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    current, candidate, candidate_sha = _write_compose_files(deploy_dir)
     config = tmp_path / "configuration.toml"
     config.write_text("[app]\n", encoding="utf-8")
     stub_bin = tmp_path / "stubbin"
@@ -608,7 +678,9 @@ def _stabilization_harness(tmp_path: Path, *, crash_loop: bool) -> subprocess.Co
         f"INSPECT_COUNTER='{(tmp_path / 'inspect-counter').as_posix()}' "
         f"CRASH_LOOP='{'1' if crash_loop else ''}' "
         f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
-        f"COMPOSE_FILE='{(deploy_dir / 'docker-compose.yml').as_posix()}' "
+        f"CURRENT_COMPOSE_FILE='{current}' "
+        f"CANDIDATE_COMPOSE_FILE='{candidate}' "
+        f"EXPECTED_COMPOSE_SHA256='{candidate_sha}' "
         f"ENV_FILE='{(deploy_dir / 'deploy.env').as_posix()}' "
         f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='0034' "
         f"STABILIZE_SECONDS=1 HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
@@ -640,9 +712,291 @@ class TestDeployStabilization:
         # fail() reports to stderr while the rollback summary goes to stdout.
         assert "bot restarted during stabilization" in result.stderr
         assert "DEPLOYMENT SUCCEEDED" not in result.stdout
+        assert "release compose promoted" not in result.stdout
         assert result.stdout.count("ROLLBACK DONE") == 1
         env = tmp_path / "deploy" / "deploy.env"
         assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
+
+
+_RELEASE_STUB_DOCKER = """#!/bin/sh
+# Fake docker for the release-compose tests: every operation succeeds unless
+# a FAIL_* flag (or the crash-loop / fail-up-once markers) says otherwise.
+echo "$@" >> "$DOCKER_CALLS_LOG"
+case " $* " in
+    *" inspect "*)
+        case "$*" in
+            *"Health"*) echo healthy ;;
+            *"RestartCount"*)
+                n="$(cat "$INSPECT_COUNTER" 2>/dev/null || echo 0)"
+                n=$((n + 1))
+                printf '%s' "$n" > "$INSPECT_COUNTER"
+                if [ "$CRASH_LOOP" = "1" ] && [ "$n" -ge 2 ]; then echo 2; else echo 0; fi
+                ;;
+            *) echo running ;;
+        esac
+        exit 0
+        ;;
+    *" ps -q "*)
+        echo "cid123"
+        exit 0
+        ;;
+    *" config "*)
+        [ "$FAIL_CONFIG" = "1" ] && exit 1
+        exit 0
+        ;;
+    *" pull "*)
+        exit 0
+        ;;
+    *" run "*)
+        [ "$FAIL_MIGRATE" = "1" ] && exit 1
+        exit 0
+        ;;
+    *" up -d api worker bot "*)
+        n="$(cat "$UP_FAIL_COUNTER" 2>/dev/null || echo 0)"
+        n=$((n + 1))
+        printf '%s' "$n" > "$UP_FAIL_COUNTER"
+        if [ "$FAIL_UP_API" = "1" ] && [ "$n" = "1" ]; then
+            echo "failed to bind host port 0.0.0.0:8000/tcp: address already in use" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    *" exec "*)
+        echo "0034 (head)"
+        exit 0
+        ;;
+esac
+exit 0
+"""
+
+
+def _release_harness(
+    tmp_path: Path,
+    *,
+    missing_candidate: bool = False,
+    bad_sha: bool = False,
+    fail_config: bool = False,
+    fail_migrate: bool = False,
+    fail_ready: bool = False,
+    fail_up_api: bool = False,
+    crash_loop: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path, bytes, bytes]:
+    """Run main() against the release-candidate flow with stubbed externals.
+
+    Returns (process, deploy_dir, canonical, candidate, env_before, config_before).
+    """
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    env_file = deploy_dir / "deploy.env"
+    env_before = (
+        "# deployment values (server-owned)\n"
+        f"PLATFORM_IMAGE={_OLD_IMAGE}\n"
+        "POSTGRES_PASSWORD=s3cret-server-value\n"
+        "API_PORT=8000\n"
+    )
+    env_file.write_text(env_before, encoding="utf-8")
+    current, candidate, candidate_sha = _write_compose_files(deploy_dir)
+    if missing_candidate:
+        (deploy_dir / ".docker-compose.abc123.candidate.yml").unlink()
+    config = tmp_path / "configuration.toml"
+    config.write_text("[app]\n", encoding="utf-8")
+    config_before = config.read_bytes()
+    canonical = deploy_dir / "docker-compose.yml"
+    stub_bin = tmp_path / "stubbin"
+    stub_bin.mkdir()
+    (stub_bin / "docker").write_text(_RELEASE_STUB_DOCKER, encoding="utf-8")
+    (stub_bin / "docker").chmod(0o755)
+    (stub_bin / "sleep").write_text(_STUB_SLEEP, encoding="utf-8")
+    (stub_bin / "sleep").chmod(0o755)
+    if fail_ready:
+        (stub_bin / "python3").write_text(_STUB_PYTHON, encoding="utf-8")
+    else:
+        (stub_bin / "python3").write_text(_STABLE_STUB_PYTHON, encoding="utf-8")
+    (stub_bin / "python3").chmod(0o755)
+    script = (
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
+        f"DOCKER_CALLS_LOG='{(tmp_path / 'docker-calls.log').as_posix()}' "
+        f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
+        f"INSPECT_COUNTER='{(tmp_path / 'inspect-counter').as_posix()}' "
+        f"UP_FAIL_COUNTER='{(tmp_path / 'up-counter').as_posix()}' "
+        f"CRASH_LOOP='{'1' if crash_loop else ''}' "
+        f"FAIL_CONFIG='{'1' if fail_config else ''}' "
+        f"FAIL_MIGRATE='{'1' if fail_migrate else ''}' "
+        f"FAIL_UP_API='{'1' if fail_up_api else ''}' "
+        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"CURRENT_COMPOSE_FILE='{current}' "
+        f"CANDIDATE_COMPOSE_FILE='{candidate}' "
+        f"EXPECTED_COMPOSE_SHA256='{'f' * 64 if bad_sha else candidate_sha}' "
+        f"ENV_FILE='{env_file.as_posix()}' "
+        f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='0034' "
+        f"STABILIZE_SECONDS=1 HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
+        f"source '{DEPLOY_SCRIPT.as_posix()}'; "
+        "set +e; main; echo MAIN_RC=$?"
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    return result, deploy_dir, canonical, Path(candidate), env_before.encode(), config_before
+
+
+def _assert_no_mutation(
+    tmp_path: Path,
+    result: subprocess.CompletedProcess[str],
+    deploy_dir: Path,
+    canonical: Path,
+    env_before: bytes,
+    config_before: bytes,
+) -> None:
+    """A preflight failure must change nothing and trigger no fake rollback."""
+    assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+    assert "MAIN_RC=1" in result.stdout
+    calls = _stub_calls(tmp_path, "docker-calls.log")
+    assert "pull" not in calls
+    assert " up " not in f" {calls} "
+    assert " run " not in f" {calls} "
+    assert (deploy_dir / "deploy.env").read_bytes() == env_before
+    assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+    assert (tmp_path / "configuration.toml").read_bytes() == config_before
+    assert "no rollback needed" in result.stdout
+    assert "ROLLBACK DONE" not in result.stdout
+    assert "release compose promoted" not in result.stdout
+
+
+class TestReleaseComposeContract:
+    """The release compose ships with the release and promotes only on success."""
+
+    @needs_bash
+    def test_missing_candidate_fails_before_mutation(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, missing_candidate=True
+        )
+        _assert_no_mutation(tmp_path, result, deploy_dir, canonical, env_before, config_before)
+
+    @needs_bash
+    def test_invalid_candidate_config_fails_before_mutation(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, fail_config=True
+        )
+        _assert_no_mutation(tmp_path, result, deploy_dir, canonical, env_before, config_before)
+
+    @needs_bash
+    def test_sha_mismatch_fails_before_mutation(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, bad_sha=True
+        )
+        assert "SHA-256 mismatch" in result.stdout or "SHA-256 mismatch" in result.stderr
+        _assert_no_mutation(tmp_path, result, deploy_dir, canonical, env_before, config_before)
+
+    @needs_bash
+    def test_success_promotes_candidate_to_canonical(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, candidate, env_before, config_before = _release_harness(
+            tmp_path
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=0" in result.stdout
+        assert "release compose promoted:" in result.stdout
+        assert "DEPLOYMENT SUCCEEDED" in result.stdout
+        # Canonical is now byte-for-byte the release candidate; the
+        # candidate no longer remains as an active artifact.
+        assert canonical.read_bytes() == b"# release candidate contract\nservices: {}\n"
+        assert not candidate.exists()
+        # deploy.env stays server-owned: only PLATFORM_IMAGE was rewritten.
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before.replace(
+            _OLD_IMAGE.encode(), _NEW_IMAGE.encode()
+        )
+        assert (tmp_path / "configuration.toml").read_bytes() == config_before
+
+    @needs_bash
+    def test_runtime_failure_rolls_back_with_canonical(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, fail_up_api=True
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "release compose promoted" not in result.stdout
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
+        assert len(up_lines) == 2
+        assert "candidate" in up_lines[0]
+        assert "candidate" not in up_lines[1]
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (tmp_path / "configuration.toml").read_bytes() == config_before
+
+    @needs_bash
+    def test_failed_migration_does_not_promote(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, fail_migrate=True
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "release compose promoted" not in result.stdout
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (tmp_path / "configuration.toml").read_bytes() == config_before
+
+    @needs_bash
+    def test_failed_readiness_does_not_promote(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, fail_ready=True
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "release compose promoted" not in result.stdout
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (tmp_path / "configuration.toml").read_bytes() == config_before
+
+    @needs_bash
+    def test_stabilization_failure_does_not_promote(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, crash_loop=True
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "release compose promoted" not in result.stdout
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (tmp_path / "configuration.toml").read_bytes() == config_before
+
+
+class TestReleaseComposeDelivery:
+    """The release compose travels with the release, never apart from it."""
+
+    def _steps(self) -> list:
+        doc = _workflow()
+        return doc["jobs"]["deploy"]["steps"]
+
+    def test_compose_candidate_comes_from_the_exact_checkout(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        assert "sha256sum deploy/production/docker-compose.yml" in text
+        assert ".docker-compose." in text and ".candidate.yml" in text
+        # The candidate name is keyed on the tested SHA for both triggers.
+        assert "needs.build.outputs.sha" in text
+
+    def test_deploy_consumes_candidate_and_expected_hash(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        assert "CANDIDATE_COMPOSE_FILE=" in text
+        assert "EXPECTED_COMPOSE_SHA256=" in text
+        assert "steps.compose.outputs.candidate" in text
+        assert "steps.compose.outputs.sha256" in text
+
+    def test_delivery_precedes_deploy_on_the_same_trust_path(self) -> None:
+        text = WORKFLOW.read_text(encoding="utf-8")
+        assert text.index("Deliver release compose candidate") < text.index(
+            "Deploy the exact image over SSH"
+        )
+        assert "StrictHostKeyChecking=no" not in text
+        # SSH key login, GHCR login, compose delivery, deploy: one trust path.
+        assert text.count("StrictHostKeyChecking=yes") >= 3
+
+    def test_single_delivery_path_for_automatic_and_manual_deploys(self) -> None:
+        steps = self._steps()
+        delivery = [
+            step for step in steps if step.get("name") == "Deliver release compose candidate"
+        ]
+        assert len(delivery) == 1
+        assert "if" not in delivery[0], "delivery must not depend on the trigger type"
 
 
 class TestProductionCompose:

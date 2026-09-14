@@ -33,16 +33,28 @@ Manual redeploys (`workflow_dispatch`, input `sha`) follow the same
 build → verify → deploy → health-check path with an explicit immutable SHA
 (which must be an ancestor of `main`); there is no second, less-safe path.
 
-## 2. Server layout (operator-owned, survives every deploy)
+## 2. Server layout and ownership
 
 ```text
-/opt/cloud-server-seller/
-    docker-compose.yml   # server copy of deploy/production/docker-compose.yml
-    deploy.env           # infrastructure values only, mode 600
+RELEASE-OWNED (promoted automatically on every successful deploy):
+    Docker image (ghcr.io/<org>/<repo>:<full-sha>)
+    /opt/cloud-server-seller/docker-compose.yml   (canonical release contract)
 
-/etc/cloud-server-seller/
-    configuration.toml   # ALL application config + secrets, mode 640 or 600
+SERVER-OWNED (never delivered from Git, never overwritten by a deploy):
+    /opt/cloud-server-seller/deploy.env           (infrastructure values only, mode 600)
+    /etc/cloud-server-seller/configuration.toml   (ALL application config + secrets, mode 640 or 600)
+    persistent Docker volumes/data, host credentials
 ```
+
+Every deploy ships the exact `deploy/production/docker-compose.yml` from the
+exact tested commit as a per-SHA candidate
+(`.docker-compose.<FULL_SHA>.candidate.yml`), verifies its SHA-256, runs the
+whole release against it, and atomically promotes it to the canonical path
+only after all health/stability/revision gates pass. A failed release leaves
+the previous canonical compose untouched and rolls back with it. Manually
+copying compose to the server is NOT required for normal deploys (and a
+manual redeploy of an older SHA ships THAT SHA's compose, never current
+main's).
 
 * `deploy.env` holds ONLY `PLATFORM_IMAGE`, `POSTGRES_PASSWORD`, `API_PORT`
   and optionally `CONFIGURATION_PATH`. Automated deploys rewrite a single
@@ -84,8 +96,9 @@ install -m 0640 -o root -g docker \
   /etc/cloud-server-seller/configuration.toml
 "$EDITOR" /etc/cloud-server-seller/configuration.toml   # fill in every secret
 
-# 4. compose file + deployment env (do NOT copy configuration.toml here)
-cp deploy/production/docker-compose.yml /opt/cloud-server-seller/
+# 4. deployment env only (the release compose arrives automatically;
+#    do NOT copy configuration.toml here and do NOT copy docker-compose.yml —
+#    the first successful deploy promotes its own canonical compose file)
 cp deploy/production/.env.example /opt/cloud-server-seller/deploy.env
 chmod 600 /opt/cloud-server-seller/deploy.env
 "$EDITOR" /opt/cloud-server-seller/deploy.env
@@ -135,27 +148,34 @@ repository secrets are needed: application secrets live only in the server
 
 ## 5. Deployment sequence (what the script does)
 
-1. Validate tools (`docker`, compose plugin, `python3`) and required files;
-   refuse to create or modify `configuration.toml` (fail if missing).
-2. Validate `PLATFORM_IMAGE_NEW` is `ghcr.io/<org>/<repo>:<40-hex-sha>`.
-3. Record the current `PLATFORM_IMAGE` as the rollback image.
-4. Rewrite ONLY the `PLATFORM_IMAGE` line in `deploy.env` (idempotent).
-5. Pull the image; on pull failure restore the previous reference and stop
-   (running containers untouched).
-6. Start/verify `postgres` + `redis` (bounded health waits).
-7. Run migrations (`alembic upgrade head` in the one-shot `migrate`
+1. Validate tools (`docker`, compose plugin, `python3`, `sha256sum`) and
+   required files; refuse to create or modify `configuration.toml` (fail
+   if missing).
+2. Verify the release candidate compose (`EXPECTED_COMPOSE_SHA256` over the
+   transferred file, regular file, no symlink, parses with the NEW image).
+   A mismatch fails before any mutation: no image switch, no migration, no
+   restarts, no rollback.
+3. Validate `PLATFORM_IMAGE_NEW` is `ghcr.io/<org>/<repo>:<40-hex-sha>`.
+4. Record the current `PLATFORM_IMAGE` as the rollback image.
+5. Rewrite ONLY the `PLATFORM_IMAGE` line in `deploy.env` (idempotent).
+6. Pull the image (candidate contract); on pull failure restore the
+   previous reference and stop (running containers untouched).
+7. Start/verify `postgres` + `redis` (bounded health waits, candidate contract).
+8. Run migrations (`alembic upgrade head` in the one-shot `migrate`
    service); on failure restore the previous reference and stop.
-8. Start/update `api`, `worker`, and exactly one `bot`.
-9. Health gates (all bounded, no infinite waits):
-   * `GET /health/ready` reports `{"status": "ok"}` (strongest readiness gate);
-   * `postgres` + `redis` containers healthy; `worker` running;
-   * exactly one `bot` container running (long-polling single consumer);
-   * `worker` + `bot` startup stability: same containers still running with
-     unchanged restart counts after a short bounded wait (a crash loop must
-     fail the deploy even if a container looks running for a moment);
-   * `alembic current` inside `api` reports the expected head
-     (`EXPECTED_HEAD`, resolved from the deployed commit in CI).
-10. Print service status; on success prune older local images (current +
+9. Start/update `api`, `worker`, and exactly one `bot` (candidate contract).
+10. Health gates (all bounded, no infinite waits):
+    * `GET /health/ready` reports `{"status": "ok"}` (strongest readiness gate);
+    * `postgres` + `redis` containers healthy; `worker` running;
+    * exactly one `bot` container running (long-polling single consumer);
+    * `worker` + `bot` startup stability: same containers still running with
+      unchanged restart counts after a short bounded wait (a crash loop must
+      fail the deploy even if a container looks running for a moment);
+    * `alembic current` inside `api` reports the expected head
+      (`EXPECTED_HEAD`, resolved from the deployed commit in CI).
+11. Atomically promote the candidate compose to the canonical path
+    (same-filesystem rename, mode 0644) and log its SHA-256.
+12. Print service status; on success prune older local images (current +
     rollback images are always kept).
 
 ## 6. Migration and rollback behavior
@@ -165,7 +185,8 @@ repository secrets are needed: application secrets live only in the server
   so rolling the application image back is always safe.
 * `alembic downgrade` is NEVER run automatically.
 * When health checks fail AFTER the switch, the script restores the previous
-  `PLATFORM_IMAGE`, restarts the previous api/worker/bot, leaves the
+  `PLATFORM_IMAGE`, restarts the previous api/worker/bot **with the previous
+  canonical compose (never the failed candidate)**, leaves the
   database at the new (forward) revision, and exits 1: **a successful
   rollback is still a failed deployment** (the workflow stays red).
 * With no previous image (first deploy), a failure reports NO ROLLBACK

@@ -17,9 +17,11 @@
 #     CONFIGURATION_PATH. Automated deploys update ONLY PLATFORM_IMAGE there.
 #
 #   Server layout:
-#     /opt/cloud-server-seller/docker-compose.yml   (copy of this file)
-#     /opt/cloud-server-seller/deploy.env           (PLATFORM_IMAGE + secrets)
-#     /etc/cloud-server-seller/configuration.toml   (application config)
+#     /opt/cloud-server-seller/docker-compose.yml   (RELEASE-OWNED: promoted
+#       from the tested commit's candidate on every successful deploy; never
+#       edited by hand for normal deploys)
+#     /opt/cloud-server-seller/deploy.env           (SERVER-OWNED: PLATFORM_IMAGE + secrets)
+#     /etc/cloud-server-seller/configuration.toml   (SERVER-OWNED: application config)
 #
 #   docker compose --env-file deploy.env -f docker-compose.yml up -d
 #   docker compose --env-file deploy.env -f docker-compose.yml --profile backup run --rm backup

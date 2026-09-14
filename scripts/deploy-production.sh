@@ -1,24 +1,48 @@
 #!/usr/bin/env bash
 # Production application-image deployment (idempotent, safe to re-run).
 #
-# Deploys ONE immutable GHCR image (ghcr.io/<org>/<repo>:<full-git-sha>) to the
-# production server layout:
+# Ownership model:
 #
-#   ${DEPLOY_PATH}/docker-compose.yml   compose file (server copy)
-#   ${DEPLOY_PATH}/deploy.env           infrastructure values (mode 600)
-#   ${CONFIGURATION_PATH}               server-owned application TOML (untouched)
+#   RELEASE-OWNED (travel with the tested Git commit, promoted on success):
+#   - the immutable GHCR image (ghcr.io/<org>/<repo>:<full-git-sha>)
+#   - the compose contract under test (candidate -> canonical promotion)
+#   - migration code and this script's release behavior
+#
+#   SERVER-OWNED (never delivered from Git, never overwritten by a deploy):
+#   - ${DEPLOY_PATH}/deploy.env (only its PLATFORM_IMAGE line is rewritten)
+#   - ${CONFIGURATION_PATH} (checked for existence, never touched)
+#   - persistent Docker volumes/data and host credentials
+#
+# Server layout:
+#
+#   ${DEPLOY_PATH}/docker-compose.yml                 canonical release compose
+#   ${DEPLOY_PATH}/.docker-compose.<FULL_SHA>.candidate.yml   release candidate
+#   ${DEPLOY_PATH}/deploy.env                         infrastructure values (mode 600)
+#   ${CONFIGURATION_PATH}                             server-owned application TOML
+#
+# The GitHub Actions runner transfers the exact compose file from the exact
+# tested commit to the per-SHA candidate path, then invokes this script with
+# the candidate path plus its expected SHA-256. Forward deployment runs
+# ENTIRELY against the candidate; the canonical file is replaced atomically
+# (same-filesystem rename) only after every health/stability/revision gate
+# passes. A failed release leaves the canonical contract untouched and rolls
+# back using the PREVIOUS canonical compose plus the previous image. The
+# database is NEVER downgraded.
 #
 # Required environment:
-#   DEPLOY_PATH          operator-owned directory (e.g. /opt/cloud-server-seller)
-#   PLATFORM_IMAGE_NEW   new image, exactly ghcr.io/<org>/<repo>:<40-hex-sha>
+#   DEPLOY_PATH              operator-owned directory (e.g. /opt/cloud-server-seller)
+#   PLATFORM_IMAGE_NEW       new image, exactly ghcr.io/<org>/<repo>:<40-hex-sha>
+#   CANDIDATE_COMPOSE_FILE   per-release candidate compose path on the server
+#   EXPECTED_COMPOSE_SHA256  SHA-256 of the exact release compose file (64 hex)
 #
 # Optional environment:
-#   COMPOSE_FILE         default: ${DEPLOY_PATH}/docker-compose.yml
-#   ENV_FILE             default: ${DEPLOY_PATH}/deploy.env
-#   CONFIGURATION_PATH   default: /etc/cloud-server-seller/configuration.toml
-#   EXPECTED_HEAD        alembic head revision the database must report
-#   HEALTH_ATTEMPTS      default: 36 (x HEALTH_INTERVAL seconds for the API)
-#   HEALTH_INTERVAL      default: 5 (seconds between health probes)
+#   CURRENT_COMPOSE_FILE   default: ${DEPLOY_PATH}/docker-compose.yml
+#   ENV_FILE               default: ${DEPLOY_PATH}/deploy.env
+#   CONFIGURATION_PATH     default: /etc/cloud-server-seller/configuration.toml
+#   EXPECTED_HEAD          alembic head revision the database must report
+#   HEALTH_ATTEMPTS        default: 36 (x HEALTH_INTERVAL seconds for the API)
+#   HEALTH_INTERVAL        default: 5 (seconds between health probes)
+#   STABILIZE_SECONDS      default: 15 (worker/bot restart-stability window)
 #
 # Sequence: validate files -> save rollback image -> switch PLATFORM_IMAGE ->
 # pull -> postgres/redis healthy -> migrate (alembic upgrade head) -> api,
@@ -50,7 +74,9 @@ load_config() {
     # sourced without side effects (see DEPLOY_PRODUCTION_SOURCED).
     DEPLOY_PATH="${DEPLOY_PATH:?set DEPLOY_PATH (e.g. /opt/cloud-server-seller)}"
     PLATFORM_IMAGE_NEW="${PLATFORM_IMAGE_NEW:?set PLATFORM_IMAGE_NEW (ghcr.io/<org>/<repo>:<full-sha>)}"
-    COMPOSE_FILE="${COMPOSE_FILE:-${DEPLOY_PATH}/docker-compose.yml}"
+    CURRENT_COMPOSE_FILE="${CURRENT_COMPOSE_FILE:-${DEPLOY_PATH}/docker-compose.yml}"
+    CANDIDATE_COMPOSE_FILE="${CANDIDATE_COMPOSE_FILE:?set CANDIDATE_COMPOSE_FILE (per-release candidate path)}"
+    EXPECTED_COMPOSE_SHA256="${EXPECTED_COMPOSE_SHA256:?set EXPECTED_COMPOSE_SHA256 (64 hex chars)}"
     ENV_FILE="${ENV_FILE:-${DEPLOY_PATH}/deploy.env}"
     CONFIGURATION_PATH="${CONFIGURATION_PATH:-/etc/cloud-server-seller/configuration.toml}"
     EXPECTED_HEAD="${EXPECTED_HEAD:-}"
@@ -68,8 +94,18 @@ fail() {
     return 1
 }
 
-compose() {
-    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
+compose_candidate() {
+    # Forward deployment ALWAYS uses the release candidate contract.
+    docker compose --env-file "${ENV_FILE}" -f "${CANDIDATE_COMPOSE_FILE}" "$@"
+}
+
+compose_current() {
+    # Rollback and canonical status ALWAYS use the previous canonical contract.
+    docker compose --env-file "${ENV_FILE}" -f "${CURRENT_COMPOSE_FILE}" "$@"
+}
+
+file_sha256() {
+    sha256sum "$1" | awk '{print $1}'
 }
 
 # Read one KEY=value line from a dotenv file without executing it.
@@ -144,7 +180,7 @@ rollback() {
     fi
     log "ROLLBACK: restoring ${PREV_IMAGE}"
     set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
-    compose up -d api worker bot >/dev/null \
+    compose_current up -d api worker bot >/dev/null \
         || { fail "ROLLBACK: cannot restart the previous application image"; return 1; }
     ROLLED_BACK="yes"
     log "ROLLBACK: previous application image restarted (database left at the new migration revision)"
@@ -155,14 +191,45 @@ deploy() {
     command -v docker >/dev/null || { fail "docker is not installed"; return 1; }
     docker compose version >/dev/null || { fail "docker compose plugin is not available"; return 1; }
     command -v python3 >/dev/null || { fail "python3 is not installed (needed for health probes)"; return 1; }
+    command -v sha256sum >/dev/null || { fail "sha256sum is not installed (needed for compose integrity)"; return 1; }
 
-    [ -f "${COMPOSE_FILE}" ] || { fail "compose file missing: ${COMPOSE_FILE}"; return 1; }
     [ -f "${ENV_FILE}" ] || { fail "deployment env file missing: ${ENV_FILE}"; return 1; }
     # Server-owned configuration: required, but never created or modified here.
     [ -f "${CONFIGURATION_PATH}" ] || {
         fail "server configuration missing: ${CONFIGURATION_PATH} (bootstrap it once, deploys never touch it)"
         return 1
     }
+
+    # Release-candidate integrity: verified BEFORE any deployment mutation.
+    # A failure here changes nothing (no image switch, no migration, no
+    # restarts, no rollback) because nothing has been mutated yet.
+    [ "${CANDIDATE_COMPOSE_FILE}" != "${CURRENT_COMPOSE_FILE}" ] || {
+        fail "candidate and canonical compose must be different files"
+        return 1
+    }
+    [ -f "${CANDIDATE_COMPOSE_FILE}" ] || {
+        fail "release candidate compose missing: ${CANDIDATE_COMPOSE_FILE}"
+        return 1
+    }
+    [ ! -L "${CANDIDATE_COMPOSE_FILE}" ] || {
+        fail "release candidate compose must not be a symlink: ${CANDIDATE_COMPOSE_FILE}"
+        return 1
+    }
+    if ! printf '%s' "${EXPECTED_COMPOSE_SHA256}" | grep -Eq '^[0-9a-f]{64}$'; then
+        fail "EXPECTED_COMPOSE_SHA256 must be 64 hex chars"
+        return 1
+    fi
+    candidate_sha="$(file_sha256 "${CANDIDATE_COMPOSE_FILE}")" \
+        || { fail "cannot hash release candidate compose"; return 1; }
+    [ "${candidate_sha}" = "${EXPECTED_COMPOSE_SHA256}" ] || {
+        fail "release candidate compose SHA-256 mismatch (expected ${EXPECTED_COMPOSE_SHA256}, got ${candidate_sha})"
+        return 1
+    }
+    log "release candidate compose verified: ${candidate_sha}"
+    # The candidate must parse with the NEW release image, not whatever old
+    # PLATFORM_IMAGE happens to sit in deploy.env.
+    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate config >/dev/null \
+        || { fail "release candidate compose does not parse"; return 1; }
 
     case "${PLATFORM_IMAGE_NEW}" in
         *[!a-z0-9.:/_-]*|'') fail "refusing malformed image reference"; return 1 ;;
@@ -207,7 +274,7 @@ deploy() {
     fi
 
     log "pulling application image"
-    if ! compose pull migrate api worker bot; then
+    if ! compose_candidate pull migrate api worker bot; then
         log "pull failed — restoring previous image reference"
         if [ -n "${PREV_IMAGE}" ]; then
             set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
@@ -216,18 +283,18 @@ deploy() {
     fi
 
     log "starting postgres + redis"
-    compose up -d postgres redis >/dev/null || { fail "cannot start postgres/redis"; return 1; }
+    compose_candidate up -d postgres redis >/dev/null || { fail "cannot start postgres/redis"; return 1; }
 
     log "waiting for postgres/redis health"
     for service in postgres redis; do
-        id="$(compose ps -q "${service}" | head -n 1)"
+        id="$(compose_candidate ps -q "${service}" | head -n 1)"
         [ -n "${id}" ] || { fail "no container id for ${service}"; return 1; }
         wait_healthy "${id}" 24 "${HEALTH_INTERVAL}" \
             || { fail "${service} did not become healthy"; return 1; }
     done
 
     log "running database migrations (alembic upgrade head)"
-    if ! compose run --rm --no-deps migrate; then
+    if ! compose_candidate run --rm --no-deps migrate; then
         log "migration failed — restoring previous image reference (database left as-is)"
         if [ -n "${PREV_IMAGE}" ]; then
             set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
@@ -237,7 +304,7 @@ deploy() {
     log "migrations applied"
 
     log "starting api + worker + bot (bot replicas = 1)"
-    compose up -d api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
+    compose_candidate up -d api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
 
     local api_port
     api_port="$(dotenv_value "${ENV_FILE}" API_PORT)"
@@ -260,11 +327,11 @@ deploy() {
     log "verifying services"
     local id worker_id=""
     for service in postgres redis; do
-        id="$(compose ps -q "${service}" | head -n 1)"
+        id="$(compose_candidate ps -q "${service}" | head -n 1)"
         container_healthy "${id}" || { fail "${service} is not healthy"; return 1; }
     done
     for service in worker; do
-        id="$(compose ps -q "${service}" | head -n 1)"
+        id="$(compose_candidate ps -q "${service}" | head -n 1)"
         [ -n "${id}" ] || { fail "${service} has no container"; return 1; }
         container_running "${id}" || { fail "${service} is not running"; return 1; }
         worker_id="${id}"
@@ -272,12 +339,12 @@ deploy() {
 
     # Telegram long polling is a single-consumer transport: exactly one bot.
     local bot_count bot_id
-    bot_count="$(compose ps -q bot | grep -c . || true)"
+    bot_count="$(compose_candidate ps -q bot | grep -c . || true)"
     [ "${bot_count}" = "1" ] || {
         fail "bot replica invariant violated: ${bot_count} bot containers (want exactly 1)"
         return 1
     }
-    bot_id="$(compose ps -q bot | head -n 1)"
+    bot_id="$(compose_candidate ps -q bot | head -n 1)"
     container_running "${bot_id}" || { fail "bot container is not running"; return 1; }
     log "bot replicas: exactly 1, running"
 
@@ -291,8 +358,8 @@ deploy() {
     log "waiting ${STABILIZE_SECONDS}s for worker/bot startup stabilization"
     sleep "${STABILIZE_SECONDS}"
     local bot_id_after worker_id_after
-    bot_id_after="$(compose ps -q bot | head -n 1)"
-    worker_id_after="$(compose ps -q worker | head -n 1)"
+    bot_id_after="$(compose_candidate ps -q bot | head -n 1)"
+    worker_id_after="$(compose_candidate ps -q worker | head -n 1)"
     [ "${bot_id_after}" = "${bot_id}" ] || { fail "bot container changed during stabilization"; return 1; }
     [ "${worker_id_after}" = "${worker_id}" ] || {
         fail "worker container changed during stabilization"
@@ -304,12 +371,12 @@ deploy() {
         return 1
     }
     if [ "$(restart_count "${bot_id}")" != "${bot_restarts_before}" ]; then
-        compose logs --tail=20 bot 2>/dev/null || true
+        compose_candidate logs --tail=20 bot 2>/dev/null || true
         fail "bot restarted during stabilization (crash loop?)"
         return 1
     fi
     if [ "$(restart_count "${worker_id}")" != "${worker_restarts_before}" ]; then
-        compose logs --tail=20 worker 2>/dev/null || true
+        compose_candidate logs --tail=20 worker 2>/dev/null || true
         fail "worker restarted during stabilization"
         return 1
     fi
@@ -317,7 +384,7 @@ deploy() {
 
     log "verifying migration revision"
     local current
-    current="$(compose exec -T api alembic current 2>/dev/null || true)"
+    current="$(compose_candidate exec -T api alembic current 2>/dev/null || true)"
     if [ -n "${EXPECTED_HEAD}" ]; then
         case "${current}" in
             *"${EXPECTED_HEAD}"*) log "alembic current reports expected head ${EXPECTED_HEAD}" ;;
@@ -332,8 +399,25 @@ deploy() {
         log "alembic current: ${current}"
     fi
 
+    # Atomic promotion: every gate above passed, so the release candidate
+    # becomes the canonical contract. Same-filesystem rename: either the
+    # canonical file is the new release, or it is untouched — never half
+    # written. The compose file holds no secrets (mode 0644 is safe).
+    log "promoting release compose to canonical"
+    mv "${CANDIDATE_COMPOSE_FILE}" "${CURRENT_COMPOSE_FILE}" \
+        || { fail "cannot promote release compose to canonical"; return 1; }
+    chmod 0644 "${CURRENT_COMPOSE_FILE}" \
+        || { fail "cannot set canonical compose permissions"; return 1; }
+    promoted_sha="$(file_sha256 "${CURRENT_COMPOSE_FILE}")" \
+        || { fail "cannot hash promoted compose"; return 1; }
+    [ "${promoted_sha}" = "${EXPECTED_COMPOSE_SHA256}" ] || {
+        fail "promoted compose hash mismatch (expected ${EXPECTED_COMPOSE_SHA256}, got ${promoted_sha})"
+        return 1
+    }
+    log "release compose promoted: ${promoted_sha}"
+
     log "service status:"
-    compose ps || { fail "cannot list service status"; return 1; }
+    compose_current ps || { fail "cannot list service status"; return 1; }
     return 0
 }
 
@@ -373,6 +457,12 @@ main() {
         fi
     else
         log "RESULT: DEPLOYMENT FAILED, ROLLBACK ATTEMPT FAILED"
+    fi
+    # A failed release must not leave its candidate behind as a stale
+    # artifact (the next release ships its own per-SHA candidate). Cleanup
+    # failure must never mask the real deployment failure.
+    if [ "${CANDIDATE_COMPOSE_FILE}" != "${CURRENT_COMPOSE_FILE}" ]; then
+        rm -f "${CANDIDATE_COMPOSE_FILE}" || true
     fi
     return 1
 }
