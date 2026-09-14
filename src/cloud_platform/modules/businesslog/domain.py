@@ -69,7 +69,7 @@ class BusinessEventType(StrEnum):
     SERVER_SNAPSHOT_CREATED = "server.snapshot_created"
     SERVER_SNAPSHOT_RESTORED = "server.snapshot_restored"
     SERVER_SNAPSHOT_DELETED = "server.snapshot_deleted"
-    SERVER_PASSWORD_RESET_REQUESTED = "server.password_reset_requested"
+    SERVER_PASSWORD_RESET_REQUESTED = "server.password_reset_requested"  # pragma: allowlist secret
     SERVER_IP_NULL_ROUTED = "server.ip_null_routed"
     SERVER_IP_UNNULL_ROUTED = "server.ip_unnull_routed"
     SERVER_OPERATION_FAILED = "server.operation_failed"
@@ -110,6 +110,8 @@ _FLAGS: Mapping[BusinessEventType, str] = {
     BusinessEventType.SERVER_SNAPSHOT_CREATED: "log_server_management",
     BusinessEventType.SERVER_SNAPSHOT_RESTORED: "log_server_management",
     BusinessEventType.SERVER_SNAPSHOT_DELETED: "log_server_management",
+    # Audited domain key (event-type contract, no credential): allowlisted for detect-secrets.
+    # pragma: allowlist nextline secret
     BusinessEventType.SERVER_PASSWORD_RESET_REQUESTED: "log_server_management",
     BusinessEventType.SERVER_IP_NULL_ROUTED: "log_server_management",
     BusinessEventType.SERVER_IP_UNNULL_ROUTED: "log_server_management",

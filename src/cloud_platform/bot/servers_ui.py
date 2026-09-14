@@ -95,7 +95,7 @@ _OPERATION_LABELS: dict[ServerOperation, str] = {
     ServerOperation.STOP: "servers.op.stop",
     ServerOperation.REBOOT: "servers.op.reboot",
     ServerOperation.REINSTALL: "servers.op.reinstall",
-    ServerOperation.PASSWORD_RESET: "servers.op.password_reset",
+    ServerOperation.PASSWORD_RESET: "servers.op.password_reset",  # pragma: allowlist secret
     ServerOperation.SNAPSHOT_CREATE: "servers.op.snapshot_create",
     ServerOperation.SNAPSHOT_RESTORE: "servers.op.snapshot_restore",
     ServerOperation.SNAPSHOT_DELETE: "servers.op.snapshot_delete",

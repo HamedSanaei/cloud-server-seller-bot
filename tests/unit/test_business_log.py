@@ -297,12 +297,12 @@ class TestSanitization:
             event_key="k",
             event_type=BusinessEventType.PURCHASE_FAILED,
             payload={
-                "api_key": "LIVEKEY",
-                "authorization": "Bearer abc",
-                "x-lsw-auth": "LIVEKEY",
-                "password": "hunter2",
-                "cloud_init": "root:secret",
-                "root_password": "hunter2",
+                "api_key": "LIVEKEY",  # pragma: allowlist secret
+                "authorization": "Bearer abc",  # pragma: allowlist secret
+                "x-lsw-auth": "LIVEKEY",  # pragma: allowlist secret
+                "password": "hunter2",  # pragma: allowlist secret
+                "cloud_init": "root:secret",  # pragma: allowlist secret
+                "root_password": "hunter2",  # pragma: allowlist secret
                 "reason": "provider rejected",
             },
         )

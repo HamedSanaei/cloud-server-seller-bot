@@ -497,7 +497,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.reinstall_empty": "No image is available for reinstall right now.",
         "servers.password_button": "🔑 Reset password",
         "servers.password_title": "⚠️ Reset password",
-        "servers.password_text": "The provider generates a new password and the current one stops working.",  # noqa: E501
+        "servers.password_text": "The provider generates a new password and the current one stops working.",  # noqa: E501  # pragma: allowlist secret
         "servers.ips_button": "🌐 IP management",
         "servers.ips_title": "🌐 IP management",
         "servers.ip_row": "{ip} — {kind}",
@@ -542,7 +542,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.op.stop": "Power off",
         "servers.op.reboot": "Reboot",
         "servers.op.reinstall": "Reinstall",
-        "servers.op.password_reset": "Reset password",
+        "servers.op.password_reset": "Reset password",  # pragma: allowlist secret
         "servers.op.snapshot_create": "Create snapshot",
         "servers.op.snapshot_restore": "Restore snapshot",
         "servers.op.snapshot_delete": "Delete snapshot",
