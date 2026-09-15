@@ -50,6 +50,7 @@ def _to_domain(row: _ProviderOrderModel) -> ProviderOrder:
         provider_cost_currency=_attr(row, "provider_cost_currency"),
         selling_price_minor=_attr(row, "selling_price_minor"),
         selling_currency=_attr(row, "selling_currency"),
+        credential_account_id=_attr(row, "credential_account_id"),
         post_attempted_at=_attr(row, "post_attempted_at"),
         settlement_status=SettlementStatus(str(_attr(row, "settlement_status") or "pending")),
         settlement_attempted_at=_attr(row, "settlement_attempted_at"),
@@ -118,6 +119,7 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
         provider_cost_currency: str | None = None,
         selling_price_minor: int | None = None,
         selling_currency: str | None = None,
+        credential_account_id: str | None = None,
     ) -> ProviderOrder:
         async with self._session_factory() as session:
             row = _ProviderOrderModel(
@@ -126,6 +128,7 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
                 provider_key=provider_key,
                 offer_id=offer_id,
                 status=OrderStatus.PENDING_SUBMIT.value,
+                credential_account_id=credential_account_id,
                 product_id=product_id,
                 location_id=location_id,
                 os_name=os_name,

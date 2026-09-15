@@ -98,21 +98,21 @@ class TestBalance:
         assert view.has_wallet is True
         assert view.balance_minor == 1234
         assert view.currency == "EUR"
-        assert view.formatted == "12.34 EUR"
+        assert view.formatted == "€12.34"
 
     async def test_small_amount_keeps_two_decimals(self) -> None:
         view = await _service(_wallet(7)).balance(USER_ID)
-        assert view.formatted == "0.07 EUR"
+        assert view.formatted == "€0.07"
 
     async def test_zero_balance(self) -> None:
         view = await _service(_wallet(0)).balance(USER_ID)
-        assert view.formatted == "0.00 EUR"
+        assert view.formatted == "€0.00"
 
     async def test_no_wallet(self) -> None:
         view = await _service(no_wallet=True).balance(USER_ID)
         assert view.has_wallet is False
         assert view.balance_minor == 0
-        assert view.formatted == "0.00 EUR"
+        assert view.formatted == "€0.00"
 
 
 # --------------------------------------------------------------------------
@@ -131,17 +131,17 @@ class TestReadableRows:
 
         credit, debit = page.items
         assert credit.amount_minor == 1234
-        assert credit.formatted == "+12.34 EUR"
+        assert credit.formatted == "+€12.34"
         assert credit.entry_type == "deposit"
 
         assert debit.amount_minor == -150
-        assert debit.formatted == "-1.50 EUR"
+        assert debit.formatted == "-€1.50"
         assert debit.entry_type == "charge"
 
     async def test_one_cent_never_rounds(self) -> None:
         entries = [_entry(-1, LedgerEntryType.CHARGE, key="c")]
         page = await _service(entries=entries).history(USER_ID)
-        assert page.items[0].formatted == "-0.01 EUR"
+        assert page.items[0].formatted == "-€0.01"
 
     async def test_reference_label_type_plus_id(self) -> None:
         server_id = str(uuid4())

@@ -75,6 +75,7 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         quantum_seconds=int(_attr(row, "quantum_seconds") or 3600),
         billing_model=str(_attr(row, "billing_model") or "hourly"),
         os=_attr(row, "os"),
+        credential_account_id=_attr(row, "credential_account_id"),
     )
 
 
@@ -349,6 +350,7 @@ class SqlAlchemyServerRepository:
                 currency=intent.currency,
                 billing_model=server.billing_model,
                 os=server.os,
+                credential_account_id=server.credential_account_id,
                 idempotency_key=intent.idempotency_key,
             )
             session.add(row)

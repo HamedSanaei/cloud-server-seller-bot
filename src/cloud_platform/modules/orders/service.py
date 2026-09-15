@@ -137,6 +137,7 @@ from cloud_platform.providers.errors import (
 )
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
+from cloud_platform.providers.routing import UnknownCredentialAccountError, provider_for
 
 logger = logging.getLogger(__name__)
 
@@ -363,7 +364,9 @@ class OrderActivator:
         contract_ends_at: object = None
         if server.provider_server_id:
             try:
-                provider = self._registry.get(server.provider_key)
+                provider = provider_for(
+                    self._registry, server.provider_key, server.credential_account_id
+                )
                 remote = await provider.get_server(server.provider_server_id)
                 if remote is not None:
                     contract_ends_at = remote.metadata.get("contract_ends_at")
@@ -739,8 +742,21 @@ class OrderWorker:
         if server.os is None:
             return await self._fail_permanent(server, order, "server has no recorded OS")
 
+        # The ORDER's pin is authoritative (LEASEWEB-MULTIACCOUNT): it was
+        # snapshotted at checkout, before any billable call. The server's pin is
+        # the same value and only a fallback for rows written by older code.
+        # NEVER re-decide the account here: retrying a billable POST through a
+        # different credential could buy a second VPS.
+        pinned_account = order.credential_account_id or server.credential_account_id
         try:
-            provider = self._registry.get(server.provider_key)
+            provider = provider_for(self._registry, server.provider_key, pinned_account)
+        except UnknownCredentialAccountError as exc:
+            return await self._fail_permanent(
+                server,
+                order,
+                f"provider credential account {pinned_account!r} is not configured "
+                f"({exc}); refusing to route this order through another account",
+            )
         except KeyError:
             return await self._fail_permanent(
                 server, order, f"provider {server.provider_key!r} not configured"
@@ -1026,7 +1042,9 @@ class OrderWorker:
         if offer is None:
             return OrderWorkerOutcome.SKIPPED_STATE
         try:
-            provider = self._registry.get(server.provider_key)
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             return OrderWorkerOutcome.SKIPPED_STATE
         ordering = ordering_support_of(provider)
@@ -1197,7 +1215,9 @@ class OrderReconciler:
             return ReconciliationOutcome.MARKED_FOR_REVIEW
 
         try:
-            provider = self._registry.get(server.provider_key)
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             return ReconciliationOutcome.LEFT_UNCHANGED
         ordering = ordering_support_of(provider)
@@ -1496,7 +1516,9 @@ class OrderRecoveryService:
         if server is None:
             return await self._escalate(order, "server row missing during recovery")
         try:
-            provider = self._registry.get(server.provider_key)
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             return await self._escalate(order, f"provider {server.provider_key!r} not configured")
         from cloud_platform.providers.base import ordering_support_of
@@ -2089,7 +2111,9 @@ class OrderManualResolutionService:
 
     def _ordering_for(self, order: ProviderOrder, server: CloudServer) -> OrderingProvider:
         try:
-            provider = self._registry.get(server.provider_key)
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError as exc:
             raise OrderManualResolutionError(
                 f"order {order.id}: provider {server.provider_key!r} not configured"

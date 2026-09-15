@@ -26,6 +26,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from cloud_platform.core.config import get_settings
@@ -68,6 +69,7 @@ from cloud_platform.providers.base import (
     ordering_support_of,
 )
 from cloud_platform.providers.registry import ProviderRegistry
+from cloud_platform.providers.routing import UnknownCredentialAccountError, provider_for
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,7 @@ class MonthlyCheckoutService:
         provider_registry: ProviderRegistry,
         event_sink: BusinessEventSink | None = None,
         event_market_lookup: Callable[[str], str] | None = None,
+        fulfillment_routes: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -163,10 +166,46 @@ class MonthlyCheckoutService:
         self._registry = provider_registry
         self._events = event_sink
         self._market_of = event_market_lookup or (lambda _key: "")
+        # LEASEWEB-MULTIACCOUNT: resolves WHICH provider credential account
+        # will place the billable order. Optional so a single-credential
+        # deployment (and the whole existing test suite) keeps working: with
+        # ``None`` the order is placed through the provider's logical adapter
+        # and no account is pinned.
+        self._routes = fulfillment_routes
 
-    async def _ordering_provider(self, provider_key: str) -> OrderingProvider:
+    async def _fulfillment_account(self, offer: SellableOffer) -> str | None:
+        """Pick the credential account this purchase will be PINNED to.
+
+        The decision is made BEFORE anything is persisted (server, order,
+        hold) so the account becomes a durable order fact rather than
+        something re-derived later — the worker must never re-decide whose key
+        to bill.
+
+        Fail-closed rule: when the provider IS served by credential accounts
+        but none currently serves this location/product, the purchase is
+        refused. Guessing an account could place a billable order through the
+        wrong credential.
+        """
+        if self._routes is None:
+            return None
+        resolved: Any = await self._routes.account_for(
+            offer.provider_key, offer.location_id, offer.product_id
+        )
+        if resolved is None and await self._routes.has_any_routes(offer.provider_key):
+            raise OfferUnavailableError(
+                f"no provider credential account currently serves {offer.ref}"
+            )
+        return None if resolved is None else str(resolved)
+
+    async def _ordering_provider(
+        self, provider_key: str, credential_account_id: str | None = None
+    ) -> OrderingProvider:
         try:
-            provider = self._registry.get(provider_key)
+            provider = provider_for(self._registry, provider_key, credential_account_id)
+        except UnknownCredentialAccountError as exc:
+            # A resource pinned to an account that is no longer configured
+            # must fail closed; falling back would bill the wrong account.
+            raise OfferUnavailableError(str(exc)) from exc
         except KeyError as exc:
             raise OfferUnavailableError(f"provider {provider_key!r} not configured") from exc
         ordering = ordering_support_of(provider)
@@ -223,7 +262,8 @@ class MonthlyCheckoutService:
         #    The successful detail fetch doubles as the location-accessibility
         #    proof (an account 403 surfaces here); the price comparison below
         #    additionally guards the race between catalog sync and checkout.
-        ordering = await self._ordering_provider(offer.provider_key)
+        credential_account_id = await self._fulfillment_account(offer)
+        ordering = await self._ordering_provider(offer.provider_key, credential_account_id)
         try:
             detail = await ordering.get_product(offer.location_id, offer.product_id)
         except Exception as exc:
@@ -272,6 +312,7 @@ class MonthlyCheckoutService:
             state=ServerLifecycleState.REQUESTED,
             billing_model=BILLING_MODEL_PREPAID_MONTHLY,
             os=os_name,
+            credential_account_id=credential_account_id,
         )
         intent = ServerCreateIntent(
             catalog_id=None,  # prepaid: offer pinned via provider_orders.offer_id
@@ -317,6 +358,7 @@ class MonthlyCheckoutService:
                 provider_cost_currency=offer.provider_cost_currency,
                 selling_price_minor=offer.selling_price_minor,
                 selling_currency=offer.selling_currency,
+                credential_account_id=credential_account_id,
             )
         except Exception:
             await self._fail_intent(created, hold)

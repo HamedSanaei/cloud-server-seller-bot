@@ -29,6 +29,7 @@ from cloud_platform.modules.networking.domain import (
     ReverseDnsRecord,
 )
 from cloud_platform.providers.base import rdns_support_of
+from cloud_platform.providers.routing import provider_for
 
 
 class ServerRepositoryPort(Protocol):
@@ -67,7 +68,7 @@ class RdnsService:
         if server is None or server.user_id != user_id:
             raise RdnsNotOwnerError("server not found")
 
-        provider = self._registry.get(server.provider_key)
+        provider = provider_for(self._registry, server.provider_key, server.credential_account_id)
         if provider is None:
             raise RdnsUnsupportedError(f"provider {server.provider_key} is not registered")
         setter = rdns_support_of(provider)

@@ -31,13 +31,14 @@ with safe fake values; the real ``configuration.toml`` is git-ignored.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 #: Bootstrap variable naming the configuration file. Never a secret.
@@ -165,6 +166,20 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("commerce", "suspension", "stop_server_after_grace"): (
         "commerce_suspension_stop_server_after_grace"
     ),
+    # --- Currency / FX resolution (platform-level, provider-neutral) --------
+    # The FIRST live source is AbanTether's public ticker (read-only, no key).
+    ("fx", "enabled"): "fx_enabled",
+    ("fx", "provider"): "fx_provider",
+    ("fx", "default_display_currency"): "fx_default_display_currency",
+    ("fx", "quote_ttl_seconds"): "fx_quote_ttl_seconds",
+    ("fx", "max_stale_seconds"): "fx_max_stale_seconds",
+    ("fx", "charge_max_stale_seconds"): "fx_charge_max_stale_seconds",
+    ("fx", "request_timeout_seconds"): "fx_request_timeout_seconds",
+    ("fx", "allow_usdt_proxy_for_display"): "fx_allow_usdt_proxy_for_display",
+    ("fx", "allow_usdt_proxy_for_settlement"): "fx_allow_usdt_proxy_for_settlement",
+    ("fx", "abantether", "base_url"): "fx_abantether_base_url",
+    ("fx", "abantether", "eur_symbol"): "fx_abantether_eur_symbol",
+    ("fx", "abantether", "usd_proxy_symbol"): "fx_abantether_usd_proxy_symbol",
 }
 
 #: TOML keys that are lists in the file but a comma-separated ``Settings``
@@ -224,6 +239,85 @@ _PROVIDER_NESTED_FIELDS: Mapping[tuple[str, str], Mapping[str, str]] = {
 #: List-valued TOML keys serialized into the comma-separated Settings string.
 _PROVIDER_SEQUENCE_FIELDS: frozenset[str] = frozenset({"locations", "os_allowlist"})
 
+#: The account id the deprecated single-``api_key`` form maps onto. Mirrors
+#: ``cloud_platform.providers.routing.DEFAULT_CREDENTIAL_ACCOUNT``; the two are
+#: asserted equal by the test suite so configuration stays import-free of
+#: provider code.
+DEFAULT_CREDENTIAL_ACCOUNT_ID = "default"
+
+#: Account ids are STABLE, non-secret handles used to pin orders, servers and
+#: routing rows. They appear in logs, diagnostics and CLI output, so they are
+#: restricted to a safe character set; the API key never is.
+_ACCOUNT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+
+#: Credential-account lifecycle (mirrors ``providers.routing`` without making
+#: this configuration module import provider code).
+_ACCOUNT_STATES: frozenset[str] = frozenset({"active", "draining", "disabled"})
+
+
+class LeasewebAccountSettings(BaseModel):
+    """One Leaseweb credential account (LEASEWEB-MULTIACCOUNT).
+
+    This is OUR infrastructure credential — one API key / Sales Organization —
+    NOT a customer's provider account (that is
+    :class:`cloud_platform.modules.provider_accounts.domain.ProviderAccount`,
+    which links an end customer to a provider).
+
+    The operator adds accounts in the server-owned ``configuration.toml``::
+
+        [[providers.leaseweb.accounts]]
+        id = "lw-eu"
+        enabled = true
+        api_key = "..."
+        priority = 100
+
+    No location mapping is configured on purpose: each credential discovers
+    its own eligible locations from live, read-only provider responses. The
+    ``state`` field separates "may receive new orders" from "may still manage
+    what it already owns", so draining an account never strands the customer
+    servers it provisioned.
+
+    ``api_key`` is never rendered: ``repr``/``str``/``model_dump`` used by logs
+    or diagnostics show only the stable account id and a length hint.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    api_key: str = ""
+    enabled: bool = True
+    priority: int = Field(default=100, ge=0, le=1_000_000)
+    state: str = "active"
+
+    def __repr__(self) -> str:
+        return (
+            f"LeasewebAccountSettings(id={self.id!r}, enabled={self.enabled!r}, "
+            f"priority={self.priority!r}, state={self.state!r}, "
+            f"api_key=<redacted len={len(self.api_key)}>)"
+        )
+
+    __str__ = __repr__
+
+    @property
+    def normalized_state(self) -> str:
+        """The canonical lifecycle state (lower-cased, validated)."""
+        return (self.state or "active").strip().lower() or "active"
+
+    @property
+    def accepts_new_orders(self) -> bool:
+        """Whether this account may receive NEW billable business."""
+        return self.enabled and self.normalized_state == "active"
+
+    @property
+    def usable(self) -> bool:
+        """Whether this account may still address what it already owns."""
+        return self.normalized_state != "disabled"
+
+    @property
+    def has_credential(self) -> bool:
+        """Whether a non-blank API key is configured for this account."""
+        return bool(self.api_key.strip())
+
 
 def _dig(data: Mapping[str, Any], path: tuple[str, ...]) -> Any:
     """Read a nested path, returning None when any level is missing."""
@@ -257,6 +351,14 @@ def toml_to_settings(data: Mapping[str, Any]) -> dict[str, Any]:
             values[field] = ",".join(str(part).strip() for part in raw if str(part).strip())
         else:
             values[field] = raw
+
+    accounts = _dig(data, ("providers", "leaseweb", "accounts"))
+    if isinstance(accounts, list | tuple):
+        values["leaseweb_accounts"] = [
+            {str(key): value for key, value in dict(entry).items()}
+            for entry in accounts
+            if isinstance(entry, Mapping)
+        ]
 
     markets: dict[str, str] = {}
     display_names: dict[str, str] = {}
@@ -374,7 +476,16 @@ class Settings(BaseSettings):
     callback_signing_key: str = ""
     hetzner_api_token: str = ""
     hetzner_api_base_url: str = "https://api.hetzner.cloud/v1"
+    #: DEPRECATED single-credential form. Still supported: it is normalized
+    #: into one credential account with :data:`DEFAULT_CREDENTIAL_ACCOUNT` as
+    #: its id, so existing deployments (and rows they already created) keep
+    #: working unchanged. New deployments should use ``accounts``.
     leaseweb_api_key: str = ""
+    #: Multiple Leaseweb credential accounts (LEASEWEB-MULTIACCOUNT). One
+    #: logical provider key (``leaseweb``) is served by many API keys, each
+    #: with its own location scope. Empty => the deprecated single ``api_key``
+    #: above (or nothing at all) is used.
+    leaseweb_accounts: list[LeasewebAccountSettings] = Field(default_factory=list)
     leaseweb_api_base_url: str = "https://api.leaseweb.com"
     # Connect/read/write/pool timeout for every Leaseweb request (the ONE
     # shared transport owns it; nothing else in the codebase sets a timeout).
@@ -433,6 +544,26 @@ class Settings(BaseSettings):
     tetraminator_callback_url: str = ""
     tetraminator_timeout_seconds: float = Field(default=30.0, gt=0)
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
+    # --- Currency / FX resolution (`[fx]` + `[fx.abantether]`) ---------------
+    # Platform-level financial subsystem (provider-neutral). The first live
+    # source is AbanTether's public ticker (read-only, no secret). Amounts
+    # stay integer minor units everywhere; the resolver owns every rate
+    # formula and the only Toman/Euro/cent conversions.
+    fx_enabled: bool = True
+    fx_provider: str = "abantether"
+    fx_default_display_currency: str = "IRT"
+    fx_quote_ttl_seconds: int = Field(default=60, gt=0)
+    fx_max_stale_seconds: int = Field(default=300, gt=0)
+    fx_charge_max_stale_seconds: int = Field(default=30, ge=0)
+    fx_request_timeout_seconds: float = Field(default=5.0, gt=0)
+    # USD has no verified fiat market: display may use the configured USDT
+    # proxy explicitly (metadata proxy=true), settlement via the proxy stays
+    # off unless the operator opts in.
+    fx_allow_usdt_proxy_for_display: bool = True
+    fx_allow_usdt_proxy_for_settlement: bool = False
+    fx_abantether_base_url: str = "https://api.abantether.com"
+    fx_abantether_eur_symbol: str = "EUR"
+    fx_abantether_usd_proxy_symbol: str = "USDT"
     default_currency: str = "EUR"
     # The OPERATOR-declared price book the selling price is derived from
     # (M08-005): confirmation, holds and immutable server price snapshots
@@ -537,6 +668,79 @@ class Settings(BaseSettings):
     toml_values: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @model_validator(mode="after")
+    def _normalize_leaseweb_accounts(self) -> Settings:
+        """Validate and normalize the Leaseweb credential accounts.
+
+        Rules (LEASEWEB-MULTIACCOUNT §config parser):
+
+        - account ids are unique, stable and safe to log;
+        - an enabled account must carry a non-empty API key;
+        - the lifecycle state is one of active/draining/disabled;
+        - at least one account must be enabled when accounts are configured;
+        - the deprecated single ``api_key`` becomes account ``default`` when
+          no explicit accounts exist, so legacy deployments and the rows they
+          already created stay routable.
+        """
+        accounts: list[LeasewebAccountSettings] = []
+        seen: set[str] = set()
+        for account in self.leaseweb_accounts:
+            account_id = (account.id or "").strip()
+            if not _ACCOUNT_ID_PATTERN.match(account_id):
+                raise ValueError(
+                    f"leaseweb account id {account.id!r} is invalid: use 1-63 "
+                    "characters of [A-Za-z0-9._-] starting alphanumeric"
+                )
+            if account_id in seen:
+                raise ValueError(f"duplicate leaseweb account id: {account_id!r}")
+            seen.add(account_id)
+            state = account.normalized_state
+            if state not in _ACCOUNT_STATES:
+                raise ValueError(
+                    f"leaseweb account {account_id!r} has invalid state {state!r}: "
+                    "expected one of active, draining, disabled"
+                )
+            if account.enabled and not account.has_credential:
+                raise ValueError(f"leaseweb account {account_id!r} is enabled but has no api_key")
+            account.id = account_id
+            account.state = state
+            accounts.append(account)
+        if accounts and not any(account.enabled for account in accounts):
+            raise ValueError(
+                "leaseweb accounts are configured but none is enabled; at least one "
+                "enabled account is required to serve the provider"
+            )
+        if not accounts and self.leaseweb_api_key.strip():
+            accounts.append(
+                LeasewebAccountSettings(
+                    id=DEFAULT_CREDENTIAL_ACCOUNT_ID,
+                    api_key=self.leaseweb_api_key,
+                    enabled=True,
+                    priority=100,
+                    state="active",
+                )
+            )
+        self.leaseweb_accounts = accounts
+        return self
+
+    @property
+    def leaseweb_new_order_accounts(self) -> list[LeasewebAccountSettings]:
+        """Enabled accounts that may receive NEW orders (priority order)."""
+        return sorted(
+            (account for account in self.leaseweb_accounts if account.accepts_new_orders),
+            key=lambda account: (account.priority, account.id),
+        )
+
+    @property
+    def leaseweb_managed_accounts(self) -> list[LeasewebAccountSettings]:
+        """Accounts that may still manage the resources they already own."""
+        return [account for account in self.leaseweb_accounts if account.usable]
+
+    @property
+    def leaseweb_configured(self) -> bool:
+        """Whether ANY usable Leaseweb credential account is configured."""
+        return any(account.enabled and account.has_credential for account in self.leaseweb_accounts)
+
+    @model_validator(mode="after")
     def _enforce_production_session_backend(self) -> Settings:
         """Production must use the shared Redis transient-state backend.
 
@@ -602,6 +806,48 @@ class Settings(BaseSettings):
                 "'production' (the callback is unauthenticated and must be publicly "
                 "reachable; use the API's reverse-proxied domain)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fx_configuration(self) -> Settings:
+        """Validate the platform FX section (read-only source, no secret)."""
+        from urllib.parse import urlsplit
+
+        provider = (self.fx_provider or "").strip().lower()
+        if provider not in ("abantether",):
+            raise ValueError(
+                "fx.provider must be a known rate source ('abantether'); "
+                "adding a source is a code change, not a config edit"
+            )
+        self.fx_provider = provider
+        if self.fx_quote_ttl_seconds <= 0:
+            raise ValueError("fx.quote_ttl_seconds must be greater than 0")
+        if self.fx_max_stale_seconds < self.fx_quote_ttl_seconds:
+            raise ValueError("fx.max_stale_seconds must be >= fx.quote_ttl_seconds")
+        if self.fx_charge_max_stale_seconds < 0:
+            raise ValueError("fx.charge_max_stale_seconds must be >= 0")
+        if self.fx_request_timeout_seconds <= 0:
+            raise ValueError("fx.request_timeout_seconds must be greater than 0")
+        base = urlsplit((self.fx_abantether_base_url or "").strip())
+        if base.scheme not in ("http", "https") or not base.netloc:
+            raise ValueError("fx.abantether.base_url must be an absolute http(s) URL")
+        if (self.app_env or "").strip().lower() == "production" and base.scheme != "https":
+            raise ValueError(
+                "fx.abantether.base_url must use https:// when app_env is 'production'"
+            )
+        if not (self.fx_abantether_eur_symbol or "").strip():
+            raise ValueError("fx.abantether.eur_symbol must not be empty")
+        proxy_enabled = (
+            self.fx_allow_usdt_proxy_for_display or self.fx_allow_usdt_proxy_for_settlement
+        )
+        if proxy_enabled and not (self.fx_abantether_usd_proxy_symbol or "").strip():
+            raise ValueError(
+                "fx.abantether.usd_proxy_symbol must not be empty when the USD proxy is enabled"
+            )
+        display = (self.fx_default_display_currency or "").strip().upper()
+        if display not in ("IRT", "EUR", "USD", "IRR"):
+            raise ValueError("fx.default_display_currency must be one of IRT, EUR, USD, IRR")
+        self.fx_default_display_currency = display
         return self
 
     @classmethod

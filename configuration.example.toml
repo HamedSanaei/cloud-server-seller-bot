@@ -93,6 +93,41 @@ order_os_only_free = true
 contract_term = "1_MONTH"
 billing_cycle = "1_MONTH"
 
+# --- Multiple Leaseweb credential accounts (LEASEWEB-MULTIACCOUNT) ----------
+# A Leaseweb API key / Sales Organization only sees a narrow set of locations,
+# so the platform can hold SEVERAL keys while customers still see ONE provider
+# called "Leaseweb". The locations of every account are merged into the single
+# storefront automatically; nothing about accounts is customer-visible.
+#
+# Each account discovers its OWN eligible locations from live, read-only
+# provider responses — there is deliberately NO location mapping to maintain
+# here. Adding a key is: append a block, restart the services. No code change,
+# no deployment secret, no database insert.
+#
+#   id       stable, non-secret handle (shows up in logs and CLI output)
+#   api_key  the provider credential — never logged, never printed
+#   enabled  false keeps the account configured but unusable
+#   priority lower wins when several accounts can serve the same location
+#   state    "active"   -> discovery + new orders + manages what it owns
+#            "draining" -> no new orders; existing servers stay manageable
+#            "disabled" -> not used at all (operator intervention required)
+#
+# Leaving every account commented out keeps the deprecated single `api_key`
+# above working exactly as before: it becomes the account id "default",
+# which is also what rows created before multi-account support are routed to.
+#
+# [[providers.leaseweb.accounts]]
+# id = "lw-eu"
+# enabled = true
+# api_key = "CHANGE_ME"
+# priority = 100
+#
+# [[providers.leaseweb.accounts]]
+# id = "lw-asia"
+# enabled = true
+# api_key = "CHANGE_ME"
+# priority = 200
+
 [providers.arvancloud]
 enabled = true
 market = "iran"
@@ -114,6 +149,33 @@ merchant_id = "CHANGE_ME"
 base_url = "https://api.zarinpal.com/pg/v4/payment"
 sandbox = false
 callback_url = "https://example.com/api/v1/payments/zarinpal/callback"
+
+# ---------------------------------------------------------------------------
+# Currency / FX resolution (platform-level, provider-neutral)
+#
+# The first live source is AbanTether's PUBLIC ticker (read-only, no secret).
+# The resolver converts already-defined money for display/charging/settlement
+# bridging — it never reprices the operator-owned selling price and never
+# auto-converts wallet balances. USD display uses the USDT market EXPLICITLY
+# as a proxy (metadata proxy=true); settlement via the proxy stays off unless
+# the operator opts in. See docs/fx/CURRENCY_FX.md.
+# ---------------------------------------------------------------------------
+
+[fx]
+enabled = true
+provider = "abantether"
+default_display_currency = "IRT"
+quote_ttl_seconds = 60
+max_stale_seconds = 300
+charge_max_stale_seconds = 30
+request_timeout_seconds = 5
+allow_usdt_proxy_for_display = true
+allow_usdt_proxy_for_settlement = false
+
+[fx.abantether]
+base_url = "https://api.abantether.com"
+eur_symbol = "EUR"
+usd_proxy_symbol = "USDT"
 
 [security]
 provider_credential_encryption_key = "CHANGE_ME"

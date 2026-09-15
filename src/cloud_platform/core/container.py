@@ -80,15 +80,52 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _CredentialHolderRegistry:
-    """Per-process credential holders, keyed by provider key (M10-008)."""
+    """Per-process credential holders (M10-008).
 
-    _holders: dict[str, CredentialHolder] = field(default_factory=dict, init=False, repr=False)
+    Keyed by ``(provider_key, credential_account_id)`` so a provider served by
+    MULTIPLE credential accounts (LEASEWEB-MULTIACCOUNT) keeps one holder per
+    account: rotating ``lw-eu``'s key provably cannot touch ``lw-asia``'s.
+    A single-credential provider registers with an account id of ``None`` and
+    is still addressed by provider key alone.
+    """
 
-    def register(self, provider_key: str, holder: CredentialHolder) -> None:
-        self._holders[provider_key] = holder
+    _holders: dict[tuple[str, str | None], CredentialHolder] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
-    def get_holder(self, provider_key: str) -> CredentialHolderLike | None:
-        return self._holders.get(provider_key)
+    def register(
+        self,
+        provider_key: str,
+        holder: CredentialHolder,
+        credential_account_id: str | None = None,
+    ) -> None:
+        account_id = (credential_account_id or "").strip() or None
+        self._holders[(provider_key, account_id)] = holder
+
+    def get_holder(
+        self, provider_key: str, credential_account_id: str | None = None
+    ) -> CredentialHolderLike | None:
+        account_id = (credential_account_id or "").strip() or None
+        holder = self._holders.get((provider_key, account_id))
+        if holder is None and account_id is None:
+            # Legacy callers may address a multi-account provider without an
+            # account id; resolve it deterministically to an enabled account
+            # rather than failing outright (reads only — never used to decide
+            # WHICH account a billable call goes to).
+            for (key, _account), candidate in sorted(
+                self._holders.items(), key=lambda item: (item[0][0], item[0][1] or "")
+            ):
+                if key == provider_key:
+                    return candidate
+        return holder
+
+    def account_ids(self, provider_key: str) -> tuple[str, ...]:
+        """Every account id registered for one provider (sorted, no secrets)."""
+        return tuple(
+            sorted(
+                account_id or "default" for key, account_id in self._holders if key == provider_key
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +144,10 @@ class Container:
     arvancloud_syncers: tuple[ArvanCloudCatalogSyncer, ...] = ()
     leaseweb_ordering_syncer: LeaseWebOrderingCatalogSyncer | None = None
     leaseweb_ordering_provider: LeaseWebOrderingProvider | None = None
+    #: LEASEWEB-MULTIACCOUNT: the per-credential-account adapters. Present only
+    #: when several Leaseweb API keys are configured; ``None`` means the legacy
+    #: single-credential deployment, where the logical adapter is the only one.
+    leaseweb_account_router: Any | None = None
     credential_holders: _CredentialHolderRegistry | None = None
     credential_rotation_service: CredentialRotationService | None = None
     # PROD-HARDENING §2: the process-wide Telegram transient-state backend.
@@ -375,7 +416,17 @@ class Container:
             provider_registry=self.provider_registry,
             event_sink=self.business_event_sink(),
             event_market_lookup=self.provider_market,
+            # LEASEWEB-MULTIACCOUNT: resolve and PIN the fulfillment credential
+            # account before anything is persisted, so the worker never has to
+            # re-decide whose API key to bill for this order.
+            fulfillment_routes=self.provider_route_selector(),
         )
+
+    def provider_route_selector(self) -> Any:
+        """Durable, provider-neutral fulfillment-account resolver."""
+        from cloud_platform.modules.provider_routes.service import ProviderRouteSelector
+
+        return ProviderRouteSelector(self.session_factory)
 
     def offer_catalog_view_service(self) -> Any:
         """Customer-facing monthly offer screens (LEASEWEB-MVP)."""
@@ -662,6 +713,7 @@ class Container:
         self,
         gateway: Any | None = None,
         gateways: dict[str, Any] | None = None,
+        fx_resolver: Any | None = None,
     ) -> Any:
         """Creates pending top-up sessions (and logs ``recharge.created``).
 
@@ -674,18 +726,96 @@ class Container:
         bot never opens two sets of HTTP clients (one of which nobody would
         ever close). The gateway collection belongs to the process owner — the
         caller that built it closes it — never to this service.
+
+        ``fx_resolver`` is the same reuse path for currency conversion: the
+        process owner builds ONE resolver (one AbanTether + one cache client)
+        and shares it; when omitted a resolver is built on demand and the
+        service never closes it (the process owner still owns its lifecycle
+        via :meth:`aclose_fx`).
         """
         from cloud_platform.modules.payments.recharge import WalletRechargeService
 
         if gateways is None:
             gateways = self.payment_gateways()
+        if fx_resolver is None:
+            fx_resolver = self.fx_resolver_or_none()
         return WalletRechargeService(
             payments_repo=SqlAlchemyPaymentSessionRepository(self.session_factory),
             gateway=gateway,
             gateways=gateways,
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
+            fx_resolver=fx_resolver,
         )
+
+    def fx_config(self) -> Any:
+        """Operator FX policy from server-owned configuration."""
+        from cloud_platform.modules.fx.service import FxConfig
+
+        settings = get_settings()
+        return FxConfig(
+            enabled=settings.fx_enabled,
+            provider=settings.fx_provider,
+            default_display_currency=settings.fx_default_display_currency,
+            quote_ttl_seconds=settings.fx_quote_ttl_seconds,
+            max_stale_seconds=settings.fx_max_stale_seconds,
+            charge_max_stale_seconds=settings.fx_charge_max_stale_seconds,
+            request_timeout_seconds=int(settings.fx_request_timeout_seconds),
+            allow_usdt_proxy_for_display=settings.fx_allow_usdt_proxy_for_display,
+            allow_usdt_proxy_for_settlement=settings.fx_allow_usdt_proxy_for_settlement,
+        )
+
+    def fx_resolver(self) -> Any:
+        """Build the platform FX resolver (process owner closes it).
+
+        One AbanTether HTTP client + one cache client per resolver; the
+        caller that built it owns closing it (see :meth:`aclose_fx` and the
+        bot/API/worker shutdown paths). Construction lives here — in
+        infrastructure — so domain/application code never branches on FX
+        sources.
+        """
+        from cloud_platform.modules.fx.cache import build_fx_cache
+        from cloud_platform.modules.fx.service import FxResolver
+        from cloud_platform.providers.abantether_fx.client import AbanTetherFxClient
+
+        settings = get_settings()
+        source = AbanTetherFxClient(
+            base_url=settings.fx_abantether_base_url,
+            timeout_seconds=float(settings.fx_request_timeout_seconds),
+            ttl_seconds=settings.fx_quote_ttl_seconds,
+            eur_symbol=settings.fx_abantether_eur_symbol,
+            usd_proxy_symbol=settings.fx_abantether_usd_proxy_symbol,
+        )
+        backend = "redis" if (settings.app_env or "").strip().lower() == "production" else "memory"
+        # Production shares Redis; dev/test use the deterministic memory cache.
+        # The FX cache backend follows the deployment topology the same way
+        # the Telegram session store does (Redis in production only).
+        cache = build_fx_cache(backend=backend, redis_url=settings.redis_url)
+        return FxResolver(source=source, cache=cache, config=self.fx_config())
+
+    def fx_resolver_or_none(self) -> Any | None:
+        """FX resolver for recharge/catalog, or None when FX is disabled."""
+        try:
+            settings = get_settings()
+        except Exception:
+            return None
+        if not settings.fx_enabled:
+            return None
+        try:
+            return self.fx_resolver()
+        except Exception:
+            logger.warning("fx resolver unavailable; continuing without FX", exc_info=True)
+            return None
+
+    @staticmethod
+    async def aclose_fx(resolver: Any | None) -> None:
+        """Best-effort close of the FX resolver (never raises)."""
+        if resolver is None:
+            return
+        try:
+            await resolver.close()
+        except Exception:
+            logger.warning("fx resolver close failed")
 
     def wallet_history_service(self) -> Any:
         """User wallet balance + ledger history."""
@@ -857,7 +987,31 @@ class Container:
                 credential_source=arvancloud_holder,
             )
             self.provider_registry.register(arvancloud)
-        if settings.leaseweb_api_key:
+        # LEASEWEB-MULTIACCOUNT: ONE logical provider key (``leaseweb``) served
+        # by N credential accounts. Each account registers as a ROUTE under that
+        # key, and each keeps its OWN transport/holder/throttle, so a request
+        # for one account can never carry another's X-LSW-Auth header.
+        router = self.leaseweb_account_router
+        if router is not None:
+            if holders is not None:
+                for account_id, holder in router.credential_holders.items():
+                    holders.register("leaseweb", holder, account_id)
+            registered: set[str] = set()
+            # Pass 1: accounts that may take NEW orders, in deterministic
+            # (priority, account_id) order — the first becomes the logical
+            # default adapter used by credential-agnostic catalog reads.
+            for account_id, provider in router.new_order_clients():
+                self.provider_registry.register_route("leaseweb", account_id, provider)
+                registered.add(account_id)
+            # Pass 2: draining accounts still address the resources they own,
+            # so they must stay resolvable even though they take no new orders.
+            for account_id, provider in router.ordered_providers.items():
+                if account_id in registered:
+                    continue
+                self.provider_registry.register_route("leaseweb", account_id, provider)
+                registered.add(account_id)
+            self.provider_registry.register_account_views("leaseweb", router.views())
+        elif settings.leaseweb_api_key:
             leaseweb_holder = CredentialHolder(settings.leaseweb_api_key)
             if holders is not None:
                 holders.register("leaseweb", leaseweb_holder)
@@ -877,8 +1031,17 @@ class Container:
 
     async def close(self) -> None:
         """Close all resources."""
-        # Close provider connections
-        for provider in self.provider_registry._providers.values():
+        # Close provider connections. A multi-account provider has one adapter
+        # per credential account, each with its own HTTP client, so the routes
+        # must be closed too — the logical map only holds the default one.
+        seen: set[int] = set()
+        candidates = list(self.provider_registry._providers.values())
+        for routes in self.provider_registry._routes.values():
+            candidates.extend(routes.values())
+        for provider in candidates:
+            if id(provider) in seen:
+                continue
+            seen.add(id(provider))
             if hasattr(provider, "close"):
                 await provider.close()
         # Release the shared Telegram session/confirmation connection too, so a
@@ -951,11 +1114,39 @@ def create_container() -> Container:
             ),
         )
 
-    # LEASEWEB-MVP: ordering-VPS provider + catalog syncer (monthly
-    # products). The ordering provider is the runtime "leaseweb" adapter.
+    # LEASEWEB-MVP: ordering-VPS provider + catalog syncer (monthly products).
+    # LEASEWEB-MULTIACCOUNT: when credential accounts are configured, EVERY
+    # account gets its own adapter/transport and the syncer runs per account,
+    # merging the observations into ONE customer-facing catalog. The logical
+    # "leaseweb" adapter stays the first account in (priority, id) order.
     leaseweb_ordering_provider = None
     leaseweb_ordering_syncer = None
-    if settings.leaseweb_api_key:
+    leaseweb_account_router = None
+    if settings.leaseweb_accounts:
+        from cloud_platform.providers.leaseweb.accounts import (
+            build_leaseweb_account_router,
+        )
+
+        leaseweb_account_router = build_leaseweb_account_router(settings)
+        assert leaseweb_account_router is not None  # accounts are configured
+        new_order_clients = leaseweb_account_router.new_order_clients()
+        ordered = leaseweb_account_router.ordered_providers
+        if new_order_clients:
+            leaseweb_ordering_provider = new_order_clients[0][1]
+        elif ordered:
+            # Every account is draining: the provider can still manage what it
+            # owns but takes no new orders.
+            leaseweb_ordering_provider = next(iter(ordered.values()))
+        # The syncer aggregates accounts in deterministic (priority, id) order
+        # and records each account's lifecycle so draining accounts stop taking
+        # new orders without losing the locations they already serve.
+        leaseweb_ordering_syncer = LeaseWebOrderingCatalogSyncer(
+            session_factory=session_factory,
+            accounts=ordered,
+            account_priorities=leaseweb_account_router.priorities,
+            account_states=leaseweb_account_router.account_states,
+        )
+    elif settings.leaseweb_api_key:
         from cloud_platform.providers.leaseweb.ordering_sync import ordering_provider_from_settings
 
         leaseweb_ordering_provider = ordering_provider_from_settings(settings)
@@ -976,6 +1167,7 @@ def create_container() -> Container:
         arvancloud_syncers=tuple(arvancloud_syncers),
         leaseweb_ordering_syncer=leaseweb_ordering_syncer,
         leaseweb_ordering_provider=leaseweb_ordering_provider,
+        leaseweb_account_router=leaseweb_account_router,
         credential_holders=holders,
         credential_rotation_service=CredentialRotationService(
             holders,

@@ -46,16 +46,27 @@ class PaymentSessionStatus(StrEnum):
 class PaymentSession:
     """One inbound payment attempt, reconciled against the wallet ledger.
 
+    ``amount_minor``/``currency`` are the GATEWAY settlement amount: what the
+    provider invoice charges and what inquiry/callback verification compares
+    EXACTLY. Cross-currency recharges additionally carry the frozen WALLET
+    credit side (``credit_amount_minor``/``credit_currency``) plus the FX
+    conversion snapshot: the callback credits the frozen credit side and
+    never fetches a new rate. ``None`` credit fields mean a legacy
+    same-currency session (credit == settlement).
+
     Attributes:
         user_id: Wallet owner the deposit belongs to.
         gateway_key: Identifier of the payment gateway (e.g. "zarinpal").
-        amount_minor: Positive integer minor units (never float).
-        currency: ISO-4217 3-letter uppercase code.
+        amount_minor: Gateway settlement amount (positive integer minor units).
+        currency: Gateway settlement currency (3-letter uppercase).
         idempotency_key: Key sent to the gateway on creation.
         id: Assigned on persistence.
         gateway_payment_id: External id assigned by the gateway, if known.
         status: Current lifecycle state.
         credited_at: When the matching ledger deposit was posted.
+        credit_amount_minor/credit_currency: Frozen wallet credit side.
+        fx_source/fx_rate/fx_path/fx_observed_at/fx_proxy/fx_proxy_asset:
+            Frozen conversion audit trail (rate as decimal text).
         created_at / updated_at: Persistence timestamps.
     """
 
@@ -68,6 +79,14 @@ class PaymentSession:
     gateway_payment_id: str | None = None
     status: PaymentSessionStatus = PaymentSessionStatus.PENDING
     credited_at: datetime | None = None
+    credit_amount_minor: int | None = None
+    credit_currency: str | None = None
+    fx_source: str | None = None
+    fx_rate: str | None = None
+    fx_path: str | None = None
+    fx_observed_at: datetime | None = None
+    fx_proxy: bool = False
+    fx_proxy_asset: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -78,6 +97,26 @@ class PaymentSession:
             raise ValueError("currency must be a 3-letter uppercase ISO-4217 code")
         if not self.gateway_key or not self.gateway_key.strip():
             raise ValueError("gateway_key must not be empty")
+        if self.credit_amount_minor is not None and self.credit_amount_minor <= 0:
+            raise ValueError("credit amount must be a positive integer of minor units")
+        if self.credit_currency is not None and (
+            len(self.credit_currency) != 3
+            or not self.credit_currency.isalpha()
+            or not self.credit_currency.isupper()
+        ):
+            raise ValueError("credit currency must be a 3-letter uppercase ISO-4217 code")
+
+    @property
+    def effective_credit_amount(self) -> int:
+        """Wallet credit amount (frozen; legacy sessions read settlement)."""
+        if self.credit_amount_minor is not None:
+            return self.credit_amount_minor
+        return self.amount_minor
+
+    @property
+    def effective_credit_currency(self) -> str:
+        """Wallet credit currency (frozen; legacy sessions read settlement)."""
+        return self.credit_currency if self.credit_currency is not None else self.currency
 
     def _require_pending(self) -> None:
         if self.status is not PaymentSessionStatus.PENDING:
@@ -110,6 +149,14 @@ class PaymentSession:
             gateway_payment_id=gateway_payment_id,
             status=self.status,
             credited_at=self.credited_at,
+            credit_amount_minor=self.credit_amount_minor,
+            credit_currency=self.credit_currency,
+            fx_source=self.fx_source,
+            fx_rate=self.fx_rate,
+            fx_path=self.fx_path,
+            fx_observed_at=self.fx_observed_at,
+            fx_proxy=self.fx_proxy,
+            fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
         )
@@ -127,6 +174,14 @@ class PaymentSession:
             gateway_payment_id=gateway_payment_id,
             status=PaymentSessionStatus.SUCCEEDED,
             credited_at=self.credited_at,
+            credit_amount_minor=self.credit_amount_minor,
+            credit_currency=self.credit_currency,
+            fx_source=self.fx_source,
+            fx_rate=self.fx_rate,
+            fx_path=self.fx_path,
+            fx_observed_at=self.fx_observed_at,
+            fx_proxy=self.fx_proxy,
+            fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
         )
@@ -144,6 +199,14 @@ class PaymentSession:
             gateway_payment_id=gateway_payment_id,
             status=PaymentSessionStatus.FAILED,
             credited_at=self.credited_at,
+            credit_amount_minor=self.credit_amount_minor,
+            credit_currency=self.credit_currency,
+            fx_source=self.fx_source,
+            fx_rate=self.fx_rate,
+            fx_path=self.fx_path,
+            fx_observed_at=self.fx_observed_at,
+            fx_proxy=self.fx_proxy,
+            fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
         )
@@ -165,6 +228,14 @@ class PaymentSession:
             gateway_payment_id=self.gateway_payment_id,
             status=self.status,
             credited_at=at,
+            credit_amount_minor=self.credit_amount_minor,
+            credit_currency=self.credit_currency,
+            fx_source=self.fx_source,
+            fx_rate=self.fx_rate,
+            fx_path=self.fx_path,
+            fx_observed_at=self.fx_observed_at,
+            fx_proxy=self.fx_proxy,
+            fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
         )
@@ -202,3 +273,31 @@ class PaymentSessionRepository(Protocol):
     async def save(self, session: PaymentSession) -> PaymentSession:
         """Persist the current state of a session aggregate."""
         ...
+
+
+def session_credit_amount(session: object) -> int:
+    """Frozen wallet credit amount for any session shape.
+
+    Prefers the persisted credit side; falls back to the settlement amount
+    for legacy rows and test doubles that predate the FX snapshot columns.
+    """
+    getter = getattr(session, "effective_credit_amount", None)
+    if isinstance(getter, int) and not isinstance(getter, bool) and getter > 0:
+        return getter
+    credit = getattr(session, "credit_amount_minor", None)
+    if isinstance(credit, int) and not isinstance(credit, bool) and credit > 0:
+        return credit
+    amount = getattr(session, "amount_minor", 0)
+    return int(amount) if isinstance(amount, int) and not isinstance(amount, bool) else 0
+
+
+def session_credit_currency(session: object) -> str:
+    """Frozen wallet credit currency for any session shape."""
+    eff = getattr(session, "effective_credit_currency", None)
+    if isinstance(eff, str) and eff.strip():
+        return eff.strip().upper()
+    credit = getattr(session, "credit_currency", None)
+    if isinstance(credit, str) and credit.strip():
+        return credit.strip().upper()
+    currency = getattr(session, "currency", "")
+    return str(currency).strip().upper() if isinstance(currency, str) else ""

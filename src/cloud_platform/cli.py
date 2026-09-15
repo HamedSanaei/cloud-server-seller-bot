@@ -7,6 +7,9 @@ Run with::
 Commands::
 
     leaseweb doctor              Pre-flight diagnostics (read-only; never
+    leaseweb accounts list       Safe credential-account inventory (no keys)
+    leaseweb accounts doctor     Per-account authentication pre-flight
+    fx doctor                    Currency/FX pre-flight (AbanTether, cache)
     leaseweb auth-check          Read-only API key check
     leaseweb coverage            Print the VPS API endpoint coverage matrix
     leaseweb products list       Read-only ordering catalogue
@@ -163,11 +166,34 @@ async def leaseweb_doctor() -> DoctorResult:
     def note(mark: str, name: str, detail: str = "") -> None:
         lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
 
-    if not settings.leaseweb_api_key:
+    # ``leaseweb_accounts`` is always populated when a credential exists (the
+    # deprecated single api_key normalizes into account ``default``), so an
+    # empty list means "nothing configured". Settings objects that predate
+    # credential accounts keep the original single-key wording.
+    accounts = list(getattr(settings, "leaseweb_accounts", None) or ())
+    legacy_single = not accounts
+    if legacy_single and not settings.leaseweb_api_key:
         report("LEASEWEB_API_KEY configured", False, "set it in .env or the environment")
         lines.append("\nAction: add LEASEWEB_API_KEY=<key> to .env (from your Leaseweb portal).")
         return DoctorResult(ok, lines)
-    report("LEASEWEB_API_KEY configured", True, f"set ({_redact(settings.leaseweb_api_key)})")
+    if legacy_single:
+        report(
+            "LEASEWEB_API_KEY configured",
+            True,
+            f"set ({_redact(settings.leaseweb_api_key)})",
+        )
+    elif len(accounts) == 1 and accounts[0].id == "default":
+        report(
+            "LEASEWEB_API_KEY configured",
+            True,
+            f"set ({_redact(accounts[0].api_key)})",
+        )
+    else:
+        report(
+            "Leaseweb credentials configured",
+            True,
+            f"{len(accounts)} account(s): " + ", ".join(account.id for account in accounts),
+        )
 
     from cloud_platform.providers.leaseweb.errors import LeasewebAuthenticationError
     from cloud_platform.providers.leaseweb.ordering import (
@@ -177,7 +203,38 @@ async def leaseweb_doctor() -> DoctorResult:
     )
     from cloud_platform.providers.leaseweb.ordering_sync import ordering_provider_from_settings
 
-    provider = ordering_provider_from_settings(settings)
+    # LEASEWEB-MULTIACCOUNT: authentication is a PER-ACCOUNT fact. One rejected
+    # key must read as DEGRADED, not as a dead provider, and must not hide the
+    # locations served by the keys that still work.
+    router = None if legacy_single else _leaseweb_account_router_factory()(settings)
+    if router is not None and len(router.accounts) > 1:
+        health = await router.verify_all()
+        for entry in health.accounts:
+            if entry.ok:
+                note("OK ", f"account {entry.account_id} authentication")
+            else:
+                note("FAIL", f"account {entry.account_id} authentication", entry.error_class or "")
+        if health.status == "ok":
+            note("OK ", "Leaseweb aggregate", f"{len(health.healthy)} account(s) usable")
+        elif health.healthy:
+            note(
+                "WARN",
+                "Leaseweb overall",
+                f"DEGRADED — {len(health.healthy)}/{len(health.accounts)} account(s) usable",
+            )
+        else:
+            report(
+                "Leaseweb overall",
+                False,
+                "UNAVAILABLE — no credential account authenticated",
+            )
+            return DoctorResult(ok, lines)
+
+    provider = (
+        next(iter(router.ordered_providers.values()))
+        if router is not None and router.ordered_providers
+        else ordering_provider_from_settings(settings)
+    )
     # Candidate discovery mirrors the catalog sync: configured seeds are
     # hints only; eligibility is decided per location by live probes.
     candidates = merge_candidates(tuple(provider.discovery_seeds), KNOWN_VPS_DATACENTERS)
@@ -343,6 +400,118 @@ async def leaseweb_doctor() -> DoctorResult:
     return DoctorResult(ok, lines)
 
 
+async def fx_doctor() -> DoctorResult:
+    """Read-only FX pre-flight: config, AbanTether markets, proxy, cache.
+
+    Never performs a trade, order or payment; only reads the public ticker
+    and the cache backend. Never prints a live price payload in full.
+    """
+    from cloud_platform.modules.fx.cache import build_fx_cache
+
+    settings = get_settings()
+    lines: list[str] = []
+    ok = True
+
+    def report(name: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and passed
+        mark = "OK " if passed else "FAIL"
+        lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+
+    def note(mark: str, name: str, detail: str = "") -> None:
+        lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+
+    if not settings.fx_enabled:
+        note("SKIP", "FX provider", "disabled ([fx] enabled = false)")
+        return DoctorResult(True, lines)
+    provider = (settings.fx_provider or "").strip().lower()
+    if provider != "abantether":
+        report("FX provider", False, f"unknown provider {provider!r}")
+        return DoctorResult(ok, lines)
+    report("FX provider", True, "AbanTether configured (read-only ticker, no key)")
+
+    from cloud_platform.providers.abantether_fx.client import AbanTetherFxClient
+
+    client = AbanTetherFxClient(
+        base_url=settings.fx_abantether_base_url,
+        timeout_seconds=float(settings.fx_request_timeout_seconds),
+        ttl_seconds=settings.fx_quote_ttl_seconds,
+        eur_symbol=settings.fx_abantether_eur_symbol,
+        usd_proxy_symbol=settings.fx_abantether_usd_proxy_symbol,
+    )
+    try:
+        try:
+            eur = await client.get_quote("EUR", "IRT")
+        except Exception as exc:
+            report("EUR/IRT", False, f"{type(exc).__name__}")
+        else:
+            report("EUR/IRT", True, f"active (market {eur.source_market})")
+        if settings.fx_allow_usdt_proxy_for_display or settings.fx_allow_usdt_proxy_for_settlement:
+            try:
+                usdt = await client.get_quote(settings.fx_abantether_usd_proxy_symbol, "IRT")
+            except Exception as exc:
+                report("USD display proxy", False, f"{type(exc).__name__}")
+            else:
+                scope = (
+                    "display+settlement"
+                    if settings.fx_allow_usdt_proxy_for_settlement
+                    else "display only"
+                )
+                report(
+                    "USD display proxy",
+                    True,
+                    f"USDT/IRT active ({scope}; proxy=true)",
+                )
+                _ = usdt
+        else:
+            note("SKIP", "USD display proxy", "disabled by configuration")
+    finally:
+        await client.close()
+
+    # Cache reachability (production shares Redis; dev/test use memory).
+    try:
+        backend = "redis" if (settings.app_env or "").strip().lower() == "production" else "memory"
+        cache = build_fx_cache(backend=backend, redis_url=settings.redis_url)
+        try:
+            from cloud_platform.modules.fx.cache import InMemoryFxCache
+
+            if isinstance(cache, InMemoryFxCache):
+                report("FX cache", True, "memory (dev/test)")
+            else:
+                # Read-only probe: a miss still proves the backend answers.
+                await cache.get("EUR->IRT")
+                report("FX cache", True, f"{backend} reachable")
+        finally:
+            closer = getattr(cache, "close", None)
+            if callable(closer):
+                await closer()
+    except Exception as exc:
+        report("FX cache", False, f"{type(exc).__name__}")
+
+    # Existing wallet currencies (report only; never mutates balances).
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+
+        wallets = await SqlAlchemyWalletRepository(SessionFactory).list_all()
+        counts: dict[str, int] = {}
+        for wallet in wallets:
+            counts[wallet.currency] = counts.get(wallet.currency, 0) + 1
+        if counts:
+            summary = ", ".join(f"{c}: {n}" for c, n in sorted(counts.items()))
+            note("INFO", "Wallet currencies", summary)
+        else:
+            note("INFO", "Wallet currencies", "no wallets yet")
+    except Exception as exc:
+        note("WARN", "Wallet currencies", f"unavailable ({type(exc).__name__})")
+
+    if not ok:
+        lines.append(
+            "\nFix the FAIL items above, then re-run: uv run python -m cloud_platform.cli fx doctor"
+        )
+    return DoctorResult(ok, lines)
+
+
 # ---------------------------------------------------------------------------
 # leaseweb sync-offers
 # ---------------------------------------------------------------------------
@@ -350,17 +519,30 @@ async def leaseweb_doctor() -> DoctorResult:
 
 async def leaseweb_sync_offers() -> int:
     from cloud_platform.db.session import SessionFactory
+    from cloud_platform.providers.leaseweb.accounts import build_leaseweb_account_router
     from cloud_platform.providers.leaseweb.ordering_sync import (
         LeaseWebOrderingCatalogSyncer,
         ordering_provider_from_settings,
     )
 
     settings = get_settings()
-    if not settings.leaseweb_api_key:
-        print("LEASEWEB_API_KEY is not set; cannot sync.")
+    router = build_leaseweb_account_router(settings)
+    if router is not None:
+        # LEASEWEB-MULTIACCOUNT: refresh EVERY configured credential account and
+        # merge the observations into the one customer-facing Leaseweb catalog.
+        print(f"leaseweb credential accounts: {', '.join(router.account_ids)}")
+        syncer = LeaseWebOrderingCatalogSyncer(
+            SessionFactory,
+            accounts=router.ordered_providers,
+            account_priorities=router.priorities,
+            account_states=router.account_states,
+        )
+    elif settings.leaseweb_api_key:
+        provider = ordering_provider_from_settings(settings)
+        syncer = LeaseWebOrderingCatalogSyncer(SessionFactory, provider)
+    else:
+        print("No Leaseweb credential account is configured; cannot sync.")
         return 1
-    provider = ordering_provider_from_settings(settings)
-    syncer = LeaseWebOrderingCatalogSyncer(SessionFactory, provider)
     result = await syncer.sync_all()
     for name, step in result.items():
         print(
@@ -382,11 +564,146 @@ async def leaseweb_sync_offers() -> int:
 # operation ledger -> worker pipeline (see docs/leaseweb/VPS_API_COVERAGE.md).
 
 
+def _leaseweb_account_router_factory() -> Any:
+    """Import the multi-account factory lazily (keeps CLI start-up fast)."""
+    from cloud_platform.providers.leaseweb.accounts import build_leaseweb_account_router
+
+    return build_leaseweb_account_router
+
+
 def _leaseweb_readonly() -> Any:
     """Import the read-only diagnostics module lazily (keeps CLI start-up fast)."""
     from cloud_platform.providers.leaseweb import diagnostics
 
     return diagnostics
+
+
+async def leaseweb_accounts_list() -> int:
+    """Operator inventory of the Leaseweb credential accounts (never a key).
+
+    Shows only SAFE metadata: the stable account id, its configured lifecycle,
+    the selection priority, this process's authentication verdict and the
+    locations the account has been observed to serve. The API key is never
+    printed, not even partially.
+    """
+    settings = get_settings()
+    router = _leaseweb_account_router_factory()(settings)
+    if router is None:
+        if settings.leaseweb_api_key:
+            print("Leaseweb uses the deprecated single api_key; no accounts configured.")
+            return 0
+        print("No Leaseweb credential account is configured.")
+        return 1
+
+    locations: dict[str, list[str]] = {}
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.provider_routes.repository import (
+            SqlAlchemyProviderRouteRepository,
+        )
+
+        repo = SqlAlchemyProviderRouteRepository(SessionFactory)
+        for route in await repo.list_for_provider("leaseweb"):
+            if route.state.value != "eligible_available":
+                continue
+            locations.setdefault(route.credential_account_id, []).append(route.location_id)
+    except Exception as exc:  # diagnostics must never raise
+        print(f"  (routing table unavailable: {type(exc).__name__})")
+
+    # KEY REMOVAL SAFETY: an account deleted from configuration does not delete
+    # the servers and orders it created — they keep its id and fail closed. The
+    # operator must be told, with counts, instead of discovering it later from a
+    # customer-side failure.
+    configured_ids = [account.account_id for account in router.accounts]
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.provider_routes.dependents import (
+            missing_credential_account_report,
+        )
+
+        dependents, scan_error = await missing_credential_account_report(
+            SessionFactory,
+            provider_key="leaseweb",
+            configured_account_ids=configured_ids,
+        )
+    except Exception as exc:  # pragma: no cover - import/session factory guard
+        dependents, scan_error = [], type(exc).__name__
+    for dependent in dependents:
+        print(f"  WARNING: {dependent.message()}")
+    if scan_error is not None:
+        print(f"  (dependency check unavailable: {scan_error})")
+
+    report = await router.verify_all()
+    health = {entry.account_id: entry for entry in report.accounts}
+    print(f"Leaseweb overall: {report.status.upper()}")
+    print()
+    print(f"{'ID':<16}{'enabled':<10}{'state':<11}{'prio':<7}{'auth':<14}locations")
+    for account in router.accounts:
+        entry = health.get(account.account_id)
+        auth = "ok" if entry is not None and entry.ok else (entry.error_class if entry else "-")
+        served = ",".join(sorted(locations.get(account.account_id, []))) or "-"
+        print(
+            f"{account.account_id:<16}{('yes' if account.enabled else 'no'):<10}"
+            f"{account.state.value:<11}{account.priority:<7}{auth:<14}{served}"
+        )
+    print()
+    print(f"{len(report.healthy)}/{len(report.accounts)} account(s) authenticated.")
+    return 0 if report.healthy else 1
+
+
+async def leaseweb_accounts_doctor() -> DoctorResult:
+    """Per-account pre-flight; the provider is DEGRADED, not down, if one fails."""
+    settings = get_settings()
+    lines: list[str] = []
+    router = _leaseweb_account_router_factory()(settings)
+    if router is None:
+        return DoctorResult(False, ["[FAIL] no Leaseweb credential account is configured"])
+
+    lines.append(f"[OK ] Leaseweb accounts configured — {len(router.accounts)} configured")
+
+    # KEY REMOVAL SAFETY: resources pinned to an account that is no longer
+    # configured fail closed. Report them explicitly (ids and counts only).
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.provider_routes.dependents import (
+            missing_credential_account_report,
+        )
+
+        dependents, scan_error = await missing_credential_account_report(
+            SessionFactory,
+            provider_key="leaseweb",
+            configured_account_ids=[account.account_id for account in router.accounts],
+        )
+    except Exception as exc:  # pragma: no cover - import/session factory guard
+        dependents, scan_error = [], type(exc).__name__
+    for dependent in dependents:
+        lines.append(f"[WARN] {dependent.message()}")
+    if scan_error is not None:
+        lines.append(f"[WARN] credential-account dependency check unavailable ({scan_error})")
+
+    report = await router.verify_all()
+    for entry in report.accounts:
+        if entry.ok:
+            lines.append(f"[OK ] account {entry.account_id} authentication")
+        else:
+            lines.append(f"[FAIL] account {entry.account_id} authentication ({entry.error_class})")
+    healthy = len(report.healthy)
+    if report.status == "ok":
+        lines.append(f"[OK ] Leaseweb aggregate catalog — {healthy} usable account(s)")
+    elif healthy:
+        lines.append(
+            f"[WARN] Leaseweb is DEGRADED — {healthy}/{len(report.accounts)} account(s) usable; "
+            "the storefront keeps serving the locations that still work"
+        )
+    else:
+        lines.append("[FAIL] Leaseweb is UNAVAILABLE — no credential account authenticated")
+    ok = healthy > 0
+    if not ok:
+        lines.append(
+            "\nAction: check each account's api_key in the server-owned "
+            "configuration.toml, then re-run this command."
+        )
+    return DoctorResult(ok, lines)
 
 
 async def leaseweb_auth_check() -> int:
@@ -904,6 +1221,11 @@ def _parser() -> argparse.ArgumentParser:
     lsw_sub.add_parser("auth-check", help="read-only API key check")
     lsw_sub.add_parser("coverage", help="print the VPS API coverage matrix")
 
+    accounts = lsw_sub.add_parser("accounts", help="read-only credential accounts")
+    accounts_sub = accounts.add_subparsers(dest="leaseweb_accounts", required=True)
+    accounts_sub.add_parser("list", help="safe per-account inventory (never a key)")
+    accounts_sub.add_parser("doctor", help="per-account authentication pre-flight")
+
     products = lsw_sub.add_parser("products", help="read-only ordering catalogue")
     products_sub = products.add_subparsers(dest="leaseweb_products", required=True)
     products_list = products_sub.add_parser("list")
@@ -1007,10 +1329,20 @@ def _parser() -> argparse.ArgumentParser:
     rl.add_argument("--attention", action="store_true")
     renewals_sub.add_parser("check")
 
+    fx = sub.add_parser("fx", help="currency / FX resolution (read-only)")
+    fx_sub = fx.add_subparsers(dest="subcommand", required=True)
+    fx_sub.add_parser("doctor", help="read-only FX pre-flight diagnostics")
+
     return parser
 
 
 async def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "fx":
+        if args.subcommand == "doctor":
+            result = await fx_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
+        return 2
     if args.command == "leaseweb":
         if args.subcommand == "doctor":
             result = await leaseweb_doctor()
@@ -1022,6 +1354,12 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return await leaseweb_auth_check()
         if args.subcommand == "coverage":
             return leaseweb_coverage()
+        if args.subcommand == "accounts":
+            if args.leaseweb_accounts == "list":
+                return await leaseweb_accounts_list()
+            result = await leaseweb_accounts_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
         if args.subcommand == "products":
             if args.leaseweb_products == "list":
                 return await leaseweb_products_list(args.location)

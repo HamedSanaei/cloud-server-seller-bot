@@ -76,6 +76,7 @@ from cloud_platform.providers.errors import (
 )
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
+from cloud_platform.providers.routing import provider_for
 from cloud_platform.providers.waiter import (
     ActionWaiter,
     WaitOutcome,
@@ -254,7 +255,9 @@ class ProvisioningWorker:
             return await self._fail_permanent(server, claimed, "catalog offer missing for server")
 
         try:
-            provider: CloudProvider = self._registry.get(server.provider_key)
+            provider: CloudProvider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             return await self._fail_permanent(
                 server, claimed, f"unknown provider {server.provider_key!r}"
@@ -780,7 +783,9 @@ class CreateTimeoutReconciler:
             await self._contain(server, "provisioning timeout with no recorded provider server id")
             return ReconciliationOutcome.MARKED_FOR_REVIEW
         try:
-            provider: CloudProvider = self._registry.get(server.provider_key)
+            provider: CloudProvider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             await self._contain(
                 server, f"provisioning timeout; unknown provider {server.provider_key!r}"
@@ -956,7 +961,9 @@ class ServerStateReconciler:
         if not server.provider_server_id:
             return StateReconciliationOutcome.SKIPPED
         try:
-            provider: CloudProvider = self._registry.get(server.provider_key)
+            provider: CloudProvider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             return StateReconciliationOutcome.SKIPPED
 
@@ -1278,7 +1285,9 @@ class PowerOperationExecutor:
                 f"{action.value} was executed",
             )
         try:
-            provider: CloudProvider = self._registry.get(server.provider_key)
+            provider: CloudProvider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             await self._fail(
                 operation,
@@ -1706,7 +1715,9 @@ class PowerControlsService:
             return None
 
         try:
-            provider: CloudProvider = self._registry.get(server.provider_key)
+            provider: CloudProvider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             capabilities: set[Capability] = set()
         else:
@@ -1923,7 +1934,9 @@ class MissingResourceDetector:
             if not server.provider_server_id:
                 continue  # nothing to check (provisioning window is M07-003's)
             try:
-                provider = self._registry.get(server.provider_key)
+                provider = provider_for(
+                    self._registry, server.provider_key, server.credential_account_id
+                )
             except KeyError:
                 continue  # unknown provider; cannot check
             try:
@@ -2269,7 +2282,9 @@ class DeleteOperationExecutor:
         provider: CloudProvider | None = None
         if server.provider_server_id:
             try:
-                provider = self._registry.get(server.provider_key)
+                provider = provider_for(
+                    self._registry, server.provider_key, server.credential_account_id
+                )
             except KeyError:
                 await self._fail(
                     operation,
@@ -2901,7 +2916,9 @@ class RebuildOperationExecutor:
                 "the rebuild was executed",
             )
         try:
-            provider: CloudProvider = self._registry.get(server.provider_key)
+            provider: CloudProvider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             await self._fail(
                 operation, actor_type, actor_id, f"unknown provider {server.provider_key!r}"
@@ -3285,7 +3302,9 @@ class RescueOperationExecutor:
                 "the rescue action was executed",
             )
         try:
-            provider: CloudProvider = self._registry.get(server.provider_key)
+            provider: CloudProvider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             await self._fail(
                 operation, actor_type, actor_id, f"unknown provider {server.provider_key!r}"

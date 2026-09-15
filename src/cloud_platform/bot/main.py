@@ -31,7 +31,7 @@ from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.ui import BotScreen, BotUi
 from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import Container, close_container, get_container
-from cloud_platform.core.i18n import Translator
+from cloud_platform.core.i18n import Locale, Translator, get_catalog
 from cloud_platform.core.session_store import SessionStoreUnavailable
 from cloud_platform.modules.navigation.domain import decode_callback
 from cloud_platform.modules.users.domain import User
@@ -93,6 +93,18 @@ def _is_foreign_callback(data: str) -> bool:
     return False
 
 
+def _button_matches(text: str, key: str) -> bool:
+    """Check if message text matches a menu key in any supported locale."""
+    target = text.strip()
+    for loc in (Locale.FA, Locale.EN):
+        try:
+            if target == get_catalog(loc).table[key].strip():
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def register_handlers(
     dp: Dispatcher, ui: BotUi, monthly_ui: MonthlyBotUi, container: Container
 ) -> None:
@@ -105,8 +117,9 @@ def register_handlers(
 
     @dp.message(CommandStart())
     async def _start(message: Message) -> None:
+        await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard())
         await _show_main_menu(
-            message, container=container, monthly_ui=monthly_ui, include_greeting=True
+            message, container=container, monthly_ui=monthly_ui, include_greeting=False
         )
 
     @dp.message(Command("menu"))
@@ -115,11 +128,11 @@ def register_handlers(
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
-        await message.answer(_t.t("greeting.help"))
+        await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard())
 
     @dp.message()
     async def _fallback(message: Message) -> None:
-        """Active prompt answers first; everything else lands on the menu.
+        """Active prompt answers first; reply buttons next; everything else lands on menu.
 
         Unknown slash commands, idle chat and unsupported media (photo,
         sticker, voice, ...) all resolve to the canonical main menu instead
@@ -134,6 +147,30 @@ def register_handlers(
                 return
             if screen is not None:
                 await message.answer(screen.text, reply_markup=screen.keyboard)
+                return
+
+            if _button_matches(message.text, "menu.buy"):
+                screen = await monthly_ui.markets_screen()
+                await message.answer(screen.text, reply_markup=screen.keyboard)
+                return
+            if _button_matches(message.text, "menu.servers"):
+                screen = await monthly_ui.servers_screen(user)
+                await message.answer(screen.text, reply_markup=screen.keyboard)
+                return
+            if _button_matches(message.text, "menu.wallet"):
+                screen = await monthly_ui.wallet_screen(user)
+                await message.answer(screen.text, reply_markup=screen.keyboard)
+                return
+            if _button_matches(message.text, "menu.recharge"):
+                screen = await monthly_ui.recharge_screen(user)
+                await message.answer(screen.text, reply_markup=screen.keyboard)
+                return
+            if _button_matches(message.text, "menu.support"):
+                screen = monthly_ui.support_screen()
+                await message.answer(screen.text, reply_markup=screen.keyboard)
+                return
+            if _button_matches(message.text, "nav.menu"):
+                await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
                 return
         await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
 
@@ -189,6 +226,7 @@ async def main() -> None:
         create=container.create_server_service(),
     )
     gateways = container.payment_gateways()  # one HTTP client each per bot process
+    fx_resolver = container.fx_resolver_or_none()  # one FX source+cache per bot process
     monthly_ui = MonthlyBotUi(
         settings.callback_signing_key,
         offers_view=container.offer_catalog_view_service(),
@@ -203,7 +241,7 @@ async def main() -> None:
         # The SAME gateway instances this process built above: building a
         # second collection here would leak a set of HTTP clients that the
         # shutdown path below never closes.
-        recharge=container.wallet_recharge_service(gateways=gateways),
+        recharge=container.wallet_recharge_service(gateways=gateways, fx_resolver=fx_resolver),
         # My Servers: the application service owns ownership, policy,
         # confirmations, idempotency and audit; the UI only renders.
         server_management=container.server_management_service(),
@@ -212,6 +250,11 @@ async def main() -> None:
         # prompts live in the SHARED store, so a restart or a second replica
         # does not lose the buttons the customer is holding.
         sessions=container.server_sessions(),
+        # Catalog display equivalents (supplementary; the DB price stays
+        # authoritative). The SAME resolver instance as recharge: one
+        # AbanTether + one cache client per process, closed once below.
+        fx_resolver=fx_resolver,
+        fx_display_currency=settings.fx_default_display_currency,
     )
     register_handlers(dp, ui, monthly_ui, container)
 
@@ -220,6 +263,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await Container.aclose_gateways(gateways)
+        await Container.aclose_fx(fx_resolver)
         await close_container()
 
 

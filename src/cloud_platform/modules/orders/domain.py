@@ -88,6 +88,13 @@ class ProviderOrder:
     server_id: UUID
     operation_key: str
     provider_key: str
+    #: The provider CREDENTIAL ACCOUNT this order is PINNED to
+    #: (LEASEWEB-MULTIACCOUNT), snapshotted BEFORE the chargeable POST. It is
+    #: authoritative for every later provider read: account-order lookups,
+    #: recovery scans and provisioning polling are credential-scoped, so
+    #: another account could never find this order — and must never be used to
+    #: re-POST it. ``None`` on legacy rows (routed as the ``default`` account).
+    credential_account_id: str | None = None
     #: The sellable offer the order was placed from (price + product pin).
     offer_id: UUID | None = None
     status: OrderStatus = OrderStatus.PENDING_SUBMIT
@@ -279,9 +286,16 @@ class ProviderOrderRepository(Protocol):
         provider_cost_currency: str | None = None,
         selling_price_minor: int | None = None,
         selling_currency: str | None = None,
+        credential_account_id: str | None = None,
     ) -> ProviderOrder:
         """Create the PENDING_SUBMIT row (unique per server + key) with the
-        order-fact snapshots committed before any provider call."""
+        order-fact snapshots committed before any provider call.
+
+        ``credential_account_id`` records WHICH provider credential account is
+        pinned to fulfil this order (LEASEWEB-MULTIACCOUNT). It is snapshotted
+        here, before the chargeable POST, and is authoritative for every later
+        read: account-order lookups and recovery scans are credential-scoped.
+        """
         ...
 
     async def save(self, order: ProviderOrder) -> ProviderOrder: ...

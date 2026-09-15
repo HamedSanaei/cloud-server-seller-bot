@@ -397,8 +397,8 @@ class TestBusinessLogEmission:
 
         assert sink.types() == [BusinessEventType.ADMIN_WALLET_ADJUSTMENT]
         payload = sink.of(BusinessEventType.ADMIN_WALLET_ADJUSTMENT).payload
-        assert payload["amount"] == "5.00 EUR"
-        assert payload["balance_after"] == "15.00 EUR"
+        assert payload["amount"] == "€5.00"
+        assert payload["balance_after"] == "€15.00"
         assert payload["reason"] == "goodwill credit"
         assert payload["entry_type"] == "adjustment"
         assert payload["actor"] == "boss"

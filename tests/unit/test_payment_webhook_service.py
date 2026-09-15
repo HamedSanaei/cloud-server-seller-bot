@@ -308,7 +308,7 @@ class TestBusinessLogEmission:
         assert outcome.action is WebhookAction.CREDITED
         assert sink.types() == [BusinessEventType.RECHARGE_SUCCEEDED]
         payload = sink.of(BusinessEventType.RECHARGE_SUCCEEDED).payload
-        assert payload["amount"] == "5.00 EUR"
+        assert payload["amount"] == "€5.00"
         assert payload["gateway"] == "zarinpal"
         assert payload["gateway_reference"] == EXT
 
@@ -336,7 +336,7 @@ class TestBusinessLogEmission:
             currency="EUR",
         )
         payload = sink.of(BusinessEventType.RECHARGE_SUCCEEDED).payload
-        assert payload["balance_after"] == "12.34 EUR"
+        assert payload["balance_after"] == "€12.34"
 
     async def test_duplicate_success_callback_emits_once(self) -> None:
         sink = _RecordingSink()

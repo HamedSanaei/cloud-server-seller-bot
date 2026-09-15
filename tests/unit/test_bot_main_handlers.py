@@ -52,6 +52,12 @@ def fakes() -> dict[str, Any]:
     monthly_ui = MagicMock(spec=MonthlyBotUi)
     monthly_ui.handle = AsyncMock(return_value=None)
     monthly_ui.menu_screen = MagicMock(return_value=SCREEN)
+    monthly_ui.reply_keyboard = MagicMock()
+    monthly_ui.markets_screen = AsyncMock(return_value=SCREEN)
+    monthly_ui.servers_screen = AsyncMock(return_value=SCREEN)
+    monthly_ui.wallet_screen = AsyncMock(return_value=SCREEN)
+    monthly_ui.recharge_screen = AsyncMock(return_value=SCREEN)
+    monthly_ui.support_screen = MagicMock(return_value=SCREEN)
     return {"container": container, "ui": ui, "monthly_ui": monthly_ui}
 
 
@@ -81,11 +87,13 @@ def test_start_command_shows_greeting_plus_menu(
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=1, message=_message("/start")))
-    # Exactly one message: greeting composed with the canonical menu.
-    _patch_outgoing["answer"].assert_awaited_once()
-    sent = _patch_outgoing["answer"].await_args.args[0]
-    assert get_catalog(Locale.FA).table["greeting.start"] in sent
-    assert "screen" in sent
+    # Two messages: greeting with reply keyboard, followed by canonical menu.
+    assert _patch_outgoing["answer"].await_count == 2
+    greeting_call = _patch_outgoing["answer"].await_args_list[0]
+    menu_call = _patch_outgoing["answer"].await_args_list[1]
+    assert get_catalog(Locale.FA).table["greeting.start"] in greeting_call.args[0]
+    assert greeting_call.kwargs["reply_markup"] == fakes["monthly_ui"].reply_keyboard()
+    assert menu_call.args[0] == "screen"
     fakes["monthly_ui"].menu_screen.assert_called_once()
     # Onboarding ran for the new contact.
     fakes["container"].user_repository().get_by_telegram_user_id.assert_awaited_once_with(10)
@@ -112,6 +120,10 @@ def test_help_command_answers(
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=3, message=_message("/help")))
     _patch_outgoing["answer"].assert_awaited_once()
+    assert (
+        _patch_outgoing["answer"].await_args.kwargs["reply_markup"]
+        == fakes["monthly_ui"].reply_keyboard()
+    )
 
 
 def test_callback_routes_to_monthly_ui_first(
@@ -229,7 +241,7 @@ def test_start_creates_user_and_wallet_for_new_contact(
     user_repo.get_by_telegram_user_id.assert_awaited_once_with(99)
     user_repo.create.assert_awaited_once()
     wallet_repo.get_or_create.assert_awaited_once()
-    _patch_outgoing["answer"].assert_awaited_once()
+    assert _patch_outgoing["answer"].await_count == 2
 
 
 def test_random_text_without_pending_prompt_shows_menu(
@@ -312,3 +324,49 @@ def test_active_reverse_dns_prompt_is_not_overridden(
     _patch_outgoing["answer"].assert_awaited_once()
     fakes["monthly_ui"].handle_text.assert_awaited_once()
     fakes["monthly_ui"].menu_screen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("button_text", "expected_method"),
+    [
+        ("🖥️ خرید سرور", "markets_screen"),
+        ("🖥️ Buy a server", "markets_screen"),
+        ("🖥 سرورهای من", "servers_screen"),
+        ("🖥 My servers", "servers_screen"),
+        ("💰 کیف پول", "wallet_screen"),
+        ("💰 Wallet", "wallet_screen"),
+        ("⬆️ شارژ حساب", "recharge_screen"),
+        ("⬆️ Top up", "recharge_screen"),
+        ("🎧 پشتیبانی", "support_screen"),
+        ("🎧 Support", "support_screen"),
+        ("🏠 منوی اصلی", "menu_screen"),
+        ("🏠 Main menu", "menu_screen"),
+    ],
+)
+def test_reply_keyboard_buttons_dispatch(
+    fakes: dict[str, Any],
+    _patch_outgoing: dict[str, AsyncMock],
+    button_text: str,
+    expected_method: str,
+) -> None:
+    fakes["monthly_ui"].handle_text = AsyncMock(return_value=None)
+    dp = Dispatcher()
+    register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
+    _dispatch(dp, Update(update_id=50, message=_message(button_text)))
+    _patch_outgoing["answer"].assert_awaited_once()
+    target_mock = getattr(fakes["monthly_ui"], expected_method)
+    target_mock.assert_called_once()
+
+
+def test_build_main_reply_keyboard() -> None:
+    from cloud_platform.bot.monthly_ui import build_main_reply_keyboard
+    from cloud_platform.core.i18n import Translator
+
+    t = Translator()
+    kb = build_main_reply_keyboard(t)
+    assert kb.is_persistent is True
+    assert kb.resize_keyboard is True
+    assert len(kb.keyboard) == 3
+    assert [btn.text for btn in kb.keyboard[0]] == [t.t("menu.buy"), t.t("menu.servers")]
+    assert [btn.text for btn in kb.keyboard[1]] == [t.t("menu.wallet"), t.t("menu.recharge")]
+    assert [btn.text for btn in kb.keyboard[2]] == [t.t("menu.support"), t.t("nav.menu")]

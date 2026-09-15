@@ -64,6 +64,7 @@ class TestContainerInitializeIdempotency:
         container = create_container()
         calls = 0
         real_register = container.provider_registry.register
+        real_register_route = container.provider_registry.register_route
 
         def _flaky(provider: Any) -> None:
             nonlocal calls
@@ -72,7 +73,16 @@ class TestContainerInitializeIdempotency:
                 raise RuntimeError("boom")
             real_register(provider)
 
+        def _flaky_route(provider_key: str, account_id: str, provider: Any) -> None:
+            # LEASEWEB-MULTIACCOUNT: a credential-scoped provider registers as a
+            # ROUTE under its logical key, so count that too — the invariant
+            # under test is "three providers, each registered once".
+            nonlocal calls
+            calls += 1
+            real_register_route(provider_key, account_id, provider)
+
         monkeypatch.setattr(container.provider_registry, "register", _flaky)
+        monkeypatch.setattr(container.provider_registry, "register_route", _flaky_route)
         with pytest.raises(RuntimeError, match="boom"):
             await container.initialize()
         # The failure happened on the first of three providers; the retry

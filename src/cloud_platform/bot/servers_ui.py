@@ -1465,12 +1465,13 @@ _RENEWAL_RESULT_KEYS: dict[str, str] = {
 def _format_minor(minor: int, currency: str) -> str:
     """Integer-formatted money (never a float).
 
-    Deliberately duplicated from the storefront renderer: importing it would
-    make the two bot modules circular, and this is two lines of integer
-    arithmetic with no policy in it.
+    Delegates to the single platform formatter (per-currency exponents);
+    kept as a thin wrapper so the management UI needs no FX import at
+    module load and no circular import with the storefront renderer.
     """
-    major, rem = divmod(int(minor), 100)
-    return f"{major}.{rem:02d} {currency}".strip()
+    from cloud_platform.modules.fx.formatting import format_minor as _fx_format
+
+    return _fx_format(minor, currency)
 
 
 def _format_day(moment: datetime) -> str:

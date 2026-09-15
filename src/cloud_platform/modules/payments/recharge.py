@@ -6,6 +6,14 @@ deposit, but nothing created the pending session. This service does, and it
 emits the operator-channel ``recharge.created`` event — after the session is
 durable, never before.
 
+Money model (FX-aware): the customer picks a CREDIT amount in the wallet's
+own currency; each gateway settles in its own currency (Tetraminator: IRT,
+ZarinPal: IRR). The service converts credit -> settlement once (CHARGE
+purpose, frozen snapshot) and persists BOTH sides on the session: the
+settlement side is what the provider invoice charges and what inquiry
+verifies EXACTLY; the credit side is what the wallet receives. The callback
+and reconciliation never fetch a new rate.
+
 Safety properties:
 
 - the gateway call happens FIRST and the session row is persisted with the
@@ -35,6 +43,8 @@ from cloud_platform.modules.payments.domain import (
     PaymentSession,
     PaymentSessionRepository,
     PaymentSessionStatus,
+    session_credit_amount,
+    session_credit_currency,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,6 +143,7 @@ class WalletRechargeService:
         gateways: dict[str, RechargeGateway] | None = None,
         event_sink: BusinessEventSink | None = None,
         user_repo: object | None = None,
+        fx_resolver: Any | None = None,
     ) -> None:
         merged: dict[str, RechargeGateway] = dict(gateways or {})
         if gateway is not None:
@@ -141,6 +152,10 @@ class WalletRechargeService:
         self._payments = payments_repo
         self._events = event_sink
         self._users = user_repo
+        # Optional platform FX resolver (credit -> settlement conversion).
+        # Owned by the process (like the gateway collection): this service
+        # never closes it.
+        self._fx = fx_resolver
 
     @property
     def gateway_key(self) -> str:
@@ -158,44 +173,146 @@ class WalletRechargeService:
         supported = getattr(gateway, "supported_currency", "")
         return bool(supported) and str(supported).upper() == str(currency).upper()
 
-    def supports_currency(self, currency: str) -> bool:
-        """Whether any configured gateway can charge in ``currency``.
+    @staticmethod
+    def _settlement_currency(gateway: Any) -> str:
+        return str(getattr(gateway, "supported_currency", "") or "").upper()
 
-        Iranian gateways settle in their own currency, so a wallet in a
-        different currency has no online top-up — the UI must say so instead
-        of offering a button that cannot work.
+    @staticmethod
+    def _exact_settlement(amount_minor: int, src: str, dst: str) -> int | None:
+        """Exact IRT<->IRR conversion (x10), or None when not applicable."""
+        s, d = src.upper(), dst.upper()
+        if s == d:
+            return amount_minor
+        if s == "IRT" and d == "IRR":
+            return amount_minor * 10
+        if s == "IRR" and d == "IRT":
+            # Sub-Toman remainder rounds UP for a charge (never undercharge).
+            return -(-amount_minor // 10)
+        return None
+
+    def _supports_or_exact(self, gateway: RechargeGateway, currency: str) -> bool:
+        """Sync compatibility: same currency or exact IRT<->IRR (no FX call)."""
+        settlement = self._settlement_currency(gateway)
+        wallet = (currency or "").upper()
+        if not settlement or not wallet:
+            return False
+        if settlement == wallet:
+            return True
+        return self._exact_settlement(1, wallet, settlement) is not None
+
+    def supports_currency(self, currency: str) -> bool:
+        """Whether any configured gateway can charge for a ``currency`` wallet.
+
+        Sync fast path (same currency + exact IRT<->IRR). Cross-currency
+        wallets needing a live FX quote use :meth:`supports_currency_async`.
         """
-        return any(self._supports(gateway, currency) for gateway in self._gateways.values())
+        return any(
+            self._supports_or_exact(gateway, currency) for gateway in self._gateways.values()
+        )
+
+    async def supports_currency_async(self, currency: str) -> bool:
+        """Full compatibility probe, including FX-converted gateways."""
+        if self.supports_currency(currency):
+            return True
+        if self._fx is None:
+            return False
+        try:
+            from cloud_platform.modules.fx.domain import FxPurpose
+        except ImportError:
+            return False
+        for gateway in self._gateways.values():
+            settlement = self._settlement_currency(gateway)
+            if not settlement:
+                continue
+            try:
+                if await self._fx.can_convert(currency, settlement, FxPurpose.CHARGE):
+                    return True
+            except Exception:
+                continue
+        return False
 
     def compatible_gateways(self, currency: str, amount_minor: int | None = None) -> list[str]:
         """Keys of gateways able to charge ``currency`` (and ``amount``).
 
+        Sync fast path: same currency + exact IRT<->IRR (no FX call).
         Drives the Telegram payment-method screen: zero means unavailable,
         one means the selection step is skipped, several means the customer
-        picks. An amount below a gateway's documented minimum excludes it.
+        picks. An amount below a gateway's documented minimum excludes it
+        (evaluated against the converted settlement amount).
         """
         compatible: list[str] = []
         for key, gateway in self._gateways.items():
-            if not self._supports(gateway, currency):
+            if not self._supports_or_exact(gateway, currency):
                 continue
-            if amount_minor is not None and amount_minor < _gateway_minimum_charge(
-                gateway, currency
-            ):
-                continue
+            if amount_minor is not None:
+                settlement = self._exact_settlement(
+                    amount_minor, currency, self._settlement_currency(gateway)
+                )
+                if settlement is None:
+                    continue
+                if settlement < _gateway_minimum_charge(gateway, currency):
+                    continue
             compatible.append(key)
+        return compatible
+
+    async def compatible_gateways_async(
+        self, currency: str, amount_minor: int | None = None
+    ) -> list[str]:
+        """Full compatible-gateway list, including FX-converted gateways.
+
+        For each gateway the wallet amount is converted to the settlement
+        amount (CHARGE purpose, frozen quote) and the gateway minimum is
+        evaluated against the converted amount. Gateways without a route
+        (or with a stale/forbidden quote) are excluded — never guessed.
+        """
+        compatible: list[str] = []
+        for key, gateway in self._gateways.items():
+            settlement_currency = self._settlement_currency(gateway)
+            if not settlement_currency:
+                continue
+            if self._supports_or_exact(gateway, currency):
+                converted = self._exact_settlement(
+                    amount_minor if amount_minor is not None else 1,
+                    currency,
+                    settlement_currency,
+                )
+                if converted is None:
+                    continue
+                if amount_minor is not None and converted < _gateway_minimum_charge(
+                    gateway, currency
+                ):
+                    continue
+                compatible.append(key)
+                continue
+            if self._fx is None:
+                continue
+            try:
+                from cloud_platform.modules.fx.domain import FxPurpose
+
+                if not await self._fx.can_convert(currency, settlement_currency, FxPurpose.CHARGE):
+                    continue
+                if amount_minor is not None:
+                    resolved = await self._fx.resolve(
+                        amount_minor, currency, settlement_currency, FxPurpose.CHARGE
+                    )
+                    if resolved.target_amount_minor < _gateway_minimum_charge(gateway, currency):
+                        continue
+                compatible.append(key)
+            except Exception:
+                continue
         return compatible
 
     def minimum_charge_minor(self, gateway_key: str, currency: str) -> int:
         """Gateway-enforced minimum charge (minor units) for UI gating."""
         gateway = self._gateways.get(gateway_key)
-        if gateway is None or not self._supports(gateway, currency):
+        if gateway is None or not self._supports_or_exact(gateway, currency):
             return 0
         return _gateway_minimum_charge(gateway, currency)
 
     def _resolve_gateway(self, currency: str, gateway_key: str | None) -> RechargeGateway:
         if gateway_key is not None:
             gateway = self._gateways.get(gateway_key)
-            if gateway is None or not self._supports(gateway, currency):
+            if gateway is None or not self._supports_or_exact(gateway, currency):
                 raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             return gateway
         compatible = self.compatible_gateways(currency)
@@ -207,6 +324,125 @@ class WalletRechargeService:
                 tuple(compatible),
             )
         return self._gateways[compatible[0]]
+
+    async def _resolve_gateway_async(
+        self, currency: str, gateway_key: str | None, amount_minor: int | None = None
+    ) -> RechargeGateway:
+        """FX-aware gateway resolution (CHARGE purpose).
+
+        An explicitly selected gateway is validated (including FX
+        convertibility); an unselected one is resolved from the full async
+        compatible list. Stale/forbidden quotes exclude the gateway — they
+        never fall back to a guessed rate. The amount minimum is enforced by
+        the caller (``start``) against the converted settlement amount, so
+        resolution itself is amount-independent (a below-minimum amount must
+        resolve the gateway and then fail as ``RechargeAmountError``).
+        """
+        del amount_minor  # resolution is amount-independent; see docstring.
+        if gateway_key is not None:
+            gateway = self._gateways.get(gateway_key)
+            if gateway is None:
+                raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
+            if self._supports_or_exact(gateway, currency):
+                return gateway
+            if self._fx is None:
+                raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
+            try:
+                from cloud_platform.modules.fx.domain import FxPurpose
+
+                if await self._fx.can_convert(
+                    currency, self._settlement_currency(gateway), FxPurpose.CHARGE
+                ):
+                    return gateway
+            except Exception:
+                pass
+            raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
+        compatible = await self.compatible_gateways_async(currency)
+        if not compatible:
+            raise RechargeDisabledError("no payment gateway is configured")
+        if len(compatible) > 1:
+            raise RechargeGatewaySelectionRequired(
+                "several gateways fit; an explicit selection is required",
+                tuple(compatible),
+            )
+        return self._gateways[compatible[0]]
+
+    async def _settle(
+        self, gateway: Any, amount_minor: int, currency: str
+    ) -> tuple[int, str, dict[str, Any] | None]:
+        """Convert wallet credit -> gateway settlement (frozen, CHARGE).
+
+        Returns ``(settlement_amount, settlement_currency, snapshot_fields)``
+        where the snapshot is None for identity and a field dict otherwise
+        (exact IRT<->IRR or live FX). Raises :class:`RechargeError` when no
+        safe conversion exists (stale/forbidden/unavailable fail closed).
+        """
+        from datetime import UTC, datetime
+
+        settlement_currency = self._settlement_currency(gateway)
+        wallet_currency = (currency or "").upper()
+        if not settlement_currency:
+            raise RechargeError("gateway has no settlement currency")
+        if settlement_currency == wallet_currency:
+            return (
+                amount_minor,
+                settlement_currency,
+                {
+                    "credit_amount_minor": amount_minor,
+                    "credit_currency": wallet_currency,
+                    "fx_source": "identity",
+                    "fx_rate": "1",
+                    "fx_path": "identity",
+                    "fx_observed_at": datetime.now(UTC),
+                    "fx_proxy": False,
+                    "fx_proxy_asset": None,
+                },
+            )
+        exact = self._exact_settlement(amount_minor, wallet_currency, settlement_currency)
+        if exact is not None:
+            rate = "10" if wallet_currency == "IRT" else "0.1"
+            return (
+                exact,
+                settlement_currency,
+                {
+                    "credit_amount_minor": amount_minor,
+                    "credit_currency": wallet_currency,
+                    "fx_source": "exact",
+                    "fx_rate": rate,
+                    "fx_path": "exact IRT<->IRR x10",
+                    "fx_observed_at": datetime.now(UTC),
+                    "fx_proxy": False,
+                    "fx_proxy_asset": None,
+                },
+            )
+        if self._fx is None:
+            raise RechargeDisabledError(
+                f"gateway {gateway.key!r} cannot charge in {currency} (no conversion route)"
+            )
+        try:
+            from cloud_platform.modules.fx.domain import FxPurpose
+
+            resolved = await self._fx.resolve(
+                amount_minor, wallet_currency, settlement_currency, FxPurpose.CHARGE
+            )
+        except Exception as exc:
+            raise RechargeDisabledError(
+                f"gateway {gateway.key!r} is temporarily unavailable for {currency}"
+            ) from exc
+        return (
+            resolved.target_amount_minor,
+            settlement_currency,
+            {
+                "credit_amount_minor": amount_minor,
+                "credit_currency": wallet_currency,
+                "fx_source": resolved.source,
+                "fx_rate": str(resolved.rate),
+                "fx_path": resolved.path,
+                "fx_observed_at": resolved.observed_at,
+                "fx_proxy": resolved.proxy,
+                "fx_proxy_asset": resolved.proxy_asset or None,
+            },
+        )
 
     async def start(
         self,
@@ -230,25 +466,34 @@ class WalletRechargeService:
             # Cheap structural guard: fail here with a domain error instead of
             # leaking a ValueError out of the IdempotencyKey value object.
             raise RechargeError("idempotency_key must be 8..128 characters")
-        gateway = self._resolve_gateway(currency, gateway_key)
+        gateway = await self._resolve_gateway_async(currency, gateway_key, amount_minor)
         resolved_key = gateway.key
+        # Credit (wallet) -> settlement (gateway) is frozen ONCE here; the
+        # minimum is evaluated against the converted settlement amount so the
+        # UI can never offer an amount the gateway will reject.
+        settlement_amount, settlement_currency, snapshot = await self._settle(
+            gateway, amount_minor, currency
+        )
         minimum = _gateway_minimum_charge(gateway, currency)
-        if amount_minor < minimum:
+        if settlement_amount < minimum:
             raise RechargeAmountError(
-                f"amount {amount_minor} is below the {resolved_key} minimum of {minimum}"
+                f"amount {settlement_amount} is below the {resolved_key} minimum of {minimum}"
             )
 
         if _gateway_needs_callback_reference(gateway):
             return await self._start_with_callback_reference(
                 gateway=gateway,
                 user=user,
-                amount_minor=amount_minor,
-                currency=currency,
+                amount_minor=settlement_amount,
+                currency=settlement_currency,
                 key=key,
+                credit_amount_minor=amount_minor,
+                credit_currency=(currency or "").upper(),
+                snapshot=snapshot,
             )
         intent = await gateway.create_payment(
-            amount_minor=amount_minor,
-            currency=currency,
+            amount_minor=settlement_amount,
+            currency=settlement_currency,
             reference=str(user.id),
             idempotency_key=IdempotencyKey(key),
             redirect_url=redirect_url,
@@ -261,10 +506,11 @@ class WalletRechargeService:
         session = PaymentSession(
             user_id=user.id,
             gateway_key=resolved_key,
-            amount_minor=amount_minor,
-            currency=currency,
+            amount_minor=settlement_amount,
+            currency=settlement_currency,
             idempotency_key=key,
             gateway_payment_id=authority,
+            **(snapshot or {}),
         )
         replayed = False
         try:
@@ -284,13 +530,15 @@ class WalletRechargeService:
 
         # Operator channel: enqueued only (delivery is a worker's job) and
         # keyed by the session id, so a replay cannot duplicate the message.
+        # The CREDIT side is logged (what the wallet receives); the gateway
+        # field says which adapter settled it.
         await emit_safe(
             self._events,
             recharge_created_event(
                 user=user,
                 payment_session_id=session_id,
-                amount_minor=session.amount_minor,
-                currency=session.currency,
+                amount_minor=session_credit_amount(session),
+                currency=session_credit_currency(session),
                 gateway=session.gateway_key,
             ),
         )
@@ -313,6 +561,9 @@ class WalletRechargeService:
         amount_minor: int,
         currency: str,
         key: str,
+        credit_amount_minor: int | None = None,
+        credit_currency: str | None = None,
+        snapshot: dict[str, Any] | None = None,
     ) -> RechargeStart:
         """Start flow for gateways that need our callback URL at create time.
 
@@ -322,6 +573,10 @@ class WalletRechargeService:
         pending session instead of POSTing a second invoice. A concurrent
         double-tap that loses the initial insert race resumes the winner's
         row instead of failing.
+
+        ``amount_minor``/``currency`` are the SETTLEMENT side; the credit
+        side rides ``snapshot`` and is frozen before the invoice call, so a
+        crash or retry can never change the wallet credit.
         """
         resolved_key = gateway.key
         existing = await self._payments.get_by_idempotency_key(resolved_key, key)
@@ -349,6 +604,7 @@ class WalletRechargeService:
                         amount_minor=amount_minor,
                         currency=currency,
                         idempotency_key=key,
+                        **(snapshot or {}),
                     )
                 )
             except DuplicateExternalIdError:
@@ -402,8 +658,8 @@ class WalletRechargeService:
             recharge_created_event(
                 user=user,
                 payment_session_id=session_id,
-                amount_minor=session.amount_minor,
-                currency=session.currency,
+                amount_minor=session_credit_amount(session),
+                currency=session_credit_currency(session),
                 gateway=session.gateway_key,
             ),
         )

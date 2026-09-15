@@ -52,6 +52,9 @@ class RotationResult:
     provider_key: str
     previous_key_hint: str
     new_key_hint: str
+    #: Which credential account rotated (multi-credential providers). Safe and
+    #: non-secret; ``None`` for a single-credential provider.
+    credential_account_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,9 +66,17 @@ class CredentialStatus:
 
 
 class CredentialHolderRegistry(Protocol):
-    """Port: the live credential holder per provider key."""
+    """Port: the live credential holder per provider credential account.
 
-    def get_holder(self, provider_key: str) -> CredentialHolderLike | None: ...
+    ``credential_account_id`` is optional so a single-credential provider keeps
+    addressing its one holder by provider key alone. A multi-credential
+    provider (LEASEWEB-MULTIACCOUNT) addresses ``(provider_key, account_id)``
+    so rotating one account's key can never touch another's.
+    """
+
+    def get_holder(
+        self, provider_key: str, credential_account_id: str | None = None
+    ) -> CredentialHolderLike | None: ...
 
 
 class CredentialHolderLike(Protocol):

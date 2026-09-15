@@ -30,6 +30,8 @@ from cloud_platform.modules.payments.domain import (
     PaymentSession,
     PaymentSessionRepository,
     PaymentSessionStatus,
+    session_credit_amount,
+    session_credit_currency,
 )
 from cloud_platform.modules.wallet.domain import (
     LedgerRepository,
@@ -135,8 +137,8 @@ class PaymentWebhookService:
                     recharge_failed_event(
                         user=await self._load_user(session.user_id),
                         payment_session_id=session.id or external_id,
-                        amount_minor=session.amount_minor,
-                        currency=session.currency,
+                        amount_minor=session_credit_amount(session),
+                        currency=session_credit_currency(session),
                         gateway=gateway_key,
                         state=PaymentSessionStatus.FAILED.value,
                     ),
@@ -171,6 +173,10 @@ class PaymentWebhookService:
         wallet: concurrent duplicates of this callback can never both
         increment the balance, and the append-only ledger keeps exactly one
         entry per deterministic deposit key.
+
+        The credited amount is the FROZEN wallet credit side, never a fresh
+        FX conversion: the settlement side was already verified EXACTLY
+        against the gateway before this point.
         """
         assert session.id is not None
         assert session.gateway_payment_id is not None
@@ -178,7 +184,7 @@ class PaymentWebhookService:
 
         wallet, _applied = await self._wallet.credit_deposit(
             session.user_id,
-            session.amount_minor,
+            session_credit_amount(session),
             deposit_key,
             reference=f"{session.gateway_key}/{session.gateway_payment_id}",
         )
@@ -191,8 +197,8 @@ class PaymentWebhookService:
             recharge_succeeded_event(
                 user=await self._load_user(session.user_id),
                 payment_session_id=session.id,
-                amount_minor=session.amount_minor,
-                currency=session.currency,
+                amount_minor=session_credit_amount(session),
+                currency=session_credit_currency(session),
                 gateway=session.gateway_key,
                 gateway_reference=session.gateway_payment_id,
                 balance_after_minor=(balance_after if isinstance(balance_after, int) else None),

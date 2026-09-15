@@ -712,13 +712,11 @@ class TestCommercialScreens:
         assert ref is not None
 
         confirm = await ui.handle(Callback("servers", "renew", (ref,)), _user())
-        assert TRANSLATOR.t("servers.renew_amount", amount="12.99 EUR") in confirm.text
+        assert TRANSLATOR.t("servers.renew_amount", amount="€12.99") in confirm.text
         exec_cb = _callback_of(confirm, TRANSLATOR.t("servers.renew_confirm_button"))
 
         done = await ui.handle(exec_cb, _user())
-        assert (
-            TRANSLATOR.t("servers.renew_done", amount="12.99 EUR", value="2026-10-01") in done.text
-        )
+        assert TRANSLATOR.t("servers.renew_done", amount="€12.99", value="2026-10-01") in done.text
         assert management.calls.count("renew_now") == 1
 
     async def test_a_double_tap_reports_already_processed(self) -> None:

@@ -60,12 +60,20 @@ class CredentialRotationService:
         self._providers = provider_registry
         self._audit = AuditTrail(audit_repo)
 
-    async def status(self, provider_key: str) -> CredentialStatus:
-        """The current credential fingerprint for one provider (no value)."""
-        holder = self._holders.get_holder(provider_key)
+    async def status(
+        self, provider_key: str, credential_account_id: str | None = None
+    ) -> CredentialStatus:
+        """The current credential fingerprint for one account (no value).
+
+        For a multi-credential provider (LEASEWEB-MULTIACCOUNT) pass the
+        account id to address one account's key; without it the provider's
+        default account is described.
+        """
+        holder = self._holders.get_holder(provider_key, credential_account_id)
         if holder is None:
+            suffix = f"/{credential_account_id}" if credential_account_id else ""
             raise ProviderCredentialNotFoundError(
-                f"no credential holder for provider {provider_key!r}"
+                f"no credential holder for provider {provider_key!r}{suffix}"
             )
         return CredentialStatus(provider_key=provider_key, key_hint=holder.key_hint)
 
@@ -77,23 +85,31 @@ class CredentialRotationService:
         reason: str,
         actor_type: ActorType,
         actor_id: UUID | None,
+        credential_account_id: str | None = None,
     ) -> RotationResult:
-        """Verify-then-swap the live credential of one provider."""
+        """Verify-then-swap the live credential of ONE provider account.
+
+        ``credential_account_id`` targets one account of a multi-credential
+        provider (LEASEWEB-MULTIACCOUNT): the candidate is verified against
+        THAT account's adapter and only THAT account's holder is swapped, so
+        rotating ``lw-eu`` provably cannot affect ``lw-asia``.
+        """
         _require_reason(reason)
         actor_type, actor_id = _actor_context(actor_type, actor_id)
+        account_suffix = f"/{credential_account_id}" if credential_account_id else ""
 
         provider: object
         try:
-            provider = self._providers.get(provider_key)
+            provider = self._providers.get_for(provider_key, credential_account_id)
         except KeyError as exc:
             raise ProviderCredentialNotFoundError(
                 f"provider {provider_key!r} is not configured"
             ) from exc
-        holder = self._holders.get_holder(provider_key)
+        holder = self._holders.get_holder(provider_key, credential_account_id)
         if holder is None:
             raise ProviderCredentialNotFoundError(
-                f"provider {provider_key!r} has no runtime credential holder; "
-                "its credential cannot be rotated without a restart"
+                f"provider {provider_key!r}{account_suffix} has no runtime credential "
+                "holder; its credential cannot be rotated without a restart"
             )
 
         new_credential = credential_from_value(new_credential_value)
@@ -114,20 +130,25 @@ class CredentialRotationService:
             ) from exc
 
         previous = await holder.swap(new_credential)
+        metadata = {
+            "previous_key_hint": previous.key_hint,
+            "new_key_hint": new_credential.key_hint,
+        }
+        if credential_account_id:
+            # Safe, non-secret account handle — records WHICH account rotated.
+            metadata["credential_account_id"] = credential_account_id
         await self._audit.record_mutation(
             actor_type=actor_type,
             actor_id=actor_id,
             action="credential.rotate",
             resource_type=_RESOURCE_TYPE,
-            resource_id=provider_key,
+            resource_id=f"{provider_key}{account_suffix}",
             reason=reason,
-            metadata={
-                "previous_key_hint": previous.key_hint,
-                "new_key_hint": new_credential.key_hint,
-            },
+            metadata=metadata,
         )
         return RotationResult(
             provider_key=provider_key,
             previous_key_hint=previous.key_hint,
             new_key_hint=new_credential.key_hint,
+            credential_account_id=credential_account_id,
         )

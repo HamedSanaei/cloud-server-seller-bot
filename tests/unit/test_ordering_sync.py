@@ -94,6 +94,11 @@ def _fake_repo(return_value: Any = None) -> AsyncMock:
 def _patch_repos(monkeypatch: Any) -> dict[str, AsyncMock]:
     loc_repo = _fake_repo()
     offers_repo = _fake_repo()
+    # LEASEWEB-MULTIACCOUNT: the sync also records which credential account can
+    # serve which location, so the routing repository is faked too.
+    route_repo = _fake_repo()
+    route_repo.upsert_observations = AsyncMock(return_value=0)
+    route_repo.account_ids_for_provider = AsyncMock(return_value=[])
     monkeypatch.setattr(
         "cloud_platform.modules.catalog.repository.SqlAlchemyLocationRepository",
         lambda *a, **k: loc_repo,
@@ -102,7 +107,11 @@ def _patch_repos(monkeypatch: Any) -> dict[str, AsyncMock]:
         "cloud_platform.providers.leaseweb.ordering_sync.SqlAlchemySellableOfferRepository",
         lambda *a, **k: offers_repo,
     )
-    return {"locations": loc_repo, "offers": offers_repo}
+    monkeypatch.setattr(
+        "cloud_platform.providers.leaseweb.ordering_sync.SqlAlchemyProviderRouteRepository",
+        lambda *a, **k: route_repo,
+    )
+    return {"locations": loc_repo, "offers": offers_repo, "routes": route_repo}
 
 
 class TestOrderingCatalogSyncer:

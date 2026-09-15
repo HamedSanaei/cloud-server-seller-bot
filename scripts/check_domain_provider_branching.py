@@ -36,6 +36,11 @@ PROVIDER_KEYS: frozenset[str] = frozenset({"hetzner", "arvancloud"})
 #: ``vps_ports`` belongs to the same category: it is the provider-neutral VPS
 #: capability port (records + protocols only, no adapter import, no provider
 #: name), and application services are *supposed* to depend on it.
+#: ``routing`` is the same kind of port (LEASEWEB-MULTIACCOUNT): it defines an
+#: OPAQUE credential-account id, its lifecycle states and the fail-closed
+#: lookup error - no adapter import, no provider name, no credential value. A
+#: domain module passing a pinned account id to the registry is exactly the
+#: provider-neutral behaviour this gate exists to protect.
 ALLOWED_PROVIDER_PACKAGES: frozenset[str] = frozenset(
     {
         "base",
@@ -47,6 +52,7 @@ ALLOWED_PROVIDER_PACKAGES: frozenset[str] = frozenset(
         "contract",
         "credentials",
         "vps_ports",
+        "routing",
     }
 )
 

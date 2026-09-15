@@ -378,8 +378,8 @@ class TestRenderer:
         assert "extra: value" in text
 
     def test_format_minor_is_integer_only(self) -> None:
-        assert format_minor(1_899, "EUR") == "18.99 EUR"
-        assert format_minor(-500, "EUR") == "-5.00 EUR"
+        assert format_minor(1_899, "EUR") == "€18.99"
+        assert format_minor(-500, "EUR") == "-€5.00"
         assert format_minor(None, "EUR") is None
         assert format_minor("10", "EUR") is None  # never coerce money
 
@@ -412,7 +412,7 @@ class TestEventBuilders:
         )
         assert event.event_key == f"purchase.requested:{SERVER_ID}"
         assert event.payload["market"] == "foreign"
-        assert event.payload["selling_price"] == "18.99 EUR"
+        assert event.payload["selling_price"] == "€18.99"
         assert event.payload["telegram_user_id"] == 42
         assert event.payload["os"] == "Ubuntu 24.04"
 
@@ -430,7 +430,7 @@ class TestEventBuilders:
             currency="EUR",
             operation_key="order-create:x",
         )
-        assert event.payload["provider_cost"] == "12.99 EUR"
+        assert event.payload["provider_cost"] == "€12.99"
         assert "selling_price" not in event.payload
         assert event.payload["provider_order_id"] == "LS-1"
 
@@ -490,9 +490,9 @@ class TestEventBuilders:
             gateway="zarinpal",
             state="failed",
         )
-        assert created.payload["amount"] == "25.00 EUR"
+        assert created.payload["amount"] == "€25.00"
         assert succeeded.payload["gateway_reference"] == "AUTH-1"
-        assert succeeded.payload["balance_after"] == "75.00 EUR"
+        assert succeeded.payload["balance_after"] == "€75.00"
         assert failed.payload["state"] == "failed"
         # Distinct keys: one event per fact.
         assert len({created.event_key, succeeded.event_key, failed.event_key}) == 3
@@ -511,7 +511,7 @@ class TestEventBuilders:
         )
         assert event.event_key == "admin.wallet_adjustment:adj-1"
         assert event.payload["actor"] == "ops"
-        assert event.payload["amount"] == "-5.00 EUR"
+        assert event.payload["amount"] == "-€5.00"
         assert event.payload["reason"] == "chargeback"
 
 

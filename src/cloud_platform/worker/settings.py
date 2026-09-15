@@ -195,7 +195,23 @@ async def process_deletes(ctx: dict[str, object]) -> None:
                     base_url=settings.hetzner_api_base_url,
                 )
             )
-        if settings.leaseweb_api_key:
+        # LEASEWEB-MULTIACCOUNT: every configured credential account registers
+        # as its own ROUTE under the ONE logical ``leaseweb`` key, each with its
+        # own transport, so this worker resolves a server's pinned account
+        # exactly like the API/bot processes do.
+        from cloud_platform.providers.leaseweb.accounts import (
+            build_leaseweb_account_router,
+        )
+
+        leaseweb_router = build_leaseweb_account_router(settings)
+        if leaseweb_router is not None:
+            for account_id, provider in leaseweb_router.new_order_clients():
+                registry.register_route("leaseweb", account_id, provider)
+            for account_id, provider in leaseweb_router.ordered_providers.items():
+                if account_id not in registry.route_ids("leaseweb"):
+                    registry.register_route("leaseweb", account_id, provider)
+            registry.register_account_views("leaseweb", leaseweb_router.views())
+        elif settings.leaseweb_api_key:
             from cloud_platform.providers.leaseweb.client import LeaseWebProvider
 
             registry.register(
@@ -328,16 +344,33 @@ async def sync_leaseweb_offers(ctx: dict[str, object]) -> None:
     async with metrics.job("sync_leaseweb_offers"):
         from cloud_platform.core.config import get_settings
         from cloud_platform.db.session import SessionFactory
+        from cloud_platform.providers.leaseweb.accounts import (
+            build_leaseweb_account_router,
+        )
         from cloud_platform.providers.leaseweb.ordering_sync import (
             LeaseWebOrderingCatalogSyncer,
             ordering_provider_from_settings,
         )
 
         settings = get_settings()
-        if not settings.leaseweb_api_key:
+        router = build_leaseweb_account_router(settings)
+        if router is not None:
+            # Accounts are processed SEQUENTIALLY on purpose: each one already
+            # respects its own throttle, and the discovery cost is
+            # ``accounts x locations x products`` — running them concurrently
+            # here would multiply Leaseweb pressure for no operational gain.
+            syncer = LeaseWebOrderingCatalogSyncer(
+                SessionFactory,
+                accounts=router.ordered_providers,
+                account_priorities=router.priorities,
+                account_states=router.account_states,
+            )
+        elif settings.leaseweb_api_key:
+            syncer = LeaseWebOrderingCatalogSyncer(
+                SessionFactory, ordering_provider_from_settings(settings)
+            )
+        else:
             return
-        provider = ordering_provider_from_settings(settings)
-        syncer = LeaseWebOrderingCatalogSyncer(SessionFactory, provider)
         result = await syncer.sync_all()
         for name, step in result.items():
             logger.info(

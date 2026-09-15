@@ -237,8 +237,8 @@ class TestConfirmScreen:
         offer = catalog.offers[0]
         screen = await ui.confirm_screen(_user(), "hetzner", "fsn1", offer.id, "ubuntu-24.04")
         assert "CX22" in screen.text
-        assert "1.07 EUR" in screen.text  # selling_minor=107, hourly quantum
-        assert "5.00 EUR" in screen.text  # wallet balance 500 minor
+        assert "€1.07" in screen.text  # selling_minor=107, hourly quantum
+        assert "€5.00" in screen.text  # wallet balance 500 minor
         texts = [b.text for row in screen.keyboard.inline_keyboard for b in row]
         assert any("تأیید و پرداخت" in t for t in texts)
         assert any("بازگشت" in t for t in texts)

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -367,6 +368,13 @@ class Server(Base):
     #: monthly products, e.g. Leaseweb ordering VPS — LEASEWEB-MVP). The
     #: accrual and low-balance jobs only ever touch ``hourly`` servers.
     billing_model = Column(String(32), nullable=False, server_default="hourly")
+    #: The provider CREDENTIAL ACCOUNT that owns this server
+    #: (LEASEWEB-MULTIACCOUNT). Snapshotted at checkout, before any billable
+    #: provider call, and never changed afterwards: a VPS lives in exactly one
+    #: credential account, so every later management/reconciliation call must
+    #: be addressed with that account's own credential. NULL on legacy rows
+    #: (routed as the ``default`` account).
+    credential_account_id = Column(String(64), nullable=True)
     #: The operating system the server was ordered with (prepaid monthly
     #: path), e.g. "Ubuntu 24.04".
     os = Column(String, nullable=True)
@@ -471,6 +479,13 @@ class ProviderOrder(Base):
     )
     operation_key = Column(String, unique=True, nullable=False)
     provider_key = Column(String(32), nullable=False)
+    #: The provider credential account this order was PINNED to before the
+    #: chargeable POST (LEASEWEB-MULTIACCOUNT). Authoritative for every later
+    #: read: account-order lookups, recovery scans and provisioning polling
+    #: are credential-scoped, so searching another account could never find
+    #: this order — and must never be used to re-POST it. NULL on legacy rows
+    #: (routed as the ``default`` account).
+    credential_account_id = Column(String(64), nullable=True)
     offer_id = Column(
         PG_UUID, ForeignKey("sellable_offers.id", ondelete="RESTRICT"), nullable=False
     )
@@ -503,6 +518,57 @@ class ProviderOrder(Base):
     settlement_attempted_at = Column(DateTime(timezone=True), nullable=True)
     settlement_attempts = Column(Integer, nullable=False, server_default="0")
     settlement_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+
+
+class ProviderRoute(Base):
+    """Observed routing: which credential account can serve which location.
+
+    Provider-neutral (LEASEWEB-MULTIACCOUNT): one logical provider key may be
+    served by many credential accounts, each with its own location scope.
+    This row is the durable answer to "whose API key can order product X at
+    location Y", so a checkout can PIN an account before the chargeable call
+    and a recovery scan can search the right credential's account orders.
+
+    No credential material is stored here — ``credential_account_id`` is the
+    stable, non-secret handle, and ``last_error_class`` carries an exception
+    CLASS name only (never a provider message, which can echo request
+    context).
+
+    Attributes:
+        provider_key: Logical provider (e.g. "leaseweb")
+        credential_account_id: Stable non-secret account handle (e.g. "lw-eu")
+        location_id: Provider location code (e.g. "FRA-01")
+        state: eligible_available | eligible_empty | ineligible |
+            transient_unknown | auth_failed | disabled
+        account_state: Operator lifecycle (active | draining | disabled)
+        priority: Deterministic selection order (lower wins)
+        product_ids: Product ids this account reports available here
+    """
+
+    __tablename__ = "provider_routes"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_key",
+            "credential_account_id",
+            "location_id",
+            name="uq_provider_routes_account_location",
+        ),
+        Index("ix_provider_routes_provider_location", "provider_key", "location_id"),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_key = Column(String(32), nullable=False)
+    credential_account_id = Column(String(64), nullable=False, server_default="default")
+    location_id = Column(String(32), nullable=False)
+    state = Column(String(32), nullable=False, server_default="transient_unknown")
+    account_state = Column(String(32), nullable=False, server_default="active")
+    priority = Column(Integer, nullable=False, server_default="100")
+    product_ids = Column(JSONB, nullable=False, server_default="[]")
+    last_error_class = Column(String(64), nullable=True)
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    last_success_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
 
@@ -710,13 +776,22 @@ class PaymentSession(Base):
     (migration 0006): a replayed webhook cannot create a second session for
     the same external payment.
 
+    ``amount_minor``/``currency`` are the GATEWAY settlement amount (what the
+    provider invoice charges and what inquiry verifies). Cross-currency
+    recharges additionally snapshot the WALLET credit side
+    (``credit_amount_minor``/``credit_currency``) plus the frozen FX
+    conversion (source/rate/path/observed/proxy): the callback and
+    reconciliation verify the settlement side and credit the frozen credit
+    side — they never fetch a new rate. Legacy rows leave the credit/FX
+    columns NULL, which reads as "credit == settlement".
+
     Attributes:
         id: Primary key
         user_id: Wallet owner the deposit belongs to
         gateway_key: Identifier of the payment gateway
         gateway_payment_id: External id assigned by the gateway (nullable)
-        amount_minor: Positive integer minor units
-        currency: ISO-4217 3-letter uppercase code
+        amount_minor: Gateway settlement amount (positive integer minor units)
+        currency: Gateway settlement currency (ISO-4217 3-letter uppercase)
         status: pending | succeeded | failed
         idempotency_key: Key sent to the gateway on creation
         credited_at: When the matching ledger deposit was posted
@@ -734,6 +809,16 @@ class PaymentSession(Base):
     status = Column(String, nullable=False, server_default="pending")
     idempotency_key = Column(String, nullable=False)
     credited_at = Column(DateTime, nullable=True)
+    # Cross-currency recharge snapshot (migration 0036): wallet credit side
+    # plus the frozen FX conversion. NULL on legacy same-currency rows.
+    credit_amount_minor = Column(BigInteger, nullable=True)
+    credit_currency = Column(String(3), nullable=True)
+    fx_source = Column(String(32), nullable=True)
+    fx_rate = Column(String(64), nullable=True)
+    fx_path = Column(String(256), nullable=True)
+    fx_observed_at = Column(DateTime(timezone=True), nullable=True)
+    fx_proxy = Column(Boolean, nullable=True)
+    fx_proxy_asset = Column(String(16), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
 

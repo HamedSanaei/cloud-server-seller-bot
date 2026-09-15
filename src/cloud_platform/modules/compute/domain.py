@@ -127,6 +127,13 @@ class CloudServer:
     #: The operating system the server was ordered with (prepaid monthly
     #: path only), e.g. "Ubuntu 24.04".
     os: str | None = None
+    #: The provider CREDENTIAL ACCOUNT that owns this server
+    #: (LEASEWEB-MULTIACCOUNT). Snapshot once, at checkout, before any billable
+    #: provider call, and never reassigned: a VPS lives in exactly one provider
+    #: credential account, so every later management call must be addressed
+    #: with THAT account's key even after the location's active route changes.
+    #: ``None`` on legacy rows (routed as the ``default`` account).
+    credential_account_id: str | None = None
 
     @property
     def is_prepaid_monthly(self) -> bool:

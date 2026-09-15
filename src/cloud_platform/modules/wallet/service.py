@@ -261,14 +261,13 @@ class LedgerHistoryPage:
 
 
 def _format_minor(amount_minor: int, currency: str, *, signed: bool = False) -> str:
-    """Integer-formatted money (no float arithmetic, per the money invariant)."""
-    sign = ""
-    if signed and amount_minor < 0:
-        sign = "-"
-    elif signed:
-        sign = "+"
-    major, minor = divmod(abs(amount_minor), 100)
-    return f"{sign}{major}.{minor:02d} {currency}"
+    """Integer-formatted money (single platform formatter, no float)."""
+    from cloud_platform.modules.fx.formatting import format_minor as _fx_format
+    from cloud_platform.modules.fx.formatting import format_minor_signed as _fx_signed
+
+    if signed:
+        return _fx_signed(amount_minor, currency)
+    return _fx_format(amount_minor, currency)
 
 
 def _reference_label(entry: LedgerEntry) -> str:
@@ -306,7 +305,7 @@ class WalletHistoryService:
         wallet = await self._wallets.get(user_id)
         if wallet is None:
             return WalletBalanceView(
-                has_wallet=False, balance_minor=0, currency="EUR", formatted="0.00 EUR"
+                has_wallet=False, balance_minor=0, currency="EUR", formatted=_format_minor(0, "EUR")
             )
         return WalletBalanceView(
             has_wallet=True,

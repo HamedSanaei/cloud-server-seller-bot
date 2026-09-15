@@ -84,6 +84,7 @@ from cloud_platform.modules.servers.models import (
 from cloud_platform.modules.servers.policies import ServerManagementPolicy
 from cloud_platform.providers.errors import ProviderError, ProviderOutcomeUnknown
 from cloud_platform.providers.registry import ProviderRegistry
+from cloud_platform.providers.routing import provider_for
 from cloud_platform.providers.vps_ports import (
     ConsoleSession,
     DataTrafficUsage,
@@ -1177,7 +1178,9 @@ class ServerManagementService:
     async def _context(self, server: CloudServer) -> _ProviderContext | None:
         """The adapter for this server plus its detected VPS capabilities."""
         try:
-            provider = self._registry.get(server.provider_key)
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
         except KeyError:
             return None
         return _ProviderContext(provider=provider, capabilities=vps_capabilities_of(provider))

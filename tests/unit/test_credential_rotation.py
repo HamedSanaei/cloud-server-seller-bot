@@ -261,13 +261,17 @@ class TestArvanCloudCredentialRotation:
 
 class _FakeHolderRegistry:
     def __init__(self) -> None:
-        self._holders: dict[str, CredentialHolder] = {}
+        self._holders: dict[tuple[str, str | None], CredentialHolder] = {}
 
-    def register(self, key: str, holder: CredentialHolder) -> None:
-        self._holders[key] = holder
+    def register(
+        self, key: str, holder: CredentialHolder, credential_account_id: str | None = None
+    ) -> None:
+        self._holders[(key, credential_account_id or None)] = holder
 
-    def get_holder(self, key: str) -> CredentialHolder | None:
-        return self._holders.get(key)
+    def get_holder(
+        self, key: str, credential_account_id: str | None = None
+    ) -> CredentialHolder | None:
+        return self._holders.get((key, credential_account_id or None))
 
 
 class _FakeAuditRepo:

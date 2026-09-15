@@ -84,6 +84,40 @@ order_os_only_free = true
 contract_term = "1_MONTH"
 billing_cycle = "1_MONTH"
 
+# --- Multiple Leaseweb credential accounts (LEASEWEB-MULTIACCOUNT) ----------
+# A Leaseweb API key / Sales Organization only sees a narrow set of locations,
+# so the platform can hold SEVERAL keys while customers still see ONE provider
+# called "Leaseweb". Locations from every account are merged into the single
+# storefront; accounts themselves are never customer-visible.
+#
+# These keys live ONLY in this server-owned file (mounted read-only into the
+# containers). Do not put them in deploy.env, the release compose or any CI
+# variable — the deployment workflow must never carry provider credentials.
+#
+# Each account discovers its own eligible locations from live, read-only
+# provider responses: there is no location mapping to maintain. Adding a key
+# means appending a block and restarting the services.
+#
+#   state = "active"   -> discovery + new orders + manages what it owns
+#           "draining" -> no new orders; existing servers stay manageable
+#           "disabled" -> not used at all (operator intervention required)
+#
+# With no accounts configured, the single `api_key` above keeps working and is
+# treated as account id "default" — which is where servers and orders created
+# before multi-account support are routed.
+#
+# [[providers.leaseweb.accounts]]
+# id = "lw-eu"
+# enabled = true
+# api_key = "CHANGE_ME"
+# priority = 100
+#
+# [[providers.leaseweb.accounts]]
+# id = "lw-asia"
+# enabled = true
+# api_key = "CHANGE_ME"
+# priority = 200
+
 [providers.arvancloud]
 # Iranian market provider. Add another Iranian provider later by adding a
 # section here — the storefront reads the market map, never a provider name.
@@ -117,6 +151,28 @@ api_key = "CHANGE_ME"  # pragma: allowlist secret
 base_url = "https://api.tetraminator.com/v1"
 callback_url = "https://your-domain.example/webhooks/payments/tetraminator"
 timeout_seconds = 30
+
+# Currency / FX resolution (platform-level, provider-neutral). The first live
+# source is AbanTether's PUBLIC ticker (read-only, no secret). Production
+# requires HTTPS for the ticker base URL. Reverse-proxy note: the API needs
+# no inbound FX connectivity (outbound HTTPS to api.abantether.com only);
+# the Tetraminator callback URL above is the one that must be publicly
+# reachable (see docs/payments/TETRAMINATOR.md).
+[fx]
+enabled = true
+provider = "abantether"
+default_display_currency = "IRT"
+quote_ttl_seconds = 60
+max_stale_seconds = 300
+charge_max_stale_seconds = 30
+request_timeout_seconds = 5
+allow_usdt_proxy_for_display = true
+allow_usdt_proxy_for_settlement = false
+
+[fx.abantether]
+base_url = "https://api.abantether.com"
+eur_symbol = "EUR"
+usd_proxy_symbol = "USDT"
 
 [security]
 # 32-byte url-safe base64 keys. Generate with:
