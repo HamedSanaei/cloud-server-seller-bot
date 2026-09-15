@@ -30,6 +30,17 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
     credited_at = _attr(row, "credited_at")
     created = _attr(row, "created_at")
     updated = _attr(row, "updated_at")
+    # Migration 0036 columns are nullable and absent on legacy rows: read
+    # defensively so old sessions stay readable (credit == settlement).
+    # isinstance guards matter: test doubles and partial rows may carry
+    # non-string sentinels (e.g. MagicMock) for columns they do not model.
+    credit_amount = getattr(row, "credit_amount_minor", None)
+    credit_currency = getattr(row, "credit_currency", None)
+    fx_source_raw = getattr(row, "fx_source", None)
+    fx_rate_raw = getattr(row, "fx_rate", None)
+    fx_path_raw = getattr(row, "fx_path", None)
+    fx_proxy_asset_raw = getattr(row, "fx_proxy_asset", None)
+    fx_observed_raw = getattr(row, "fx_observed_at", None)
     session = PaymentSession(
         user_id=_attr(row, "user_id"),
         gateway_key=str(_attr(row, "gateway_key")),
@@ -39,6 +50,16 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
         id=_attr(row, "id"),
         gateway_payment_id=_attr(row, "gateway_payment_id"),
         status=status,
+        credit_amount_minor=int(credit_amount)
+        if isinstance(credit_amount, int) and not isinstance(credit_amount, bool)
+        else None,
+        credit_currency=credit_currency if isinstance(credit_currency, str) else None,
+        fx_source=fx_source_raw if isinstance(fx_source_raw, str) else None,
+        fx_rate=str(fx_rate_raw) if isinstance(fx_rate_raw, (str, int)) else None,
+        fx_path=fx_path_raw if isinstance(fx_path_raw, str) else None,
+        fx_observed_at=fx_observed_raw if isinstance(fx_observed_raw, datetime) else None,
+        fx_proxy=bool(getattr(row, "fx_proxy", False) or False),
+        fx_proxy_asset=fx_proxy_asset_raw if isinstance(fx_proxy_asset_raw, str) else None,
         created_at=created,
         updated_at=updated,
     )
@@ -57,6 +78,14 @@ def _to_row(aggregate: PaymentSession) -> _PaymentModel:
         status=aggregate.status.value,
         idempotency_key=aggregate.idempotency_key,
         credited_at=aggregate.credited_at,
+        credit_amount_minor=aggregate.credit_amount_minor,
+        credit_currency=aggregate.credit_currency,
+        fx_source=aggregate.fx_source,
+        fx_rate=aggregate.fx_rate,
+        fx_path=aggregate.fx_path,
+        fx_observed_at=aggregate.fx_observed_at,
+        fx_proxy=aggregate.fx_proxy,
+        fx_proxy_asset=aggregate.fx_proxy_asset,
     )
 
 
@@ -147,6 +176,19 @@ class SqlAlchemyPaymentSessionRepository:
             cast_any.status = session.status.value
             cast_any.gateway_payment_id = session.gateway_payment_id
             cast_any.credited_at = session.credited_at
+            # Cross-currency snapshot columns (nullable; legacy rows keep NULL).
+            for field_name in (
+                "credit_amount_minor",
+                "credit_currency",
+                "fx_source",
+                "fx_rate",
+                "fx_path",
+                "fx_observed_at",
+                "fx_proxy",
+                "fx_proxy_asset",
+            ):
+                if hasattr(cast_any, field_name):
+                    setattr(cast_any, field_name, getattr(session, field_name))
             await db.commit()
             await db.refresh(row)
             return _to_domain(row)

@@ -2429,7 +2429,7 @@ class TestBusinessLogEmission:
         assert len(deps["ordering"].posts) == 1  # emission changed nothing
         payload = sink.of(BusinessEventType.PROVIDER_ACCEPTED).payload
         # Provider cost, never the customer selling price.
-        assert payload["provider_cost"] == "9.99 EUR"
+        assert payload["provider_cost"] == "€9.99"
         assert "selling_price" not in payload
         assert payload["operation_key"].startswith("order-create:")
 

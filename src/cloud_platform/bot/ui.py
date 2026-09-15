@@ -119,9 +119,10 @@ class BotUi:
 
     @staticmethod
     def _format_minor(minor: int, currency: str) -> str:
-        """Minor units -> \"1.23 EUR\" (no float money)."""
-        major, rem = divmod(minor, 100)
-        return f"{major}.{rem:02d} {currency}"
+        """Minor units -> display text (single platform formatter, no float)."""
+        from cloud_platform.modules.fx.formatting import format_minor as _fx_format
+
+        return _fx_format(minor, currency)
 
     # -- screens -----------------------------------------------------------
 

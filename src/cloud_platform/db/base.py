@@ -710,13 +710,22 @@ class PaymentSession(Base):
     (migration 0006): a replayed webhook cannot create a second session for
     the same external payment.
 
+    ``amount_minor``/``currency`` are the GATEWAY settlement amount (what the
+    provider invoice charges and what inquiry verifies). Cross-currency
+    recharges additionally snapshot the WALLET credit side
+    (``credit_amount_minor``/``credit_currency``) plus the frozen FX
+    conversion (source/rate/path/observed/proxy): the callback and
+    reconciliation verify the settlement side and credit the frozen credit
+    side — they never fetch a new rate. Legacy rows leave the credit/FX
+    columns NULL, which reads as "credit == settlement".
+
     Attributes:
         id: Primary key
         user_id: Wallet owner the deposit belongs to
         gateway_key: Identifier of the payment gateway
         gateway_payment_id: External id assigned by the gateway (nullable)
-        amount_minor: Positive integer minor units
-        currency: ISO-4217 3-letter uppercase code
+        amount_minor: Gateway settlement amount (positive integer minor units)
+        currency: Gateway settlement currency (ISO-4217 3-letter uppercase)
         status: pending | succeeded | failed
         idempotency_key: Key sent to the gateway on creation
         credited_at: When the matching ledger deposit was posted
@@ -734,6 +743,16 @@ class PaymentSession(Base):
     status = Column(String, nullable=False, server_default="pending")
     idempotency_key = Column(String, nullable=False)
     credited_at = Column(DateTime, nullable=True)
+    # Cross-currency recharge snapshot (migration 0036): wallet credit side
+    # plus the frozen FX conversion. NULL on legacy same-currency rows.
+    credit_amount_minor = Column(BigInteger, nullable=True)
+    credit_currency = Column(String(3), nullable=True)
+    fx_source = Column(String(32), nullable=True)
+    fx_rate = Column(String(64), nullable=True)
+    fx_path = Column(String(256), nullable=True)
+    fx_observed_at = Column(DateTime(timezone=True), nullable=True)
+    fx_proxy = Column(Boolean, nullable=True)
+    fx_proxy_asset = Column(String(16), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
 

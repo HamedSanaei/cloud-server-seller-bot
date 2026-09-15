@@ -662,6 +662,7 @@ class Container:
         self,
         gateway: Any | None = None,
         gateways: dict[str, Any] | None = None,
+        fx_resolver: Any | None = None,
     ) -> Any:
         """Creates pending top-up sessions (and logs ``recharge.created``).
 
@@ -674,18 +675,96 @@ class Container:
         bot never opens two sets of HTTP clients (one of which nobody would
         ever close). The gateway collection belongs to the process owner — the
         caller that built it closes it — never to this service.
+
+        ``fx_resolver`` is the same reuse path for currency conversion: the
+        process owner builds ONE resolver (one AbanTether + one cache client)
+        and shares it; when omitted a resolver is built on demand and the
+        service never closes it (the process owner still owns its lifecycle
+        via :meth:`aclose_fx`).
         """
         from cloud_platform.modules.payments.recharge import WalletRechargeService
 
         if gateways is None:
             gateways = self.payment_gateways()
+        if fx_resolver is None:
+            fx_resolver = self.fx_resolver_or_none()
         return WalletRechargeService(
             payments_repo=SqlAlchemyPaymentSessionRepository(self.session_factory),
             gateway=gateway,
             gateways=gateways,
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
+            fx_resolver=fx_resolver,
         )
+
+    def fx_config(self) -> Any:
+        """Operator FX policy from server-owned configuration."""
+        from cloud_platform.modules.fx.service import FxConfig
+
+        settings = get_settings()
+        return FxConfig(
+            enabled=settings.fx_enabled,
+            provider=settings.fx_provider,
+            default_display_currency=settings.fx_default_display_currency,
+            quote_ttl_seconds=settings.fx_quote_ttl_seconds,
+            max_stale_seconds=settings.fx_max_stale_seconds,
+            charge_max_stale_seconds=settings.fx_charge_max_stale_seconds,
+            request_timeout_seconds=int(settings.fx_request_timeout_seconds),
+            allow_usdt_proxy_for_display=settings.fx_allow_usdt_proxy_for_display,
+            allow_usdt_proxy_for_settlement=settings.fx_allow_usdt_proxy_for_settlement,
+        )
+
+    def fx_resolver(self) -> Any:
+        """Build the platform FX resolver (process owner closes it).
+
+        One AbanTether HTTP client + one cache client per resolver; the
+        caller that built it owns closing it (see :meth:`aclose_fx` and the
+        bot/API/worker shutdown paths). Construction lives here — in
+        infrastructure — so domain/application code never branches on FX
+        sources.
+        """
+        from cloud_platform.modules.fx.cache import build_fx_cache
+        from cloud_platform.modules.fx.service import FxResolver
+        from cloud_platform.providers.abantether_fx.client import AbanTetherFxClient
+
+        settings = get_settings()
+        source = AbanTetherFxClient(
+            base_url=settings.fx_abantether_base_url,
+            timeout_seconds=float(settings.fx_request_timeout_seconds),
+            ttl_seconds=settings.fx_quote_ttl_seconds,
+            eur_symbol=settings.fx_abantether_eur_symbol,
+            usd_proxy_symbol=settings.fx_abantether_usd_proxy_symbol,
+        )
+        backend = "redis" if (settings.app_env or "").strip().lower() == "production" else "memory"
+        # Production shares Redis; dev/test use the deterministic memory cache.
+        # The FX cache backend follows the deployment topology the same way
+        # the Telegram session store does (Redis in production only).
+        cache = build_fx_cache(backend=backend, redis_url=settings.redis_url)
+        return FxResolver(source=source, cache=cache, config=self.fx_config())
+
+    def fx_resolver_or_none(self) -> Any | None:
+        """FX resolver for recharge/catalog, or None when FX is disabled."""
+        try:
+            settings = get_settings()
+        except Exception:
+            return None
+        if not settings.fx_enabled:
+            return None
+        try:
+            return self.fx_resolver()
+        except Exception:
+            logger.warning("fx resolver unavailable; continuing without FX", exc_info=True)
+            return None
+
+    @staticmethod
+    async def aclose_fx(resolver: Any | None) -> None:
+        """Best-effort close of the FX resolver (never raises)."""
+        if resolver is None:
+            return
+        try:
+            await resolver.close()
+        except Exception:
+            logger.warning("fx resolver close failed")
 
     def wallet_history_service(self) -> Any:
         """User wallet balance + ledger history."""

@@ -926,7 +926,7 @@ class TestBusinessLogEmission:
         assert event.payload["location"] == "AMS-01"
         assert event.payload["plan"] == "VPS S"
         assert event.payload["os"] == "Ubuntu 24.04"
-        assert event.payload["selling_price"] == "12.99 EUR"
+        assert event.payload["selling_price"] == "€12.99"
         assert event.payload["server_id"] == str(result.server.id)
         assert event.payload["order_id"] == str(result.order.id)
         # No secrets and no provider cost leaking into the sale-price field.

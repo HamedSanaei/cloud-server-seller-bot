@@ -118,6 +118,28 @@ base_url = "https://api.tetraminator.com/v1"
 callback_url = "https://your-domain.example/webhooks/payments/tetraminator"
 timeout_seconds = 30
 
+# Currency / FX resolution (platform-level, provider-neutral). The first live
+# source is AbanTether's PUBLIC ticker (read-only, no secret). Production
+# requires HTTPS for the ticker base URL. Reverse-proxy note: the API needs
+# no inbound FX connectivity (outbound HTTPS to api.abantether.com only);
+# the Tetraminator callback URL above is the one that must be publicly
+# reachable (see docs/payments/TETRAMINATOR.md).
+[fx]
+enabled = true
+provider = "abantether"
+default_display_currency = "IRT"
+quote_ttl_seconds = 60
+max_stale_seconds = 300
+charge_max_stale_seconds = 30
+request_timeout_seconds = 5
+allow_usdt_proxy_for_display = true
+allow_usdt_proxy_for_settlement = false
+
+[fx.abantether]
+base_url = "https://api.abantether.com"
+eur_symbol = "EUR"
+usd_proxy_symbol = "USDT"
+
 [security]
 # 32-byte url-safe base64 keys. Generate with:
 #   python -c "import base64; from cloud_platform.core.secrets import MasterKey; print(base64.urlsafe_b64encode(MasterKey.generate().material).decode())"

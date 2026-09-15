@@ -243,7 +243,7 @@ class FakeWalletHistory:
                 "has_wallet": True,
                 "balance_minor": 10_000,
                 "currency": "EUR",
-                "formatted": "100.00 EUR",
+                "formatted": "€100.00",
             },
         )()
 
@@ -416,7 +416,7 @@ class TestBuyFlow:
         _assert_callback_target(confirm_button.callback_data, "offers", "confirm")
         # confirm
         screen = await ui.handle(confirm_button.callback_data, user=USER_A)
-        assert "12.99 EUR" in screen.text
+        assert "€12.99" in screen.text
         buy_button = screen.keyboard.inline_keyboard[0][0]
         _assert_callback_target(buy_button.callback_data, "offers", "buy")
         # buy -> order created
@@ -524,7 +524,7 @@ class TestWalletAndSupport:
         cb = ui._callback("wallet", "balance")
         screen = await ui.handle(cb, user=USER_A)
         assert "Your wallet" in screen.text
-        assert "100.00 EUR" in screen.text
+        assert "€100.00" in screen.text
 
     async def test_support_screen(self) -> None:
         ui = MonthlyBotUi(

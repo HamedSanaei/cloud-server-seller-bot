@@ -124,6 +124,30 @@ class PlatformMetrics:
             registry=self.registry,
         )
 
+        # -- FX (currency resolution; closed label sets, never amounts) ------
+        self.fx_quote_requests_total = Counter(
+            "cloud_platform_fx_quote_requests_total",
+            "FX quote resolutions by source, pair, purpose and outcome",
+            ("source", "base", "quote", "purpose", "outcome"),
+            registry=self.registry,
+        )
+        self.fx_quote_failures_total = Counter(
+            "cloud_platform_fx_quote_failures_total",
+            "FX live-fetch failures by source and market",
+            ("source", "market"),
+            registry=self.registry,
+        )
+        self.fx_cache_hits_total = Counter(
+            "cloud_platform_fx_cache_hits_total",
+            "FX cache hits (fresh quotes served without a live fetch)",
+            registry=self.registry,
+        )
+        self.fx_stale_quote_uses_total = Counter(
+            "cloud_platform_fx_stale_quote_uses_total",
+            "FX bounded-stale quote uses (degraded, never silent)",
+            registry=self.registry,
+        )
+
         # -- Alert feeds (M11-006) ------------------------------------------
         # Spend: daily provider cost in minor units (gauge, set by the cost
         # circuit breaker as it aggregates the current UTC day).

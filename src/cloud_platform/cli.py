@@ -7,6 +7,7 @@ Run with::
 Commands::
 
     leaseweb doctor              Pre-flight diagnostics (read-only; never
+    fx doctor                    Currency/FX pre-flight (AbanTether, cache)
     leaseweb auth-check          Read-only API key check
     leaseweb coverage            Print the VPS API endpoint coverage matrix
     leaseweb products list       Read-only ordering catalogue
@@ -339,6 +340,118 @@ async def leaseweb_doctor() -> DoctorResult:
         lines.append(
             "\nFix the FAIL items above, then re-run: "
             "uv run python -m cloud_platform.cli leaseweb doctor"
+        )
+    return DoctorResult(ok, lines)
+
+
+async def fx_doctor() -> DoctorResult:
+    """Read-only FX pre-flight: config, AbanTether markets, proxy, cache.
+
+    Never performs a trade, order or payment; only reads the public ticker
+    and the cache backend. Never prints a live price payload in full.
+    """
+    from cloud_platform.modules.fx.cache import build_fx_cache
+
+    settings = get_settings()
+    lines: list[str] = []
+    ok = True
+
+    def report(name: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and passed
+        mark = "OK " if passed else "FAIL"
+        lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+
+    def note(mark: str, name: str, detail: str = "") -> None:
+        lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+
+    if not settings.fx_enabled:
+        note("SKIP", "FX provider", "disabled ([fx] enabled = false)")
+        return DoctorResult(True, lines)
+    provider = (settings.fx_provider or "").strip().lower()
+    if provider != "abantether":
+        report("FX provider", False, f"unknown provider {provider!r}")
+        return DoctorResult(ok, lines)
+    report("FX provider", True, "AbanTether configured (read-only ticker, no key)")
+
+    from cloud_platform.providers.abantether_fx.client import AbanTetherFxClient
+
+    client = AbanTetherFxClient(
+        base_url=settings.fx_abantether_base_url,
+        timeout_seconds=float(settings.fx_request_timeout_seconds),
+        ttl_seconds=settings.fx_quote_ttl_seconds,
+        eur_symbol=settings.fx_abantether_eur_symbol,
+        usd_proxy_symbol=settings.fx_abantether_usd_proxy_symbol,
+    )
+    try:
+        try:
+            eur = await client.get_quote("EUR", "IRT")
+        except Exception as exc:
+            report("EUR/IRT", False, f"{type(exc).__name__}")
+        else:
+            report("EUR/IRT", True, f"active (market {eur.source_market})")
+        if settings.fx_allow_usdt_proxy_for_display or settings.fx_allow_usdt_proxy_for_settlement:
+            try:
+                usdt = await client.get_quote(settings.fx_abantether_usd_proxy_symbol, "IRT")
+            except Exception as exc:
+                report("USD display proxy", False, f"{type(exc).__name__}")
+            else:
+                scope = (
+                    "display+settlement"
+                    if settings.fx_allow_usdt_proxy_for_settlement
+                    else "display only"
+                )
+                report(
+                    "USD display proxy",
+                    True,
+                    f"USDT/IRT active ({scope}; proxy=true)",
+                )
+                _ = usdt
+        else:
+            note("SKIP", "USD display proxy", "disabled by configuration")
+    finally:
+        await client.close()
+
+    # Cache reachability (production shares Redis; dev/test use memory).
+    try:
+        backend = "redis" if (settings.app_env or "").strip().lower() == "production" else "memory"
+        cache = build_fx_cache(backend=backend, redis_url=settings.redis_url)
+        try:
+            from cloud_platform.modules.fx.cache import InMemoryFxCache
+
+            if isinstance(cache, InMemoryFxCache):
+                report("FX cache", True, "memory (dev/test)")
+            else:
+                # Read-only probe: a miss still proves the backend answers.
+                await cache.get("EUR->IRT")
+                report("FX cache", True, f"{backend} reachable")
+        finally:
+            closer = getattr(cache, "close", None)
+            if callable(closer):
+                await closer()
+    except Exception as exc:
+        report("FX cache", False, f"{type(exc).__name__}")
+
+    # Existing wallet currencies (report only; never mutates balances).
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+
+        wallets = await SqlAlchemyWalletRepository(SessionFactory).list_all()
+        counts: dict[str, int] = {}
+        for wallet in wallets:
+            counts[wallet.currency] = counts.get(wallet.currency, 0) + 1
+        if counts:
+            summary = ", ".join(f"{c}: {n}" for c, n in sorted(counts.items()))
+            note("INFO", "Wallet currencies", summary)
+        else:
+            note("INFO", "Wallet currencies", "no wallets yet")
+    except Exception as exc:
+        note("WARN", "Wallet currencies", f"unavailable ({type(exc).__name__})")
+
+    if not ok:
+        lines.append(
+            "\nFix the FAIL items above, then re-run: uv run python -m cloud_platform.cli fx doctor"
         )
     return DoctorResult(ok, lines)
 
@@ -1007,10 +1120,20 @@ def _parser() -> argparse.ArgumentParser:
     rl.add_argument("--attention", action="store_true")
     renewals_sub.add_parser("check")
 
+    fx = sub.add_parser("fx", help="currency / FX resolution (read-only)")
+    fx_sub = fx.add_subparsers(dest="subcommand", required=True)
+    fx_sub.add_parser("doctor", help="read-only FX pre-flight diagnostics")
+
     return parser
 
 
 async def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "fx":
+        if args.subcommand == "doctor":
+            result = await fx_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
+        return 2
     if args.command == "leaseweb":
         if args.subcommand == "doctor":
             result = await leaseweb_doctor()
