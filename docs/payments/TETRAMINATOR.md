@@ -45,7 +45,7 @@ Toman**, enforced server-side in the adapter AND hidden in the Telegram UI
 ```toml
 [payments.tetraminator]
 enabled = false          # opt in explicitly
-api_key = "CHANGE_ME"    # NEVER committed with a real value
+api_key = "CHANGE_ME"    # pragma: allowlist secret — never a real value
 base_url = "https://api.tetraminator.com/v1"
 callback_url = "https://YOUR-PUBLIC-DOMAIN/webhooks/payments/tetraminator"
 timeout_seconds = 30
