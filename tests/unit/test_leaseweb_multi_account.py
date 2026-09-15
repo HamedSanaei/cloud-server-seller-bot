@@ -223,12 +223,12 @@ locations = ["FRA-01"]
 
 [[providers.leaseweb.accounts]]
 id = "lw-eu"
-api_key = "TOML_KEY_A"
+api_key = "TOML_KEY_A"  # pragma: allowlist secret
 priority = 100
 
 [[providers.leaseweb.accounts]]
 id = "lw-asia"
-api_key = "TOML_KEY_B"
+api_key = "TOML_KEY_B"  # pragma: allowlist secret
 priority = 200
 """,
             encoding="utf-8",

@@ -157,7 +157,7 @@ class TestMessage:
         assert "fail closed" in message
 
     def test_message_never_carries_a_credential(self) -> None:
-        secret = "lsw_test_ACCOUNT_A_SUPER_SECRET"
+        secret = "lsw_test_ACCOUNT_A_SUPER_SECRET"  # pragma: allowlist secret
         entry = CredentialAccountDependents(
             provider_key="leaseweb",
             credential_account_id="lw-2",
@@ -185,7 +185,8 @@ class TestBestEffortWrapper:
         """Diagnostics never raise, and never echo a connection string."""
 
         def exploding_factory() -> Any:
-            raise RuntimeError("postgresql://user:sekret@db.internal/cloud")
+            dsn = "postgresql://user:sekret@db.internal/cloud"  # pragma: allowlist secret
+            raise RuntimeError(dsn)
 
         report, error = await missing_credential_account_report(
             exploding_factory,

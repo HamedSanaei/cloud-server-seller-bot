@@ -148,11 +148,13 @@ class TestBotHandlerUsesCatalog:
         dp = Dispatcher()
         register_handlers(dp, MagicMock(), monthly_ui, container)
         await dp.feed_update(MagicMock(), Update(update_id=1, message=message))
-        answer.assert_awaited_once()
-        sent = answer.call_args.args[0]
-        assert get_catalog(Locale.FA).table["greeting.start"] in sent
-        assert get_catalog(Locale.FA).table["menu.title"] in sent
-        assert "starter is running" not in sent  # old scattered literal is gone
+        assert answer.await_count == 2
+        greeting = answer.await_args_list[0].args[0]
+        menu = answer.await_args_list[1].args[0]
+        assert get_catalog(Locale.FA).table["greeting.start"] in greeting
+        assert get_catalog(Locale.FA).table["menu.title"] in menu
+        assert "starter is running" not in greeting
+        assert "starter is running" not in menu
 
 
 class TestCustomCatalog:
