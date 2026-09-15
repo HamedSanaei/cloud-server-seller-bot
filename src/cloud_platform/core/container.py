@@ -439,6 +439,8 @@ class Container:
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
             signing_key=get_settings().callback_signing_key,
             market_catalog=self.market_catalog(),
+            # Display names for the product card's availability list; optional.
+            location_repo=SqlAlchemyLocationRepository(self.session_factory),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:

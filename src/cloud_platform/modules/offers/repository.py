@@ -43,6 +43,7 @@ def _to_domain(row: _SellableOfferModel) -> SellableOffer:
         enabled=bool(_attr(row, "enabled")),
         created_at=_attr(row, "created_at"),
         updated_at=_attr(row, "updated_at"),
+        provider_account_id=_attr(row, "provider_account_id"),
     )
 
 
@@ -135,7 +136,15 @@ class SqlAlchemySellableOfferRepository:
         product_id: str,
         location_id: str,
         update: OfferSpecUpdate,
+        provider_account_id: str | None = None,
     ) -> SellableOffer:
+        """Refresh one provider observation (idempotent per product+location).
+
+        ``provider_account_id`` records WHICH credential account supplied this
+        observation; omitting it leaves the existing provenance untouched so a
+        caller that does not know about credential accounts cannot erase it.
+        """
+        account_id = provider_account_id or update.provider_account_id
         async with self._session_factory() as session:
             row = (
                 (
@@ -165,6 +174,7 @@ class SqlAlchemySellableOfferRepository:
                     billing_parameters=update.billing_parameters,
                     provider_available=update.provider_available,
                     selling_currency=update.provider_cost_currency,
+                    provider_account_id=account_id,
                 )
                 session.add(row)
             else:
@@ -178,6 +188,8 @@ class SqlAlchemySellableOfferRepository:
                 cast_any.provider_cost_currency = update.provider_cost_currency
                 cast_any.billing_parameters = update.billing_parameters
                 cast_any.provider_available = update.provider_available
+                if account_id:
+                    cast_any.provider_account_id = account_id
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)

@@ -56,11 +56,12 @@ def _offer(
     price_minor: int = 1_899,
     offer_id: UUID | None = None,
     enabled: bool = True,
+    product_id: str | None = None,
 ) -> SellableOffer:
     return SellableOffer(
         id=offer_id or uuid4(),
         provider_key=provider_key,
-        product_id=f"{provider_key}-product",
+        product_id=product_id or f"{provider_key}-product",
         location_id=location_id,
         name=name,
         vcpu=2,
@@ -259,6 +260,14 @@ class FakeView:
 
     async def locations_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
         return await self._service.locations_screen(provider_key)
+
+    async def products_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
+        return await self._service.products_screen(provider_key)
+
+    async def product_locations_screen(
+        self, provider_key: str, product_id: str, price_minor: int | None = None
+    ) -> tuple[list[Any], str, str]:
+        return await self._service.product_locations_screen(provider_key, product_id, price_minor)
 
     async def plans_screen(
         self, location_id: str, provider_key: str | None = None
@@ -502,25 +511,141 @@ class TestProviderListing:
             assert provider not in code, f"{provider} leaked into the storefront handlers"
 
 
+class TestAggregatedCatalog:
+    """One product card per product, with its availability listed underneath.
+
+    Leaseweb is served by SEVERAL credential accounts, each with its own
+    location scope, so the same product is sellable in many places. The
+    customer still sees ONE card per product — never one per location — and the
+    locations are the availability options they choose between.
+    """
+
+    @staticmethod
+    def _multi_location_service() -> OfferCatalogViewService:
+        """One product, identical spec/price, available in three locations."""
+        shared = dict(
+            product_id="shared-product",
+            name="Shared VPS",
+            price_minor=1_899,
+        )
+        offers = [
+            _offer(provider_key=FOREIGN_PROVIDER, location_id=code, **shared)
+            for code in ("AAA-01", "BBB-02", "CCC-03")
+        ]
+        return _view_service(offers=offers)
+
+    async def test_a_product_available_in_many_locations_is_one_card(self) -> None:
+        service = self._multi_location_service()
+        products, _, _ = await service.products_screen(FOREIGN_PROVIDER)
+        assert len(products) == 1
+        assert products[0].locations == ("AAA-01", "BBB-02", "CCC-03")
+
+    async def test_the_card_shows_one_price_and_the_location_count(self) -> None:
+        bot = MonthlyBotUi(
+            SIGNING_KEY,
+            offers_view=FakeView(self._multi_location_service()),
+            checkout=FakeCheckout(),
+            servers=FakeServers(),
+            orders=FakeOrders(),
+            renewals=FakeRenewals(),
+            offers_repo=FakeOffersRepo([]),
+            wallet_history=FakeWalletHistory(),
+        )
+        screen = await _press(bot, bot._callback("store", "products", FOREIGN_PROVIDER))
+        cards = [b for b in _buttons(screen) if "Shared VPS" in b.text]
+        assert len(cards) == 1
+        assert "€18.99" in cards[0].text
+        assert "3" in cards[0].text
+
+    async def test_each_location_is_its_own_offer_behind_one_card(self) -> None:
+        service = self._multi_location_service()
+        products, _, _ = await service.products_screen(FOREIGN_PROVIDER)
+        locations, _, _ = await service.product_locations_screen(
+            FOREIGN_PROVIDER, products[0].product_id, products[0].monthly_price_minor
+        )
+        assert [view.location_id for view in locations] == ["AAA-01", "BBB-02", "CCC-03"]
+        # Distinct sellable offers — each with its own fulfillment route.
+        assert len({view.offer_id for view in locations}) == 3
+
+    async def test_products_with_different_specs_or_prices_stay_apart(self) -> None:
+        offers = [
+            _offer(
+                provider_key=FOREIGN_PROVIDER,
+                location_id="AAA-01",
+                name="Small VPS",
+                price_minor=1_899,
+            ),
+            _offer(
+                provider_key=FOREIGN_PROVIDER,
+                location_id="BBB-02",
+                name="Small VPS",
+                price_minor=3_499,
+            ),
+        ]
+        products, _, _ = await _view_service(offers=offers).products_screen(FOREIGN_PROVIDER)
+        assert len(products) == 2
+
+    async def test_the_location_list_of_one_card_excludes_other_prices(self) -> None:
+        offers = [
+            _offer(
+                provider_key=FOREIGN_PROVIDER,
+                location_id="AAA-01",
+                name="Small VPS",
+                price_minor=1_899,
+            ),
+            _offer(
+                provider_key=FOREIGN_PROVIDER,
+                location_id="BBB-02",
+                name="Small VPS",
+                price_minor=3_499,
+            ),
+        ]
+        service = _view_service(offers=offers)
+        products, _, _ = await service.products_screen(FOREIGN_PROVIDER)
+        cheap = next(p for p in products if p.monthly_price_minor == 1_899)
+        locations, _, _ = await service.product_locations_screen(
+            FOREIGN_PROVIDER, cheap.product_id, cheap.monthly_price_minor
+        )
+        assert [view.location_id for view in locations] == ["AAA-01"]
+
+    async def test_a_product_card_leads_to_its_availability_list(self) -> None:
+        bot = MonthlyBotUi(
+            SIGNING_KEY,
+            offers_view=FakeView(self._multi_location_service()),
+            checkout=FakeCheckout(),
+            servers=FakeServers(),
+            orders=FakeOrders(),
+            renewals=FakeRenewals(),
+            offers_repo=FakeOffersRepo([]),
+            wallet_history=FakeWalletHistory(),
+        )
+        products = await _press(bot, bot._callback("store", "products", FOREIGN_PROVIDER))
+        card = next(b for b in _buttons(products) if "Shared VPS" in b.text)
+        availability = await _press(bot, card.callback_data)
+        labels = [b.text for b in _buttons(availability)]
+        assert any("AAA-01" in label for label in labels)
+        assert any("BBB-02" in label for label in labels)
+        assert any("CCC-03" in label for label in labels)
+
+
 class TestFlowAndBackChain:
-    """market -> provider -> location -> plan -> OS -> confirm, and back."""
+    """market -> provider -> product -> location -> OS -> confirm, and back."""
 
     async def test_full_forward_flow_shows_the_exact_monthly_price(self, ui: MonthlyBotUi) -> None:
         # market -> providers(foreign)
         screen = await _press(ui, ui._callback("store", "providers", "foreign"))
         provider_button = next(b for b in _buttons(screen) if "Global Host" in b.text)
-        # provider -> locations
+        # provider -> product cards (aggregated inventory)
         screen = await _press(ui, provider_button.callback_data)
         assert "Global Host" in screen.text
+        card = next(b for b in _buttons(screen) if "EU Small" in b.text)
+        assert "€18.99" in card.text
+        # product card -> its availability (locations)
+        screen = await _press(ui, card.callback_data)
         location_button = next(b for b in _buttons(screen) if "AMS-01" in b.text)
-        assert "1 پلن" in location_button.text
-        # location -> plans
+        assert "€18.99" in location_button.text
+        # location -> OS
         screen = await _press(ui, location_button.callback_data)
-        plan_button = next(b for b in _buttons(screen) if "EU Small" in b.text)
-        assert "€18.99" in plan_button.text
-        assert "4 GB" in plan_button.text
-        # plan -> OS
-        screen = await _press(ui, plan_button.callback_data)
         assert "سیستم‌عامل" in screen.text
         os_button = _buttons(screen)[0]
         # OS -> confirm
@@ -540,11 +665,11 @@ class TestFlowAndBackChain:
         )
         providers = await _press(ui, encode_callback(foreign, SIGNING_KEY))
         provider_button = next(b for b in _buttons(providers) if "Global Host" in b.text)
-        locations = await _press(ui, provider_button.callback_data)
-        location_button = next(b for b in _buttons(locations) if "AMS-01" in b.text)
-        plans = await _press(ui, location_button.callback_data)
-        plan_button = next(b for b in _buttons(plans) if "EU Small" in b.text)
-        os_screen = await _press(ui, plan_button.callback_data)
+        products = await _press(ui, provider_button.callback_data)
+        card = next(b for b in _buttons(products) if "EU Small" in b.text)
+        availability = await _press(ui, card.callback_data)
+        location_button = next(b for b in _buttons(availability) if "AMS-01" in b.text)
+        os_screen = await _press(ui, location_button.callback_data)
         os_button = _buttons(os_screen)[0]
         confirm = await _press(ui, os_button.callback_data)
 
@@ -553,24 +678,26 @@ class TestFlowAndBackChain:
         os_again = await _press(ui, back.callback_data)
         assert "سیستم‌عامل" in os_again.text
 
-        # OS -> back = plans of (provider, location)
-        back = next(b for b in _buttons(os_again) if _decode(b.callback_data).screen == "plans")
-        target = _decode(back.callback_data)
-        assert target.args == ("eu-provider", "AMS-01")
-        plans_again = await _press(ui, back.callback_data)
-        assert any("EU Small" in b.text for b in _buttons(plans_again))
-
-        # plans -> back = locations of the provider
+        # OS -> back = the product's availability list
         back = next(
-            b for b in _buttons(plans_again) if _decode(b.callback_data).screen == "locations"
+            b for b in _buttons(os_again) if _decode(b.callback_data).screen == "product_locations"
+        )
+        target = _decode(back.callback_data)
+        assert target.args[0] == "eu-provider"
+        availability_again = await _press(ui, back.callback_data)
+        assert any("AMS-01" in b.text for b in _buttons(availability_again))
+
+        # availability -> back = the provider's product cards
+        back = next(
+            b for b in _buttons(availability_again) if _decode(b.callback_data).screen == "products"
         )
         assert _decode(back.callback_data).args == ("eu-provider",)
-        locations_again = await _press(ui, back.callback_data)
-        assert any("AMS-01" in b.text for b in _buttons(locations_again))
+        products_again = await _press(ui, back.callback_data)
+        assert any("EU Small" in b.text for b in _buttons(products_again))
 
-        # locations -> back = providers of the market
+        # products -> back = providers of the market
         back = next(
-            b for b in _buttons(locations_again) if _decode(b.callback_data).screen == "providers"
+            b for b in _buttons(products_again) if _decode(b.callback_data).screen == "providers"
         )
         assert _decode(back.callback_data).args == ("foreign",)
         providers_again = await _press(ui, back.callback_data)

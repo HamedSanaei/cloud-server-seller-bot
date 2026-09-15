@@ -152,6 +152,18 @@ def format_minor(minor: int, currency: str) -> str:
     return _fx_format(minor, currency)
 
 
+def _country_flag(country_code: str | None) -> str:
+    """Regional-indicator flag for an ISO 3166-1 alpha-2 code ("" when unset).
+
+    Purely presentational and provider-neutral: the code comes from the synced
+    location row, so any future datacenter gets its flag without a code change.
+    """
+    code = (country_code or "").strip().upper()
+    if len(code) != 2 or not code.isalpha() or not code.isascii():
+        return ""
+    return "".join(chr(0x1F1E6 + (ord(char) - ord("A"))) for char in code) + " "
+
+
 def _short_id(value: UUID) -> str:
     return str(value)[:8]
 
@@ -451,6 +463,116 @@ class MonthlyBotUi:
             ),
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
+
+    # -- store flow: product card -> locations (aggregated inventory) ------─
+
+    async def store_products_screen(self, provider_key: str) -> BotScreen:
+        """store.products:{provider}: one card per product, locations under it.
+
+        The provider is served by MANY credential accounts, each seeing only its
+        own locations, so the same product may be sellable in several
+        datacenters. The customer sees one card per product/spec/price with its
+        availability underneath — never one duplicated card per location.
+        """
+        try:
+            products, back_callback, cancel_callback = await self._view.products_screen(
+                provider_key
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not products:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        rows: list[list[InlineKeyboardButton]] = []
+        for product in products:
+            price = await self._price_label(product.monthly_price_minor, product.currency)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t(
+                            "store.product_row",
+                            name=product.name,
+                            price=price,
+                            count=len(product.locations),
+                        ),
+                        callback_data=product.select_callback,
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=back_callback),
+                InlineKeyboardButton(text=self._t.t("nav.cancel"), callback_data=cancel_callback),
+            ]
+        )
+        return BotScreen(
+            self._t.t(
+                "store.products_title",
+                provider=self._provider_name(provider_key),
+                count=len(products),
+            ),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def store_product_locations_screen(
+        self, provider_key: str, product_id: str, price_minor: int | None = None
+    ) -> BotScreen:
+        """store.product_locations:{provider}:{product}:{price}: availability.
+
+        Every row is its own sellable offer (own price, own fulfillment
+        credential behind it), so choosing a location is a real choice.
+        """
+        try:
+            locations, back_callback, cancel_callback = await self._view.product_locations_screen(
+                provider_key, product_id, price_minor
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not locations:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        rows: list[list[InlineKeyboardButton]] = []
+        for item in locations:
+            price = await self._price_label(item.monthly_price_minor, item.currency)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t(
+                            "store.product_location_row",
+                            location=self._location_label(
+                                item.name, item.location_id, item.country_code
+                            ),
+                            price=price,
+                        ),
+                        callback_data=item.select_callback,
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=back_callback),
+                InlineKeyboardButton(text=self._t.t("nav.cancel"), callback_data=cancel_callback),
+            ]
+        )
+        return BotScreen(
+            self._t.t(
+                "store.product_locations_title",
+                product=locations[0].product_name or product_id,
+                count=len(locations),
+            ),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    @staticmethod
+    def _location_label(name: str, location_id: str, country_code: str | None) -> str:
+        """Customer-facing availability label: ``🇩🇪 Frankfurt FRA-01``.
+
+        Presentation only — a location whose catalog row has not synced yet
+        still shows (as its code) instead of disappearing, and no provider is
+        special-cased: the flag comes from the synced ISO country code.
+        """
+        label = (name or "").strip() or location_id
+        if label == location_id:
+            return f"{_country_flag(country_code)}{location_id}".strip()
+        return f"{_country_flag(country_code)}{label} {location_id}".strip()
 
     def _provider_name(self, provider_key: str) -> str:
         """Customer-facing provider name from configuration (never the key)."""
@@ -1003,6 +1125,11 @@ class MonthlyBotUi:
             return await self.store_locations_screen(cb.args[0])
         if cb.screen == "plans" and len(cb.args) == 2:
             return await self.store_plans_screen(cb.args[0], cb.args[1])
+        if cb.screen == "products" and len(cb.args) == 1:
+            return await self.store_products_screen(cb.args[0])
+        if cb.screen == "product_locations" and len(cb.args) in (2, 3):
+            price = int(cb.args[2]) if len(cb.args) == 3 else None
+            return await self.store_product_locations_screen(cb.args[0], cb.args[1], price)
         if cb.screen == "os" and len(cb.args) == 1:
             return await self.os_screen(UUID(cb.args[0]))
         if cb.screen == "confirm" and len(cb.args) == 2:

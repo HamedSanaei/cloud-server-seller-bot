@@ -69,6 +69,14 @@ class SellableOffer:
     enabled: bool
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: The Leaseweb credential account this offer was DISCOVERED through — a
+    #: stable, non-secret id such as ``fra-account`` (never an API key, never
+    #: customer-visible). One API key only sees its own Sales Organization's
+    #: locations, so an offer is always owned by exactly one credential; the
+    #: full ``(provider_account_id, location, product_id)`` inventory identity
+    #: is durable in ``provider_routes`` (per account+location product list),
+    #: and checkout pins the fulfillment account from there.
+    provider_account_id: str | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -108,6 +116,8 @@ class OfferSpecUpdate:
     provider_cost_currency: str
     billing_parameters: dict[str, object]
     provider_available: bool = True
+    #: Credential account this observation came from (provenance, not a price).
+    provider_account_id: str | None = None
 
 
 class SellableOfferRepository(Protocol):

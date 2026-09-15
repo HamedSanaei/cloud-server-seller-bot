@@ -21,12 +21,19 @@ resource.
    `/etc/cloud-server-seller/configuration.toml`). Append:
 
    ```toml
-   [[providers.leaseweb.accounts]]
-   id = "lw-asia"
+   # The table key IS the account id — nothing repeated, nothing to drift.
+   [providers.leaseweb.accounts.sales-org-asia]
+   api_key = "..."            # never committed, never printed
    enabled = true
-   api_key = "..."   # never committed, never printed
+   label = "Singapore Sales Organization"   # optional, operator-facing only
    priority = 200
    ```
+
+   The equivalent list form (`id` as a field) is also accepted, and an account
+   may be declared at the document root as `[leaseweb.accounts.<id>]`. A keyed
+   table that states an `id` disagreeing with its key is refused at
+   configuration load: the id addresses every server and order that account
+   ever created, so a silent rename would orphan them.
 
 2. Restart / redeploy the application services.
 
@@ -42,8 +49,9 @@ Keys stay out of the deployment workflow on purpose: `docker-compose.yml`,
 
 | Field | Meaning |
 | --- | --- |
-| `id` | Stable, **non-secret** handle (`[A-Za-z0-9._-]`, 1–63 chars). Appears in logs, CLI output, `provider_routes` and order/server rows. It survives key rotation; the credential does not. |
+| `id` | Stable, **non-secret** handle (`[A-Za-z0-9._-]`, 1–63 chars). Appears in logs, CLI output, `provider_routes` and order/server rows. It survives key rotation; the credential does not. In the keyed TOML form it is the table name. |
 | `api_key` | The provider credential. Redacted everywhere (repr, logs, CLI, exceptions). |
+| `label` | Optional human name for operators; `leaseweb accounts doctor` prints it, and it falls back to `id`. Never customer-visible, never a secret, never used for routing. |
 | `enabled` | `false` takes the account out of service completely: no discovery, no orders, no management of what it owns. To stop *new sales* while still managing the servers the account already provisioned, keep `enabled = true` and set `state = "draining"`. |
 | `priority` | Lower wins when several accounts can serve the same location. Selection is deterministic: `(priority, id)`. |
 | `state` | See below. |
@@ -160,15 +168,44 @@ accounts report.
 # safe inventory: id, enabled, state, priority, auth verdict, served locations
 python -m cloud_platform.cli leaseweb accounts list
 
-# per-account authentication, aggregated honestly
+# per-credential authentication AND per-location product counts
 python -m cloud_platform.cli leaseweb accounts doctor
 
-# refresh the price book from EVERY account
+# refresh the price book from EVERY account, reporting what each one served
 python -m cloud_platform.cli leaseweb sync-offers
 
 # full pre-flight (adds per-account auth + the default account's locations)
 python -m cloud_platform.cli leaseweb doctor
 ```
+
+`accounts doctor` prints, per credential, what that key alone can sell where —
+and never a key:
+
+```text
+[OK ] Leaseweb accounts configured — 2 configured
+[OK ] credential North Org authenticated
+[OK ] AAA-01 products: 6
+[OK ] BBB-02 products: 6
+[WARN] detail endpoint unavailable for BBB-02
+[OK ] credential UK Org authenticated
+[OK ] CCC-03 products: 6
+[OK ] Leaseweb aggregate catalog — 2 usable account(s)
+Summary:
+credentials: 2
+locations: 3
+offers: 18
+```
+
+`sync-offers` prints the same evidence per sync step:
+
+```text
+products: fetched=18 upserted=18 skipped=0
+  account north: AAA-01: 6 products, BBB-02: 6 products
+  account uk: CCC-03: 6 products
+  warning/error: detail north/VPS02_1/BBB-02: LeasewebServerError
+```
+
+A `detail` line there is a **warning**: the product stays on sale (see §13).
 
 No command prints an API key, not even partially.
 
@@ -203,8 +240,56 @@ rotation, so no order, server or route needs to change.
 | Store | Purpose |
 | --- | --- |
 | `provider_routes` | durable `(provider, account, location)` eligibility + priority + observed products. Unique per triple, so a sync run is idempotent. |
+| `sellable_offers.provider_account_id` | the credential an offer was **discovered through** (provenance; never a key, never customer-visible). One offer row per `(provider, location, product)` — the thing the operator prices and the customer buys — while the per-account inventory identity lives in `provider_routes`. |
 | `provider_orders.credential_account_id` | the account PINNED before the chargeable POST |
 | `servers.credential_account_id` | the account that owns the VPS |
+
+### Catalog identity
+
+The sellable inventory item is
+
+```
+(provider_account_id, location, product_id)
+```
+
+— **not** `product_id` alone. The same product in two datacenters, or seen by
+two keys, is a different thing to sell:
+
+```
+VPS02_1 + AAA-01   <- one offer
+VPS02_1 + BBB-02   <- another offer
+VPS02_1 + CCC-03   <- another offer
+```
+
+The per-account half of that triple is durable in `provider_routes` (one row per
+account + location, carrying the products that account sells there);
+`provider_routes` also decides which account fulfills a purchase for a given
+location, deterministically by `(priority, id)`. Because several accounts can
+legitimately serve one datacenter, the *customer-visible* offer row stays unique
+per `(provider, location, product)` — one price, one card, no duplicates — and
+records its discovering credential in `provider_account_id`.
+
+## 13. Which endpoint decides the catalog
+
+```
+GET /ordering/v1/products/vps?location={location}          <- SOURCE OF TRUTH
+GET /ordering/v1/products/vps/{productId}?location={...}   <- OPTIONAL ENRICHMENT
+```
+
+The location-scoped **list** endpoint decides which products this credential may
+sell where, and its row is enough on its own (name, spec, price). The
+per-product **detail** endpoint only enriches that row (contract-term price,
+full configuration, OS options) and is known to answer **HTTP 500 for locations
+whose list endpoint works normally** — so a detail failure is recorded as a
+warning and the product stays on sale on the list row's data:
+
+| Detail outcome | Effect on the catalog |
+| --- | --- |
+| 200 | row enriched (contract-term price, spec, available locations) |
+| 403 / 404 / 500 / timeout / malformed | product **kept** from the list row, warning recorded |
+
+`leaseweb accounts doctor` probes one product per discovered location so an
+operator can see this condition before a customer notices anything.
 
 ## 12. Deleting a credential account
 

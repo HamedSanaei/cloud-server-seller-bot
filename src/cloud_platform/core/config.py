@@ -263,19 +263,31 @@ class LeasewebAccountSettings(BaseModel):
     :class:`cloud_platform.modules.provider_accounts.domain.ProviderAccount`,
     which links an end customer to a provider).
 
-    The operator adds accounts in the server-owned ``configuration.toml``::
+    The operator adds accounts in the server-owned ``configuration.toml``. Both
+    shapes are accepted and mean exactly the same thing::
 
+        # Keyed table — the account id IS the table key (no id to keep in sync)
+        [providers.leaseweb.accounts.fra-account]
+        api_key = "..."
+        enabled = true
+        label = "Frankfurt Sales Organization"
+
+        # List table — the id is a field
         [[providers.leaseweb.accounts]]
         id = "lw-eu"
         enabled = true
         api_key = "..."
         priority = 100
 
-    No location mapping is configured on purpose: each credential discovers
-    its own eligible locations from live, read-only provider responses. The
-    ``state`` field separates "may receive new orders" from "may still manage
-    what it already owns", so draining an account never strands the customer
-    servers it provisioned.
+    One credential may legitimately see SEVERAL locations; locations are never
+    configured per account. Each credential discovers its own eligible
+    locations from live, read-only provider responses (see
+    ``providers/leaseweb/ordering_sync.py``). The ``state`` field separates "may
+    receive new orders" from "may still manage what it already owns", so
+    draining an account never strands the customer servers it provisioned.
+
+    ``label`` is optional operator-facing text used by ``leaseweb accounts
+    doctor`` and never reaches a customer; ``label`` falls back to ``id``.
 
     ``api_key`` is never rendered: ``repr``/``str``/``model_dump`` used by logs
     or diagnostics show only the stable account id and a length hint.
@@ -288,6 +300,8 @@ class LeasewebAccountSettings(BaseModel):
     enabled: bool = True
     priority: int = Field(default=100, ge=0, le=1_000_000)
     state: str = "active"
+    #: Optional human label for operators (never customer-visible).
+    label: str = ""
 
     def __repr__(self) -> str:
         return (
@@ -295,6 +309,11 @@ class LeasewebAccountSettings(BaseModel):
             f"priority={self.priority!r}, state={self.state!r}, "
             f"api_key=<redacted len={len(self.api_key)}>)"
         )
+
+    @property
+    def display_name(self) -> str:
+        """Operator-facing name: the label when set, else the stable id."""
+        return (self.label or "").strip() or self.id
 
     __str__ = __repr__
 
@@ -329,6 +348,59 @@ def _dig(data: Mapping[str, Any], path: tuple[str, ...]) -> Any:
     return node
 
 
+def _leaseweb_accounts_toml(data: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """Read the Leaseweb credential accounts from every accepted TOML shape.
+
+    Shapes (all equivalent, see :class:`LeasewebAccountSettings`):
+
+    1. ``[[providers.leaseweb.accounts]]`` — array of tables with an ``id``;
+    2. ``[providers.leaseweb.accounts.<id>]`` — keyed table, the canonical
+       form: the account id is the table key, so nothing has to be repeated;
+    3. ``[leaseweb.accounts.<id>]`` — the same keyed table at the top level.
+
+    Returns ``None`` when no account is configured from TOML (the deprecated
+    single ``api_key`` then owns the provider, as before).
+
+    A keyed entry derives its ``id`` from the table key. Stating an ``id`` that
+    DISAGREES with the key is a configuration error and fails closed: the
+    account id addresses every server and order that account ever created, so a
+    silent rename would orphan them.
+    """
+    entries: list[dict[str, Any]] = []
+    entries.extend(_leaseweb_account_entries(_dig(data, ("providers", "leaseweb", "accounts"))))
+    # Convenience alias for the keyed form at the document root.
+    entries.extend(_leaseweb_account_entries(_dig(data, ("leaseweb", "accounts"))))
+    return entries or None
+
+
+def _leaseweb_account_entries(raw: Any) -> list[dict[str, Any]]:
+    """Normalize one ``accounts`` node (list table or keyed table) to entries."""
+    if isinstance(raw, list | tuple):
+        return [
+            {str(key): value for key, value in dict(entry).items()}
+            for entry in raw
+            if isinstance(entry, Mapping)
+        ]
+    if not isinstance(raw, Mapping):
+        return []
+    entries: list[dict[str, Any]] = []
+    for raw_key, value in raw.items():
+        if not isinstance(value, Mapping):
+            continue
+        key = str(raw_key).strip()
+        entry = {str(field): field_value for field, field_value in dict(value).items()}
+        declared = str(entry.get("id") or "").strip()
+        if declared and declared != key:
+            raise ValueError(
+                f"leaseweb account table {key!r} declares id {declared!r}; the "
+                "table key is the account id — remove the id field or rename "
+                "the table (the id addresses existing servers and orders)"
+            )
+        entry["id"] = key
+        entries.append(entry)
+    return entries
+
+
 def _provider_sections(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     providers = data.get("providers")
     if not isinstance(providers, Mapping):
@@ -352,13 +424,9 @@ def toml_to_settings(data: Mapping[str, Any]) -> dict[str, Any]:
         else:
             values[field] = raw
 
-    accounts = _dig(data, ("providers", "leaseweb", "accounts"))
-    if isinstance(accounts, list | tuple):
-        values["leaseweb_accounts"] = [
-            {str(key): value for key, value in dict(entry).items()}
-            for entry in accounts
-            if isinstance(entry, Mapping)
-        ]
+    accounts = _leaseweb_accounts_toml(data)
+    if accounts is not None:
+        values["leaseweb_accounts"] = accounts
 
     markets: dict[str, str] = {}
     display_names: dict[str, str] = {}
@@ -703,6 +771,7 @@ class Settings(BaseSettings):
                 raise ValueError(f"leaseweb account {account_id!r} is enabled but has no api_key")
             account.id = account_id
             account.state = state
+            account.label = (account.label or "").strip()
             accounts.append(account)
         if accounts and not any(account.enabled for account in accounts):
             raise ValueError(

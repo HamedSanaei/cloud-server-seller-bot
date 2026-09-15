@@ -102,21 +102,39 @@ billing_cycle = "1_MONTH"
 #           "draining" -> no new orders; existing servers stay manageable
 #           "disabled" -> not used at all (operator intervention required)
 #
+# ONE key may see SEVERAL locations, and several keys may each see their own:
+# locations are therefore never configured per account. Every account discovers
+# its own eligible locations from live read-only provider responses, and ALL of
+# them are merged into the single "Leaseweb" storefront (one card per product,
+# with the locations listed as availability options).
+#
 # With no accounts configured, the single `api_key` above keeps working and is
 # treated as account id "default" — which is where servers and orders created
 # before multi-account support are routed.
 #
+# Preferred form — the table key IS the account id, so nothing is repeated and
+# nothing can drift out of sync. `label` is optional operator-facing text shown
+# by `leaseweb accounts doctor` and is never visible to customers.
+#
+# [providers.leaseweb.accounts.sales-org-north]
+# api_key = "CHANGE_ME"
+# enabled = true
+# label = "Frankfurt Sales Organization"
+# priority = 100
+#
+# [providers.leaseweb.accounts.sales-org-uk]
+# api_key = "CHANGE_ME"
+# enabled = true
+# label = "UK Sales Organization"
+# priority = 200
+#
+# Equivalent list form (the id is a field):
+#
 # [[providers.leaseweb.accounts]]
-# id = "lw-eu"
+# id = "sales-org-north"
 # enabled = true
 # api_key = "CHANGE_ME"
 # priority = 100
-#
-# [[providers.leaseweb.accounts]]
-# id = "lw-asia"
-# enabled = true
-# api_key = "CHANGE_ME"
-# priority = 200
 
 [providers.arvancloud]
 # Iranian market provider. Add another Iranian provider later by adding a

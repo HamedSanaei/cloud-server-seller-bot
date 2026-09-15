@@ -309,6 +309,13 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.locations_title": "🌍 انتخاب لوکیشن — {provider}:",
         "store.location_row": "{code} — {count} پلن",
         "store.plans_title": "📋 پلن‌های {location} — {provider}:",
+        # Aggregated catalog: ONE card per product, its availability listed as
+        # locations underneath (a product sold in several datacenters, possibly
+        # through several credential accounts, is still one product).
+        "store.products_title": "🖥 انتخاب سرور — {provider} ({count} محصول):",
+        "store.product_row": "{name} — {price} · {count} لوکیشن",
+        "store.product_locations_title": "📍 {product} — انتخاب لوکیشن ({count}):",
+        "store.product_location_row": "{location} — {price}",
         "store.price_unavailable": "قیمت تبدیل‌شده لحظه‌ای در دسترس نیست؛ قیمت اصلی اعمال می‌شود.",
         "recharge.title": "⬆️ شارژ کیف پول",
         "recharge.amount_row": "{amount}",
@@ -633,6 +640,11 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.locations_title": "🌍 Choose a location — {provider}:",
         "store.location_row": "{code} — {count} plans",
         "store.plans_title": "📋 Plans at {location} — {provider}:",
+        # Aggregated catalog: ONE card per product with its availability listed.
+        "store.products_title": "🖥 Choose a server — {provider} ({count} products):",
+        "store.product_row": "{name} — {price} · {count} locations",
+        "store.product_locations_title": "📍 {product} — choose a location ({count}):",
+        "store.product_location_row": "{location} — {price}",
         "store.price_unavailable": "The live converted price is temporarily unavailable; the native price applies.",  # noqa: E501
         "recharge.title": "⬆️ Wallet top-up",
         "recharge.amount_row": "{amount}",

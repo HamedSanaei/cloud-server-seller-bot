@@ -34,6 +34,7 @@ from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
 from cloud_platform.modules.businesslog.events import purchase_requested_event
+from cloud_platform.modules.catalog.domain import LocationRepository
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_PREPAID_MONTHLY,
     CloudServer,
@@ -528,6 +529,44 @@ class LocationOptionView:
     select_callback: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProductGroupView:
+    """One customer-facing PRODUCT CARD: a product and where it is available.
+
+    A provider can sell the SAME product at several locations (inventory is
+    identified by ``(credential account, location, product)``), but the customer
+    sees one card per product/spec/price combination with its locations listed
+    underneath — never one duplicated card per location.
+    """
+
+    product_id: str
+    name: str
+    vcpu: int
+    ram_gb: int
+    disk_gb: int
+    traffic: str | None
+    monthly_price_minor: int
+    currency: str
+    locations: tuple[str, ...]
+    select_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProductLocationView:
+    """One availability option of a product card: a location with its own
+    sellable offer (its own price, its own credential account behind it)."""
+
+    location_id: str
+    offer_id: UUID
+    name: str
+    country_code: str | None
+    #: Product display name (same for every row of one card).
+    product_name: str
+    monthly_price_minor: int
+    currency: str
+    select_callback: str
+
+
 class OfferCatalogViewService:
     """Builds the customer screens of the monthly purchase flow.
 
@@ -553,9 +592,11 @@ class OfferCatalogViewService:
         wallet_repo: WalletRepository,
         signing_key: str,
         market_catalog: ProviderCatalog | None = None,
+        location_repo: LocationRepository | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
+        self._locations = location_repo
         self._offers = offers_repo
         self._registry = provider_registry
         self._wallets = wallet_repo
@@ -622,7 +663,7 @@ class OfferCatalogViewService:
                     buyable=capable,
                     offer_count=counts[provider_key],
                     select_callback=(
-                        self._store_callback("locations", provider_key) if capable else None
+                        self._store_callback("products", provider_key) if capable else None
                     ),
                 )
             )
@@ -649,6 +690,131 @@ class OfferCatalogViewService:
         back = self._store_callback("providers", market.value if market else "")
         cancel = self._store_callback("market")
         return views, back, cancel
+
+    # -- storefront: product-centric catalog -----------------------------
+
+    @staticmethod
+    def _product_signature(offer: SellableOffer) -> tuple[object, ...]:
+        """What makes two offers the SAME customer-facing product card.
+
+        Product identity PLUS the visible spec and price. Offers that differ in
+        either stay separate cards, because they are genuinely different things
+        to buy; only identical ones are merged into one card with several
+        locations.
+        """
+        return (
+            offer.product_id,
+            offer.name,
+            offer.vcpu,
+            offer.ram_gb,
+            offer.disk_gb,
+            offer.traffic or "",
+            offer.selling_price_minor,
+            offer.selling_currency,
+        )
+
+    async def products_screen(self, provider_key: str) -> tuple[list[ProductGroupView], str, str]:
+        """Aggregated inventory of one provider: one card per product.
+
+        A provider sells from SEVERAL credential accounts, each seeing its own
+        locations, so the same product may be sellable in many places. The
+        customer sees one card per product with its availability listed as
+        locations — never one duplicated card per location, account or key.
+        """
+        offers = [o for o in await self._offers.list_sellable(provider_key) if o.sellable]
+        if not offers:
+            raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
+        groups: dict[tuple[object, ...], list[SellableOffer]] = {}
+        for offer in sorted(offers, key=lambda o: (o.name, o.location_id, str(o.id))):
+            groups.setdefault(self._product_signature(offer), []).append(offer)
+        views: list[ProductGroupView] = []
+        for rows in groups.values():
+            head = rows[0]
+            # Order-preserving dedup: distinct locations, stable order.
+            locations = tuple(dict.fromkeys(row.location_id for row in rows))
+            views.append(
+                ProductGroupView(
+                    product_id=head.product_id,
+                    name=head.name,
+                    vcpu=head.vcpu,
+                    ram_gb=head.ram_gb,
+                    disk_gb=head.disk_gb,
+                    traffic=head.traffic,
+                    monthly_price_minor=head.selling_price_minor,
+                    currency=head.selling_currency,
+                    locations=locations,
+                    # The card is identified by product AND price: two cards
+                    # that differ only by price (different provider cost per
+                    # credential account) must not lead to the same list.
+                    select_callback=self._store_callback(
+                        "product_locations",
+                        provider_key,
+                        head.product_id,
+                        str(head.selling_price_minor),
+                    ),
+                )
+            )
+        market = self._markets.market_of(provider_key)
+        back = self._store_callback("providers", market.value if market else "")
+        return views, back, self._store_callback("market")
+
+    async def product_locations_screen(
+        self, provider_key: str, product_id: str, price_minor: int | None = None
+    ) -> tuple[list[ProductLocationView], str, str]:
+        """Where one product is available, each row its own sellable offer.
+
+        ``price_minor`` narrows to the product card the customer tapped (the
+        same product can, in principle, carry different prices in different
+        locations); omitting it lists every availability of the product.
+        """
+        offers = [
+            o
+            for o in await self._offers.list_sellable(provider_key)
+            if o.sellable
+            and o.product_id == product_id
+            and (price_minor is None or o.selling_price_minor == price_minor)
+        ]
+        if not offers:
+            raise OfferUnavailableError(
+                f"no sellable offers for product {product_id!r} of provider {provider_key!r}"
+            )
+        names = await self._location_metadata(provider_key)
+        views = [
+            ProductLocationView(
+                location_id=offer.location_id,
+                offer_id=offer.id,
+                name=names.get(offer.location_id, (offer.location_id, None))[0],
+                country_code=names.get(offer.location_id, (offer.location_id, None))[1],
+                product_name=offer.name,
+                monthly_price_minor=offer.selling_price_minor,
+                currency=offer.selling_currency,
+                select_callback=self._store_callback("os", str(offer.id)),
+            )
+            for offer in sorted(offers, key=lambda o: o.location_id)
+        ]
+        return (
+            views,
+            self._store_callback("products", provider_key),
+            self._store_callback("market"),
+        )
+
+    async def _location_metadata(self, provider_key: str) -> dict[str, tuple[str, str | None]]:
+        """Synced display names per location; falls back to the code.
+
+        Presentation only: a location the provider started selling at before
+        its catalog row synced still shows (as its code) instead of disappearing.
+        """
+        if self._locations is None:
+            return {}
+        try:
+            records = await self._locations.list_for_provider(provider_key)
+        except Exception:  # pragma: no cover - display metadata is optional
+            logger.warning("location display metadata unavailable for %s", provider_key)
+            return {}
+        return {
+            record.location_id: (record.name or record.location_id, record.country_code)
+            for record in records
+        }
 
     @staticmethod
     def _view(offer: SellableOffer) -> OfferCatalogView:
@@ -749,7 +915,11 @@ class OfferCatalogViewService:
         if not options:
             raise OsUnavailableError(f"no free OS options for {offer.ref}")
 
-        back_callback = self._store_callback("plans", offer.provider_key, offer.location_id)
+        # Back returns to the product's availability list, so the customer
+        # stays in product-first navigation (market -> provider -> product).
+        back_callback = self._store_callback(
+            "product_locations", offer.provider_key, offer.product_id
+        )
         cancel_callback = self._store_callback("market")
         return self._view(offer), options, back_callback, cancel_callback
 

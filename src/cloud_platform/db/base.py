@@ -417,6 +417,15 @@ class SellableOffer(Base):
         billing_parameters: Contract/billing params (JSONB, e.g. contractTerm/billingCycle)
         provider_available: Whether the provider currently reports the product
         enabled: Whether the operator enabled it for sale
+        provider_account_id: Stable, non-secret id of the credential account
+            this offer was discovered through (LEASEWEB-MULTIACCOUNT). One
+            Leaseweb API key only sees its own Sales Organization's locations,
+            so an INVENTORY item is identified by
+            (provider_account_id, location_id, product_id); the per-account
+            product list is durable in ``provider_routes``, while this row is
+            the single operator-priced, customer-visible offer for one
+            (provider, location, product). NULL for providers without
+            credential accounts and for pre-multi-account leaseweb rows.
     """
 
     __tablename__ = "sellable_offers"
@@ -445,6 +454,7 @@ class SellableOffer(Base):
     billing_parameters = Column(JSONB, nullable=False, server_default="{}")
     provider_available = Column(Boolean, nullable=False, server_default="true")
     enabled = Column(Boolean, nullable=False, server_default="false")
+    provider_account_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
 

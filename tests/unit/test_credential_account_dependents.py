@@ -250,6 +250,19 @@ def _patch_cli(monkeypatch: Any, *, with_routes: bool) -> Any:
         cli_module, "_leaseweb_account_router_factory", lambda: lambda _settings: router
     )
     monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    # The doctor also DISCOVERS what each credential can sell where; these tests
+    # are about the dependents of a deleted account, so discovery is stubbed
+    # (no provider call is ever made from the unit suite).
+    from cloud_platform.providers.leaseweb.ordering_sync import AccountCatalogProbe
+
+    monkeypatch.setattr(
+        "cloud_platform.providers.leaseweb.ordering_sync.probe_account_catalog",
+        AsyncMock(
+            side_effect=lambda _provider, account_id, **_kw: AccountCatalogProbe(
+                account_id=account_id, authenticated=True, products_by_location={}
+            )
+        ),
+    )
     if with_routes:
         routes_repo = AsyncMock()
         routes_repo.list_for_provider = AsyncMock(return_value=[])

@@ -544,13 +544,21 @@ async def leaseweb_sync_offers() -> int:
         print("No Leaseweb credential account is configured; cannot sync.")
         return 1
     result = await syncer.sync_all()
+    # Per-credential, per-location evidence: an operator must be able to see
+    # that EACH key really served the locations it was probed for, and that a
+    # failure in one key did not disturb the others.
     for name, step in result.items():
         print(
             f"{name}: fetched={step.total_fetched} upserted={step.total_upserted} "
             f"skipped={step.total_skipped}"
         )
+        for account_id, locations in sorted(step.account_locations.items()):
+            served = ", ".join(
+                f"{location}: {count} products" for location, count in sorted(locations.items())
+            )
+            print(f"  account {account_id}: {served or 'no sellable locations'}")
         for error in step.errors:
-            print(f"  error: {error}")
+            print(f"  warning/error: {error}")
     return 0
 
 
@@ -681,22 +689,80 @@ async def leaseweb_accounts_doctor() -> DoctorResult:
     if scan_error is not None:
         lines.append(f"[WARN] credential-account dependency check unavailable ({scan_error})")
 
+    # Per-credential evidence. Authentication first (read-only, never billable),
+    # then catalog discovery: which locations THIS key can actually sell in and
+    # how many products each of them reports. Locations are discovered from the
+    # provider response, never assumed to be globally available.
+    from cloud_platform.providers.leaseweb.ordering_sync import probe_account_catalog
+
     report = await router.verify_all()
+    enabled = [account for account in router.accounts if account.enabled]
+    probes: list[Any] = []
+    healthy = 0
     for entry in report.accounts:
-        if entry.ok:
-            lines.append(f"[OK ] account {entry.account_id} authentication")
-        else:
-            lines.append(f"[FAIL] account {entry.account_id} authentication ({entry.error_class})")
-    healthy = len(report.healthy)
-    if report.status == "ok":
+        account = router.account(entry.account_id)
+        if not account.enabled:
+            lines.append(
+                f"[WARN] credential {account.display_name} is configured but disabled; "
+                "nothing was probed and it receives no new traffic"
+            )
+            continue
+        if not entry.ok:
+            lines.append(
+                f"[FAIL] credential {account.display_name} authentication "
+                f"({entry.error_class or 'unknown'})"
+            )
+            continue
+        healthy += 1
+        lines.append(f"[OK ] credential {account.display_name} authenticated")
+        if not router.has_provider(entry.account_id):
+            continue
+        probe = await probe_account_catalog(
+            router.client_for(entry.account_id), entry.account_id, seeds=router.locations
+        )
+        probes.append(probe)
+        if not probe.authenticated:
+            lines.append(
+                f"[WARN] credential {account.display_name} catalog discovery "
+                f"failed ({probe.error_class or 'unknown'})"
+            )
+            continue
+        for location_id, count in sorted(probe.products_by_location.items()):
+            lines.append(f"[OK ] {location_id} products: {count}")
+        for location_id in probe.detail_warnings:
+            lines.append(f"[WARN] detail endpoint unavailable for {location_id}")
+
+    if healthy and healthy == len(enabled):
         lines.append(f"[OK ] Leaseweb aggregate catalog — {healthy} usable account(s)")
     elif healthy:
         lines.append(
-            f"[WARN] Leaseweb is DEGRADED — {healthy}/{len(report.accounts)} account(s) usable; "
-            "the storefront keeps serving the locations that still work"
+            f"[WARN] Leaseweb is DEGRADED — {healthy}/{len(enabled)} credential account(s) "
+            "usable; the storefront keeps serving the locations that still work"
         )
     else:
         lines.append("[FAIL] Leaseweb is UNAVAILABLE — no credential account authenticated")
+
+    # Summary: how many credentials, how many DISTINCT locations across them,
+    # and how many offers those locations currently put on sale. Two keys that
+    # both see the same datacenter count it once — the customer sees one place.
+    locations = {loc for probe in probes for loc in probe.products_by_location}
+    credentials = len(enabled)
+    offers = 0
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.offers.repository import (
+            SqlAlchemySellableOfferRepository,
+        )
+
+        rows = await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+        offers = sum(1 for row in rows if row.provider_key == "leaseweb" and row.provider_available)
+    except Exception as exc:  # pragma: no cover - DB may be unreachable
+        lines.append(f"[WARN] stored offer counts unavailable ({type(exc).__name__})")
+    lines.append("Summary:")
+    lines.append(f"credentials: {credentials}")
+    lines.append(f"locations: {len(locations)}")
+    lines.append(f"offers: {offers}")
+
     ok = healthy > 0
     if not ok:
         lines.append(

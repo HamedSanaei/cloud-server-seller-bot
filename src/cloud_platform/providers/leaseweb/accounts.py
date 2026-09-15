@@ -89,6 +89,8 @@ class LeasewebCredentialAccount:
     enabled: bool = True
     priority: int = 100
     state: CredentialAccountState = CredentialAccountState.ACTIVE
+    #: Optional operator label (never customer-visible, never a secret).
+    label: str = ""
 
     def __post_init__(self) -> None:
         account_id = normalize_account_id(self.account_id)
@@ -109,6 +111,11 @@ class LeasewebCredentialAccount:
         )
 
     __str__ = __repr__
+
+    @property
+    def display_name(self) -> str:
+        """Operator-facing name: the configured label, else the stable id."""
+        return (self.label or "").strip() or self.account_id
 
     @property
     def accepts_new_orders(self) -> bool:
@@ -224,6 +231,7 @@ def leaseweb_accounts_from_settings(settings: Any) -> list[LeasewebCredentialAcc
                 enabled=account.enabled,
                 priority=account.priority,
                 state=CredentialAccountState(account.normalized_state),
+                label=getattr(account, "label", "") or "",
             )
         )
     return accounts
@@ -315,6 +323,13 @@ class LeasewebAccountRouter:
     @property
     def account_ids(self) -> tuple[str, ...]:
         return tuple(account.account_id for account in self.accounts)
+
+    @property
+    def locations(self) -> tuple[str, ...]:
+        """Configured discovery SEEDS shared by every account (never an
+        authorization allowlist): each account still proves its own eligibility
+        with a live read-only probe."""
+        return self._locations
 
     @property
     def providers(self) -> Mapping[str, LeaseWebOrderingProvider]:

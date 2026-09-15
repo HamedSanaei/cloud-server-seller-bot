@@ -60,15 +60,20 @@ from cloud_platform.modules.wallet.domain import (
     Wallet,
 )
 from cloud_platform.providers.leaseweb.accounts import (
+    LeasewebAccountHealth,
     LeasewebAccountRouter,
     LeasewebCredentialAccount,
+    LeasewebHealthReport,
     build_leaseweb_account_router,
 )
 from cloud_platform.providers.leaseweb.ordering import (
     LocationEligibility,
     LocationProbe,
 )
-from cloud_platform.providers.leaseweb.ordering_sync import LeaseWebOrderingCatalogSyncer
+from cloud_platform.providers.leaseweb.ordering_sync import (
+    AccountCatalogProbe,
+    LeaseWebOrderingCatalogSyncer,
+)
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.routing import (
     DEFAULT_CREDENTIAL_ACCOUNT,
@@ -187,6 +192,73 @@ class TestAccountConfiguration:
         assert account.accepts_new_orders
         assert account.usable
         assert account.has_credential
+
+    def test_toml_keyed_table_uses_the_table_key_as_the_account_id(self) -> None:
+        """``[providers.leaseweb.accounts.<id>]`` — the id IS the key, so there
+        is nothing to repeat and nothing to drift out of sync."""
+        from cloud_platform.core.config import toml_to_settings
+
+        values = toml_to_settings(
+            {
+                "providers": {
+                    "leaseweb": {
+                        "enabled": True,
+                        "accounts": {
+                            "sales-org-north": {"api_key": KEY_A, "label": "North"},
+                            "sales-org-south": {"api_key": KEY_B, "enabled": False},
+                        },
+                    }
+                }
+            }
+        )
+        assert values["leaseweb_accounts"] == [
+            {"api_key": KEY_A, "label": "North", "id": "sales-org-north"},
+            {"api_key": KEY_B, "enabled": False, "id": "sales-org-south"},
+        ]
+
+    def test_toml_root_alias_accepts_the_same_keyed_table(self) -> None:
+        from cloud_platform.core.config import toml_to_settings
+
+        values = toml_to_settings(
+            {"leaseweb": {"accounts": {"sales-org-north": {"api_key": KEY_A}}}}
+        )
+        assert values["leaseweb_accounts"] == [{"api_key": KEY_A, "id": "sales-org-north"}]
+
+    def test_keyed_accounts_load_into_settings_with_their_labels(self) -> None:
+        from cloud_platform.core.config import toml_to_settings
+
+        values = toml_to_settings(
+            {
+                "leaseweb": {
+                    "accounts": {
+                        "sales-org-north": {"api_key": KEY_A, "label": "North Org"},
+                    }
+                }
+            }
+        )
+        settings = Settings(**values)
+        assert [account.id for account in settings.leaseweb_accounts] == ["sales-org-north"]
+        assert settings.leaseweb_accounts[0].display_name == "North Org"
+        assert settings.leaseweb_new_order_accounts[0].api_key == KEY_A
+
+    def test_an_account_id_that_disagrees_with_its_table_key_is_refused(self) -> None:
+        """The id addresses every row the account ever created: a rename would
+        orphan them, so it fails closed instead of silently winning."""
+        from cloud_platform.core.config import toml_to_settings
+
+        with pytest.raises(ValueError, match="declares id"):
+            toml_to_settings(
+                {"leaseweb": {"accounts": {"sales-org-north": {"id": "other", "api_key": KEY_A}}}}
+            )
+
+    def test_label_defaults_to_the_account_id_and_is_never_a_secret(self) -> None:
+        account = LeasewebCredentialAccount(account_id="sales-org-north", api_key=KEY_A)
+        assert account.display_name == "sales-org-north"
+        assert KEY_A not in repr(account)
+        with_label = LeasewebCredentialAccount(
+            account_id="sales-org-north", api_key=KEY_A, label="  North  "
+        )
+        assert with_label.display_name == "North"
 
     def test_toml_array_of_tables_maps_onto_accounts(self) -> None:
         from cloud_platform.core.config import toml_to_settings
@@ -503,15 +575,18 @@ class _AccountProvider:
         price: int = 999,
         transient: tuple[str, ...] = (),
         auth_failed: bool = False,
+        detail_error: Exception | None = None,
+        seeds: tuple[str, ...] | None = None,
     ) -> None:
         self.account_id = account_id
         self.key = "leaseweb"
-        self.discovery_seeds = (FRA, AMS, SIN)
+        self.discovery_seeds = seeds if seeds is not None else (FRA, AMS, SIN)
         self._serves = set(serves)
         self._products = products
         self._price = price
         self._transient = set(transient)
         self._auth_failed = auth_failed
+        self._detail_error = detail_error
         self._contract_term = "1_MONTH"
         self._billing_cycle = "1_MONTH"
         self.probed: list[str] = []
@@ -556,6 +631,10 @@ class _AccountProvider:
         )
 
     async def get_product(self, location_id: str, product_id: str) -> Any:
+        # Leaseweb's per-product DETAIL endpoint is documented to fail (HTTP
+        # 500) for locations whose LIST endpoint answers normally.
+        if self._detail_error is not None:
+            raise self._detail_error
         return _Detail(_Product(product_id, self._price), (location_id,))
 
     async def verify_credential(self, candidate: str) -> None:
@@ -720,6 +799,159 @@ class TestMultiAccountCatalogSync:
             assert "selling_price_minor" not in names
 
 
+class TestAggregatedInventory:
+    """Every credential's inventory merges into ONE catalog, per location.
+
+    A single API key can serve SEVERAL locations, and several keys may each
+    serve their own; the sellable item is always
+    ``(provider_account_id, location, product_id)``, so the same product in two
+    datacenters is two independent offers — never one collapsed row keyed by
+    product id alone.
+    """
+
+    async def test_one_credential_serving_many_locations_creates_one_offer_each(
+        self, monkeypatch: Any
+    ) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer({"north": _AccountProvider(account_id="north", serves=(FRA, AMS, SIN))})
+        result = await syncer.sync_all()
+        assert result["products"].total_upserted == 3, result["products"].errors
+        assert set(_offered_pairs(repos)) == {
+            ("VPS02_1", FRA),
+            ("VPS02_1", AMS),
+            ("VPS02_1", SIN),
+        }
+        # All three came from ONE credential: the account dimension is recorded
+        # even though the key is the same.
+        assert {
+            call.kwargs["provider_account_id"]
+            for call in repos["offers"].upsert_from_provider.await_args_list
+        } == {"north"}
+
+    async def test_the_same_product_in_several_locations_is_several_offers(
+        self, monkeypatch: Any
+    ) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer({"north": _AccountProvider(account_id="north", serves=(FRA, AMS))})
+        await syncer.sync_all()
+        pairs = _offered_pairs(repos)
+        assert len(pairs) == 2
+        assert len(set(pairs)) == 2
+
+    async def test_two_credentials_with_their_own_locations_merge_into_one_catalog(
+        self, monkeypatch: Any
+    ) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "north": _AccountProvider(account_id="north", serves=(FRA, AMS)),
+                "south": _AccountProvider(account_id="south", serves=(SIN,)),
+            }
+        )
+        await syncer.sync_all()
+        by_account: dict[str, set[str]] = {}
+        for call in repos["offers"].upsert_from_provider.await_args_list:
+            by_account.setdefault(call.kwargs["provider_account_id"], set()).add(
+                call.kwargs["location_id"]
+            )
+        assert by_account == {"north": {FRA, AMS}, "south": {SIN}}
+
+    async def test_a_detail_500_keeps_the_offer_from_the_list_response(
+        self, monkeypatch: Any
+    ) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebServerError
+
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "north": _AccountProvider(
+                    account_id="north",
+                    serves=(FRA,),
+                    detail_error=LeasewebServerError("HTTP 500"),
+                )
+            }
+        )
+        result = await syncer.sync_all()
+        # The LIST endpoint is the authority for membership: the product stays
+        # sellable, on the list row's own spec and price.
+        assert _offered_pairs(repos) == [("VPS02_1", FRA)]
+        assert repos["offers"].upsert_from_provider.await_args.kwargs["update"].name == "VPS S"
+        assert result["products"].total_upserted == 1
+        # Recorded as a warning, not as a failure that empties the storefront.
+        assert any("detail north/VPS02_1/FRA-01" in error for error in result["products"].errors)
+        # The product is never listed for hiding either.
+        assert ("VPS02_1", FRA) in repos["offers"].mark_unavailable.await_args.args[1]
+
+    async def test_a_detail_500_never_marks_an_existing_offer_unavailable(
+        self, monkeypatch: Any
+    ) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebServerError
+
+        # The location is resolved (the account serves it) and the product is
+        # reported, so the pair may not be hidden merely because enrichment
+        # failed.
+        repos = _patch_sync_repos(monkeypatch, list_all=AsyncMock(return_value=[]))
+        syncer = _syncer(
+            {
+                "north": _AccountProvider(
+                    account_id="north",
+                    serves=(FRA,),
+                    detail_error=LeasewebServerError("HTTP 500"),
+                )
+            }
+        )
+        await syncer.sync_all()
+        available = repos["offers"].mark_unavailable.await_args.args[1]
+        assert ("VPS02_1", FRA) in available
+
+    async def test_a_detail_403_keeps_the_offer_too(self, monkeypatch: Any) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebForbiddenError
+
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "north": _AccountProvider(
+                    account_id="north",
+                    serves=(AMS,),
+                    detail_error=LeasewebForbiddenError("forbidden"),
+                )
+            }
+        )
+        await syncer.sync_all()
+        assert _offered_pairs(repos) == [("VPS02_1", AMS)]
+
+    async def test_a_timeout_on_detail_keeps_the_offer_too(self, monkeypatch: Any) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebTimeoutError
+
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "north": _AccountProvider(
+                    account_id="north",
+                    serves=(SIN,),
+                    detail_error=LeasewebTimeoutError("timed out"),
+                )
+            }
+        )
+        await syncer.sync_all()
+        assert _offered_pairs(repos) == [("VPS02_1", SIN)]
+
+    async def test_per_credential_location_counts_are_reported(self, monkeypatch: Any) -> None:
+        _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "north": _AccountProvider(account_id="north", serves=(FRA, AMS)),
+                "south": _AccountProvider(account_id="south", serves=(SIN,)),
+            }
+        )
+        result = await syncer.sync_all()
+        assert result["products"].account_locations == {
+            "north": {FRA: 1, AMS: 1},
+            "south": {SIN: 1},
+        }
+        assert result["products"].location_count == 3
+
+
 class TestPerAccountFailureIsolation:
     async def test_one_account_auth_failure_does_not_kill_the_others(
         self, monkeypatch: Any
@@ -838,6 +1070,192 @@ class TestPerAccountFailureIsolation:
         assert router is not None
         transports = {id(provider._transport) for provider in router.providers.values()}
         assert len(transports) == 2
+
+
+# ---------------------------------------------------------------------------
+# `leaseweb accounts doctor`
+# ---------------------------------------------------------------------------
+
+
+class _DoctorRouter:
+    """Minimal router surface the doctor needs (fake providers, no transport)."""
+
+    def __init__(
+        self, accounts: list[LeasewebCredentialAccount], providers: dict[str, Any]
+    ) -> None:
+        self._accounts = {account.account_id: account for account in accounts}
+        self._providers = dict(providers)
+
+    @property
+    def accounts(self) -> tuple[LeasewebCredentialAccount, ...]:
+        return tuple(sorted(self._accounts.values(), key=lambda a: (a.priority, a.account_id)))
+
+    @property
+    def locations(self) -> tuple[str, ...]:
+        return ()
+
+    def account(self, account_id: str | None) -> LeasewebCredentialAccount:
+        return self._accounts[str(account_id)]
+
+    def has_provider(self, account_id: str | None) -> bool:
+        return str(account_id) in self._providers
+
+    def client_for(self, account_id: str | None) -> Any:
+        return self._providers[str(account_id)]
+
+    async def verify_all(self) -> Any:
+        """Mirrors the real router: a disabled account has no adapter to verify."""
+        return LeasewebHealthReport(
+            tuple(
+                LeasewebAccountHealth(
+                    account_id,
+                    ok=account.enabled,
+                    error_class=None if account.enabled else "NotConfigured",
+                )
+                for account_id, account in sorted(self._accounts.items())
+            )
+        )
+
+
+class _DoctorOfferRow:
+    def __init__(self, provider_key: str = "leaseweb", available: bool = True) -> None:
+        self.provider_key = provider_key
+        self.provider_available = available
+
+
+class TestCredentialDoctor:
+    """``leaseweb accounts doctor`` shows what EACH key can really sell.
+
+    The output must make three things obvious: every credential authenticated,
+    which locations each one serves and with how many products, and where only
+    the optional DETAIL endpoint is unavailable (never a reason to lose an
+    offer). No location is special-cased anywhere.
+    """
+
+    @staticmethod
+    def _patch(monkeypatch: Any, router: _DoctorRouter, rows: list[Any]) -> None:
+        import cloud_platform.cli as cli_module
+
+        settings = Settings(
+            leaseweb_accounts=[
+                {"id": "north", "api_key": KEY_A, "label": "North Org"},
+                {"id": "south", "api_key": KEY_B},
+            ]
+        )
+        monkeypatch.setattr(
+            cli_module, "_leaseweb_account_router_factory", lambda: lambda _s: router
+        )
+        monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+        monkeypatch.setattr(
+            "cloud_platform.modules.provider_routes.dependents.missing_credential_account_report",
+            AsyncMock(return_value=([], None)),
+        )
+
+        class _Offers:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def list_all(self) -> list[Any]:
+                return rows
+
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            _Offers,
+        )
+
+    @staticmethod
+    def _router(detail_error: Exception | None) -> _DoctorRouter:
+        north = _AccountProvider(
+            account_id="north",
+            serves=("AAA-01", "BBB-02"),
+            products=tuple(f"VPS{i:02d}" for i in range(6)),
+            seeds=("AAA-01", "BBB-02"),
+            detail_error=detail_error,
+        )
+        south = _AccountProvider(
+            account_id="south",
+            serves=("CCC-03",),
+            products=tuple(f"VPS{i:02d}" for i in range(6)),
+            seeds=("CCC-03",),
+        )
+        return _DoctorRouter(
+            [
+                LeasewebCredentialAccount(
+                    account_id="north", api_key=KEY_A, priority=100, label="North Org"
+                ),
+                LeasewebCredentialAccount(account_id="south", api_key=KEY_B, priority=200),
+            ],
+            {"north": north, "south": south},
+        )
+
+    async def test_every_credential_reports_its_own_locations_and_counts(
+        self, monkeypatch: Any
+    ) -> None:
+        from cloud_platform.cli import leaseweb_accounts_doctor
+
+        self._patch(monkeypatch, self._router(None), [_DoctorOfferRow() for _ in range(18)])
+        result = await leaseweb_accounts_doctor()
+
+        text = "\n".join(result.lines)
+        assert result.ok
+        assert "[OK ] credential North Org authenticated" in text
+        assert "[OK ] credential south authenticated" in text
+        assert "[OK ] AAA-01 products: 6" in text
+        assert "[OK ] BBB-02 products: 6" in text
+        assert "[OK ] CCC-03 products: 6" in text
+        assert "credentials: 2" in text
+        assert "locations: 3" in text
+        assert "offers: 18" in text
+        assert KEY_A not in text and KEY_B not in text
+
+    async def test_a_detail_endpoint_failure_is_a_warning_not_a_loss(
+        self, monkeypatch: Any
+    ) -> None:
+        from cloud_platform.cli import leaseweb_accounts_doctor
+        from cloud_platform.providers.leaseweb.errors import LeasewebServerError
+
+        self._patch(
+            monkeypatch,
+            self._router(LeasewebServerError("HTTP 500")),
+            [_DoctorOfferRow() for _ in range(12)],
+        )
+        result = await leaseweb_accounts_doctor()
+
+        text = "\n".join(result.lines)
+        # The credential is still healthy and its products still count; only the
+        # optional detail endpoint is reported as unavailable.
+        assert "[OK ] credential North Org authenticated" in text
+        assert "[OK ] AAA-01 products: 6" in text
+        assert "[WARN] detail endpoint unavailable for AAA-01" in text
+        assert "[WARN] detail endpoint unavailable for BBB-02" in text
+        assert "offers: 12" in text
+
+    async def test_a_disabled_credential_is_reported_and_never_probed(
+        self, monkeypatch: Any
+    ) -> None:
+        from cloud_platform.cli import leaseweb_accounts_doctor
+
+        router = self._router(None)
+        router._accounts["south"] = LeasewebCredentialAccount(
+            account_id="south", api_key=KEY_B, enabled=False, priority=200
+        )
+        probes: list[str] = []
+
+        async def _record(_provider: Any, account_id: str, **_kw: Any) -> Any:
+            probes.append(account_id)
+            return AccountCatalogProbe(account_id=account_id, authenticated=True)
+
+        self._patch(monkeypatch, router, [])
+        monkeypatch.setattr(
+            "cloud_platform.providers.leaseweb.ordering_sync.probe_account_catalog", _record
+        )
+
+        result = await leaseweb_accounts_doctor()
+
+        text = "\n".join(result.lines)
+        assert probes == ["north"]
+        assert "configured but disabled" in text
+        assert "credentials: 1" in text
 
 
 # ---------------------------------------------------------------------------

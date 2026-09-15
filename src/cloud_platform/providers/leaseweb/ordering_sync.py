@@ -60,7 +60,6 @@ from cloud_platform.modules.provider_routes.repository import (
 )
 from cloud_platform.providers.leaseweb.errors import (
     LeasewebAuthenticationError,
-    LeasewebNotFoundError,
 )
 from cloud_platform.providers.leaseweb.ordering import (
     KNOWN_VPS_DATACENTERS,
@@ -124,11 +123,159 @@ def ordering_provider_from_settings(settings: Any) -> LeaseWebOrderingProvider:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountCatalogProbe:
+    """Read-only catalog discovery of ONE credential account (doctor output).
+
+    Product counts are keyed by location and come from the location-scoped
+    LIST endpoint, which is the authority for what this credential may sell
+    where. ``detail_warnings`` names the locations whose optional per-product
+    DETAIL endpoint failed — information for the operator, never a reason to
+    drop an offer.
+    """
+
+    account_id: str
+    authenticated: bool
+    products_by_location: dict[str, int] = field(default_factory=dict)
+    detail_warnings: tuple[str, ...] = ()
+    error_class: str | None = None
+
+    @property
+    def location_count(self) -> int:
+        return len(self.products_by_location)
+
+    @property
+    def product_count(self) -> int:
+        return sum(self.products_by_location.values())
+
+
+async def probe_account_catalog(
+    provider: LeaseWebOrderingProvider,
+    account_id: str = DEFAULT_CREDENTIAL_ACCOUNT,
+    *,
+    seeds: tuple[str, ...] = (),
+    persisted: tuple[str, ...] = (),
+) -> AccountCatalogProbe:
+    """Discover what ONE credential can sell where, read-only.
+
+    Shared by ``leaseweb accounts doctor`` and the multi-account sync so both
+    answer the same question the same way: the account is authenticated, then
+    every candidate location is probed with a single LIST read, and only the
+    locations that actually answered contribute offers.
+
+    Locations are DISCOVERED (provider responses first, then configured seeds,
+    built-in datacenter seeds and previously observed routes) — never assumed
+    to be globally available, and never hard-coded per account.
+    """
+    try:
+        unscoped = await provider.list_products_unscoped()
+    except LeasewebAuthenticationError:
+        return AccountCatalogProbe(
+            account_id=account_id,
+            authenticated=False,
+            error_class="AuthenticationError",
+        )
+    except Exception as exc:
+        # A transport failure is not proof of a bad credential; the per-location
+        # probes below still decide what is sellable.
+        logger.info("leaseweb account %s unscoped catalog unavailable: %s", account_id, exc)
+        unscoped = []
+
+    candidates = merge_candidates(
+        tuple(seeds or getattr(provider, "discovery_seeds", ())),
+        KNOWN_VPS_DATACENTERS,
+        tuple(persisted),
+        tuple(product.location for product in unscoped if product.location),
+    )
+    products_by_location: dict[str, int] = {}
+    detail_warnings: list[str] = []
+    probed: set[str] = set()
+    queue = list(candidates)
+    while queue:
+        location = queue.pop(0)
+        if location in probed:
+            continue
+        probed.add(location)
+        try:
+            probe = await provider.probe_location(location)
+        except LeasewebAuthenticationError:
+            return AccountCatalogProbe(
+                account_id=account_id,
+                authenticated=False,
+                products_by_location=products_by_location,
+                detail_warnings=tuple(detail_warnings),
+                error_class="AuthenticationError",
+            )
+        except Exception as exc:
+            logger.warning(
+                "leaseweb account %s probe of %s failed inconclusively: %s",
+                account_id,
+                location,
+                type(exc).__name__,
+            )
+            continue
+        for extra in probe.discovered_locations:
+            if extra not in probed and extra not in queue:
+                queue.append(extra)
+        if probe.eligibility is LocationEligibility.FATAL_AUTHENTICATION:
+            return AccountCatalogProbe(
+                account_id=account_id,
+                authenticated=False,
+                products_by_location=products_by_location,
+                detail_warnings=tuple(detail_warnings),
+                error_class="AuthenticationError",
+            )
+        if probe.eligibility is not LocationEligibility.ELIGIBLE_AVAILABLE:
+            continue
+        products_by_location[location] = len(probe.products)
+        if probe.products and not await _detail_probe(
+            account_id, provider, location, probe.products[0].id
+        ):
+            detail_warnings.append(location)
+    return AccountCatalogProbe(
+        account_id=account_id,
+        authenticated=True,
+        products_by_location=products_by_location,
+        detail_warnings=tuple(detail_warnings),
+    )
+
+
+async def _detail_probe(
+    account_id: str, provider: LeaseWebOrderingProvider, location: str, product_id: str
+) -> bool:
+    """Whether the OPTIONAL detail endpoint works for one product/location.
+
+    Read-only and advisory: it exists so an operator can see that Leaseweb's
+    detail endpoint is unavailable for a location the LIST endpoint serves
+    normally. It never changes the catalog.
+    """
+    try:
+        await provider.get_product(location, product_id)
+    except Exception as exc:
+        logger.warning(
+            "leaseweb detail endpoint unavailable for %s at %s (%s)",
+            product_id,
+            location,
+            type(exc).__name__,
+        )
+        return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
 class SyncResult:
     total_fetched: int
     total_upserted: int
     total_skipped: int
     errors: list[str]
+    #: Per-credential, per-location product counts for this run
+    #: (``{account_id: {location_id: products}}``) — operator evidence that a
+    #: credential really does serve the locations it was probed for.
+    account_locations: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    @property
+    def location_count(self) -> int:
+        """Distinct (credential, location) pairs observed this run."""
+        return sum(len(locations) for locations in self.account_locations.values())
 
 
 @dataclass(slots=True)
@@ -138,15 +285,25 @@ class _AccountDiscovery:
     account_id: str
     probes: dict[str, LocationProbe] = field(default_factory=dict)
     details: dict[tuple[str, str], LeasewebProductDetail] = field(default_factory=dict)
-    #: (product_id, location) pairs whose detail read failed transiently; when
-    #: the offer is already available its last-known state is preserved.
-    transient_details: set[tuple[str, str]] = field(default_factory=set)
+    #: (product_id, location) pairs whose DETAIL read failed. Leaseweb's detail
+    #: endpoint is documented to return HTTP 500 for locations whose LIST
+    #: endpoint works fine, so this is enrichment loss only: the product stays
+    #: in the catalog on the strength of the list response, plus a warning.
+    detail_failures: set[tuple[str, str]] = field(default_factory=set)
     auth_failed: bool = False
     note: str = ""
 
     def probe_state(self, location: str) -> LocationEligibility | None:
         probe = self.probes.get(location)
         return probe.eligibility if probe is not None else None
+
+    def product_counts(self) -> dict[str, int]:
+        """Products this credential serves per eligible location."""
+        return {
+            location: len(probe.products)
+            for location, probe in sorted(self.probes.items())
+            if probe.eligibility is LocationEligibility.ELIGIBLE_AVAILABLE
+        }
 
 
 class LeaseWebOrderingCatalogSyncer:
@@ -403,7 +560,16 @@ class LeaseWebOrderingCatalogSyncer:
             else:
                 if marked:
                     logger.info("leaseweb ordering sync marked %d products unavailable", marked)
-        return SyncResult(fetched, upserted, skipped, errors)
+        return SyncResult(
+            fetched,
+            upserted,
+            skipped,
+            errors,
+            account_locations={
+                account_id: discovery.product_counts()
+                for account_id, discovery in discoveries.items()
+            },
+        )
 
     # ------------------------------------------------------------------
     # Internals
@@ -465,9 +631,17 @@ class LeaseWebOrderingCatalogSyncer:
     ) -> int:
         """Upsert every product a serving account reports at one location.
 
+        The location-scoped LIST response is the authority for catalog
+        MEMBERSHIP: every product it reported is written (or kept) available,
+        even when the optional per-product detail read failed. The detail read
+        only enriches the row — contract-term price and full configuration —
+        and its absence is recorded as a warning, never as a removal.
+
         One logical customer-facing offer per (product, location) even when two
         credentials can supply it: the FIRST serving account in deterministic
-        order supplies the provider cost snapshot and the product detail.
+        order supplies the provider cost snapshot, the product detail AND the
+        ``provider_account_id`` provenance, so the same configuration always
+        produces the same catalog and the same fulfillment route.
 
         Returns the number of offers newly written as AVAILABLE (so the sync
         result reflects real work, not merely locations probed).
@@ -485,32 +659,25 @@ class LeaseWebOrderingCatalogSyncer:
                     continue
                 detail = discovery.details.get(pair)
                 if detail is None:
-                    if pair in discovery.transient_details:
-                        if current_available is not None and pair in current_available:
-                            available.add(pair)
-                        continue
-                    try:
-                        detail = await self._details_of(account_id, discovery, location, product)
-                    except LeasewebNotFoundError:
-                        logger.info(
-                            "leaseweb product %s vanished at %s (%s)",
-                            product.id,
-                            location,
-                            account_id,
-                        )
-                        continue
-                    except Exception as exc:
-                        errors.append(f"detail {product.id}/{location}[{account_id}]: {exc}")
-                        if current_available is not None and pair in current_available:
-                            available.add(pair)
-                        continue
+                    detail = await self._optional_detail(
+                        account_id, discovery, location, product, errors
+                    )
                 available.add(pair)
                 self._report_cost_disagreement(location, product, discoveries, serving_accounts)
-                offer_product = detail.product
-                if detail.available_locations and location not in detail.available_locations:
-                    # Product no longer sold at this location: flag unavailable.
+                # Baseline spec = the LIST row (authoritative for membership and
+                # always present); a successful detail read upgrades the price
+                # to the contract-term total and keeps the full configuration.
+                offer_product = detail.product if detail is not None else product
+                if (
+                    detail is not None
+                    and detail.available_locations
+                    and location not in detail.available_locations
+                ):
+                    # The DETAIL endpoint says the product is no longer sold
+                    # here: real provider evidence, so flag it unavailable.
                     await self._write_offer(
                         offers_repo,
+                        provider_account_id=account_id,
                         product=product,
                         location=location,
                         update=OfferSpecUpdate(
@@ -521,6 +688,7 @@ class LeaseWebOrderingCatalogSyncer:
                             traffic=product.traffic,
                             provider_cost_minor=product.monthly_price_minor,
                             provider_cost_currency=product.currency,
+                            provider_account_id=account_id,
                             billing_parameters={
                                 "contract_term": self._contract_term_of(account_id),
                                 "billing_cycle": self._billing_cycle_of(account_id),
@@ -533,6 +701,7 @@ class LeaseWebOrderingCatalogSyncer:
                     continue
                 if await self._write_offer(
                     offers_repo,
+                    provider_account_id=account_id,
                     product=product,
                     location=location,
                     update=OfferSpecUpdate(
@@ -543,11 +712,17 @@ class LeaseWebOrderingCatalogSyncer:
                         traffic=offer_product.traffic,
                         provider_cost_minor=offer_product.monthly_price_minor,
                         provider_cost_currency=offer_product.currency,
+                        provider_account_id=account_id,
                         billing_parameters={
                             "contract_term": self._contract_term_of(account_id),
                             "billing_cycle": self._billing_cycle_of(account_id),
                             "monthly_price_minor": offer_product.monthly_price_minor,
-                            "available_locations": sorted(detail.available_locations),
+                            "monthly_price_source": (
+                                "contractTerms" if detail is not None else "list"
+                            ),
+                            "available_locations": sorted(
+                                detail.available_locations if detail is not None else ()
+                            ),
                         },
                         provider_available=True,
                     ),
@@ -593,6 +768,7 @@ class LeaseWebOrderingCatalogSyncer:
     async def _write_offer(
         offers_repo: SqlAlchemySellableOfferRepository,
         *,
+        provider_account_id: str,
         product: LeasewebProduct,
         location: str,
         update: OfferSpecUpdate,
@@ -604,6 +780,7 @@ class LeaseWebOrderingCatalogSyncer:
                 provider_key=PROVIDER_KEY,
                 product_id=product.id,
                 location_id=location,
+                provider_account_id=provider_account_id,
                 update=update,
             )
         except Exception as exc:
@@ -725,25 +902,50 @@ class LeaseWebOrderingCatalogSyncer:
                 continue
             for product in probe.products:
                 pair = (product.id, location)
-                try:
-                    discovery.details[pair] = await provider.get_product(location, product.id)
-                except LeasewebNotFoundError:
-                    # Definitive: the product is gone at this location.
-                    logger.info(
-                        "leaseweb account %s product %s vanished at %s",
-                        account_id,
-                        product.id,
-                        location,
-                    )
-                    continue
-                except Exception as exc:
-                    errors.append(f"detail {account_id}/{product.id}/{location}: {exc}")
-                    discovery.transient_details.add(pair)
-                    continue
-                for extra in discovery.details[pair].available_locations:
-                    if extra not in probed and extra not in queue:
-                        queue.append(extra)
+                if await self._optional_detail(account_id, discovery, location, product, errors):
+                    for extra in discovery.details[pair].available_locations:
+                        if extra not in probed and extra not in queue:
+                            queue.append(extra)
         return discovery
+
+    async def _optional_detail(
+        self,
+        account_id: str,
+        discovery: _AccountDiscovery,
+        location: str,
+        product: LeasewebProduct,
+        errors: list[str],
+    ) -> LeasewebProductDetail | None:
+        """Best-effort DETAIL read for one product — never authoritative.
+
+        ``GET /ordering/v1/products/vps?location=`` (the LIST endpoint) decides
+        which products exist at which location for this credential. The
+        per-product detail endpoint is OPTIONAL ENRICHMENT ONLY: Leaseweb
+        returns HTTP 500 for it on locations whose list endpoint answers
+        normally, so a failure here (403/404/500/timeout/anything) must never
+        drop the product, fail the sync or hide the offer. It records a warning
+        and the caller falls back to the list row.
+
+        Returns the detail, or ``None`` when it could not be read.
+        """
+        pair = (product.id, location)
+        if pair in discovery.detail_failures:
+            return None
+        try:
+            detail = await self._accounts[account_id].get_product(location, product.id)
+        except Exception as exc:
+            discovery.detail_failures.add(pair)
+            logger.warning(
+                "leaseweb detail endpoint unavailable for %s at %s (%s); "
+                "keeping the product from the location list response",
+                product.id,
+                location,
+                type(exc).__name__,
+            )
+            errors.append(f"detail {account_id}/{product.id}/{location}: {type(exc).__name__}")
+            return None
+        discovery.details[pair] = detail
+        return detail
 
     async def sync_all(self) -> dict[str, SyncResult]:
         locations = await self.sync_locations()
