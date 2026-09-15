@@ -178,7 +178,7 @@ class TestPlansScreen:
         screen = await ui.plans_screen("hetzner", "fsn1")
         assert "Falkenstein" in screen.text
         buttons = _buttons(screen.keyboard)
-        assert any("CX22" in b.text and "2.19 EUR" in b.text for b in buttons)
+        assert any("CX22" in b.text and "€2.19" in b.text for b in buttons)
         plan = next(b for b in buttons if "buy:plans" in (b.callback_data or ""))
         cb = decode_callback(plan.callback_data or "", KEY)
         assert cb.flow == "buy"

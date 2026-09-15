@@ -309,6 +309,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.locations_title": "🌍 انتخاب لوکیشن — {provider}:",
         "store.location_row": "{code} — {count} پلن",
         "store.plans_title": "📋 پلن‌های {location} — {provider}:",
+        "store.price_unavailable": "قیمت تبدیل‌شده لحظه‌ای در دسترس نیست؛ قیمت اصلی اعمال می‌شود.",
         "recharge.title": "⬆️ شارژ کیف پول",
         "recharge.amount_row": "{amount}",
         "recharge.gateway_title": "روش پرداخت را انتخاب کنید:",
@@ -632,6 +633,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.locations_title": "🌍 Choose a location — {provider}:",
         "store.location_row": "{code} — {count} plans",
         "store.plans_title": "📋 Plans at {location} — {provider}:",
+        "store.price_unavailable": "The live converted price is temporarily unavailable; the native price applies.",  # noqa: E501
         "recharge.title": "⬆️ Wallet top-up",
         "recharge.amount_row": "{amount}",
         "recharge.gateway_title": "Choose a payment method:",

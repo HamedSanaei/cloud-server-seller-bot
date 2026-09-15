@@ -73,6 +73,10 @@ from cloud_platform.modules.navigation.domain import (
 )
 from cloud_platform.modules.offers.domain import SellableOfferRepository
 from cloud_platform.modules.orders.domain import ProviderOrderRepository
+from cloud_platform.modules.payments.domain import (
+    session_credit_amount,
+    session_credit_currency,
+)
 from cloud_platform.modules.payments.recharge import (
     RechargeAmountError,
     RechargeError,
@@ -110,9 +114,15 @@ def recharge_presets(currency: str) -> tuple[int, ...]:
 
 
 def format_minor(minor: int, currency: str) -> str:
-    """Integer-formatted money (no floats)."""
-    major, rem = divmod(int(minor), 100)
-    return f"{major}.{rem:02d} {currency}"
+    """Integer-formatted money (no floats).
+
+    Canonical presentation lives in :mod:`cloud_platform.modules.fx.formatting`
+    (per-currency exponents: IRT/IRR zero-decimal, EUR/USD 2-decimal); this
+    wrapper keeps the existing import path working for callers and tests.
+    """
+    from cloud_platform.modules.fx.formatting import format_minor as _fx_format
+
+    return _fx_format(minor, currency)
 
 
 def _short_id(value: UUID) -> str:
@@ -158,6 +168,8 @@ class MonthlyBotUi:
         server_management: ServerManagementService | None = None,
         sessions: ServerSessions | None = None,
         server_page_size: int = 5,
+        fx_resolver: object | None = None,
+        fx_display_currency: str = "IRT",
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
@@ -173,6 +185,12 @@ class MonthlyBotUi:
         self._support_contact = support_contact
         self._recharge = recharge
         self._t = translator or Translator()
+        # Platform FX resolver for DISPLAY conversions (catalog equivalents,
+        # never a repricing: the DB selling price is authoritative and is
+        # always shown; the converted figure is supplementary). Owned by the
+        # process like the gateway collection; this UI never closes it.
+        self._fx = fx_resolver
+        self._fx_display_currency = (fx_display_currency or "IRT").upper()
         # The My Servers flow lives in its own renderer: this module only keeps
         # the storefront and routes the ``servers`` callbacks to it.
         self._servers_ui = (
@@ -359,22 +377,27 @@ class MonthlyBotUi:
             )
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
-        rows = [
-            [
-                InlineKeyboardButton(
-                    text=self._t.t(
-                        "offers.plan_row",
-                        name=plan.name,
-                        vcpu=plan.vcpu,
-                        ram=plan.ram_gb,
-                        disk=plan.disk_gb,
-                        price=format_minor(plan.monthly_price_minor, plan.currency),
-                    ),
-                    callback_data=self._callback("store", "os", str(plan.offer_id)),
-                )
-            ]
-            for plan in plans
-        ]
+        # The DB selling price is authoritative and never overwritten; the FX
+        # equivalent is supplementary display only (native-only when FX is
+        # briefly down — availability never depends on presentation).
+        rows: list[list[InlineKeyboardButton]] = []
+        for plan in plans:
+            price = await self._price_label(plan.monthly_price_minor, plan.currency)
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t(
+                            "offers.plan_row",
+                            name=plan.name,
+                            vcpu=plan.vcpu,
+                            ram=plan.ram_gb,
+                            disk=plan.disk_gb,
+                            price=price,
+                        ),
+                        callback_data=self._callback("store", "os", str(plan.offer_id)),
+                    )
+                ]
+            )
         rows.append(
             [
                 InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=back_callback),
@@ -398,6 +421,34 @@ class MonthlyBotUi:
             return provider_key
         return listings or provider_key
 
+    async def _display_equivalent(self, amount_minor: int, currency: str) -> str | None:
+        """Supplementary display-currency equivalent (None when unavailable).
+
+        The authoritative native price is always shown by the caller; this
+        only adds the ``≈ X`` equivalent. Same-currency needs no FX call; a
+        briefly-down FX source degrades to native-only (never a fabricated
+        or zero price, never hides the offer).
+        """
+        target = (self._fx_display_currency or "").upper()
+        source = (currency or "").upper()
+        if not target or not source or target == source or self._fx is None:
+            return None
+        try:
+            from cloud_platform.modules.fx.domain import FxPurpose
+
+            resolved = await self._fx.resolve(amount_minor, source, target, FxPurpose.DISPLAY)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        return format_minor(resolved.target_amount_minor, resolved.target_currency)
+
+    async def _price_label(self, amount_minor: int, currency: str) -> str:
+        """Native price plus the FX display equivalent when convertible."""
+        native = format_minor(amount_minor, currency)
+        equivalent = await self._display_equivalent(amount_minor, currency)
+        if equivalent:
+            return f"{native} (≈ {equivalent})"
+        return native
+
     # -- recharge flow -----------------------------------------------------
 
     async def recharge_screen(self, user: User) -> BotScreen:
@@ -407,9 +458,31 @@ class MonthlyBotUi:
         view: WalletBalanceView = await self._wallet.balance(user.id)
         if not view.has_wallet or not view.currency:
             return BotScreen(self._t.t("wallet.no_wallet"), self._menu_only())
-        if self._recharge is None or not self._recharge.supports_currency(view.currency):
+        if self._recharge is None:
+            lines = [self._t.t("recharge.unavailable")]
+            if self._support_contact:
+                lines.append(self._t.t("support.contact", contact=self._support_contact))
+            return BotScreen("\n".join(lines), self._market_back_only())
+        # FX-aware availability: a wallet whose currency needs conversion
+        # (e.g. EUR -> Tetraminator IRT) is offered only when the resolver
+        # can convert it; sync fast path first, async FX probe second.
+        available = self._recharge.supports_currency(view.currency)
+        if not available and hasattr(self._recharge, "supports_currency_async"):
+            try:
+                available = await self._recharge.supports_currency_async(view.currency)
+            except Exception:
+                available = False
+        if not available:
             # No online top-up for this currency: say so and point at support
             # instead of offering a button that cannot work.
+            lines = [self._t.t("recharge.unavailable")]
+            if self._support_contact:
+                lines.append(self._t.t("support.contact", contact=self._support_contact))
+            return BotScreen("\n".join(lines), self._market_back_only())
+        # Filter presets below every gateway's (converted) minimum so the UI
+        # never offers an amount the gateway will reject.
+        presets = await self._available_presets(view.currency)
+        if not presets:
             lines = [self._t.t("recharge.unavailable")]
             if self._support_contact:
                 lines.append(self._t.t("support.contact", contact=self._support_contact))
@@ -424,7 +497,7 @@ class MonthlyBotUi:
                     callback_data=self._callback("recharge", "start", str(amount)),
                 )
             ]
-            for amount in recharge_presets(view.currency)
+            for amount in presets
         ]
         rows.append([self._back_button("wallet", "balance"), self._menu_button()])
         return BotScreen(
@@ -433,6 +506,23 @@ class MonthlyBotUi:
             + f"{self._t.t('wallet.balance_row', balance=view.formatted)}",
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
+
+    async def _available_presets(self, currency: str) -> tuple[int, ...]:
+        """Preset amounts that at least one gateway can settle (converted min)."""
+        if self._recharge is None:
+            return ()
+        out: list[int] = []
+        for amount in recharge_presets(currency):
+            try:
+                if hasattr(self._recharge, "compatible_gateways_async"):
+                    compatible = await self._recharge.compatible_gateways_async(currency, amount)
+                else:
+                    compatible = self._recharge.compatible_gateways(currency, amount)
+            except Exception:
+                continue
+            if compatible:
+                out.append(amount)
+        return tuple(out)
 
     async def recharge_start_screen(
         self, user: User, amount_text: str, gateway_key: str | None = None
@@ -448,7 +538,13 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("recharge.invalid_amount"), self._menu_only())
         view: WalletBalanceView = await self._wallet.balance(user.id)
         currency = view.currency or ""
-        compatible = self._recharge.compatible_gateways(currency, amount_minor)
+        try:
+            if hasattr(self._recharge, "compatible_gateways_async"):
+                compatible = await self._recharge.compatible_gateways_async(currency, amount_minor)
+            else:
+                compatible = self._recharge.compatible_gateways(currency, amount_minor)
+        except Exception:
+            return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
         if not compatible:
             return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
         if gateway_key is None and len(compatible) > 1:
@@ -474,7 +570,10 @@ class MonthlyBotUi:
         lines = [
             self._t.t(
                 "recharge.created",
-                amount=format_minor(start.session.amount_minor, start.session.currency),
+                amount=format_minor(
+                    session_credit_amount(start.session),
+                    session_credit_currency(start.session),
+                ),
             )
         ]
         rows: list[list[InlineKeyboardButton]] = []
@@ -636,7 +735,7 @@ class MonthlyBotUi:
             self._t.t("offers.confirm_location", location=view.offer.location_id),
             self._t.t(
                 "offers.confirm_price",
-                price=format_minor(view.offer.monthly_price_minor, view.currency),
+                price=await self._price_label(view.offer.monthly_price_minor, view.currency),
             ),
             self._t.t("offers.confirm_billing"),
             self._t.t(

@@ -165,6 +165,20 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("commerce", "suspension", "stop_server_after_grace"): (
         "commerce_suspension_stop_server_after_grace"
     ),
+    # --- Currency / FX resolution (platform-level, provider-neutral) --------
+    # The FIRST live source is AbanTether's public ticker (read-only, no key).
+    ("fx", "enabled"): "fx_enabled",
+    ("fx", "provider"): "fx_provider",
+    ("fx", "default_display_currency"): "fx_default_display_currency",
+    ("fx", "quote_ttl_seconds"): "fx_quote_ttl_seconds",
+    ("fx", "max_stale_seconds"): "fx_max_stale_seconds",
+    ("fx", "charge_max_stale_seconds"): "fx_charge_max_stale_seconds",
+    ("fx", "request_timeout_seconds"): "fx_request_timeout_seconds",
+    ("fx", "allow_usdt_proxy_for_display"): "fx_allow_usdt_proxy_for_display",
+    ("fx", "allow_usdt_proxy_for_settlement"): "fx_allow_usdt_proxy_for_settlement",
+    ("fx", "abantether", "base_url"): "fx_abantether_base_url",
+    ("fx", "abantether", "eur_symbol"): "fx_abantether_eur_symbol",
+    ("fx", "abantether", "usd_proxy_symbol"): "fx_abantether_usd_proxy_symbol",
 }
 
 #: TOML keys that are lists in the file but a comma-separated ``Settings``
@@ -433,6 +447,26 @@ class Settings(BaseSettings):
     tetraminator_callback_url: str = ""
     tetraminator_timeout_seconds: float = Field(default=30.0, gt=0)
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
+    # --- Currency / FX resolution (`[fx]` + `[fx.abantether]`) ---------------
+    # Platform-level financial subsystem (provider-neutral). The first live
+    # source is AbanTether's public ticker (read-only, no secret). Amounts
+    # stay integer minor units everywhere; the resolver owns every rate
+    # formula and the only Toman/Euro/cent conversions.
+    fx_enabled: bool = True
+    fx_provider: str = "abantether"
+    fx_default_display_currency: str = "IRT"
+    fx_quote_ttl_seconds: int = Field(default=60, gt=0)
+    fx_max_stale_seconds: int = Field(default=300, gt=0)
+    fx_charge_max_stale_seconds: int = Field(default=30, ge=0)
+    fx_request_timeout_seconds: float = Field(default=5.0, gt=0)
+    # USD has no verified fiat market: display may use the configured USDT
+    # proxy explicitly (metadata proxy=true), settlement via the proxy stays
+    # off unless the operator opts in.
+    fx_allow_usdt_proxy_for_display: bool = True
+    fx_allow_usdt_proxy_for_settlement: bool = False
+    fx_abantether_base_url: str = "https://api.abantether.com"
+    fx_abantether_eur_symbol: str = "EUR"
+    fx_abantether_usd_proxy_symbol: str = "USDT"
     default_currency: str = "EUR"
     # The OPERATOR-declared price book the selling price is derived from
     # (M08-005): confirmation, holds and immutable server price snapshots
@@ -602,6 +636,48 @@ class Settings(BaseSettings):
                 "'production' (the callback is unauthenticated and must be publicly "
                 "reachable; use the API's reverse-proxied domain)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fx_configuration(self) -> Settings:
+        """Validate the platform FX section (read-only source, no secret)."""
+        from urllib.parse import urlsplit
+
+        provider = (self.fx_provider or "").strip().lower()
+        if provider not in ("abantether",):
+            raise ValueError(
+                "fx.provider must be a known rate source ('abantether'); "
+                "adding a source is a code change, not a config edit"
+            )
+        self.fx_provider = provider
+        if self.fx_quote_ttl_seconds <= 0:
+            raise ValueError("fx.quote_ttl_seconds must be greater than 0")
+        if self.fx_max_stale_seconds < self.fx_quote_ttl_seconds:
+            raise ValueError("fx.max_stale_seconds must be >= fx.quote_ttl_seconds")
+        if self.fx_charge_max_stale_seconds < 0:
+            raise ValueError("fx.charge_max_stale_seconds must be >= 0")
+        if self.fx_request_timeout_seconds <= 0:
+            raise ValueError("fx.request_timeout_seconds must be greater than 0")
+        base = urlsplit((self.fx_abantether_base_url or "").strip())
+        if base.scheme not in ("http", "https") or not base.netloc:
+            raise ValueError("fx.abantether.base_url must be an absolute http(s) URL")
+        if (self.app_env or "").strip().lower() == "production" and base.scheme != "https":
+            raise ValueError(
+                "fx.abantether.base_url must use https:// when app_env is 'production'"
+            )
+        if not (self.fx_abantether_eur_symbol or "").strip():
+            raise ValueError("fx.abantether.eur_symbol must not be empty")
+        proxy_enabled = (
+            self.fx_allow_usdt_proxy_for_display or self.fx_allow_usdt_proxy_for_settlement
+        )
+        if proxy_enabled and not (self.fx_abantether_usd_proxy_symbol or "").strip():
+            raise ValueError(
+                "fx.abantether.usd_proxy_symbol must not be empty when the USD proxy is enabled"
+            )
+        display = (self.fx_default_display_currency or "").strip().upper()
+        if display not in ("IRT", "EUR", "USD", "IRR"):
+            raise ValueError("fx.default_display_currency must be one of IRT, EUR, USD, IRR")
+        self.fx_default_display_currency = display
         return self
 
     @classmethod

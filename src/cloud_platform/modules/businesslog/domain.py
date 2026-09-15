@@ -352,17 +352,20 @@ def compact(**fields: Any) -> dict[str, Any]:
 
 
 def format_minor(minor: int | None, currency: str | None) -> str | None:
-    """Integer money rendering (never float).
+    """Integer money rendering (single platform formatter, never float).
 
     Returns None for anything that is not an integer: money only ever enters
     a business event as integer minor units, and an oddly-typed value must
     degrade to "field omitted" rather than break the renderer.
     """
-    if not isinstance(minor, int):
+    if not isinstance(minor, int) or isinstance(minor, bool):
         return None
-    # divmod already carries the sign for negatives (-450 -> (-5, 50)).
-    major, rem = divmod(minor, 100)
-    return f"{major}.{rem:02d} {currency or ''}".strip()
+    try:
+        from cloud_platform.modules.fx.formatting import format_minor as _fx_format
+
+        return _fx_format(minor, currency or "")
+    except Exception:
+        return None
 
 
 def render_event(event_type: BusinessEventType, payload: Mapping[str, Any]) -> str:

@@ -115,6 +115,33 @@ base_url = "https://api.zarinpal.com/pg/v4/payment"
 sandbox = false
 callback_url = "https://example.com/api/v1/payments/zarinpal/callback"
 
+# ---------------------------------------------------------------------------
+# Currency / FX resolution (platform-level, provider-neutral)
+#
+# The first live source is AbanTether's PUBLIC ticker (read-only, no secret).
+# The resolver converts already-defined money for display/charging/settlement
+# bridging — it never reprices the operator-owned selling price and never
+# auto-converts wallet balances. USD display uses the USDT market EXPLICITLY
+# as a proxy (metadata proxy=true); settlement via the proxy stays off unless
+# the operator opts in. See docs/fx/CURRENCY_FX.md.
+# ---------------------------------------------------------------------------
+
+[fx]
+enabled = true
+provider = "abantether"
+default_display_currency = "IRT"
+quote_ttl_seconds = 60
+max_stale_seconds = 300
+charge_max_stale_seconds = 30
+request_timeout_seconds = 5
+allow_usdt_proxy_for_display = true
+allow_usdt_proxy_for_settlement = false
+
+[fx.abantether]
+base_url = "https://api.abantether.com"
+eur_symbol = "EUR"
+usd_proxy_symbol = "USDT"
+
 [security]
 provider_credential_encryption_key = "CHANGE_ME"
 backup_encryption_key = "CHANGE_ME"

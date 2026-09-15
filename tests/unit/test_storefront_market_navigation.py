@@ -328,7 +328,7 @@ class FakeWalletHistory:
                 "has_wallet": True,
                 "balance_minor": 50_000,
                 "currency": "EUR",
-                "formatted": "500.00 EUR",
+                "formatted": "€500.00",
             },
         )()
 
@@ -517,7 +517,7 @@ class TestFlowAndBackChain:
         # location -> plans
         screen = await _press(ui, location_button.callback_data)
         plan_button = next(b for b in _buttons(screen) if "EU Small" in b.text)
-        assert "18.99 EUR" in plan_button.text
+        assert "€18.99" in plan_button.text
         assert "4 GB" in plan_button.text
         # plan -> OS
         screen = await _press(ui, plan_button.callback_data)
@@ -526,8 +526,8 @@ class TestFlowAndBackChain:
         # OS -> confirm
         screen = await _press(ui, os_button.callback_data)
         assert "تأیید نهایی خرید" in screen.text
-        assert "18.99 EUR" in screen.text
-        assert "موجودی کیف پول: 500.00 EUR" in screen.text
+        assert "€18.99" in screen.text
+        assert "موجودی کیف پول: €500.00" in screen.text
 
     async def test_back_walks_the_flow_in_reverse_to_the_menu(self, ui: MonthlyBotUi) -> None:
         market = ui._callback("store", "market")
@@ -689,5 +689,5 @@ class TestMarketCatalogFromSettings:
         assert {v.billing_model for v in views} == {BILLING_MODEL_PREPAID_MONTHLY}
 
     def test_price_formatting_is_integer_based(self) -> None:
-        assert format_minor(1_899, "EUR") == "18.99 EUR"
-        assert format_minor(0, "EUR") == "0.00 EUR"
+        assert format_minor(1_899, "EUR") == "€18.99"
+        assert format_minor(0, "EUR") == "€0.00"

@@ -189,6 +189,7 @@ async def main() -> None:
         create=container.create_server_service(),
     )
     gateways = container.payment_gateways()  # one HTTP client each per bot process
+    fx_resolver = container.fx_resolver_or_none()  # one FX source+cache per bot process
     monthly_ui = MonthlyBotUi(
         settings.callback_signing_key,
         offers_view=container.offer_catalog_view_service(),
@@ -203,7 +204,7 @@ async def main() -> None:
         # The SAME gateway instances this process built above: building a
         # second collection here would leak a set of HTTP clients that the
         # shutdown path below never closes.
-        recharge=container.wallet_recharge_service(gateways=gateways),
+        recharge=container.wallet_recharge_service(gateways=gateways, fx_resolver=fx_resolver),
         # My Servers: the application service owns ownership, policy,
         # confirmations, idempotency and audit; the UI only renders.
         server_management=container.server_management_service(),
@@ -212,6 +213,11 @@ async def main() -> None:
         # prompts live in the SHARED store, so a restart or a second replica
         # does not lose the buttons the customer is holding.
         sessions=container.server_sessions(),
+        # Catalog display equivalents (supplementary; the DB price stays
+        # authoritative). The SAME resolver instance as recharge: one
+        # AbanTether + one cache client per process, closed once below.
+        fx_resolver=fx_resolver,
+        fx_display_currency=settings.fx_default_display_currency,
     )
     register_handlers(dp, ui, monthly_ui, container)
 
@@ -220,6 +226,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await Container.aclose_gateways(gateways)
+        await Container.aclose_fx(fx_resolver)
         await close_container()
 
 

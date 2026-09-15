@@ -206,7 +206,7 @@ class TestRechargeStart:
         assert gateway.calls[0]["reference"] == str(USER_ID)
         assert sink.events[0].event_type is BusinessEventType.RECHARGE_CREATED
         assert sink.events[0].payload["payment_session_id"] == str(SESSION_ID)
-        assert sink.events[0].payload["amount"] == "25.00 EUR"
+        assert sink.events[0].payload["amount"] == "€25.00"
 
     async def test_replayed_authority_reuses_the_session(self) -> None:
         sink = RecordingSink()
@@ -437,8 +437,8 @@ class TestRechargeScreens:
         bot = _bot(recharge=FakeRecharge())
         screen = await bot.recharge_screen(_user())
         labels = [b.text for b in _buttons(screen)]
-        assert "10.00 EUR" in labels
-        assert "25.00 EUR" in labels
+        assert "€10.00" in labels
+        assert "€25.00" in labels
 
     async def test_start_screen_creates_the_session_and_offers_the_gateway(
         self,
@@ -446,7 +446,7 @@ class TestRechargeScreens:
         recharge = FakeRecharge()
         bot = _bot(recharge=recharge)
         screen = await bot.recharge_start_screen(_user(), "2500")
-        assert "25.00 EUR" in screen.text
+        assert "€25.00" in screen.text
         pay = next(b for b in _buttons(screen) if b.url)
         assert pay.url == "https://pay.example/AUTH-1"
         assert recharge.started == [(2_500, f"bot-recharge:{USER_ID}:2500")]
@@ -483,7 +483,7 @@ class TestRechargeScreens:
         amounts = await bot.handle(bot._callback("recharge", "amounts"), user=_user())
         assert amounts is not None and "شارژ" in amounts.text
         started = await bot.handle(bot._callback("recharge", "start", "1000"), user=_user())
-        assert started is not None and "10.00 EUR" in started.text
+        assert started is not None and "€10.00" in started.text
 
     async def test_unknown_recharge_screen_falls_back_to_the_menu(self) -> None:
         bot = _bot(recharge=FakeRecharge())
