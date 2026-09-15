@@ -200,7 +200,10 @@ async def main() -> None:
         wallet_history=container.wallet_history_service(),
         power=container.power_command_service(),
         support_contact=settings.support_contact,
-        recharge=container.wallet_recharge_service(),
+        # The SAME gateway instances this process built above: building a
+        # second collection here would leak a set of HTTP clients that the
+        # shutdown path below never closes.
+        recharge=container.wallet_recharge_service(gateways=gateways),
         # My Servers: the application service owns ownership, policy,
         # confirmations, idempotency and audit; the UI only renders.
         server_management=container.server_management_service(),

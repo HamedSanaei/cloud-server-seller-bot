@@ -658,16 +658,27 @@ class Container:
             return next(iter(gateways.values()))
         return None
 
-    def wallet_recharge_service(self, gateway: Any | None = None) -> Any:
+    def wallet_recharge_service(
+        self,
+        gateway: Any | None = None,
+        gateways: dict[str, Any] | None = None,
+    ) -> Any:
         """Creates pending top-up sessions (and logs ``recharge.created``).
 
         Pass one gateway (legacy single-gateway call sites) or rely on the
         configured collection: with no argument every enabled gateway is
         offered and the customer picks among the compatible ones.
+
+        ``gateways`` is the reuse path for a process that ALREADY built the
+        collection: the very same adapter instances are handed over, so the
+        bot never opens two sets of HTTP clients (one of which nobody would
+        ever close). The gateway collection belongs to the process owner — the
+        caller that built it closes it — never to this service.
         """
         from cloud_platform.modules.payments.recharge import WalletRechargeService
 
-        gateways = self.payment_gateways()
+        if gateways is None:
+            gateways = self.payment_gateways()
         return WalletRechargeService(
             payments_repo=SqlAlchemyPaymentSessionRepository(self.session_factory),
             gateway=gateway,

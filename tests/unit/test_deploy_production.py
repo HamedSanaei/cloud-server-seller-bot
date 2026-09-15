@@ -286,6 +286,51 @@ class TestDeployScriptStatic:
             assert token in script, token
         assert "[0-9a-f]{64}" in script
 
+    def test_configuration_preflight_exercises_the_settings_validator(self) -> None:
+        """The release image must accept the server config before any mutation."""
+        script = _script()
+        assert "verify_application_configuration() {" in script
+        # The applications' own Settings loader runs inside the new image, so
+        # the payments invariant is enforced release-side, not by luck.
+        assert "cloud_platform.core.config import get_settings" in script
+        preflight = script.index("verify_application_configuration ||")
+        assert preflight < script.index("PLATFORM_IMAGE updated in")
+        assert preflight < script.index("running database migrations")
+        assert preflight < script.index("starting api + worker + bot")
+        # A rejected configuration must not look like a rollback candidate.
+        assert "nothing was changed" in script
+
+    @needs_bash
+    def test_rejected_configuration_fails_before_mutation(self, tmp_path: Path) -> None:
+        """An enabled gateway with an unusable callback URL must not deploy."""
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, fail_config_check=True
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "server configuration rejected" in (result.stdout + result.stderr)
+        # ``fail`` reports on stderr; the summary line lands on stdout.
+        assert "deployment aborted before anything was mutated" in (result.stdout + result.stderr)
+        assert "deployment failed before anything was mutated" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        # The preflight itself pulled the image and ran the Settings loader...
+        assert "get_settings" in calls
+        # ...and nothing past it ran: no migration, no service replacement.
+        migrate_lines = [
+            line
+            for line in calls.splitlines()
+            if "run --rm --no-deps migrate" in line and "get_settings" not in line
+        ]
+        assert migrate_lines == []
+        assert "up -d api worker bot" not in calls
+        # Nothing was mutated and nothing needed rolling back.
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (tmp_path / "configuration.toml").read_bytes() == config_before
+        assert "no rollback needed" in result.stdout
+        assert "ROLLBACK DONE" not in result.stdout
+        assert "release compose promoted" not in result.stdout
+
     def test_promotion_happens_only_after_verification(self) -> None:
         script = _script()
         assert 'mv "${CANDIDATE_COMPOSE_FILE}" "${CURRENT_COMPOSE_FILE}"' in script
@@ -347,11 +392,32 @@ _STUB_DOCKER = """#!/bin/sh
 echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
     *" pull "*)
-        [ "$STUB_FAIL_PULL" = "1" ] && exit 1
+        # The configuration preflight pulls the new image first; the deploy's
+        # own compose pull is the second. Counting pulls keeps the
+        # restore-on-pull-failure path under test.
+        n="$(cat "$PULL_COUNTER" 2>/dev/null || echo 0)"
+        n=$((n + 1))
+        printf '%s' "$n" > "$PULL_COUNTER"
+        if [ "$STUB_FAIL_PULL" = "1" ] && [ "$n" -ge 2 ]; then exit 1; fi
         ;;
 esac
 exit 0
 """
+
+
+def _deploy_path(path: Path) -> str:
+    """The deploy script guards ``DEPLOY_PATH`` with a POSIX absolute regex.
+
+    Windows checkouts hand it ``C:/...``; MSYS bash accepts the ``/c/...`` form
+    for both the guard and the script's own ``cd``, so the end-to-end harnesses
+    stay runnable outside Linux (CI is unaffected: the path already starts
+    with ``/`` there).
+    """
+    raw = path.as_posix()
+    if raw.startswith("/"):
+        return raw
+    drive, _, rest = raw.partition(":/")
+    return f"/{drive.lower()}/{rest}"
 
 
 def _write_compose_files(
@@ -364,10 +430,16 @@ def _write_compose_files(
     """
     current = deploy_dir / "docker-compose.yml"
     candidate = deploy_dir / ".docker-compose.abc123.candidate.yml"
+    # newline="\n": these fixtures are byte-compared after the deploy script
+    # rewrites them, so Windows text-mode translation must not creep in.
     if not missing_current:
-        current.write_text("# canonical release contract\nservices: {}\n", encoding="utf-8")
+        current.write_text(
+            "# canonical release contract\nservices: {}\n", encoding="utf-8", newline="\n"
+        )
     if not missing_candidate:
-        candidate.write_text("# release candidate contract\nservices: {}\n", encoding="utf-8")
+        candidate.write_text(
+            "# release candidate contract\nservices: {}\n", encoding="utf-8", newline="\n"
+        )
         sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
     else:
         sha = "0" * 64
@@ -388,7 +460,7 @@ def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = Fals
     deploy_dir.mkdir()
     if missing != "env":
         (deploy_dir / "deploy.env").write_text(
-            f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
+            f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8", newline="\n"
         )
     current, candidate, candidate_sha = _write_compose_files(
         deploy_dir,
@@ -403,9 +475,10 @@ def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = Fals
     (stub_bin / "docker").chmod(0o755)
     calls = tmp_path / "docker-calls.log"
     script = (
-        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{_deploy_path(stub_bin)}:$PATH" '
         f"DOCKER_CALLS_LOG='{calls.as_posix()}' STUB_FAIL_PULL={'1' if fail_pull else '0'} "
-        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"PULL_COUNTER='{(tmp_path / 'pull-counter').as_posix()}' "
+        f"DEPLOY_PATH='{_deploy_path(deploy_dir)}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
         f"CURRENT_COMPOSE_FILE='{current}' "
         f"CANDIDATE_COMPOSE_FILE='{candidate}' "
         f"EXPECTED_COMPOSE_SHA256='{candidate_sha}' "
@@ -475,7 +548,14 @@ class TestDeployFailClosed:
         calls = _docker_calls(tmp_path)
         assert "pull" in calls
         assert " up " not in f" {calls} "
-        assert " run " not in f" {calls} "
+        # The ONLY container allowed to run before a failed pull is the
+        # ephemeral configuration validator — never the migration.
+        migrate_runs = [
+            line
+            for line in calls.splitlines()
+            if "run --rm --no-deps migrate" in line and "get_settings" not in line
+        ]
+        assert migrate_runs == []
         env = tmp_path / "deploy" / "deploy.env"
         assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
 
@@ -547,12 +627,12 @@ def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProces
     (stub_bin / "python3").write_text(_STUB_PYTHON, encoding="utf-8")
     (stub_bin / "python3").chmod(0o755)
     script = (
-        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{_deploy_path(stub_bin)}:$PATH" '
         f"DOCKER_CALLS_LOG='{(tmp_path / 'docker-calls.log').as_posix()}' "
         f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
         f"PYTHON_CALLS_LOG='{(tmp_path / 'python-calls.log').as_posix()}' "
         f"UP_FAIL_COUNTER='{(tmp_path / 'up-counter').as_posix()}' "
-        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"DEPLOY_PATH='{_deploy_path(deploy_dir)}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
         f"CURRENT_COMPOSE_FILE='{current}' "
         f"CANDIDATE_COMPOSE_FILE='{candidate}' "
         f"EXPECTED_COMPOSE_SHA256='{candidate_sha}' "
@@ -658,11 +738,11 @@ def _stabilization_harness(tmp_path: Path, *, crash_loop: bool) -> subprocess.Co
     deploy_dir = tmp_path / "deploy"
     deploy_dir.mkdir()
     (deploy_dir / "deploy.env").write_text(
-        f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8"
+        f"PLATFORM_IMAGE={_OLD_IMAGE}\nAPI_PORT=8000\n", encoding="utf-8", newline="\n"
     )
     current, candidate, candidate_sha = _write_compose_files(deploy_dir)
     config = tmp_path / "configuration.toml"
-    config.write_text("[app]\n", encoding="utf-8")
+    config.write_text("[app]\n", encoding="utf-8", newline="\n")
     stub_bin = tmp_path / "stubbin"
     stub_bin.mkdir()
     (stub_bin / "docker").write_text(_STABLE_STUB_DOCKER, encoding="utf-8")
@@ -672,12 +752,12 @@ def _stabilization_harness(tmp_path: Path, *, crash_loop: bool) -> subprocess.Co
     (stub_bin / "python3").write_text(_STABLE_STUB_PYTHON, encoding="utf-8")
     (stub_bin / "python3").chmod(0o755)
     script = (
-        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{_deploy_path(stub_bin)}:$PATH" '
         f"DOCKER_CALLS_LOG='{(tmp_path / 'docker-calls.log').as_posix()}' "
         f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
         f"INSPECT_COUNTER='{(tmp_path / 'inspect-counter').as_posix()}' "
         f"CRASH_LOOP='{'1' if crash_loop else ''}' "
-        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"DEPLOY_PATH='{_deploy_path(deploy_dir)}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
         f"CURRENT_COMPOSE_FILE='{current}' "
         f"CANDIDATE_COMPOSE_FILE='{candidate}' "
         f"EXPECTED_COMPOSE_SHA256='{candidate_sha}' "
@@ -747,6 +827,12 @@ case " $* " in
     *" pull "*)
         exit 0
         ;;
+    *" get_settings"*)
+        # Configuration preflight: the release image refusing the server-owned
+        # configuration must fail the deploy before anything is mutated.
+        [ "$FAIL_CONFIG_CHECK" = "1" ] && exit 1
+        exit 0
+        ;;
     *" run "*)
         [ "$FAIL_MIGRATE" = "1" ] && exit 1
         exit 0
@@ -776,6 +862,7 @@ def _release_harness(
     missing_candidate: bool = False,
     bad_sha: bool = False,
     fail_config: bool = False,
+    fail_config_check: bool = False,
     fail_migrate: bool = False,
     fail_ready: bool = False,
     fail_up_api: bool = False,
@@ -794,12 +881,12 @@ def _release_harness(
         "POSTGRES_PASSWORD=s3cret-server-value\n"
         "API_PORT=8000\n"
     )
-    env_file.write_text(env_before, encoding="utf-8")
+    env_file.write_text(env_before, encoding="utf-8", newline="\n")
     current, candidate, candidate_sha = _write_compose_files(deploy_dir)
     if missing_candidate:
         (deploy_dir / ".docker-compose.abc123.candidate.yml").unlink()
     config = tmp_path / "configuration.toml"
-    config.write_text("[app]\n", encoding="utf-8")
+    config.write_text("[app]\n", encoding="utf-8", newline="\n")
     config_before = config.read_bytes()
     canonical = deploy_dir / "docker-compose.yml"
     stub_bin = tmp_path / "stubbin"
@@ -814,16 +901,17 @@ def _release_harness(
         (stub_bin / "python3").write_text(_STABLE_STUB_PYTHON, encoding="utf-8")
     (stub_bin / "python3").chmod(0o755)
     script = (
-        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{stub_bin.as_posix()}:$PATH" '
+        f'export DEPLOY_PRODUCTION_SOURCED=1 PATH="{_deploy_path(stub_bin)}:$PATH" '
         f"DOCKER_CALLS_LOG='{(tmp_path / 'docker-calls.log').as_posix()}' "
         f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
         f"INSPECT_COUNTER='{(tmp_path / 'inspect-counter').as_posix()}' "
         f"UP_FAIL_COUNTER='{(tmp_path / 'up-counter').as_posix()}' "
         f"CRASH_LOOP='{'1' if crash_loop else ''}' "
         f"FAIL_CONFIG='{'1' if fail_config else ''}' "
+        f"FAIL_CONFIG_CHECK='{'1' if fail_config_check else ''}' "
         f"FAIL_MIGRATE='{'1' if fail_migrate else ''}' "
         f"FAIL_UP_API='{'1' if fail_up_api else ''}' "
-        f"DEPLOY_PATH='{deploy_dir.as_posix()}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
+        f"DEPLOY_PATH='{_deploy_path(deploy_dir)}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
         f"CURRENT_COMPOSE_FILE='{current}' "
         f"CANDIDATE_COMPOSE_FILE='{candidate}' "
         f"EXPECTED_COMPOSE_SHA256='{'f' * 64 if bad_sha else candidate_sha}' "

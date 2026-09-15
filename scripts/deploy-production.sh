@@ -186,6 +186,30 @@ rollback() {
     log "ROLLBACK: previous application image restarted (database left at the new migration revision)"
 }
 
+verify_application_configuration() {
+    # Configuration preflight: the NEW release image must accept the
+    # server-owned configuration BEFORE anything is mutated (no image switch,
+    # no migration, no service replacement, no bot/API restart).
+    #
+    # It runs the same Settings loader the services use, inside the release
+    # image, with the real configuration mounted exactly as the services mount
+    # it — so an enabled payment gateway with a callback URL the provider could
+    # never reach fails the deployment instead of surfacing the first time a
+    # customer presses "pay". The file is mounted by the compose service and
+    # is never read, printed or rewritten by this script; validation errors are
+    # secret-free (they name fields, never values).
+    if ! docker pull "${PLATFORM_IMAGE_NEW}" >/dev/null 2>&1; then
+        fail "cannot pull ${PLATFORM_IMAGE_NEW} for the configuration preflight"
+        return 1
+    fi
+    if ! PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        python -c 'from cloud_platform.core.config import get_settings; get_settings()'; then
+        fail "server configuration rejected by the release image (see the error above; fix the configuration file and redeploy — nothing was changed)"
+        return 1
+    fi
+    log "server configuration accepted by the release image"
+}
+
 deploy() {
     load_config
     command -v docker >/dev/null || { fail "docker is not installed"; return 1; }
@@ -252,6 +276,10 @@ deploy() {
     case "${STABILIZE_SECONDS}" in
         '' | *[!0-9]*) fail "STABILIZE_SECONDS must be a non-negative integer"; return 1 ;;
     esac
+
+    # Still before the mutation window: a rejected configuration must leave
+    # the running release completely untouched.
+    verify_application_configuration || { fail "deployment aborted before anything was mutated"; return 1; }
 
     PREV_IMAGE="$(dotenv_value "${ENV_FILE}" PLATFORM_IMAGE)"
     log "target commit image : ${PLATFORM_IMAGE_NEW}"

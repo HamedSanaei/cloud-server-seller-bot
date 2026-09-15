@@ -559,6 +559,51 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_production_payment_configuration(self) -> Settings:
+        """An ENABLED payment gateway must be usable in the resolved environment.
+
+        A gateway is either off (any placeholder may stay in the file) or fully
+        configured. Catching it here — at the configuration boundary — means a
+        bad production callback URL fails the deployment preflight instead of
+        surfacing the first time a customer presses "pay".
+
+        Tetraminator calls its callback itself, with no signature and no
+        credentials, so in production that URL must be an absolute public
+        ``https://`` one: plain http could be read or forged in transit and
+        would have to be rejected at request time anyway. Development and test
+        may use http. Secrets are never echoed in the error text.
+        """
+        if not self.tetraminator_enabled:
+            return self
+        from urllib.parse import urlsplit
+
+        if not (self.tetraminator_api_key or "").strip():
+            raise ValueError(
+                "payments.tetraminator.api_key is required when "
+                "payments.tetraminator.enabled is true"
+            )
+        if self.tetraminator_timeout_seconds <= 0:
+            raise ValueError("payments.tetraminator.timeout_seconds must be greater than 0")
+
+        base_url = urlsplit((self.tetraminator_base_url or "").strip())
+        if base_url.scheme not in ("http", "https") or not base_url.netloc:
+            raise ValueError("payments.tetraminator.base_url must be an absolute http(s) URL")
+
+        callback_url = urlsplit((self.tetraminator_callback_url or "").strip())
+        if callback_url.scheme not in ("http", "https") or not callback_url.netloc:
+            raise ValueError(
+                "payments.tetraminator.callback_url must be an absolute http(s) URL: "
+                "it is the address Tetraminator calls after a payment"
+            )
+        if (self.app_env or "").strip().lower() == "production" and callback_url.scheme != "https":
+            raise ValueError(
+                "payments.tetraminator.callback_url must use https:// when app_env is "
+                "'production' (the callback is unauthenticated and must be publicly "
+                "reachable; use the API's reverse-proxied domain)"
+            )
+        return self
+
     @classmethod
     def settings_customise_sources(
         cls,
