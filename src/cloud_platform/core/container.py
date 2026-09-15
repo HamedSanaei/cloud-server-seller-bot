@@ -7,6 +7,7 @@ worker, and bot entry points.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -73,6 +74,8 @@ __all__ = [
     "get_container",
     "get_session",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -598,31 +601,77 @@ class Container:
             policy,
         )
 
-    def payment_gateway(self) -> Any:
-        """The configured payment gateway, or None when disabled/unconfigured.
+    def payment_gateways(self) -> dict[str, Any]:
+        """Every configured + enabled payment gateway, keyed by gateway key.
 
-        Built once per process (it owns an HTTP client): the bot creates it
-        at startup and hands it to the recharge service.
+        Built fresh per call (each adapter owns an HTTP client); the caller
+        owns closing them (see :meth:`aclose_gateways`). Construction lives
+        here — in infrastructure — so domain/application code never branches
+        on gateway keys.
         """
-        settings = get_settings()
-        if not settings.zarinpal_enabled or not settings.zarinpal_merchant_id:
-            return None
+        from cloud_platform.providers.tetraminator.client import TetraminatorGateway
         from cloud_platform.providers.zarinpal.client import ZarinPalGateway
 
-        return ZarinPalGateway(
-            merchant_id=settings.zarinpal_merchant_id,
-            base_url=settings.zarinpal_base_url,
-            sandbox=settings.zarinpal_sandbox,
-            callback_url=settings.zarinpal_callback_url,
-        )
+        settings = get_settings()
+        gateways: dict[str, Any] = {}
+        if settings.zarinpal_enabled and settings.zarinpal_merchant_id:
+            gateways[ZarinPalGateway.key] = ZarinPalGateway(
+                merchant_id=settings.zarinpal_merchant_id,
+                base_url=settings.zarinpal_base_url,
+                sandbox=settings.zarinpal_sandbox,
+                callback_url=settings.zarinpal_callback_url,
+            )
+        if settings.tetraminator_enabled and settings.tetraminator_api_key:
+            gateways[TetraminatorGateway.key] = TetraminatorGateway(
+                api_key=settings.tetraminator_api_key,
+                base_url=settings.tetraminator_base_url,
+                callback_url=settings.tetraminator_callback_url,
+                timeout_seconds=settings.tetraminator_timeout_seconds,
+                require_https_callback=(settings.app_env or "").strip().lower() == "production",
+            )
+        return gateways
+
+    @staticmethod
+    async def aclose_gateways(gateways: dict[str, Any]) -> None:
+        """Best-effort close of gateway HTTP clients (never raises)."""
+        for gateway in gateways.values():
+            close = getattr(gateway, "close", None)
+            if not callable(close):
+                continue
+            try:
+                await close()
+            except Exception:
+                logger.warning(
+                    "gateway client close failed for %s",
+                    getattr(gateway, "key", type(gateway).__name__),
+                )
+
+    def payment_gateway(self, key: str | None = None) -> Any | None:
+        """Select one configured gateway: explicit key, or the single one.
+
+        Returns None when nothing (or nothing unambiguous) is configured.
+        """
+        gateways = self.payment_gateways()
+        if key is not None:
+            return gateways.get(key)
+        if len(gateways) == 1:
+            return next(iter(gateways.values()))
+        return None
 
     def wallet_recharge_service(self, gateway: Any | None = None) -> Any:
-        """Creates pending top-up sessions (and logs ``recharge.created``)."""
+        """Creates pending top-up sessions (and logs ``recharge.created``).
+
+        Pass one gateway (legacy single-gateway call sites) or rely on the
+        configured collection: with no argument every enabled gateway is
+        offered and the customer picks among the compatible ones.
+        """
         from cloud_platform.modules.payments.recharge import WalletRechargeService
 
+        gateways = self.payment_gateways()
         return WalletRechargeService(
             payments_repo=SqlAlchemyPaymentSessionRepository(self.session_factory),
             gateway=gateway,
+            gateways=gateways,
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
         )

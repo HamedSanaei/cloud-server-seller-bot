@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -100,6 +101,39 @@ class SqlAlchemyPaymentSessionRepository:
             result = await db.execute(stmt)
             row = result.scalar_one_or_none()
             return None if row is None else _to_domain(row)
+
+    async def get_by_idempotency_key(
+        self, gateway_key: str, idempotency_key: str
+    ) -> PaymentSession | None:
+        async with self._session_factory() as db:
+            stmt = (
+                select(_PaymentModel)
+                .where(
+                    _PaymentModel.gateway_key == gateway_key,
+                    _PaymentModel.idempotency_key == idempotency_key,
+                )
+                .order_by(_PaymentModel.created_at.desc())
+            )
+            result = await db.execute(stmt)
+            row = result.scalars().first()
+            return None if row is None else _to_domain(row)
+
+    async def list_pending_before(
+        self, gateway_key: str, before: datetime, limit: int = 100
+    ) -> list[PaymentSession]:
+        async with self._session_factory() as db:
+            stmt = (
+                select(_PaymentModel)
+                .where(
+                    _PaymentModel.gateway_key == gateway_key,
+                    _PaymentModel.status == PaymentSessionStatus.PENDING.value,
+                    _PaymentModel.created_at <= before,
+                )
+                .order_by(_PaymentModel.created_at.asc())
+                .limit(limit)
+            )
+            result = await db.execute(stmt)
+            return [_to_domain(row) for row in result.scalars().all()]
 
     async def save(self, session: PaymentSession) -> PaymentSession:
         assert session.id is not None  # only persisted sessions can be saved

@@ -103,10 +103,20 @@ base_url = "https://api.hetzner.cloud/v1"
 
 [payments.zarinpal]
 enabled = true
-merchant_id = "CHANGE_ME"
+merchant_id = "CHANGE_ME"  # pragma: allowlist secret
 base_url = "https://api.zarinpal.com/pg/v4/payment"
 sandbox = false
 callback_url = "https://your-domain.example/api/v1/payments/zarinpal/callback"
+
+[payments.tetraminator]
+# Second Iranian gateway (Toman). Disabled until the operator opts in by
+# setting enabled = true AND a real api_key below. Amounts are integer
+# Toman; the documented minimum invoice is 50,000 Toman.
+enabled = false
+api_key = "CHANGE_ME"  # pragma: allowlist secret
+base_url = "https://api.tetraminator.com/v1"
+callback_url = "https://your-domain.example/webhooks/payments/tetraminator"
+timeout_seconds = 30
 
 [security]
 # 32-byte url-safe base64 keys. Generate with:

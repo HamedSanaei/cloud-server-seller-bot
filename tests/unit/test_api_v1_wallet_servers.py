@@ -70,7 +70,8 @@ class TestWalletEndpoint:
         row.currency = "EUR"
         row.status = "active"
         session = _session(fake)
-        session.get = AsyncMock(return_value=row)
+        # get() is by owner: SELECT ... WHERE wallets.user_id = ...
+        session.execute = AsyncMock(return_value=_row_result(row))
         monkeypatch.setattr(router_module, "get_container", AsyncMock(return_value=fake))
         body = await get_wallet(AUTH)
         assert body["wallet"]["balance_minor"] == 2500
@@ -80,7 +81,8 @@ class TestWalletEndpoint:
         self, fake: FakeContainer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         session = _session(fake)
-        session.get = AsyncMock(return_value=None)
+        # get() is by owner: SELECT ... WHERE wallets.user_id = ...
+        session.execute = AsyncMock(return_value=_row_result(None))
         monkeypatch.setattr(router_module, "get_container", AsyncMock(return_value=fake))
         with pytest.raises(ApiError) as exc_info:
             await get_wallet(AUTH)

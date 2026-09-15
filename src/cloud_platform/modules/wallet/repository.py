@@ -83,9 +83,12 @@ class SqlAlchemyWalletRepository:
         self._session_factory = session_factory
 
     async def get(self, user_id: UUID) -> Wallet | None:
+        """The wallet owned by ``user_id`` (wallets.user_id is UNIQUE)."""
         async with self._session_factory() as session:
-            row = await session.get(SQLAlchemyWallet, user_id)
-            return _wallet_to_domain(row) if row is not None else None
+            stmt = select(SQLAlchemyWallet).where(SQLAlchemyWallet.user_id == user_id)
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+            return None if row is None else _wallet_to_domain(row)
 
     async def list_all(self) -> list[Wallet]:
         async with self._session_factory() as session:
@@ -113,9 +116,10 @@ class SqlAlchemyWalletRepository:
             bal = int(_attr(row, "balance"))
             if bal < amount:
                 raise InsufficientBalanceError(f"balance {bal} < required {amount}")
+            wallet_id: UUID = _attr(row, "id")
             cast(Any, row).balance = bal - amount
             await session.commit()
-            updated_row = await session.get(SQLAlchemyWallet, user_id)
+            updated_row = await session.get(SQLAlchemyWallet, wallet_id)
             assert updated_row is not None
             return _wallet_to_domain(updated_row)
 
@@ -135,10 +139,87 @@ class SqlAlchemyWalletRepository:
                 raise ValueError(f"no wallet for user {user_id}")
             bal = int(_attr(row, "balance"))
             cast(Any, row).balance = bal + amount
+            wallet_id: UUID = _attr(row, "id")
             await session.commit()
-            updated_row = await session.get(SQLAlchemyWallet, user_id)
+            updated_row = await session.get(SQLAlchemyWallet, wallet_id)
             assert updated_row is not None
             return _wallet_to_domain(updated_row)
+
+    async def credit_deposit(
+        self,
+        user_id: UUID,
+        amount: int,
+        idempotency_key: str,
+        *,
+        reference: str = "",
+    ) -> tuple[Wallet, bool]:
+        """Apply a gateway deposit EXACTLY once (atomically, row-locked).
+
+        The wallet row is locked with ``SELECT FOR UPDATE``, the ledger
+        existence is checked and the balance incremented inside ONE
+        transaction that commits wallet+ledger together. A concurrent
+        duplicate callback therefore cannot double-credit: the second
+        transaction either sees the committed ledger row (applied=False) or
+        loses the unique-constraint race and rolls back both of its writes.
+
+        ``idempotency_key`` is the deterministic deposit key (e.g.
+        ``deposit-{gateway}-{external_id}``) from the ledger's
+        ``(wallet_id, idempotency_key)`` uniqueness.
+        """
+        if amount <= 0:
+            raise ValueError("credit_deposit requires a positive amount")
+        new_key = str(idempotency_key)
+        async with self._session_factory() as session:
+            stmt = (
+                select(SQLAlchemyWallet)
+                .where(SQLAlchemyWallet.user_id == user_id)
+                .with_for_update()
+            )
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+            if row is None:
+                raise ValueError(f"no wallet for user {user_id}")
+            wallet_id: UUID = _attr(row, "id")
+            existing = await session.execute(
+                select(_LEModel.idempotency_key).where(
+                    _LEModel.wallet_id == wallet_id,
+                    _LEModel.idempotency_key == new_key,
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                await session.rollback()
+                return _wallet_to_domain(row), False
+            bal = int(_attr(row, "balance"))
+            cast(Any, row).balance = bal + amount
+            session.add(
+                _LEModel(
+                    wallet_id=wallet_id,
+                    amount=amount,
+                    currency=str(_attr(row, "currency")),
+                    entry_type=LedgerEntryType.DEPOSIT,
+                    idempotency_key=new_key,
+                    reference_type="payment",
+                    # ``reference_id`` is a UUID column and gateway payment
+                    # ids are NOT UUIDs — the gateway/external id lives in
+                    # the (never-secret) description instead.
+                    description=f"gateway deposit {reference or new_key}",
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                # Lost the concurrent race for this deposit key: the winner's
+                # transaction already committed the credit, so this one must
+                # roll back BOTH writes (balance + ledger) and report a replay.
+                await session.rollback()
+                if "uq_ledger_wallet_idempotency" in str(exc.orig):
+                    refreshed = await session.get(SQLAlchemyWallet, wallet_id)
+                    assert refreshed is not None
+                    return _wallet_to_domain(refreshed), False
+                raise
+            updated_row = await session.get(SQLAlchemyWallet, wallet_id)
+            assert updated_row is not None
+            return _wallet_to_domain(updated_row), True
 
     async def _create(self, user_id: UUID, currency: str) -> Wallet:
         async with self._session_factory() as session:

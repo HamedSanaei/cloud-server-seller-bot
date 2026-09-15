@@ -311,6 +311,10 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.plans_title": "📋 پلن‌های {location} — {provider}:",
         "recharge.title": "⬆️ شارژ کیف پول",
         "recharge.amount_row": "{amount}",
+        "recharge.gateway_title": "روش پرداخت را انتخاب کنید:",
+        "recharge.gateway_row": "پرداخت با {name}",
+        "payments.gateway.tetraminator": "تترامیناتور",
+        "payments.gateway.zarinpal": "زرین‌پال",
         # The escaped newline + `{amount}` make this literal mixed-script, which
         # the ambiguous-unicode rule flags even though the Persian text is fine.
         "recharge.created": "🧾 درخواست شارژ به مبلغ {amount} ثبت شد.\nبرای پرداخت روی دکمه زیر بزنید.",  # noqa: E501, RUF001
@@ -630,6 +634,10 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.plans_title": "📋 Plans at {location} — {provider}:",
         "recharge.title": "⬆️ Wallet top-up",
         "recharge.amount_row": "{amount}",
+        "recharge.gateway_title": "Choose a payment method:",
+        "recharge.gateway_row": "Pay with {name}",
+        "payments.gateway.tetraminator": "Tetraminator",
+        "payments.gateway.zarinpal": "ZarinPal",
         "recharge.created": "🧾 Top-up of {amount} created.\nUse the button below to pay.",
         "recharge.unavailable": "Online top-up is currently disabled. Please contact support.",
         "recharge.invalid_amount": "The selected amount is not valid.",

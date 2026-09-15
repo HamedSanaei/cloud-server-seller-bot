@@ -141,6 +141,7 @@ class TestCronWiring:
             "process_leaseweb_orders",
             "reconcile_leaseweb_orders",
             "check_renewals",
+            "reconcile_tetraminator_payments",
         } <= names
 
     def test_worker_settings_functions_include_leaseweb_jobs(self) -> None:
@@ -149,6 +150,7 @@ class TestCronWiring:
         assert "process_leaseweb_orders" in names
         assert "reconcile_leaseweb_orders" in names
         assert "check_renewals" in names
+        assert "reconcile_tetraminator_payments" in names
 
 
 class TestWorkerLifecycleAndNotifiers:
@@ -194,18 +196,20 @@ class TestWorkerLifecycleAndNotifiers:
         by_name = {
             getattr(job, "coroutine", getattr(job, "func", None)).__name__: job for job in jobs
         }
-        assert len(by_name) == 5
+        assert len(by_name) == 6
         assert by_name["process_leaseweb_orders"].minute == set(range(0, 60, 2))
         assert by_name["reconcile_leaseweb_orders"].minute == set(range(0, 60, 3))
         # Dynamic eligibility discovery needs a short freshness bound.
         assert by_name["sync_leaseweb_offers"].minute == set(range(0, 60, 10))
         assert by_name["check_renewals"].hour == {3}
+        # Tetraminator pending-payment reconciliation is bounded polling.
+        assert by_name["reconcile_tetraminator_payments"].minute == set(range(0, 60, 15))
         # The business-log delivery pass runs every minute (bounded retries).
         assert by_name["deliver_business_log_events"].minute == set(range(0, 60))
         for job in jobs:
             assert getattr(job, "run_at_startup", False) is True
 
     def test_worker_settings_cron_jobs_match(self) -> None:
-        assert len(ws.WorkerSettings.cron_jobs) == 5
+        assert len(ws.WorkerSettings.cron_jobs) == 6
         assert ws.WorkerSettings.on_startup is ws.startup
         assert ws.WorkerSettings.on_shutdown is ws.shutdown

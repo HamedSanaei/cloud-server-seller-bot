@@ -79,6 +79,11 @@ def create_app() -> FastAPI:
     app.middleware("http")(_observe_api)
     app.include_router(health_router)
     app.include_router(webhooks_router)
+    from cloud_platform.api.routes.tetraminator import router as tetraminator_router
+
+    # Tetraminator uses an unsigned GET callback (documented protocol), so it
+    # gets a dedicated edge; the generic signed-POST route stays strict.
+    app.include_router(tetraminator_router)
     # M14-001: versioned customer REST surface with the stable
     # error/idempotency envelope.
     from cloud_platform.api.v1 import install_error_handlers

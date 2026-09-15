@@ -6,7 +6,7 @@ import dataclasses
 import types
 from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -20,7 +20,6 @@ from cloud_platform.modules.payments.service import (
     PaymentWebhookService,
     WebhookAction,
 )
-from cloud_platform.modules.wallet.domain import DuplicateIdempotencyError, LedgerEntryType
 
 USER_ID = uuid4()
 EXT = "ext-1"
@@ -56,10 +55,16 @@ def _failed() -> PaymentSession:
 
 
 def _repos() -> tuple[AsyncMock, AsyncMock, AsyncMock]:
+    """AsyncMock repos with the atomic-deposit contract.
+
+    ``credit_deposit`` returns ``(wallet, applied=True)`` and carries the
+    deterministic deposit key; the wallet mock exposes a ``balance`` so the
+    business-event payload can report it.
+    """
     payments = AsyncMock()
     wallet = AsyncMock()
     ledger = AsyncMock()
-    ledger.get_entry_by_idempotency = AsyncMock(return_value=None)
+    wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
     payments.save = AsyncMock(side_effect=lambda s: s)
     return payments, wallet, ledger
 
@@ -86,12 +91,13 @@ class TestFirstSuccess:
         assert outcome.action is WebhookAction.CREDITED
         assert outcome.session.status is PaymentSessionStatus.SUCCEEDED
         assert outcome.session.credited_at is not None
-        wallet.add_funds.assert_awaited_once_with(USER_ID, 500, DEPOSIT_KEY)
+        wallet.credit_deposit.assert_awaited_once_with(
+            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}"
+        )
 
-        args, kwargs = ledger.post_entry.call_args
-        assert args[3] is LedgerEntryType.DEPOSIT
-        assert args[4] == DEPOSIT_KEY
-        assert kwargs["reference_id"] == EXT
+        # The deposit key is deterministic from (gateway, external id).
+        key = wallet.credit_deposit.await_args.args[2]
+        assert key == DEPOSIT_KEY
         payments.save.assert_awaited_once()
 
     async def test_existing_pending_session_is_credited(self) -> None:
@@ -106,7 +112,9 @@ class TestFirstSuccess:
 
         assert outcome.action is WebhookAction.CREDITED
         payments.create.assert_not_awaited()
-        wallet.add_funds.assert_awaited_once_with(USER_ID, 500, DEPOSIT_KEY)
+        wallet.credit_deposit.assert_awaited_once_with(
+            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}"
+        )
 
 
 class TestReplaySafety:
@@ -122,8 +130,7 @@ class TestReplaySafety:
         )
 
         assert outcome.action is WebhookAction.DUPLICATE_IGNORED
-        wallet.add_funds.assert_not_awaited()
-        ledger.post_entry.assert_not_awaited()
+        wallet.credit_deposit.assert_not_awaited()
         payments.save.assert_not_awaited()
 
     async def test_late_callback_credits_uncredited_succeeded_session(self) -> None:
@@ -138,13 +145,13 @@ class TestReplaySafety:
         )
 
         assert outcome.action is WebhookAction.LATE_CREDIT
-        wallet.add_funds.assert_awaited_once()
+        wallet.credit_deposit.assert_awaited_once()
 
-    async def test_ledger_replay_skips_wallet_debit(self) -> None:
-        """If the ledger entry already exists, the wallet must not be re-debited."""
+    async def test_already_applied_deposit_is_not_credited_again(self) -> None:
+        """A concurrent duplicate (applied=False) still marks the session credited."""
         payments, wallet, ledger = _repos()
         payments.get_by_external_id = AsyncMock(return_value=_pending())
-        ledger.get_entry_by_idempotency = AsyncMock(return_value=MagicMock())
+        wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), False))
 
         outcome = await _service(payments, wallet, ledger).process_callback(
             gateway_key="zarinpal",
@@ -153,16 +160,15 @@ class TestReplaySafety:
         )
 
         assert outcome.action is WebhookAction.CREDITED
-        wallet.add_funds.assert_not_awaited()
-        ledger.post_entry.assert_not_awaited()
+        assert outcome.session.credited_at is not None
         payments.save.assert_awaited_once()
 
-    async def test_concurrent_duplicate_ledger_post_is_tolerated(self) -> None:
+    async def test_concurrent_duplicate_deposit_is_tolerated(self) -> None:
+        """Losing the atomic deposit race still settles the session, once."""
         payments, wallet, ledger = _repos()
         payments.get_by_external_id = AsyncMock(return_value=_pending())
-        ledger.post_entry = AsyncMock(
-            side_effect=DuplicateIdempotencyError("duplicate deposit key")
-        )
+        # The concurrent winner already applied this exact deposit.
+        wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), False))
 
         outcome = await _service(payments, wallet, ledger).process_callback(
             gateway_key="zarinpal",
@@ -172,6 +178,7 @@ class TestReplaySafety:
 
         assert outcome.action is WebhookAction.CREDITED
         assert outcome.session.credited_at is not None  # still marked credited
+        wallet.credit_deposit.assert_awaited_once()
 
 
 class TestFailurePath:
@@ -191,8 +198,7 @@ class TestFailurePath:
 
         assert outcome.action is WebhookAction.FAILED_RECORDED
         assert outcome.session.status is PaymentSessionStatus.FAILED
-        wallet.add_funds.assert_not_awaited()
-        ledger.post_entry.assert_not_awaited()
+        wallet.credit_deposit.assert_not_awaited()
 
     async def test_duplicate_failed_callback_ignored(self) -> None:
         payments, wallet, ledger = _repos()
@@ -205,7 +211,7 @@ class TestFailurePath:
         )
 
         assert outcome.action is WebhookAction.DUPLICATE_IGNORED
-        wallet.add_funds.assert_not_awaited()
+        wallet.credit_deposit.assert_not_awaited()
 
     async def test_failure_after_success_raises_transition_error(self) -> None:
         payments, wallet, ledger = _repos()
@@ -312,7 +318,7 @@ class TestBusinessLogEmission:
         payments, wallet, ledger = _repos()
         payments.get_by_external_id = AsyncMock(return_value=None)
         payments.create = AsyncMock(side_effect=_with_id)
-        wallet.add_funds = AsyncMock(return_value=types.SimpleNamespace(balance=1_234))
+        wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=1_234), True))
         sink = _RecordingSink()
         service = PaymentWebhookService(
             payments,
@@ -407,4 +413,4 @@ class TestBusinessLogEmission:
             currency="EUR",
         )
         assert outcome.action is WebhookAction.CREDITED
-        wallet.add_funds.assert_awaited_once()
+        wallet.credit_deposit.assert_awaited_once()

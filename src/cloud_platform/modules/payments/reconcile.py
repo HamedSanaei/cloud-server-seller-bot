@@ -141,3 +141,109 @@ class PaymentReconciliationService:
                     out.append(item)
             return out
         return []
+
+
+async def reconcile_tetraminator_pending(
+    *,
+    payments_repo: Any,
+    webhook_service: Any,
+    gateway: Any,
+    stale_after: timedelta = timedelta(minutes=10),
+    now: datetime | None = None,
+    limit: int = 50,
+    audit_repo: Any | None = None,
+) -> ReconcileReport:
+    """Recheck stuck Tetraminator PENDING sessions via read-only inquiry.
+
+    Missed-callback safety net: sessions older than ``stale_after`` that
+    already carry a gateway ``pay_id`` are verified with
+    ``GET /payment/inquiry/{pay_id}``. A paid inquiry with the EXACT stored
+    pay_id and amount flows through the SAME replay-safe webhook service as
+    the callback; anything else stays pending (transient) — unknown provider
+    states are never auto-failed and never credited.
+    """
+    from cloud_platform.modules.payments.domain import PaymentSessionStatus
+
+    moment = now or datetime.now(UTC)
+    try:
+        sessions: list[Any] = await payments_repo.list_pending_before(
+            "tetraminator", moment - stale_after, limit
+        )
+    except Exception:
+        logger.warning("tetraminator reconcile scan failed", exc_info=True)
+        return ReconcileReport(errors=1)
+    checked = credited = marked_failed = still_pending = skipped = errors = 0
+    for session in sessions:
+        external_id: str | None = session.gateway_payment_id
+        if not external_id:
+            skipped += 1
+            continue
+        checked += 1
+        try:
+            intent: Any = await gateway.verify_payment(external_id)
+        except Exception:
+            logger.warning(
+                "tetraminator reconcile inquiry failed for %s", session.id, exc_info=True
+            )
+            errors += 1
+            continue
+        try:
+            status = getattr(intent, "status", None)
+            status_value = getattr(status, "value", status)
+            if status_value != PaymentSessionStatus.SUCCEEDED.value:
+                still_pending += 1
+                continue
+            intent_pay_id = str(getattr(intent, "gateway_payment_id", "") or "")
+            intent_amount = getattr(intent, "amount_minor", None)
+            intent_currency = str(getattr(intent, "currency", "") or "")
+            if (
+                intent_pay_id != external_id
+                or not isinstance(intent_amount, int)
+                or isinstance(intent_amount, bool)
+                or intent_amount != session.amount_minor
+                or intent_currency != session.currency
+            ):
+                await webhook_service.process_callback(
+                    gateway_key=session.gateway_key,
+                    external_id=external_id,
+                    status="failed",
+                )
+                marked_failed += 1
+                continue
+            outcome: Any = await webhook_service.process_callback(
+                gateway_key=session.gateway_key,
+                external_id=external_id,
+                status="succeeded",
+            )
+            action = getattr(getattr(outcome, "action", None), "value", "")
+            if action in ("credited", "late_credit"):
+                credited += 1
+            else:
+                still_pending += 1
+        except Exception:
+            logger.warning("tetraminator reconcile credit failed for %s", session.id, exc_info=True)
+            errors += 1
+    if audit_repo is not None:
+        try:
+            await audit_repo.append(
+                actor_type="system",
+                actor_id=UUID(int=0),
+                action="payments.reconcile",
+                resource_type="payment",
+                resource_id=None,
+                metadata={
+                    "checked": checked,
+                    "credited": credited,
+                    "failed": marked_failed,
+                },
+            )
+        except Exception:
+            logger.warning("reconcile audit append failed", exc_info=True)
+    return ReconcileReport(
+        checked=checked,
+        credited=credited,
+        marked_failed=marked_failed,
+        still_pending=still_pending,
+        skipped=skipped,
+        errors=errors,
+    )

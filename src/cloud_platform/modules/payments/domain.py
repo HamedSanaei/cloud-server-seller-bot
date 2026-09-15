@@ -92,6 +92,28 @@ class PaymentSession:
             raise ValueError("gateway_payment_id must not be empty")
         object.__setattr__(self, "gateway_payment_id", gateway_payment_id)
 
+    def with_gateway_payment_id(self, gateway_payment_id: str) -> PaymentSession:
+        """Return a copy bound to the external id, staying PENDING.
+
+        Used when the local intent row is persisted BEFORE the gateway
+        call (so the callback URL can reference it) and the gateway id
+        arrives afterwards. Requires PENDING, like every other transition.
+        """
+        self._bind_external_id(gateway_payment_id)
+        return PaymentSession(
+            user_id=self.user_id,
+            gateway_key=self.gateway_key,
+            amount_minor=self.amount_minor,
+            currency=self.currency,
+            idempotency_key=self.idempotency_key,
+            id=self.id,
+            gateway_payment_id=gateway_payment_id,
+            status=self.status,
+            credited_at=self.credited_at,
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+        )
+
     def mark_succeeded(self, *, gateway_payment_id: str) -> PaymentSession:
         """Return a SUCCEEDED copy bound to the external id."""
         self._bind_external_id(gateway_payment_id)
@@ -163,6 +185,18 @@ class PaymentSessionRepository(Protocol):
         self, gateway_key: str, gateway_payment_id: str
     ) -> PaymentSession | None:
         """Fetch by unique external identity pair."""
+        ...
+
+    async def get_by_idempotency_key(
+        self, gateway_key: str, idempotency_key: str
+    ) -> PaymentSession | None:
+        """Fetch the latest session for a local idempotency key, if any."""
+        ...
+
+    async def list_pending_before(
+        self, gateway_key: str, before: datetime, limit: int = 100
+    ) -> list[PaymentSession]:
+        """Oldest PENDING sessions of one gateway (bounded reconciliation scan)."""
         ...
 
     async def save(self, session: PaymentSession) -> PaymentSession:

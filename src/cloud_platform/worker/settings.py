@@ -473,6 +473,54 @@ async def reconcile_payments(ctx: dict[str, object]) -> None:
             await gateway.close()
 
 
+async def reconcile_tetraminator_payments(ctx: dict[str, object]) -> None:
+    """Recheck stuck Tetraminator PENDING sessions via read-only inquiry.
+
+    Missed-callback safety net (Tetraminator webhooks are unsigned and may
+    be lost): sufficiently old sessions carrying a pay_id are verified and
+    credited through the same replay-safe webhook service. Skipped entirely
+    when Tetraminator is not configured.
+    """
+    del ctx
+    async with metrics.job("reconcile_tetraminator_payments"):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
+        from cloud_platform.modules.payments.reconcile import reconcile_tetraminator_pending
+        from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
+        from cloud_platform.modules.payments.service import PaymentWebhookService
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyLedgerRepository,
+            SqlAlchemyWalletRepository,
+        )
+        from cloud_platform.providers.tetraminator.client import TetraminatorGateway
+
+        settings = get_settings()
+        if not settings.tetraminator_enabled or not settings.tetraminator_api_key:
+            return
+        gateway = TetraminatorGateway(
+            api_key=settings.tetraminator_api_key,
+            base_url=settings.tetraminator_base_url,
+            callback_url=settings.tetraminator_callback_url,
+            timeout_seconds=settings.tetraminator_timeout_seconds,
+            require_https_callback=(settings.app_env or "").strip().lower() == "production",
+        )
+        try:
+            report = await reconcile_tetraminator_pending(
+                payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                webhook_service=PaymentWebhookService(
+                    payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                    wallet_repo=SqlAlchemyWalletRepository(SessionFactory),
+                    ledger_repo=SqlAlchemyLedgerRepository(SessionFactory),
+                ),
+                gateway=gateway,
+                audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+            )
+            logger.info("tetraminator reconcile: %s", report.render())
+        finally:
+            await gateway.close()
+
+
 async def deliver_business_log_events(ctx: dict[str, object]) -> None:
     """Deliver queued operator-channel business events (release hardening).
 
@@ -524,12 +572,14 @@ def _cron_jobs() -> list[Any]:
     every_two_minutes = set(range(0, 60, 2))
     every_three_minutes = set(range(0, 60, 3))
     every_ten_minutes = set(range(0, 60, 10))
+    every_fifteen_minutes = set(range(0, 60, 15))
     return [
         cron(sync_leaseweb_offers, minute=every_ten_minutes, run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
         cron(deliver_business_log_events, minute=every_minute, run_at_startup=True),
+        cron(reconcile_tetraminator_payments, minute=every_fifteen_minutes, run_at_startup=True),
     ]
 
 
@@ -546,6 +596,7 @@ class WorkerSettings:
         sync_leaseweb_offers,
         process_leaseweb_orders,
         reconcile_leaseweb_orders,
+        reconcile_tetraminator_payments,
         check_renewals,
         deliver_business_log_events,
     ]
@@ -566,7 +617,12 @@ PROVISIONING_FUNCTIONS: list[Any] = [
     process_deletes,
     reconcile_deletes,
 ]
-BILLING_FUNCTIONS: list[Any] = [accrue_usage, evaluate_low_balance, reconcile_payments]
+BILLING_FUNCTIONS: list[Any] = [
+    accrue_usage,
+    evaluate_low_balance,
+    reconcile_payments,
+    reconcile_tetraminator_payments,
+]
 
 
 class ProvisioningWorkerSettings(WorkerSettings):

@@ -30,7 +30,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.ui import BotScreen, BotUi
 from cloud_platform.core.config import get_settings
-from cloud_platform.core.container import close_container, get_container
+from cloud_platform.core.container import Container, close_container, get_container
 from cloud_platform.core.i18n import Translator
 from cloud_platform.core.session_store import SessionStoreUnavailable
 from cloud_platform.modules.navigation.domain import decode_callback
@@ -39,8 +39,6 @@ from cloud_platform.modules.users.onboarding import handle_start
 
 if TYPE_CHECKING:
     from aiogram.types import User as TelegramUser
-
-    from cloud_platform.core.container import Container
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +188,7 @@ async def main() -> None:
         catalog=container.catalog_repository(),
         create=container.create_server_service(),
     )
-    gateway = container.payment_gateway()  # one HTTP client per bot process
+    gateways = container.payment_gateways()  # one HTTP client each per bot process
     monthly_ui = MonthlyBotUi(
         settings.callback_signing_key,
         offers_view=container.offer_catalog_view_service(),
@@ -202,7 +200,7 @@ async def main() -> None:
         wallet_history=container.wallet_history_service(),
         power=container.power_command_service(),
         support_contact=settings.support_contact,
-        recharge=container.wallet_recharge_service(gateway),
+        recharge=container.wallet_recharge_service(),
         # My Servers: the application service owns ownership, policy,
         # confirmations, idempotency and audit; the UI only renders.
         server_management=container.server_management_service(),
@@ -218,8 +216,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
-        if gateway is not None:
-            await gateway.close()
+        await Container.aclose_gateways(gateways)
         await close_container()
 
 

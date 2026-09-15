@@ -142,6 +142,23 @@ class WalletRepository(Protocol):
         """Credit the wallet idempotently. Returns updated aggregate."""
         ...
 
+    async def credit_deposit(
+        self,
+        user_id: UUID,
+        amount: int,
+        idempotency_key: str,
+        *,
+        reference: str = "",
+    ) -> tuple[Wallet, bool]:
+        """Apply a gateway deposit EXACTLY once, atomically.
+
+        Returns ``(wallet_after, applied)``: ``applied`` is False when this
+        exact deposit (same wallet + idempotency key) was already applied.
+        The check and the balance increment happen in ONE transaction against
+        a row-locked wallet, so two concurrent callbacks for the same payment
+        can never both increment the balance."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Hold aggregate & repository port

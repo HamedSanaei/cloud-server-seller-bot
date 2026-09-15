@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
@@ -31,11 +32,10 @@ from cloud_platform.modules.payments.domain import (
     PaymentSessionStatus,
 )
 from cloud_platform.modules.wallet.domain import (
-    DuplicateIdempotencyError,
-    LedgerEntryType,
     LedgerRepository,
     WalletRepository,
 )
+from cloud_platform.providers.errors import ProviderError
 
 logger = logging.getLogger(__name__)
 
@@ -164,34 +164,24 @@ class PaymentWebhookService:
         return WebhookOutcome(WebhookAction.CREDITED, credited)
 
     async def _credit(self, session: PaymentSession) -> PaymentSession:
-        """Post the deposit exactly once for this session, then mark credited."""
+        """Post the deposit exactly once for this session, then mark credited.
+
+        The wallet credit and its ledger entry are applied ATOMICALLY by
+        :meth:`SqlAlchemyWalletRepository.credit_deposit` under a row-locked
+        wallet: concurrent duplicates of this callback can never both
+        increment the balance, and the append-only ledger keeps exactly one
+        entry per deterministic deposit key.
+        """
         assert session.id is not None
         assert session.gateway_payment_id is not None
         deposit_key = f"deposit-{session.gateway_key}-{session.gateway_payment_id}"
 
-        existing = await self._ledger.get_entry_by_idempotency(session.id, deposit_key)
-        wallet = None
-        if existing is None:
-            wallet = await self._wallet.add_funds(
-                session.user_id, session.amount_minor, deposit_key
-            )
-            ext_id = session.gateway_payment_id
-            try:
-                await self._ledger.post_entry(
-                    session.id,
-                    session.amount_minor,
-                    session.currency,
-                    LedgerEntryType.DEPOSIT,
-                    deposit_key,
-                    reference_type="payment",
-                    reference_id=ext_id,
-                    description=f"gateway deposit {session.gateway_key}/{ext_id}",
-                )
-            except DuplicateIdempotencyError:
-                # A concurrent duplicate callback already posted this deposit;
-                # the ledger's unique constraint is the arbiter.
-                logger.warning("deposit %s was already posted concurrently", deposit_key)
-
+        wallet, _applied = await self._wallet.credit_deposit(
+            session.user_id,
+            session.amount_minor,
+            deposit_key,
+            reference=f"{session.gateway_key}/{session.gateway_payment_id}",
+        )
         credited = await self._payments.save(session.mark_credited(at=datetime.now(UTC)))
         # Operator channel: emitted only AFTER the wallet was actually
         # credited (the session is persisted as credited above).
@@ -209,3 +199,109 @@ class PaymentWebhookService:
             ),
         )
         return credited
+
+
+class TetraminatorCallbackAction(StrEnum):
+    """What the Tetraminator callback handler did (all HTTP 200-safe)."""
+
+    CREDITED = "credited"  # inquiry verified paid + exact amount; deposit posted
+    ALREADY_PROCESSED = "already_processed"  # replay or terminal session; no effect
+    STILL_PENDING = "still_pending"  # not paid yet (or inquiry transient); retry later
+    FAILED_RECORDED = "failed_recorded"  # verified mismatch; session failed, operator alerted
+
+
+@dataclass(frozen=True, slots=True)
+class TetraminatorCallbackOutcome:
+    action: TetraminatorCallbackAction
+    session: PaymentSession | None
+
+
+class TetraminatorCallbackService:
+    """Verifies unsigned Tetraminator GET callbacks before any wallet effect.
+
+    Tetraminator documents NO webhook signature, so the callback itself is
+    UNTRUSTED: it only identifies a local session. Every credit decision
+    comes from a server-side ``inquiry`` compared EXACTLY against the stored
+    session (gateway key, pinned pay_id, exact Toman amount). The actual
+    deposit reuses :class:`PaymentWebhookService`, so replay/concurrent
+    callbacks share its idempotency guarantees.
+    """
+
+    def __init__(
+        self,
+        payments_repo: PaymentSessionRepository,
+        webhook_service: PaymentWebhookService,
+        gateway: Any,
+    ) -> None:
+        self._payments = payments_repo
+        self._webhook = webhook_service
+        self._gateway = gateway
+
+    async def process_callback(self, *, ref: str) -> TetraminatorCallbackOutcome:
+        """Handle one ``GET /webhooks/payments/tetraminator?ref=...`` call."""
+        try:
+            session_id = UUID(str(ref or "").strip())
+        except (ValueError, AttributeError, TypeError):
+            raise ValueError("callback reference must be a session UUID") from None
+        session = await self._payments.get(session_id)
+        if session is None or session.gateway_key != "tetraminator":
+            return TetraminatorCallbackOutcome(TetraminatorCallbackAction.ALREADY_PROCESSED, None)
+        if session.status is not PaymentSessionStatus.PENDING:
+            # Terminal sessions (SUCCEEDED/FAILED) replay through the same
+            # idempotent webhook path: zero new wallet effect, guaranteed.
+            if session.status is PaymentSessionStatus.SUCCEEDED:
+                await self._webhook.process_callback(
+                    gateway_key=session.gateway_key,
+                    external_id=session.gateway_payment_id or "",
+                    status="succeeded",
+                )
+            return TetraminatorCallbackOutcome(
+                TetraminatorCallbackAction.ALREADY_PROCESSED, session
+            )
+        if not session.gateway_payment_id:
+            # Intent persisted but the invoice call never completed: nothing
+            # to inquire about yet; the next refresh or retry will bind it.
+            return TetraminatorCallbackOutcome(TetraminatorCallbackAction.STILL_PENDING, session)
+        try:
+            intent = await self._gateway.verify_payment(session.gateway_payment_id)
+        except ProviderError as exc:
+            # Transport/auth/rate-limit failures keep the session pending;
+            # reconciliation retries. The error is already redacted upstream.
+            logger.warning("tetraminator inquiry transient for %s: %s", session.id, exc)
+            return TetraminatorCallbackOutcome(TetraminatorCallbackAction.STILL_PENDING, session)
+        intent_status = getattr(getattr(intent, "status", None), "value", None) or getattr(
+            intent, "status", None
+        )
+        if intent_status != PaymentSessionStatus.SUCCEEDED.value:
+            return TetraminatorCallbackOutcome(TetraminatorCallbackAction.STILL_PENDING, session)
+        intent_pay_id = str(getattr(intent, "gateway_payment_id", "") or "")
+        intent_amount = getattr(intent, "amount_minor", None)
+        intent_currency = str(getattr(intent, "currency", "") or "")
+        if (
+            intent_pay_id != session.gateway_payment_id
+            or not isinstance(intent_amount, int)
+            or isinstance(intent_amount, bool)
+            or intent_amount != session.amount_minor
+            or intent_currency != session.currency
+        ):
+            # Paid — but NOT for this session. Never credit, never adjust:
+            # record an attention-worthy failure for operator review.
+            failed = await self._webhook.process_callback(
+                gateway_key=session.gateway_key,
+                external_id=session.gateway_payment_id,
+                status="failed",
+            )
+            logger.warning(
+                "tetraminator inquiry mismatch for %s: provider pay_id/amount "
+                "does not match the stored session",
+                session.id,
+            )
+            return TetraminatorCallbackOutcome(
+                TetraminatorCallbackAction.FAILED_RECORDED, failed.session
+            )
+        outcome = await self._webhook.process_callback(
+            gateway_key=session.gateway_key,
+            external_id=session.gateway_payment_id,
+            status="succeeded",
+        )
+        return TetraminatorCallbackOutcome(TetraminatorCallbackAction.CREDITED, outcome.session)

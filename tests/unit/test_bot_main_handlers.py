@@ -76,7 +76,7 @@ def test_start_command_shows_greeting_plus_menu(
     fakes: dict[str, Any],
     _patch_outgoing: dict[str, AsyncMock],
 ) -> None:
-    from cloud_platform.core.i18n import get_catalog, Locale
+    from cloud_platform.core.i18n import Locale, get_catalog
 
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])

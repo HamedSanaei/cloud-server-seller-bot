@@ -55,12 +55,27 @@ class FakePayments:
         self.by_authority: dict[str, Any] = {}
         self.create_calls = 0
 
+    @staticmethod
+    def _key(session: Any) -> Any:
+        # Sessions without an external id yet (persist-first intents) never
+        # clash, mirroring the nullable UNIQUE pair in PostgreSQL.
+        if session.gateway_payment_id is None:
+            return ("pending", session.idempotency_key, FakePayments._nonce())
+        return session.gateway_payment_id
+
+    _nonce_counter = 0
+
+    @classmethod
+    def _nonce(cls) -> int:
+        cls._nonce_counter += 1
+        return cls._nonce_counter
+
     async def create(self, session: Any) -> Any:
         self.create_calls += 1
         if session.gateway_payment_id in self.by_authority:
             raise DuplicateExternalIdError("already exists")
-        stored = _session(session, session_id=SESSION_ID)
-        self.by_authority[session.gateway_payment_id] = stored
+        stored = _bindable(_session(session, session_id=SESSION_ID))
+        self.by_authority[self._key(stored)] = stored
         return stored
 
     async def get(self, session_id: UUID) -> Any:
@@ -72,7 +87,17 @@ class FakePayments:
     async def get_by_external_id(self, gateway_key: str, authority: str) -> Any:
         return self.by_authority.get(authority)
 
+    async def get_by_idempotency_key(self, gateway_key: str, idempotency_key: str) -> Any:
+        for session in self.by_authority.values():
+            if session.gateway_key == gateway_key and session.idempotency_key == idempotency_key:
+                return session
+        return None
+
     async def save(self, session: Any) -> Any:
+        for key, stored in list(self.by_authority.items()):
+            if getattr(stored, "id", None) == session.id:
+                self.by_authority[key] = session
+                break
         return session
 
 
@@ -92,6 +117,17 @@ def _session(session: Any, *, session_id: UUID) -> Any:
             "credited_at": None,
         },
     )()
+
+
+def _bindable(session: Any) -> Any:
+    """Add the aggregate transition the intent flow relies on (in-place)."""
+
+    def _bind(pay_id: str) -> Any:
+        session.gateway_payment_id = pay_id
+        return session
+
+    session.with_gateway_payment_id = _bind
+    return session
 
 
 class FakeGateway:
@@ -319,6 +355,10 @@ class FakeRecharge:
     def supports_currency(self, currency: str) -> bool:
         return bool(self.supports) and self.supports == currency
 
+    def compatible_gateways(self, currency: str, amount_minor: int | None = None) -> list[str]:
+        del amount_minor
+        return ["fake-gateway"] if self.supports_currency(currency) else []
+
     async def start(self, **kwargs: Any) -> Any:
         if self.fail is not None:
             raise self.fail
@@ -460,6 +500,13 @@ class TestRechargeServiceAgainstTheRealGatewayShape:
         gateway = ZarinPalGateway(merchant_id="m")
         assert gateway.supported_currency == CURRENCY == "IRR"
 
+    def test_tetraminator_declares_irt(self) -> None:
+        from cloud_platform.providers.tetraminator.client import CURRENCY, TetraminatorGateway
+
+        gateway = TetraminatorGateway(api_key="k")
+        assert gateway.supported_currency == CURRENCY == "IRT"
+        assert gateway.key == "tetraminator"
+
     def test_a_matching_currency_is_accepted(self) -> None:
         service = WalletRechargeService(payments_repo=FakePayments(), gateway=FakeGateway())
         assert service.supports_currency("eur") is True
@@ -467,3 +514,160 @@ class TestRechargeServiceAgainstTheRealGatewayShape:
     def test_timestamps_are_utc_aware(self) -> None:
         moment = datetime.now(UTC)
         assert moment.tzinfo is not None
+
+
+class _TetraGateway:
+    """Tetraminator-shaped double: callback ref required, Toman minimum."""
+
+    key = "tetraminator"
+    supported_currency = "IRT"
+    minimum_charge_minor = 50_000
+    requires_callback_reference = True
+    callback_url = "https://example.com/webhooks/payments/tetraminator"
+
+    def __init__(self, *, pay_id: str = "pay-1", fail: Exception | None = None) -> None:
+        self._pay_id = pay_id
+        self._fail = fail
+        self.calls: list[dict[str, Any]] = []
+
+    def payment_link_for(self, pay_id: str) -> str:
+        return f"https://t.me/tetraminator_bot?start=pay_{pay_id}"
+
+    async def create_payment(self, **kwargs: Any) -> Any:
+        if self._fail is not None:
+            raise self._fail
+        self.calls.append(kwargs)
+        return type(
+            "Intent",
+            (),
+            {
+                "gateway_payment_id": self._pay_id,
+                "redirect_url": self.payment_link_for(self._pay_id),
+            },
+        )()
+
+
+class _IrtUser:
+    id = uuid4()
+
+
+def _tetra_service(
+    *, gateway: Any | None = None, repo: FakePayments | None = None
+) -> tuple[WalletRechargeService, FakePayments, Any]:
+    gateway = gateway if gateway is not None else _TetraGateway()
+    repo = repo if repo is not None else FakePayments()
+    service = WalletRechargeService(
+        payments_repo=repo,
+        gateways={"tetraminator": gateway},
+        event_sink=RecordingSink(),
+    )
+    return service, repo, gateway
+
+
+class TestMultiGatewaySelection:
+    def test_single_gateway_auto_selected(self) -> None:
+        service = WalletRechargeService(payments_repo=FakePayments(), gateway=FakeGateway())
+        assert service.gateway_keys == ("fake-gateway",)
+        assert service.compatible_gateways("EUR") == ["fake-gateway"]
+
+    def test_explicit_key_selects_among_several(self) -> None:
+        tetra = _TetraGateway()
+        service = WalletRechargeService(
+            payments_repo=FakePayments(),
+            gateways={"fake-gateway": FakeGateway(), "tetraminator": tetra},
+        )
+        assert service.compatible_gateways("IRT") == ["tetraminator"]
+        assert service.compatible_gateways("EUR") == ["fake-gateway"]
+        assert service.gateway_key == ""
+
+    def test_ambiguous_selection_requires_explicit_key(self) -> None:
+        from cloud_platform.modules.payments.recharge import RechargeGatewaySelectionRequired
+
+        other = _TetraGateway()
+        other.key = "tetraminator-2"  # type: ignore[assignment]
+        service = WalletRechargeService(
+            payments_repo=FakePayments(),
+            gateways={"tetraminator": _TetraGateway(), "tetraminator-2": other},
+        )
+        with pytest.raises(RechargeGatewaySelectionRequired):
+            service._resolve_gateway("IRT", None)
+
+    def test_unknown_key_refused(self) -> None:
+        service = WalletRechargeService(payments_repo=FakePayments(), gateway=FakeGateway())
+        with pytest.raises(RechargeDisabledError):
+            service._resolve_gateway("EUR", "nope")
+
+    def test_minimum_excludes_gateway_from_compatible_list(self) -> None:
+        service = WalletRechargeService(
+            payments_repo=FakePayments(), gateways={"tetraminator": _TetraGateway()}
+        )
+        assert service.compatible_gateways("IRT", 49_999) == []
+        assert service.compatible_gateways("IRT", 50_000) == ["tetraminator"]
+        assert service.minimum_charge_minor("tetraminator", "IRT") == 50_000
+        assert service.minimum_charge_minor("tetraminator", "EUR") == 0
+        assert service.minimum_charge_minor("unknown", "IRT") == 0
+
+
+class TestPersistFirstTetraminatorFlow:
+    async def test_creates_intent_first_with_callback_reference(self) -> None:
+        service, _, gateway = _tetra_service()
+        result = await service.start(
+            user=_user(),
+            amount_minor=100_000,
+            currency="IRT",
+            idempotency_key="tetra-recharge-1",
+        )
+        assert result.replayed is False
+        assert result.session.gateway_payment_id == "pay-1"
+        assert result.redirect_url == "https://t.me/tetraminator_bot?start=pay_pay-1"
+        (call,) = gateway.calls
+        assert call["amount_minor"] == 100_000
+        assert call["currency"] == "IRT"
+        assert call["redirect_url"].startswith(
+            "https://example.com/webhooks/payments/tetraminator?ref="
+        )
+        ref = call["redirect_url"].split("ref=")[1]
+        assert ref == str(result.session.id)
+
+    async def test_replay_reuses_bound_session_without_new_post(self) -> None:
+        service, _repo, gateway = _tetra_service()
+        first = await service.start(
+            user=_user(), amount_minor=100_000, currency="IRT", idempotency_key="tetra-replay-1"
+        )
+        second = await service.start(
+            user=_user(), amount_minor=100_000, currency="IRT", idempotency_key="tetra-replay-1"
+        )
+        assert second.replayed is True
+        assert second.session.id == first.session.id
+        assert second.redirect_url == first.redirect_url
+        assert len(gateway.calls) == 1
+
+    async def test_below_minimum_refused_before_gateway_call(self) -> None:
+        service, _repo, gateway = _tetra_service()
+        with pytest.raises(RechargeAmountError):
+            await service.start(
+                user=_user(), amount_minor=10_000, currency="IRT", idempotency_key="tetra-min-1"
+            )
+        assert gateway.calls == []
+
+    async def test_wrong_currency_refused(self) -> None:
+        service, _repo, gateway = _tetra_service()
+        with pytest.raises(RechargeDisabledError):
+            await service.start(
+                user=_user(), amount_minor=100_000, currency="EUR", idempotency_key="tetra-cur-1"
+            )
+        assert gateway.calls == []
+
+    async def test_other_users_authority_refused(self) -> None:
+        from cloud_platform.modules.payments.recharge import RechargeError
+
+        other_id = uuid4()
+        other = type("U", (), {"id": other_id})()
+        service, _repo, _gateway = _tetra_service()
+        await service.start(
+            user=_user(), amount_minor=100_000, currency="IRT", idempotency_key="tetra-clash-1"
+        )
+        with pytest.raises(RechargeError, match="another user"):
+            await service.start(
+                user=other, amount_minor=100_000, currency="IRT", idempotency_key="tetra-clash-1"
+            )

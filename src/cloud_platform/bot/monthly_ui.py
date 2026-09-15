@@ -434,8 +434,10 @@ class MonthlyBotUi:
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
-    async def recharge_start_screen(self, user: User, amount_text: str) -> BotScreen:
-        """recharge.start:{amount}: create the pending session, then pay."""
+    async def recharge_start_screen(
+        self, user: User, amount_text: str, gateway_key: str | None = None
+    ) -> BotScreen:
+        """recharge.start:{amount}[:{gateway}]: create the pending session, then pay."""
         if user.id is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
         if self._recharge is None:
@@ -446,6 +448,14 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("recharge.invalid_amount"), self._menu_only())
         view: WalletBalanceView = await self._wallet.balance(user.id)
         currency = view.currency or ""
+        compatible = self._recharge.compatible_gateways(currency, amount_minor)
+        if not compatible:
+            return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
+        if gateway_key is None and len(compatible) > 1:
+            return self.recharge_gateway_screen(amount_minor, currency, compatible)
+        key = gateway_key or compatible[0]
+        if key not in compatible:
+            return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
         try:
             start: RechargeStart = await self._recharge.start(
                 user=user,
@@ -454,6 +464,7 @@ class MonthlyBotUi:
                 # Deterministic per (user, amount): a double tap replays the
                 # same session instead of creating a second one.
                 idempotency_key=f"bot-recharge:{user.id}:{amount_minor}",
+                gateway_key=key,
             )
         except RechargeAmountError:
             return BotScreen(self._t.t("recharge.invalid_amount"), self._menu_only())
@@ -474,6 +485,32 @@ class MonthlyBotUi:
         rows.append([self._back_button("wallet", "balance"), self._menu_button()])
         return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
+    def gateway_display_name(self, gateway_key: str) -> str:
+        """Customer-facing gateway name (never the technical key alone)."""
+        try:
+            return self._t.t(f"payments.gateway.{gateway_key}")
+        except Exception:
+            return gateway_key
+
+    def recharge_gateway_screen(
+        self, amount_minor: int, currency: str, gateway_keys: list[str]
+    ) -> BotScreen:
+        """recharge gateway picker: one button per compatible gateway."""
+        del currency
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("recharge.gateway_row", name=self.gateway_display_name(key)),
+                    callback_data=self._callback("recharge", "start", str(amount_minor), key),
+                )
+            ]
+            for key in gateway_keys
+        ]
+        rows.append([self._back_button("recharge", "amounts"), self._menu_button()])
+        return BotScreen(
+            self._t.t("recharge.gateway_title"), InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+
     async def _recharge_cb(self, cb: Callback, user: User | None) -> BotScreen:
         if user is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
@@ -481,6 +518,8 @@ class MonthlyBotUi:
             return await self.recharge_screen(user)
         if cb.screen == "start" and len(cb.args) == 1:
             return await self.recharge_start_screen(user, cb.args[0])
+        if cb.screen == "start" and len(cb.args) == 2:
+            return await self.recharge_start_screen(user, cb.args[0], gateway_key=cb.args[1])
         return self._menu_screen()
 
     # -- offers flow -------------------------------------------------------

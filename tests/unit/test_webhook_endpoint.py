@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import types
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -27,6 +28,7 @@ def _service() -> tuple[PaymentWebhookService, AsyncMock, AsyncMock, AsyncMock]:
     payments.create = AsyncMock(side_effect=lambda s: dataclasses.replace(s, id=uuid4()))
     payments.save = AsyncMock(side_effect=lambda s: s)
     wallet = AsyncMock()
+    wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
     ledger = AsyncMock()
     ledger.get_entry_by_idempotency = AsyncMock(return_value=None)
     return (
@@ -105,7 +107,7 @@ class TestCallbackProcessing:
         response = _post(client, body, sign_gateway_payload(SECRET, body))
         assert response.status_code == 200
         assert response.json() == {"action": "credited", "session_status": "succeeded"}
-        wallet.add_funds.assert_awaited_once()
+        wallet.credit_deposit.assert_awaited_once()
 
     def test_replayed_callback_cannot_duplicate_deposit(self) -> None:
         """The core acceptance: duplicate callback cannot duplicate deposit."""
@@ -117,6 +119,8 @@ class TestCallbackProcessing:
         payments.create = AsyncMock(side_effect=lambda s: dataclasses.replace(s, id=uuid4()))
         payments.save = AsyncMock(side_effect=lambda s: state.update({"session": s}) or s)
         wallet = AsyncMock()
+        # Atomic deposit contract: (wallet_after, applied=True).
+        wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
         ledger = AsyncMock()
         ledger.get_entry_by_idempotency = AsyncMock(return_value=None)
         service = PaymentWebhookService(payments, wallet, ledger)
@@ -134,7 +138,7 @@ class TestCallbackProcessing:
         assert second.status_code == 200
         assert second.json()["action"] == "duplicate_ignored"
         # The wallet was credited exactly once across both deliveries.
-        wallet.add_funds.assert_awaited_once()
+        wallet.credit_deposit.assert_awaited_once()
 
     def test_invalid_json_returns_400(self) -> None:
         service, _p, _w, _l = _service()

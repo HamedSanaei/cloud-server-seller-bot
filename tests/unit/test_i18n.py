@@ -118,7 +118,7 @@ class TestBotHandlerUsesCatalog:
     async def test_start_handler_renders_persian_greeting_plus_menu(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import MagicMock
 
         from aiogram import Dispatcher
         from aiogram.types import Chat, Message, Update

@@ -96,6 +96,11 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("payments", "zarinpal", "base_url"): "zarinpal_base_url",
     ("payments", "zarinpal", "sandbox"): "zarinpal_sandbox",
     ("payments", "zarinpal", "callback_url"): "zarinpal_callback_url",
+    ("payments", "tetraminator", "enabled"): "tetraminator_enabled",
+    ("payments", "tetraminator", "api_key"): "tetraminator_api_key",
+    ("payments", "tetraminator", "base_url"): "tetraminator_base_url",
+    ("payments", "tetraminator", "callback_url"): "tetraminator_callback_url",
+    ("payments", "tetraminator", "timeout_seconds"): "tetraminator_timeout_seconds",
     ("security", "provider_credential_encryption_key"): ("provider_credential_encryption_key"),
     ("security", "backup_encryption_key"): "backup_encryption_key",
     ("billing", "price_book_name"): "price_book_name",
@@ -422,6 +427,11 @@ class Settings(BaseSettings):
     zarinpal_base_url: str = "https://api.zarinpal.com/pg/v4/payment"
     zarinpal_sandbox: bool = False
     zarinpal_callback_url: str = ""
+    tetraminator_enabled: bool = False
+    tetraminator_api_key: str = ""
+    tetraminator_base_url: str = "https://api.tetraminator.com/v1"
+    tetraminator_callback_url: str = ""
+    tetraminator_timeout_seconds: float = Field(default=30.0, gt=0)
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
     default_currency: str = "EUR"
     # The OPERATOR-declared price book the selling price is derived from

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import types
 from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
@@ -656,6 +657,8 @@ class TestPaymentWebhookReplay:
         payments.create = AsyncMock(side_effect=lambda s: dataclasses.replace(s, id=uuid4()))
         payments.save = AsyncMock(side_effect=lambda s: state.update({"session": s}) or s)
         wallet = AsyncMock()
+        # Atomic deposit contract: (wallet_after, applied=True).
+        wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
         ledger = AsyncMock()
         ledger.get_entry_by_idempotency = AsyncMock(return_value=None)
         service = PaymentWebhookService(payments, wallet, ledger)
@@ -691,7 +694,7 @@ class TestPaymentWebhookReplay:
         )
         assert second.status_code == 200
         assert second.json()["action"] == "duplicate_ignored"
-        wallet.add_funds.assert_awaited_once()  # exactly one deposit
+        wallet.credit_deposit.assert_awaited_once()  # exactly one deposit
 
     def test_inflated_amount_with_old_signature_is_rejected(self) -> None:
         client, _service, wallet, secret, user_id = self._harness()
@@ -704,7 +707,7 @@ class TestPaymentWebhookReplay:
             headers={"x-gateway-signature": sig},
         )
         assert response.status_code == 401
-        wallet.add_funds.assert_not_awaited()
+        wallet.credit_deposit.assert_not_awaited()
 
     def test_tampered_body_fails_verification(self) -> None:
         secret = "sweep-secret"
