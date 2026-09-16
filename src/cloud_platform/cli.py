@@ -23,6 +23,9 @@ Commands::
     leaseweb sync-offers         Refresh the sellable-offer price book from
                                  the Leaseweb ordering API
     offers list [--all]          Sellable offers (or all rows)
+    offers doctor                Read-only: why the customer catalog is empty
+    offers preview [--market M]  Print the catalog as the BOT would render it
+    offers price-book --markup-percent N    Bulk-price UNPRICED offers from cost
     offers enable <offer_id>     Operator-enable an offer
     offers disable <offer_id>    Hide an offer from sale
     offers price <offer_id> <minor> [currency]   Set the customer price
@@ -559,7 +562,46 @@ async def leaseweb_sync_offers() -> int:
             print(f"  account {account_id}: {served or 'no sellable locations'}")
         for error in step.errors:
             print(f"  warning/error: {error}")
+    await _print_storefront_readiness("leaseweb")
     return 0
+
+
+async def _print_storefront_readiness(provider_key: str) -> None:
+    """Say out loud whether the sync produced anything a CUSTOMER can see.
+
+    A sync that stores offers but leaves them unpriced is indistinguishable
+    from a broken storefront to the operator, so the gate counts and the exact
+    next command are printed here instead of being discovered in Telegram.
+    """
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.offers.repository import (
+            SqlAlchemySellableOfferRepository,
+        )
+
+        rows = [
+            row
+            for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+            if row.provider_key == provider_key
+        ]
+    except Exception as exc:  # pragma: no cover - DB may be unreachable
+        print(f"Storefront readiness: unavailable ({type(exc).__name__})")
+        return
+    counts = _offer_gate_counts(rows)
+    print("Storefront readiness:")
+    print(f"  stored offers: {len(rows)}")
+    print("  " + _visibility_line("customer-visible", counts))
+    if counts["sellable"]:
+        print(f"  [OK ] {counts['sellable']} offer(s) are on sale now")
+        return
+    print("  [WARN] NOTHING is on sale — the customer-facing catalog is empty")
+    if counts["unpriced"]:
+        print("  a provider cost is not a selling price by design; set yours:")
+        print(
+            f"    python -m cloud_platform.cli offers price-book "
+            f"--provider {provider_key} --markup-percent 30"
+        )
+    print("    python -m cloud_platform.cli offers doctor")
 
 
 # ---------------------------------------------------------------------------
@@ -883,22 +925,319 @@ async def offers_list(include_all: bool) -> int:
     repo = SqlAlchemySellableOfferRepository(SessionFactory)
     offers = await repo.list_all() if include_all else await repo.list_sellable("leaseweb")
     if not offers:
-        print("no offers" + ("" if include_all else " — sync and enable+price first"))
+        print("no offers" + ("" if include_all else " — sync, then price (offers price-book)"))
         return 0
+    # One definition of visibility for every diagnostic: the SAME first
+    # blocking gate the storefront enforces, not a second opinion.
+    from cloud_platform.modules.offers.domain import (
+        GATE_DISABLED,
+        GATE_PROVIDER_UNAVAILABLE,
+        GATE_UNPRICED,
+        blocking_gate,
+    )
+
+    flags = {
+        None: "SALE",
+        GATE_DISABLED: "off",
+        GATE_UNPRICED: "no-price",
+        GATE_PROVIDER_UNAVAILABLE: "unavail",
+    }
     for offer in sorted(offers, key=lambda o: (o.location_id, o.product_id)):
-        if offer.sellable:
-            flag = "SALE"
-        elif not offer.enabled:
-            flag = "off"
-        elif offer.selling_price_minor <= 0:
-            flag = "no-price"
-        else:
-            flag = "unavail"
+        flag = flags[blocking_gate(offer)]
         print(
             f"{offer.id}  {flag:8s}  {offer.location_id:8s} {offer.product_id:12s} "
             f"{offer.name:24s} cost={offer.provider_cost_minor} {offer.provider_cost_currency} "
             f"price={offer.selling_price_minor} {offer.selling_currency}"
         )
+    return 0
+
+
+def _offer_gate_counts(offers: list[Any]) -> dict[str, int]:
+    """Count offers per blocking gate for one provider (pure domain helper)."""
+    from cloud_platform.modules.offers.domain import visibility_summary
+
+    return visibility_summary(offers)
+
+
+async def offers_doctor() -> DoctorResult:
+    """Read-only: WHY the storefront is empty, end to end.
+
+    An offer reaches a customer only through five gates: the provider must be
+    configured with a market, enabled, and have an ORDERING adapter; and the
+    offer row itself must be provider-reported, operator-enabled and
+    explicitly priced. "Nothing is for sale" is therefore not diagnosable
+    from the offer table alone, so this walks the whole funnel and names the
+    failing step with counts. Read-only; never prints a credential.
+    """
+    lines: list[str] = []
+    ok = True
+
+    def fail(message: str) -> None:
+        nonlocal ok
+        ok = False
+        lines.append(f"[FAIL] {message}")
+
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.offers.repository import (
+            SqlAlchemySellableOfferRepository,
+        )
+
+        rows = await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+    except Exception as exc:
+        # Only the exception CLASS is ever printed: a configuration
+        # ValidationError embeds the offending input, which can carry
+        # credentials, so its message and errors must never reach the output.
+        return DoctorResult(
+            False,
+            [
+                f"[FAIL] the offer price book could not be read "
+                f"({type(exc).__name__}) — check configuration.toml and the database"
+            ],
+        )
+
+    by_provider: dict[str, list[Any]] = {}
+    for row in rows:
+        by_provider.setdefault(row.provider_key, []).append(row)
+
+    # 1) configuration gates: a provider without a market is INVISIBLE even
+    # with a fully priced catalog, and a provider without an ordering adapter
+    # is shown as "soon" and cannot be entered. The container is inspected
+    # read-only and closed again; a container that cannot be built must not
+    # hide the offer-gate evidence below.
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.markets.domain import MARKET_ORDER
+    from cloud_platform.providers.base import ordering_support_of
+
+    catalog: Any = None
+    providers: dict[str, Any] = {}
+    container = None
+    try:
+        container = create_container()
+        await container.initialize()
+        catalog = container.market_catalog()
+        for key in container.provider_registry.keys():
+            providers[key] = container.provider_registry.get(key)
+    except Exception as exc:  # pragma: no cover - depends on local settings
+        lines.append(f"[WARN] provider registry unavailable ({type(exc).__name__})")
+    finally:
+        if container is not None:
+            await container.close()
+
+    markets_shown: dict[str, list[str]] = {}
+    for provider_key in sorted(set(providers) | set(by_provider)):
+        market = catalog.market_of(provider_key) if catalog is not None else None
+        enabled = catalog.is_enabled(provider_key) if catalog is not None else True
+        provider = providers.get(provider_key)
+        ordering = provider is not None and ordering_support_of(provider) is not None
+        if market is None:
+            fail(
+                f"provider {provider_key} has no market configured — it never "
+                'appears in the store (set market = "iran" or "foreign")'
+            )
+        elif not enabled:
+            lines.append(f"[WARN] provider {provider_key} is disabled in configuration")
+        elif not ordering:
+            lines.append(
+                f"[WARN] provider {provider_key} has no ordering adapter — the "
+                "storefront can only show it as unavailable"
+            )
+        else:
+            markets_shown.setdefault(market.value, []).append(provider_key)
+        counts = _offer_gate_counts(by_provider.get(provider_key, []))
+        lines.append(
+            f"[{'OK ' if counts['sellable'] else 'WARN'}] provider {provider_key} "
+            f"(stored={len(by_provider.get(provider_key, []))}): "
+            + _visibility_line("offers", counts)
+        )
+        if counts["unpriced"] and not counts["sellable"]:
+            lines.append(
+                "       every offer is missing a CUSTOMER PRICE — a provider "
+                "cost is not a selling price by design"
+            )
+            lines.append(
+                f"       Action: python -m cloud_platform.cli offers price-book "
+                f"--provider {provider_key} --markup-percent 30"
+            )
+
+    # 2) what the bot would actually render for each market
+    for market in MARKET_ORDER:
+        market_providers = markets_shown.get(market.value, [])
+        has_sellable = [
+            key
+            for key in market_providers
+            if _offer_gate_counts(by_provider.get(key, []))["sellable"]
+        ]
+        if has_sellable:
+            lines.append(f"[OK ] market {market.value}: {', '.join(sorted(has_sellable))}")
+        elif market_providers:
+            fail(
+                f"market {market.value} would show NO provider: "
+                f"{', '.join(sorted(market_providers))} configured but none has a "
+                "sellable offer"
+            )
+        else:
+            lines.append(f"[WARN] market {market.value}: no provider configured")
+
+    if not rows:
+        fail(
+            "the offer price book is EMPTY — no catalog sync has ever landed; "
+            "run: python -m cloud_platform.cli leaseweb sync-offers"
+        )
+    return DoctorResult(ok, lines)
+
+
+def _visibility_line(label: str, counts: dict[str, int]) -> str:
+    """One human line of gate counts (used by the catalog diagnostics)."""
+    return (
+        f"{label}: sellable={counts['sellable']} "
+        f"unpriced={counts['unpriced']} disabled={counts['disabled']} "
+        f"provider-unavailable={counts['provider_unavailable']}"
+    )
+
+
+async def offers_preview(market: str | None) -> int:
+    """Print the customer catalog EXACTLY as the bot assembles it.
+
+    Read-only and presentation-only: it walks the same view service the
+    Telegram UI walks (market -> provider -> product card -> locations), so
+    what an operator sees here is what a customer sees — including an empty
+    catalog, which is why the gate counts are printed alongside it.
+    """
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.checkout.service import OfferUnavailableError
+    from cloud_platform.modules.fx.formatting import format_minor
+    from cloud_platform.modules.markets.domain import MARKET_ORDER
+
+    wanted = [market] if market else [m.value for m in MARKET_ORDER]
+    container = create_container()
+    printed_any = False
+    try:
+        await container.initialize()
+        view = container.offer_catalog_view_service()
+        for entry in view.markets_screen():
+            if entry.market not in wanted:
+                continue
+            print(f"market {entry.market}")
+            try:
+                providers, _back = await view.providers_screen(entry.market)
+            except OfferUnavailableError as exc:
+                print(f"  (unavailable: {exc})")
+                continue
+            if not providers:
+                print("  (no provider has a sellable offer)")
+                continue
+            for provider in providers:
+                state = "buyable" if provider.select_callback else "shown as soon"
+                print(
+                    f"  {provider.display_name} ({provider.provider_key}) — {state}, "
+                    f"{provider.offer_count} sellable offer(s)"
+                )
+                if not provider.select_callback:
+                    continue
+                try:
+                    groups, _b, _c = await view.products_screen(provider.provider_key)
+                except OfferUnavailableError:
+                    continue
+                for group in groups:
+                    printed_any = True
+                    price = format_minor(group.monthly_price_minor, group.currency)
+                    print(
+                        f"    {group.name} — {price}/month — "
+                        f"{group.vcpu} vCPU / {group.ram_gb} GB RAM / "
+                        f"{group.disk_gb} GB disk"
+                    )
+                    locations, _lb, _lc = await view.product_locations_screen(
+                        provider.provider_key, group.product_id, group.monthly_price_minor
+                    )
+                    for location in locations:
+                        line_price = format_minor(location.monthly_price_minor, location.currency)
+                        print(
+                            f"      {location.name} {location.location_id} "
+                            f"({location.country_code or '??'}) — {line_price}"
+                        )
+    finally:
+        await container.close()
+    if not printed_any:
+        print("no product card is visible to a customer — run: offers doctor")
+        return 1
+    return 0
+
+
+async def offers_price_book(
+    provider: str,
+    markup_percent: int,
+    dry_run: bool,
+    include_disabled: bool,
+) -> int:
+    """Bulk-price every UNPRICED offer of one provider from its synced cost.
+
+    The operator supplies the markup explicitly — this never invents a price,
+    never reprices an offer that already has one, and never crosses
+    currencies: the selling price is denominated in the SAME currency the
+    provider cost was captured in, because relabelling without an explicit FX
+    policy would be an implicit conversion. Integer minor units throughout.
+    """
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.offers.domain import markup_unit_price
+    from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
+
+    if markup_percent < 0:
+        print("markup-percent must not be negative")
+        return 2
+
+    repo = SqlAlchemySellableOfferRepository(SessionFactory)
+    rows = [row for row in await repo.list_all() if row.provider_key == provider]
+    if not rows:
+        print(f"no stored offers for provider {provider!r} — sync the catalog first")
+        return 1
+
+    priced = 0
+    skipped_priced = 0
+    skipped_disabled = 0
+    skipped_cost = 0
+    for row in sorted(rows, key=lambda o: (o.location_id, o.product_id)):
+        if row.selling_price_minor > 0:
+            skipped_priced += 1
+            continue
+        if not row.enabled and not include_disabled:
+            # A disabled offer is hidden by the operator; pricing it would
+            # imply an intent they did not express.
+            skipped_disabled += 1
+            continue
+        if row.provider_cost_minor <= 0:
+            skipped_cost += 1
+            print(f"  warning: {row.ref} has no usable provider cost; left unpriced")
+            continue
+        try:
+            price = markup_unit_price(row.provider_cost_minor, markup_percent)
+        except ValueError as exc:  # pragma: no cover - guarded above
+            print(f"  warning: {row.ref}: {exc}")
+            skipped_cost += 1
+            continue
+        currency = row.provider_cost_currency
+        if dry_run:
+            print(
+                f"  would price {row.ref}: cost {row.provider_cost_minor} "
+                f"{currency} -> {price} {currency} (+{markup_percent}%)"
+            )
+            priced += 1
+            continue
+        await repo.set_selling_price(row.id, price, currency)
+        print(
+            f"priced {row.ref}: {price} {currency} "
+            f"(cost {row.provider_cost_minor}, +{markup_percent}%)"
+        )
+        priced += 1
+
+    verb = "would price" if dry_run else "priced"
+    print(
+        f"{verb} {priced} offer(s); already priced: {skipped_priced}, "
+        f"disabled (use --include-disabled): {skipped_disabled}, "
+        f"no cost: {skipped_cost}"
+    )
+    if not dry_run and priced:
+        print("next: python -m cloud_platform.cli offers doctor")
     return 0
 
 
@@ -1277,6 +1616,8 @@ async def renewals_check() -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
+    from cloud_platform.modules.markets.domain import MARKET_ORDER
+
     parser = argparse.ArgumentParser(prog="cloud_platform.cli")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1335,6 +1676,24 @@ def _parser() -> argparse.ArgumentParser:
     offers_sub = offers.add_subparsers(dest="subcommand", required=True)
     offers_list_p = offers_sub.add_parser("list")
     offers_list_p.add_argument("--all", action="store_true", help="include disabled/unpriced")
+    offers_sub.add_parser("doctor", help="read-only: why the catalog is empty")
+    preview = offers_sub.add_parser(
+        "preview", help="print the customer catalog exactly as the bot builds it"
+    )
+    preview.add_argument("--market", choices=[m.value for m in MARKET_ORDER], default=None)
+    price_book = offers_sub.add_parser(
+        "price-book", help="bulk-price UNPRICED offers from their synced provider cost"
+    )
+    price_book.add_argument("--provider", default="leaseweb")
+    price_book.add_argument(
+        "--markup-percent", type=int, required=True, help="operator-chosen markup over cost"
+    )
+    price_book.add_argument("--dry-run", action="store_true")
+    price_book.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="also price offers the operator has switched off",
+    )
     for action in ("enable", "disable"):
         p = offers_sub.add_parser(action)
         p.add_argument("offer_id")
@@ -1451,6 +1810,19 @@ async def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "offers":
         if args.subcommand == "list":
             return await offers_list(args.all)
+        if args.subcommand == "doctor":
+            result = await offers_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
+        if args.subcommand == "preview":
+            return await offers_preview(args.market)
+        if args.subcommand == "price-book":
+            return await offers_price_book(
+                args.provider,
+                args.markup_percent,
+                args.dry_run,
+                args.include_disabled,
+            )
         if args.subcommand == "price":
             return await offers_set(args.offer_id, "price", str(args.minor), args.currency)
         return await offers_set(args.offer_id, args.subcommand, None, None)

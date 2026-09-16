@@ -18,6 +18,7 @@ All three must hold for the customer to see and buy the offer.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -103,6 +104,46 @@ class SellableOffer:
         return f"{self.provider_key}/{self.product_id}/{self.location_id}"
 
 
+#: The three gates, named for diagnostics/reporting (never customer-facing).
+GATE_PROVIDER_UNAVAILABLE = "provider_unavailable"
+GATE_DISABLED = "disabled"
+GATE_UNPRICED = "unpriced"
+
+
+def blocking_gate(offer: SellableOffer) -> str | None:
+    """The FIRST gate keeping an offer off the storefront (None = on sale).
+
+    Evaluated in the same order the domain documents them, so the reported
+    gate is the one an operator must clear first. Pure and provider-neutral:
+    this is the single definition of "why can a customer not see this".
+    """
+    if not offer.provider_available:
+        return GATE_PROVIDER_UNAVAILABLE
+    if not offer.enabled:
+        return GATE_DISABLED
+    if offer.selling_price_minor <= 0:
+        return GATE_UNPRICED
+    return None
+
+
+def visibility_summary(offers: Iterable[SellableOffer]) -> dict[str, int]:
+    """Count offers per blocking gate (always every key, plus ``sellable``).
+
+    Used by the operator diagnostics: an empty storefront must be explainable
+    by COUNTS, not by guessing which gate failed.
+    """
+    summary = {
+        "sellable": 0,
+        GATE_PROVIDER_UNAVAILABLE: 0,
+        GATE_DISABLED: 0,
+        GATE_UNPRICED: 0,
+    }
+    for offer in offers:
+        gate = blocking_gate(offer)
+        summary["sellable" if gate is None else gate] += 1
+    return summary
+
+
 @dataclass(frozen=True, slots=True)
 class OfferSpecUpdate:
     """Provider-reported spec/cost refresh (catalog sync)."""
@@ -118,6 +159,25 @@ class OfferSpecUpdate:
     provider_available: bool = True
     #: Credential account this observation came from (provenance, not a price).
     provider_account_id: str | None = None
+
+
+def markup_unit_price(cost_minor: int, markup_percent: int) -> int:
+    """Customer price from a provider cost and an integer markup percentage.
+
+    Integer-only by construction: ``cost * (100 + markup)`` is computed in
+    minor units and rounded UP to the next minor unit so a non-zero cost can
+    never be sold below cost. No float, no Decimal-to-float, per the money
+    invariant.
+
+    The selling price is normally operator-owned; this is the explicit bulk
+    pricing tool an operator invokes with a markup THEY choose — never an
+    automatic repricing of an existing price.
+    """
+    if cost_minor <= 0:
+        raise ValueError("provider cost must be positive minor units to price from")
+    if markup_percent < 0:
+        raise ValueError("markup must not be negative")
+    return -((-cost_minor * (100 + markup_percent)) // 100)
 
 
 class SellableOfferRepository(Protocol):

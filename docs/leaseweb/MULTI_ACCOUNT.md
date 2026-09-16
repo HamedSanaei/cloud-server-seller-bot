@@ -178,6 +178,42 @@ python -m cloud_platform.cli leaseweb sync-offers
 python -m cloud_platform.cli leaseweb doctor
 ```
 
+### 8.1 "The customer catalog is empty" — sync is only half the job
+
+An offer reaches a customer through **five** gates. A sync clears only one of
+them, so a freshly synced catalog is *expected* to be invisible:
+
+| Gate | Cleared by |
+| --- | --- |
+| provider has a `market` | `[providers.leaseweb] market = "..."` |
+| provider is `enabled` | `[providers.leaseweb] enabled = true` |
+| provider implements ordering | built-in (no config) |
+| offer `provider_available` | **catalog sync** |
+| offer `enabled` | operator (`offers enable`) |
+| offer `selling_price_minor > 0` | **operator (a sync never sets a price)** |
+
+So the go-live sequence is sync **then price**, never sync alone:
+
+```bash
+python -m cloud_platform.cli leaseweb sync-offers
+# ... then, when the report says "NOTHING is on sale":
+python -m cloud_platform.cli offers price-book --provider leaseweb --markup-percent 30
+python -m cloud_platform.cli offers doctor    # every gate, with counts
+python -m cloud_platform.cli offers preview   # the catalog as the BOT builds it
+```
+
+`offers price-book` prices only offers that have **no** price yet, in the
+currency the provider cost was captured in (the markup is an integer
+percentage you choose; it never relabels currency, so it can never imply an
+exchange rate). `--dry-run` shows the effect first. A provider cost is not a
+selling price — `--markup-percent 0` is legitimate but is then a deliberate
+choice, not a default.
+
+`offers doctor` names the failing gate (with counts) and the exact command
+that clears it; `offers preview` walks the same view service as the Telegram
+storefront, so it shows precisely what a customer would see — including
+nothing.
+
 `accounts doctor` prints, per credential, what that key alone can sell where —
 and never a key:
 
