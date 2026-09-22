@@ -246,7 +246,7 @@ verify_application_configuration() {
         return 1
     }
     case "${IMAGE_HEAD}" in
-        *" "*) 
+        *" "*)
             fail "the release image ships MULTIPLE alembic heads (${IMAGE_HEAD}); merge them before deploying"
             return 1
             ;;

@@ -1117,11 +1117,14 @@ class TestCredentialVerification:
         assert len(probed) < len(seeds)
 
     async def test_the_candidate_key_never_appears_in_the_failure(self) -> None:
+        # The sentinel is deliberately NOT secret-looking (detect-secrets flags
+        # credential-shaped literals): the property under test is that whatever
+        # key was tried is absent from the error, not that the key looks exotic.
         from cloud_platform.providers.leaseweb.errors import LeasewebAuthenticationError
 
-        secret = "LSW-SUPER-SECRET-CANDIDATE"
+        candidate = "candidate-key"
         provider = _provider(lambda m, p, **kw: _response(401, {"errorMessage": "invalid key"}))
         with pytest.raises(LeasewebAuthenticationError) as excinfo:
-            await provider.verify_credential(secret)
-        assert secret not in str(excinfo.value)
-        assert secret not in repr(excinfo.value)
+            await provider.verify_credential(candidate)
+        assert candidate not in str(excinfo.value)
+        assert candidate not in repr(excinfo.value)

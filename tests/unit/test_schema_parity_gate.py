@@ -234,7 +234,7 @@ class TestGateEntryPoint:
 
     def test_an_uninspectable_database_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def _observe() -> sp.ObservedSchema:
-            raise RuntimeError("connection refused: postgresql://user:secret@host/db")
+            raise RuntimeError("database connection refused")
 
         monkeypatch.setattr(sp, "observe_live", _observe)
         assert sp.main([]) == sp.EXIT_UNINSPECTABLE
