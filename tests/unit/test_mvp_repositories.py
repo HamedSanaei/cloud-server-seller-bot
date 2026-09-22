@@ -180,6 +180,151 @@ class TestSellableOfferRepository:
         assert offer.id == OFFER_ID
         assert offer.provider_available is True
 
+    async def test_provider_sync_preserves_the_operator_price_and_currency(
+        self, db: AsyncMock
+    ) -> None:
+        """SYNC != PRICE: a refresh updates COST, never the storefront.
+
+        Production risk this pins down: a re-sync of a GBP Sales Organization
+        must not rewrite the operator's GBP selling price, must not change the
+        selling currency, and must not flip enable/disable.
+        """
+        row = _offer_row(
+            provider_cost_minor=999,
+            provider_cost_currency="GBP",
+            selling_price_minor=1499,
+            selling_currency="GBP",
+            enabled=True,
+            provider_available=True,
+        )
+        db.execute.return_value = _result(row)
+        offer = await _offer_repo(db).upsert_from_provider(
+            provider_key="leaseweb",
+            product_id="VPS02_1",
+            location_id="LON-01",
+            update=OfferSpecUpdate(
+                name="VPS S",
+                vcpu=2,
+                ram_gb=4,
+                disk_gb=100,
+                traffic="10 TB",
+                provider_cost_minor=1099,
+                provider_cost_currency="GBP",
+                billing_parameters={},
+                provider_available=True,
+            ),
+        )
+        assert row.provider_cost_minor == 1099
+        assert row.provider_cost_currency == "GBP"
+        assert row.selling_price_minor == 1499
+        assert row.selling_currency == "GBP"
+        assert row.enabled is True
+        assert offer.id == OFFER_ID
+
+    async def test_a_refresh_repins_legacy_provenance_to_the_supplying_account(
+        self, db: AsyncMock
+    ) -> None:
+        """Production: 36 offers carried migration 0037's legacy `default` pin.
+
+        The next successful catalog sync must replace that with the account that
+        actually supplied the observation (FRA -> the German Sales Organization,
+        LON -> the UK one).
+        """
+        row = _offer_row(provider_account_id="default", provider_cost_currency="GBP")
+        db.execute.return_value = _result(row)
+        await _offer_repo(db).upsert_from_provider(
+            provider_key="leaseweb",
+            product_id="VPS02_1",
+            location_id="LON-01",
+            provider_account_id="sales-org-uk",
+            update=OfferSpecUpdate(
+                name="VPS S",
+                vcpu=2,
+                ram_gb=4,
+                disk_gb=100,
+                traffic="10 TB",
+                provider_cost_minor=1099,
+                provider_cost_currency="GBP",
+                billing_parameters={},
+                provider_available=True,
+            ),
+        )
+        assert row.provider_account_id == "sales-org-uk"
+        # The operator's selling price and enable state are untouched by a sync.
+        assert row.selling_price_minor == 1299
+        assert row.enabled is True
+
+    async def test_a_caller_without_account_knowledge_cannot_erase_provenance(
+        self, db: AsyncMock
+    ) -> None:
+        row = _offer_row(provider_account_id="sales-org-north")
+        db.execute.return_value = _result(row)
+        await _offer_repo(db).upsert_from_provider(
+            provider_key="leaseweb",
+            product_id="VPS02_1",
+            location_id="FRA-01",
+            update=OfferSpecUpdate(
+                name="VPS S",
+                vcpu=2,
+                ram_gb=4,
+                disk_gb=100,
+                traffic="10 TB",
+                provider_cost_minor=999,
+                provider_cost_currency="EUR",
+                billing_parameters={},
+                provider_available=True,
+            ),
+        )
+        assert row.provider_account_id == "sales-org-north"
+
+    async def test_a_new_offer_is_unpriced_and_disabled(self, db: AsyncMock) -> None:
+        """A discovered product must never go on sale by itself."""
+        db.execute.return_value = _result()
+        await _offer_repo(db).upsert_from_provider(
+            provider_key="leaseweb",
+            product_id="VPS02_1",
+            location_id="LON-01",
+            update=OfferSpecUpdate(
+                name="VPS S",
+                vcpu=2,
+                ram_gb=4,
+                disk_gb=100,
+                traffic="10 TB",
+                provider_cost_minor=1099,
+                provider_cost_currency="GBP",
+                billing_parameters={},
+                provider_available=True,
+            ),
+        )
+        created = db.add.call_args.args[0]
+        # No selling price is set (the column defaults to 0) and the offer is
+        # not enabled; both remain explicit operator decisions.
+        assert created.selling_price_minor is None
+        assert created.enabled is None
+        assert created.provider_cost_currency == "GBP"
+
+    async def test_an_observation_without_a_currency_is_refused(self, db: AsyncMock) -> None:
+        """Fail closed: the column default is EUR, which would be a lie."""
+        db.execute.return_value = _result()
+        with pytest.raises(ValueError, match="without a provider currency"):
+            await _offer_repo(db).upsert_from_provider(
+                provider_key="leaseweb",
+                product_id="VPS02_1",
+                location_id="LON-11",
+                update=OfferSpecUpdate(
+                    name="VPS S",
+                    vcpu=2,
+                    ram_gb=4,
+                    disk_gb=100,
+                    traffic="10 TB",
+                    provider_cost_minor=1099,
+                    provider_cost_currency="",
+                    billing_parameters={},
+                    provider_available=True,
+                ),
+            )
+        db.add.assert_not_called()
+
     async def test_upsert_from_provider_creates_new_row(self, db: AsyncMock) -> None:
         db.execute.return_value = _result()  # no existing row -> create path
         offer = await _offer_repo(db).upsert_from_provider(

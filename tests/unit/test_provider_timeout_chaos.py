@@ -50,7 +50,7 @@ from cloud_platform.modules.operations.service import (
 )
 from cloud_platform.modules.wallet.domain import Wallet
 from cloud_platform.providers.base import CreateServerRequest, ProviderImage
-from cloud_platform.providers.errors import ProviderUnavailable
+from cloud_platform.providers.errors import ProviderOutcomeUnknown, ProviderUnavailable
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.registry import ProviderRegistry
 
@@ -378,7 +378,7 @@ class TestCreateTimeoutChaos:
         )
         claimed = await harness.ops.claim(op.id)
         assert claimed is not None
-        with pytest.raises(ProviderUnavailable):
+        with pytest.raises(ProviderOutcomeUnknown):
             await harness.provider.create_server(_fake_request(), IdempotencyKey(op.operation_key))
         # chaos: the crash means NO requeue - the op is still IN_FLIGHT
         assert op.status is OperationStatus.IN_FLIGHT

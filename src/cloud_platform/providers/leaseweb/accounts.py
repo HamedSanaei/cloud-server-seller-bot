@@ -445,7 +445,13 @@ class LeasewebAccountRouter:
         try:
             holder = self._holders.get(normalize_account_id(account_id))
             credential = await holder.get() if holder is not None else None
-            await verify(credential.value if credential is not None else "")
+            # SCOPED candidates (configured locations first, then the
+            # provider's own discovery seeds): a location-less probe is not a
+            # valid authentication test for this provider.
+            await verify(
+                credential.value if credential is not None else "",
+                candidates=self.locations,
+            )
         except LeasewebAuthenticationError:
             return LeasewebAccountHealth(account_id, ok=False, error_class="AuthenticationError")
         except LeasewebError as exc:

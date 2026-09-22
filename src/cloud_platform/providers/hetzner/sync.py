@@ -10,7 +10,7 @@ import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -36,6 +36,8 @@ from cloud_platform.modules.catalog.repository import (
     provider_key_to_uuid,
 )
 from cloud_platform.modules.catalog.service import PricingIngestionService
+from cloud_platform.modules.offers.domain import OfferSpecUpdate
+from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderConflict,
@@ -70,6 +72,25 @@ class PaginationState:
     page: int
     per_page: int
     has_next: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LocationOfferReport:
+    """How many sellable products one location contributed (or why it did not)."""
+
+    location_id: str
+    products: int
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OfferSyncResult:
+    """Result of the sellable-offer sync (one row per location + totals)."""
+
+    locations: tuple[LocationOfferReport, ...]
+    offers_written: int
+    marked_unavailable: int
+    warnings: tuple[str, ...]
 
 
 class HetznerCatalogSyncer:
@@ -414,6 +435,132 @@ class HetznerCatalogSyncer:
             "images": images_result,
         }
 
+    # --- Sellable-offer sync (the customer-facing price book) ---
+
+    async def sync_offers(self) -> OfferSyncResult:
+        """Turn real Hetzner server types into ``SellableOffer`` rows.
+
+        For every location the provider reports, the LOCATION-SCOPED list
+        endpoint (``/server_types?location=...``) is authoritative: each server
+        type it returns with a monthly price at that location becomes one
+        offer, identified by ``(provider, product, location)``. A location that
+        fails is isolated — its offers are left untouched rather than being
+        marked unavailable — while every other location still syncs.
+
+        Provider cost is recorded as integer minor units parsed from the
+        provider's Decimal string (never float, never hard-coded).
+        ``enabled`` and ``selling_price_minor`` are NEVER written here: the
+        operator owns both, so a newly discovered server type arrives switched
+        off and unpriced. Nothing is ever deleted — a server type or location
+        that stops being offered is marked provider-unavailable.
+        """
+        repo = SqlAlchemySellableOfferRepository(self._session_factory)
+        locations, location_errors = await self._offer_locations()
+        available: set[tuple[str, str]] = set()
+        reports: list[LocationOfferReport] = []
+        warnings: list[str] = list(location_errors)
+        written = 0
+
+        for location_id in locations:
+            try:
+                items = await self._server_types_at(location_id)
+            except ProviderError as exc:
+                # One bad location must never fail the whole sync, and must
+                # never mark its offers unavailable: the provider told us
+                # nothing about it.
+                reports.append(
+                    LocationOfferReport(
+                        location_id=location_id, products=0, error=type(exc).__name__
+                    )
+                )
+                warnings.append(f"location {location_id}: {type(exc).__name__}")
+                continue
+            counted = 0
+            for item in items:
+                spec = _offer_spec_from_hetzner(item, location_id)
+                if spec is None:
+                    warnings.append(
+                        f"{location_id}: server type {item.get('name')} has no monthly price"
+                    )
+                    continue
+                await repo.upsert_from_provider(
+                    provider_key=PROVIDER_KEY,
+                    product_id=spec.product_id,
+                    location_id=location_id,
+                    update=spec.update,
+                )
+                available.add((spec.product_id, location_id))
+                counted += 1
+                written += 1
+            reports.append(LocationOfferReport(location_id=location_id, products=counted))
+
+        # Only reconcile availability when EVERY configured location synced: a
+        # partial view of the catalog must not retire offers we simply could
+        # not look at this round.
+        marked = 0
+        if not any(report.error for report in reports) and locations:
+            marked = await repo.mark_unavailable(PROVIDER_KEY, available)
+        else:
+            warnings.append("skipped mark_unavailable: current availability unreadable")
+
+        return OfferSyncResult(
+            locations=tuple(reports),
+            offers_written=written,
+            marked_unavailable=marked,
+            warnings=tuple(warnings),
+        )
+
+    async def probe_locations(self) -> tuple[list[str], list[str]]:
+        """READ-ONLY: the locations this credential can see (ids, errors)."""
+        return await self._offer_locations()
+
+    async def probe_server_types(self, location_id: str) -> list[dict[str, Any]]:
+        """READ-ONLY: the server types offered at ONE location."""
+        return await self._server_types_at(location_id)
+
+    async def _offer_locations(self) -> tuple[list[str], list[str]]:
+        """Every location id the credential can see (paginated, isolated)."""
+        found: list[str] = []
+        errors: list[str] = []
+        page = 1
+        while True:
+            try:
+                payload = await self._request(
+                    "GET", "/locations", params=self._get_pagination_params(page)
+                )
+            except ProviderError as exc:
+                errors.append(f"locations page {page}: {type(exc).__name__}")
+                break
+            data = payload.get("locations", [])
+            if not data:
+                break
+            found.extend(str(item["id"]) for item in data if item.get("id"))
+            next_page = ((payload.get("meta") or {}).get("pagination") or {}).get("next_page")
+            if not isinstance(next_page, int) or next_page <= page:
+                break
+            page = next_page
+        return found, errors
+
+    async def _server_types_at(self, location_id: str) -> list[dict[str, Any]]:
+        """Server types offered at ONE location (paginated).
+
+        The list endpoint is the source of truth for catalog membership; the
+        per-id detail endpoint is never required here.
+        """
+        items: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            params: dict[str, Any] = {**self._get_pagination_params(page), "location": location_id}
+            payload = await self._request("GET", "/server_types", params=params)
+            data = payload.get("server_types", [])
+            if not data:
+                return items
+            items.extend(data)
+            next_page = ((payload.get("meta") or {}).get("pagination") or {}).get("next_page")
+            if not isinstance(next_page, int) or next_page <= page:
+                return items
+            page = next_page
+
 
 def _int_or_none(value: str | None) -> int | None:
     if value is None:
@@ -432,6 +579,112 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     if not text:
         return None
     return Decimal(text)
+
+
+@dataclass(frozen=True, slots=True)
+class _OfferSpec:
+    """One server type at one location, ready to be written to the price book."""
+
+    product_id: str
+    update: OfferSpecUpdate
+
+
+def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSpec | None:
+    """Map one ``/server_types`` LIST entry to a sellable-offer observation.
+
+    Returns None when the provider reports no monthly price for this location:
+    without a provider price there is nothing safe to sell, so the caller
+    records a warning instead of inventing one.
+    """
+    monthly = _monthly_minor_for_location(item, location_id)
+    if monthly is None:
+        return None
+    # The server type NAME is the stable, human-meaningful provider reference
+    # an operator can match against the Hetzner console (and the provider
+    # accepts it wherever an id is accepted).
+    name = str(item.get("name") or item["id"])
+    return _OfferSpec(
+        product_id=name,
+        update=OfferSpecUpdate(
+            name=name,
+            vcpu=int(item.get("cores") or 0),
+            ram_gb=_memory_gb(item.get("memory")),
+            disk_gb=int(item.get("disk") or 0),
+            traffic=_traffic_label(item.get("included_traffic")),
+            provider_cost_minor=monthly,
+            provider_cost_currency=CURRENCY,
+            billing_parameters={
+                "contract_term": "1_MONTH",
+                "billing_cycle": "1_MONTH",
+                "monthly_price_minor": monthly,
+                "monthly_price_source": "server_types.location",
+                "server_type_id": str(item.get("id") or ""),
+                "location": location_id,
+            },
+            provider_available=True,
+        ),
+    )
+
+
+def _monthly_minor_for_location(item: dict[str, Any], location_id: str) -> int | None:
+    """Provider monthly price at one location, as integer minor units.
+
+    The provider's Decimal STRING is scaled to minor units — never parsed as
+    float, never rounded implicitly.
+    """
+    raw_prices = [raw for raw in item.get("prices", []) if isinstance(raw, dict)]
+    for raw in raw_prices:
+        declared = str(raw.get("location") or raw.get("location_name") or "")
+        if declared != location_id:
+            continue
+        return _monthly_minor(raw)
+    # A location-scoped request can return a single already-filtered price.
+    if len(raw_prices) == 1:
+        return _monthly_minor(raw_prices[0])
+    return None
+
+
+def _monthly_minor(raw: dict[str, Any]) -> int | None:
+    gross = (raw.get("monthly") or {}).get("gross")
+    if gross is None:
+        return None
+    try:
+        value = Decimal(str(gross))
+    except (InvalidOperation, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _memory_gb(value: Any) -> int:
+    """Hetzner reports memory in GB as a decimal string ("4.0") -> integer GB."""
+    if value is None:
+        return 0
+    try:
+        return int(Decimal(str(value)).to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return 0
+
+
+def _traffic_label(value: Any) -> str | None:
+    """Included traffic (bytes, provider-reported) -> display label.
+
+    Rendered in binary terabytes, the unit the provider itself uses for
+    included traffic, from Decimal arithmetic only.
+    """
+    if value is None:
+        return None
+    try:
+        total = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if total <= 0:
+        return None
+    terabytes = total / (Decimal(2) ** 40)
+    if terabytes == terabytes.to_integral_value():
+        return f"{int(terabytes)} TB"
+    return f"{terabytes.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)} TB"
 
 
 def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:

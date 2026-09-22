@@ -232,6 +232,28 @@ class TestDeployScriptStatic:
         assert "HEALTH_ATTEMPTS" in script
         assert "alembic current" in script
 
+    def test_physical_schema_gate_runs_between_head_and_services(self) -> None:
+        """Revision equality is not compatibility: the physical schema is checked too.
+
+        Production reported revision 0037 (== image head) while provider_routes
+        and both credential-account columns were physically absent. The head
+        comparison passes on that database, so the release verifies the schema
+        its own code queries, read-only, BEFORE api/worker/bot are replaced.
+        """
+        script = _script()
+        gate = script.index("python -m cloud_platform.db.schema_parity")
+        assert script.index("database migration head verified") < gate
+        assert gate < script.index("starting api + worker + bot")
+        assert "database physical schema verified against the release" in script
+        # Read with the RELEASE image and in a one-shot container: no service is
+        # touched and deploy.env's PLATFORM_IMAGE is not consulted.
+        window = script[max(0, gate - 300) : gate]
+        assert 'PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}"' in window
+        assert "compose_candidate run --rm --no-deps migrate" in window
+        # It repairs nothing itself: the migration step owns schema changes.
+        assert "alembic downgrade" not in script.lower()
+        assert "alembic stamp" not in script
+
     def test_single_bot_polling_is_enforced(self) -> None:
         script = _script()
         assert 'bot_count="$(compose_candidate ps -q bot | grep -c . || true)"' in script
@@ -400,6 +422,14 @@ case " $* " in
         printf '%s' "$n" > "$PULL_COUNTER"
         if [ "$STUB_FAIL_PULL" = "1" ] && [ "$n" -ge 2 ]; then exit 1; fi
         ;;
+    *" alembic heads"*)
+        printf '%s\n' "${ALEMBIC_IMAGE_HEAD:-0034 (head)}"
+        exit 0
+        ;;
+    *" alembic current"*)
+        printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
+        exit 0
+        ;;
 esac
 exit 0
 """
@@ -548,14 +578,19 @@ class TestDeployFailClosed:
         calls = _docker_calls(tmp_path)
         assert "pull" in calls
         assert " up " not in f" {calls} "
-        # The ONLY container allowed to run before a failed pull is the
-        # ephemeral configuration validator — never the migration.
+        # Before a failed pull only READ-ONLY, database-free probes may run:
+        # the ephemeral configuration validator and the alembic head probe
+        # (which reads the head out of the image's own migrations directory).
+        # A MIGRATION must never have run.
         migrate_runs = [
             line
             for line in calls.splitlines()
-            if "run --rm --no-deps migrate" in line and "get_settings" not in line
+            if "run --rm --no-deps migrate" in line
+            and "get_settings" not in line
+            and "alembic heads" not in line
         ]
         assert migrate_runs == []
+        assert "alembic upgrade" not in calls
         env = tmp_path / "deploy" / "deploy.env"
         assert f"PLATFORM_IMAGE={_OLD_IMAGE}" in env.read_text(encoding="utf-8")
 
@@ -575,6 +610,20 @@ case " $* " in
         ;;
     *" ps -q "*)
         echo "cid123"
+        exit 0
+        ;;
+    *" alembic heads"*)
+        # The head must come from the RELEASE image, never from the image still
+        # recorded in deploy.env during the preflight.
+        [ "$PLATFORM_IMAGE" = "$PLATFORM_IMAGE_NEW" ] || {
+            echo "PROBE_USED_THE_WRONG_IMAGE: $PLATFORM_IMAGE" >&2
+            exit 3
+        }
+        printf '%s\n' "${ALEMBIC_IMAGE_HEAD:-0034 (head)}"
+        exit 0
+        ;;
+    *" alembic current"*)
+        printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
         exit 0
         ;;
     *" up -d api worker bot "*)
@@ -717,7 +766,15 @@ case " $* " in
         echo "cid123"
         exit 0
         ;;
-    *" exec "*) echo "0034 (head)" ;;
+    *" alembic heads"*)
+        printf '%s\n' "${ALEMBIC_IMAGE_HEAD:-0034 (head)}"
+        exit 0
+        ;;
+    *" alembic current"*)
+        printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
+        exit 0
+        ;;
+    *" exec "*) printf '%s\n' "${ALEMBIC_IMAGE_HEAD:-0034 (head)}" ;;
 esac
 exit 0
 """
@@ -833,6 +890,55 @@ case " $* " in
         [ "$FAIL_CONFIG_CHECK" = "1" ] && exit 1
         exit 0
         ;;
+    *"cloud_platform.db.schema_parity"*)
+        # Physical schema gate. It must run with the RELEASE image (deploy.env
+        # still holds the previous one at this point) and it fails the deploy
+        # when the database lacks objects the release queries.
+        case "$PLATFORM_IMAGE" in
+            "$PLATFORM_IMAGE_NEW") ;;
+            *)
+                echo "PROBE_USED_THE_WRONG_IMAGE: $PLATFORM_IMAGE" >&2
+                exit 3
+                ;;
+        esac
+        if [ "$FAIL_SCHEMA_PARITY" = "1" ]; then
+            echo "[FAIL] the release's code queries schema this database does not have:"
+            echo "  missing table:   provider_routes"
+            exit 1
+        fi
+        exit 0
+        ;;
+    *" alembic heads"*)
+        # The head SHIPPED IN THE IMAGE (read from the artifact itself), and
+        # read from the RELEASE image — deploy.env still holds the previous one
+        # during the preflight. (`exec` against the running api container is not
+        # image-pinned by the script: that container IS the release candidate.)
+        [ "$FAIL_IMAGE_HEAD" = "1" ] && exit 1
+        case " $* " in
+            *" run "*)
+                [ "$PLATFORM_IMAGE" = "$PLATFORM_IMAGE_NEW" ] || {
+                    echo "PROBE_USED_THE_WRONG_IMAGE: $PLATFORM_IMAGE" >&2
+                    exit 3
+                }
+                ;;
+        esac
+        printf '%s\n' "${ALEMBIC_IMAGE_HEAD:-0034 (head)}"
+        exit 0
+        ;;
+    *" alembic current"*)
+        # The revision the DATABASE reports, read with the release image.
+        [ "$FAIL_DB_HEAD" = "1" ] && exit 1
+        case " $* " in
+            *" run "*)
+                [ "$PLATFORM_IMAGE" = "$PLATFORM_IMAGE_NEW" ] || {
+                    echo "PROBE_USED_THE_WRONG_IMAGE: $PLATFORM_IMAGE" >&2
+                    exit 3
+                }
+                ;;
+        esac
+        printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
+        exit 0
+        ;;
     *" run "*)
         [ "$FAIL_MIGRATE" = "1" ] && exit 1
         exit 0
@@ -848,7 +954,7 @@ case " $* " in
         exit 0
         ;;
     *" exec "*)
-        echo "0034 (head)"
+        printf '%s\n' "${ALEMBIC_IMAGE_HEAD:-0034 (head)}"
         exit 0
         ;;
 esac
@@ -866,9 +972,19 @@ def _release_harness(
     fail_migrate: bool = False,
     fail_ready: bool = False,
     fail_up_api: bool = False,
+    fail_schema_parity: bool = False,
     crash_loop: bool = False,
+    alembic_image_head: str = "0034 (head)",
+    alembic_db_head: str = "0034 (head)",
+    expected_head: str = "0034",
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path, bytes, bytes]:
     """Run main() against the release-candidate flow with stubbed externals.
+
+    ``alembic_image_head`` is the head the release IMAGE ships (read from the
+    artifact); ``alembic_db_head`` is what the DATABASE reports. They must
+    match before any schema-dependent service starts. ``fail_schema_parity``
+    is the production shape where they DO match while the physical schema is
+    still missing objects.
 
     Returns (process, deploy_dir, canonical, candidate, env_before, config_before).
     """
@@ -911,12 +1027,15 @@ def _release_harness(
         f"FAIL_CONFIG_CHECK='{'1' if fail_config_check else ''}' "
         f"FAIL_MIGRATE='{'1' if fail_migrate else ''}' "
         f"FAIL_UP_API='{'1' if fail_up_api else ''}' "
+        f"FAIL_SCHEMA_PARITY='{'1' if fail_schema_parity else ''}' "
+        f"ALEMBIC_IMAGE_HEAD='{alembic_image_head}' "
+        f"ALEMBIC_DB_HEAD='{alembic_db_head}' "
         f"DEPLOY_PATH='{_deploy_path(deploy_dir)}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
         f"CURRENT_COMPOSE_FILE='{current}' "
         f"CANDIDATE_COMPOSE_FILE='{candidate}' "
         f"EXPECTED_COMPOSE_SHA256='{'f' * 64 if bad_sha else candidate_sha}' "
         f"ENV_FILE='{env_file.as_posix()}' "
-        f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='0034' "
+        f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='{expected_head}' "
         f"STABILIZE_SECONDS=1 HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
         f"source '{DEPLOY_SCRIPT.as_posix()}'; "
         "set +e; main; echo MAIN_RC=$?"
@@ -1022,6 +1141,113 @@ class TestReleaseComposeContract:
         assert (deploy_dir / "deploy.env").read_bytes() == env_before
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
         assert (tmp_path / "configuration.toml").read_bytes() == config_before
+
+    @needs_bash
+    def test_database_behind_image_head_never_starts_services(self, tmp_path: Path) -> None:
+        """Regression: code that queries a table the database lacks reached prod.
+
+        The database must be AT the head the release image ships BEFORE any
+        schema-dependent service starts. This is the exact failure mode of the
+        `relation "provider_routes" does not exist` incident: the image shipped
+        migration 0035, the database stayed at 0033, and api/worker/bot started
+        anyway.
+        """
+        result, deploy_dir, canonical, _, env_before, _config_before = _release_harness(
+            tmp_path, alembic_db_head="0033 (head)"
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "database is NOT at the image alembic head" in result.stderr
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
+        # No CANDIDATE service start at all: the mismatch is caught before
+        # api/worker/bot are replaced. The only `up` left is the rollback of the
+        # previous release, which is the correct end state of a failed deploy.
+        assert up_lines, calls
+        assert all("candidate" not in line for line in up_lines)
+        assert "release compose promoted" not in result.stdout
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+
+    @needs_bash
+    def test_revision_match_with_missing_physical_schema_never_starts_services(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: the CONFIRMED production shape must be rejected.
+
+        Reproduces it exactly: ``alembic_version`` == 0037, migration 0036's FX
+        columns and 0037's ``sellable_offers.provider_account_id`` present,
+        while migration 0035's objects (``provider_routes``,
+        ``provider_orders.credential_account_id``,
+        ``servers.credential_account_id``) are MISSING. The revision matches the
+        image, so only the physical-schema gate can catch it - and it must do so
+        before any schema-dependent service is replaced.
+        """
+        result, deploy_dir, canonical, candidate, env_before, _config_before = _release_harness(
+            tmp_path,
+            alembic_image_head="0037 (head)",
+            alembic_db_head="0037 (head)",
+            expected_head="0037",
+            fail_schema_parity=True,
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "physical schema does not support the release" in result.stderr
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        gate_lines = [line for line in calls.splitlines() if "schema_parity" in line]
+        assert gate_lines, calls
+        # Read with the RELEASE image: deploy.env still holds the previous one.
+        assert "PROBE_USED_THE_WRONG_IMAGE" not in result.stderr
+        # No CANDIDATE service start at all: the drift is caught before api/
+        # worker/bot are replaced, so the running release keeps serving.
+        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
+        assert all("candidate" not in line for line in up_lines), up_lines
+        assert "release compose promoted" not in result.stdout
+        # The recorded image reference goes back to the release still running,
+        # and the failed release leaves no stale candidate behind.
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        assert "restored previous image reference" in result.stdout
+        assert not candidate.exists()
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_image_with_multiple_heads_fails_before_mutation(self, tmp_path: Path) -> None:
+        """Two open heads mean `upgrade head` is ambiguous: refuse to deploy."""
+        result, deploy_dir, canonical, _, env_before, _config_before = _release_harness(
+            tmp_path, alembic_image_head="0033 (head)\n0034 (head)"
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "ships MULTIPLE alembic heads" in result.stderr
+        assert "no rollback needed" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        assert "alembic upgrade" not in calls
+        assert "up -d api worker bot" not in calls
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_pipeline_head_drift_fails_before_mutation(self, tmp_path: Path) -> None:
+        """EXPECTED_HEAD is cross-checked against the head in the artifact.
+
+        A CI variable can drift from the built image; the artifact cannot drift
+        from itself. Detecting the drift pre-flight keeps a deploy from applying
+        the WRONG schema while believing it applied the expected one.
+        """
+        result, deploy_dir, canonical, candidate, env_before, _config_before = _release_harness(
+            tmp_path, expected_head="0033"
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "does not match the head shipped in the image" in result.stderr
+        assert "no rollback needed" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        assert "alembic upgrade" not in calls
+        assert "up -d api worker bot" not in calls
+        assert candidate.exists()
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
 
     @needs_bash
     def test_failed_readiness_does_not_promote(self, tmp_path: Path) -> None:

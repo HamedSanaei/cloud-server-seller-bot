@@ -65,14 +65,22 @@ class TestHealthChecks:
 
 
 class TestMigrationHead:
-    def test_repo_head_is_the_latest_revision(self) -> None:
+    def test_repo_head_is_a_single_well_formed_revision(self) -> None:
+        """Derived from the chain, not pinned to a number.
+
+        The smoke test already computes the head by walking the migrations, so
+        pinning the literal here only meant every new revision needed two edits
+        — and a stale pin would have claimed a head the image does not ship.
+        """
         head = smoke.repo_head_revision()
-        assert head == "0037", f"expected 0037 to be the head, got {head!r}"
+        assert head, "the checkout has no alembic head"
+        assert "," not in head, f"the migration chain has several heads: {head}"
+        assert head.isdigit() and len(head) == 4, head
 
     def test_check_reports_expected_head(self) -> None:
         result = smoke.check_migration_head("http://x", None)
         assert result.ok
-        assert "0037" in result.detail
+        assert smoke.repo_head_revision() in result.detail
 
     def test_check_with_override(self) -> None:
         result = smoke.check_migration_head("http://x", "0099")

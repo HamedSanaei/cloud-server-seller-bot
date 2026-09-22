@@ -67,7 +67,15 @@ from cloud_platform.modules.wallet.domain import (
 )
 from cloud_platform.providers.base import (
     OrderingProvider,
+    offer_options_support_of,
     ordering_support_of,
+    provisioning_mode_of,
+)
+from cloud_platform.providers.errors import (
+    ProviderAuthError,
+    ProviderConflict,
+    ProviderError,
+    ProviderNotFound,
 )
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.routing import UnknownCredentialAccountError, provider_for
@@ -198,23 +206,76 @@ class MonthlyCheckoutService:
             )
         return None if resolved is None else str(resolved)
 
-    async def _ordering_provider(
-        self, provider_key: str, credential_account_id: str | None = None
-    ) -> OrderingProvider:
+    async def _validate_offer_selection(
+        self,
+        offer: SellableOffer,
+        os_name: str,
+        credential_account_id: str | None,
+    ) -> None:
+        """Prove the selection is still purchasable, provider-neutrally.
+
+        Direct-create providers validate the offer and the selected OS through
+        their offer-options port; order-based providers are read through their
+        ordering port. Neither branch knows a provider NAME — only which
+        capability the port exposes.
+        """
         try:
-            provider = provider_for(self._registry, provider_key, credential_account_id)
+            provider = provider_for(self._registry, offer.provider_key, credential_account_id)
         except UnknownCredentialAccountError as exc:
-            # A resource pinned to an account that is no longer configured
-            # must fail closed; falling back would bill the wrong account.
             raise OfferUnavailableError(str(exc)) from exc
         except KeyError as exc:
-            raise OfferUnavailableError(f"provider {provider_key!r} not configured") from exc
-        ordering = ordering_support_of(provider)
+            raise OfferUnavailableError(f"provider {offer.provider_key!r} not configured") from exc
+
+        options = offer_options_support_of(provider)
+        if options is not None:
+            try:
+                await options.validate_offer_for_checkout(
+                    location_id=offer.location_id,
+                    product_id=offer.product_id,
+                    os_name=os_name,
+                    expected_cost_minor=offer.provider_cost_minor,
+                    currency=offer.provider_cost_currency,
+                )
+            except ProviderConflict as exc:
+                logger.warning(
+                    "offer %s: provider state moved since catalog sync: %s", offer.ref, exc
+                )
+                raise OfferUnavailableError("provider price changed since catalog sync") from exc
+            except (ProviderNotFound, ProviderAuthError) as exc:
+                logger.warning("offer %s: selection no longer offered: %s", offer.ref, exc)
+                raise OfferUnavailableError("product details currently unavailable") from exc
+            except ProviderError as exc:
+                logger.warning("offer %s: selection validation failed: %s", offer.ref, exc)
+                raise OfferUnavailableError("product details currently unavailable") from exc
+            return
+
+        # The provider is resolved ONCE per validation: resolving it per branch
+        # would ask the routing layer (and therefore the credential pin) twice
+        # for the same decision.
+        ordering: OrderingProvider | None = ordering_support_of(provider)
         if ordering is None:
             raise OfferUnavailableError(
-                f"provider {provider_key!r} does not support asynchronous ordering"
+                f"provider {offer.provider_key!r} cannot validate an offer selection"
             )
-        return ordering
+        try:
+            detail = await ordering.get_product(offer.location_id, offer.product_id)
+        except Exception as exc:
+            logger.warning("offer %s: product detail unavailable: %s", offer.ref, exc)
+            raise OfferUnavailableError("product details currently unavailable") from exc
+        current_price = detail.product.monthly_price_minor
+        if abs(current_price - offer.provider_cost_minor) > _PROVIDER_PRICE_TOLERANCE_MINOR:
+            logger.warning(
+                "offer %s: provider price moved %s -> %s since catalog sync",
+                offer.ref,
+                offer.provider_cost_minor,
+                current_price,
+            )
+            raise OfferUnavailableError("provider price changed since catalog sync")
+        if detail.product.currency != offer.provider_cost_currency:
+            logger.warning("offer %s: provider currency moved since catalog sync", offer.ref)
+            raise OfferUnavailableError("provider price changed since catalog sync")
+        if not ordering.os_name_allowed(detail, os_name):
+            raise OsUnavailableError(f"OS {os_name!r} is not available for {offer.ref}")
 
     async def create_order(
         self,
@@ -260,30 +321,15 @@ class MonthlyCheckoutService:
 
         # 3. OS validation SERVER-SIDE against the live product API (free
         #    options only by default — the price shown is the price charged).
-        #    The successful detail fetch doubles as the location-accessibility
-        #    proof (an account 403 surfaces here); the price comparison below
-        #    additionally guards the race between catalog sync and checkout.
+        #    HOW that proof is obtained is provider-neutral: an order-based
+        #    provider is read through its ordering port, a direct-create
+        #    provider through its offer-options port. Both prove the same
+        #    facts — the offer is still sold at this location, the provider
+        #    price/currency have not moved since catalog sync, and the selected
+        #    OS really exists — and the price comparison additionally guards
+        #    the race between catalog sync and checkout.
         credential_account_id = await self._fulfillment_account(offer)
-        ordering = await self._ordering_provider(offer.provider_key, credential_account_id)
-        try:
-            detail = await ordering.get_product(offer.location_id, offer.product_id)
-        except Exception as exc:
-            logger.warning("offer %s: product detail unavailable: %s", offer.ref, exc)
-            raise OfferUnavailableError("product details currently unavailable") from exc
-        current_price = detail.product.monthly_price_minor
-        if abs(current_price - offer.provider_cost_minor) > _PROVIDER_PRICE_TOLERANCE_MINOR:
-            logger.warning(
-                "offer %s: provider price moved %s -> %s since catalog sync",
-                offer.ref,
-                offer.provider_cost_minor,
-                current_price,
-            )
-            raise OfferUnavailableError("provider price changed since catalog sync")
-        if detail.product.currency != offer.provider_cost_currency:
-            logger.warning("offer %s: provider currency moved since catalog sync", offer.ref)
-            raise OfferUnavailableError("provider price changed since catalog sync")
-        if not ordering.os_name_allowed(detail, os_name):
-            raise OsUnavailableError(f"OS {os_name!r} is not available for {offer.ref}")
+        await self._validate_offer_selection(offer, os_name, credential_account_id)
 
         # 4. Provider account (per-customer link row; created on demand).
         account = await self._accounts.get_or_create_active(user.id, offer.provider_key)
@@ -581,8 +627,10 @@ class OfferCatalogViewService:
 
     Which providers appear under a market comes from the operator
     configuration (``ProviderCatalog``); whether one can actually SELL comes
-    from the provider port itself (``ordering_support_of``). Neither the
-    domain nor this service contains a concrete provider name.
+    from the provider port itself (the provisioning capability), so both
+    fulfillment modes are first-class: an order-based provider (asynchronous
+    ordering) and a direct-create provider (synchronous compute creation).
+    Neither the domain nor this service contains a concrete provider name.
     """
 
     def __init__(
@@ -626,13 +674,18 @@ class OfferCatalogViewService:
         """Customer-facing provider name from configuration (never the key)."""
         return self._markets.display_name_of(provider_key)
 
-    def _ordering_capable(self, provider_key: str) -> bool:
-        """Whether the provider currently implements the ordering port."""
+    def _provisioning_capable(self, provider_key: str) -> bool:
+        """Whether the provider can actually provision what we sell.
+
+        Provider-neutral and mode-aware: an order-based provider is capable
+        through its ordering port, a direct-create provider through ordinary
+        compute creation.
+        """
         try:
             provider = self._registry.get(provider_key)
         except KeyError:
             return False
-        return ordering_support_of(provider) is not None
+        return provisioning_mode_of(provider) is not None
 
     async def providers_screen(self, market: str) -> tuple[list[ProviderOptionView], str]:
         """Providers of one market that have sellable offers (+ back callback)."""
@@ -654,7 +707,7 @@ class OfferCatalogViewService:
             order.append(provider_key)
         views: list[ProviderOptionView] = []
         for provider_key in dict.fromkeys(order):
-            capable = self._ordering_capable(provider_key)
+            capable = self._provisioning_capable(provider_key)
             views.append(
                 ProviderOptionView(
                     provider_key=provider_key,
@@ -833,14 +886,33 @@ class OfferCatalogViewService:
         )
 
     async def os_options(self, offer: SellableOffer) -> list[OfferOsOptionView]:
-        """Live OS options for the offer (server-side filtered)."""
+        """Live OS options for the offer (server-side filtered).
+
+        A provider that exposes the offer-options capability enumerates its own
+        creatable images; an order-based provider is read through its ordering
+        product detail. The customer never sees a provider API DTO.
+        """
         try:
             provider = self._registry.get(offer.provider_key)
         except KeyError:
             raise OfferUnavailableError(f"provider {offer.provider_key!r} not configured") from None
+        options_port = offer_options_support_of(provider)
+        if options_port is not None:
+            live = await options_port.get_os_options(offer.location_id, offer.product_id)
+            return [
+                OfferOsOptionView(
+                    name=option.name,
+                    price_minor=option.price_minor,
+                    index=i,
+                    select_callback=self._os_select_callback(offer.id, i),
+                )
+                for i, option in enumerate(live)
+            ]
         ordering = ordering_support_of(provider)
         if ordering is None:
-            raise OfferUnavailableError("provider does not support ordering")
+            raise OfferUnavailableError(
+                f"provider {offer.provider_key!r} cannot enumerate operating systems"
+            )
         detail = await ordering.get_product(offer.location_id, offer.product_id)
         options = (
             detail.free_os_options()

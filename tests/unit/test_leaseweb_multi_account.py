@@ -24,6 +24,7 @@ down the properties that make that safe:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -537,14 +538,16 @@ class TestProviderRouteSelector:
 
 
 class _Product:
-    def __init__(self, pid: str = "VPS02_1", price: int = 999) -> None:
+    def __init__(self, pid: str = "VPS02_1", price: int = 999, currency: str = "EUR") -> None:
         self.id = pid
         self.name = "VPS S"
         self.vcpu = 2
         self.ram_gb = 4
         self.disk_gb = 100
         self.traffic = "10 TB"
-        self.currency = "EUR"
+        #: Sales Organizations bill in different currencies; "" means the
+        #: response did not report one (never inferred to EUR).
+        self.currency = currency
         self.monthly_price_minor = price
         self.location = None
 
@@ -577,6 +580,7 @@ class _AccountProvider:
         auth_failed: bool = False,
         detail_error: Exception | None = None,
         seeds: tuple[str, ...] | None = None,
+        currency: str = "EUR",
     ) -> None:
         self.account_id = account_id
         self.key = "leaseweb"
@@ -584,6 +588,7 @@ class _AccountProvider:
         self._serves = set(serves)
         self._products = products
         self._price = price
+        self._currency = currency
         self._transient = set(transient)
         self._auth_failed = auth_failed
         self._detail_error = detail_error
@@ -620,7 +625,7 @@ class _AccountProvider:
             return LocationProbe(
                 location,
                 LocationEligibility.ELIGIBLE_AVAILABLE,
-                tuple(_Product(pid, self._price) for pid in self._products),
+                tuple(_Product(pid, self._price, self._currency) for pid in self._products),
                 (),
                 f"{len(self._products)} products",
             )
@@ -635,7 +640,7 @@ class _AccountProvider:
         # 500) for locations whose LIST endpoint answers normally.
         if self._detail_error is not None:
             raise self._detail_error
-        return _Detail(_Product(product_id, self._price), (location_id,))
+        return _Detail(_Product(product_id, self._price, self._currency), (location_id,))
 
     async def verify_credential(self, candidate: str) -> None:
         if self._auth_failed:
@@ -661,10 +666,16 @@ def _fake_repo(**methods: Any) -> AsyncMock:
     return repo
 
 
-def _patch_sync_repos(monkeypatch: pytest.MonkeyPatch, **methods: Any) -> dict[str, AsyncMock]:
+def _patch_sync_repos(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    offers: dict[str, Any] | None = None,
+    routes: dict[str, Any] | None = None,
+    **methods: Any,
+) -> dict[str, AsyncMock]:
     locations = _fake_repo()
-    offers = _fake_repo(**{k: v for k, v in methods.items() if k in {"list_all"}})
-    routes = _fake_repo()
+    offers = _fake_repo(**{k: v for k, v in methods.items() if k in {"list_all"}}, **(offers or {}))
+    routes = _fake_repo(**(routes or {}))
     monkeypatch.setattr(
         "cloud_platform.modules.catalog.repository.SqlAlchemyLocationRepository",
         lambda *a, **k: locations,
@@ -1229,6 +1240,71 @@ class TestCredentialDoctor:
         assert "[WARN] detail endpoint unavailable for AAA-01" in text
         assert "[WARN] detail endpoint unavailable for BBB-02" in text
         assert "offers: 12" in text
+
+    async def test_an_inconclusive_auth_probe_is_verified_by_scoped_reads(
+        self, monkeypatch: Any
+    ) -> None:
+        """The production false negative, end to end through the command.
+
+        Both credentials were reported INVALID by the authentication probe while
+        their scoped catalogs answered normally (six products per location). The
+        scoped reads are the authority, so the command must report them healthy.
+        """
+        from cloud_platform.cli import leaseweb_accounts_doctor
+
+        router = self._router(None)
+
+        async def _inconclusive() -> Any:
+            return LeasewebHealthReport(
+                tuple(
+                    LeasewebAccountHealth(account_id, ok=False, error_class="AuthenticationError")
+                    for account_id in ("north", "south")
+                )
+            )
+
+        monkeypatch.setattr(router, "verify_all", _inconclusive)
+        self._patch(monkeypatch, router, [])
+        result = await leaseweb_accounts_doctor()
+
+        text = "\n".join(result.lines)
+        assert result.ok is True
+        assert "[WARN] credential North Org authentication probe inconclusive" in text
+        assert "[OK ] credential North Org authenticated — scoped catalog reads" in text
+        assert "[OK ] credential south authenticated — scoped catalog reads" in text
+        assert "[OK ] AAA-01 products: 6" in text
+        assert "[OK ] CCC-03 products: 6" in text
+        assert "[FAIL]" not in text
+        assert "2 usable account(s)" in text
+
+    async def test_one_broken_credential_is_degraded_not_unavailable(
+        self, monkeypatch: Any
+    ) -> None:
+        """A failing account must not condemn the ones that still work."""
+        from cloud_platform.cli import leaseweb_accounts_doctor
+
+        router = self._router(None)
+        broken = _AccountProvider(account_id="north", auth_failed=True, serves=("AAA-01",))
+
+        async def _north_failed() -> Any:
+            return LeasewebHealthReport(
+                (
+                    LeasewebAccountHealth("north", ok=False, error_class="AuthenticationError"),
+                    LeasewebAccountHealth("south", ok=True),
+                )
+            )
+
+        monkeypatch.setattr(router, "verify_all", _north_failed)
+        router._providers["north"] = broken
+        self._patch(monkeypatch, router, [_DoctorOfferRow() for _ in range(6)])
+        result = await leaseweb_accounts_doctor()
+
+        text = "\n".join(result.lines)
+        assert result.ok is True
+        assert "[FAIL] credential North Org" in text
+        assert "[WARN] Leaseweb is DEGRADED — 1/2 credential account(s) usable" in text
+        assert "[OK ] credential south authenticated" in text
+        assert "[OK ] CCC-03 products: 6" in text
+        assert "AAA-01 products" not in text
 
     async def test_a_disabled_credential_is_reported_and_never_probed(
         self, monkeypatch: Any
@@ -2112,3 +2188,364 @@ class TestOrderWorkerAccountRouting:
         squashed = " ".join(source.split())
         assert "order.credential_account_id or server.credential_account_id" in squashed
         assert "UnknownCredentialAccountError" in source
+
+
+#: A non-German location used to prove currency follows the provider's data,
+#: never the location and never a hard-coded default.
+LON = "LON-01"
+
+
+def _offered_updates(repos: dict[str, AsyncMock]) -> list[Any]:
+    return [call.kwargs["update"] for call in repos["offers"].upsert_from_provider.await_args_list]
+
+
+class TestCatalogPersistenceIsReportedHonestly:
+    """A run that READ the provider but failed to WRITE is not a successful sync.
+
+    Production evidence: the sync reported products for every scoped location
+    while every offer upsert failed with ``relation "provider_routes" does not
+    exist``. The command must fail loudly instead, and a failed persistence
+    phase must never retire offers it could not even read the state of.
+    """
+
+    def _fail(self, message: str) -> AsyncMock:
+        return AsyncMock(side_effect=RuntimeError(message))
+
+    async def test_an_offer_upsert_failure_fails_the_run(self, monkeypatch: Any) -> None:
+        _patch_sync_repos(
+            monkeypatch,
+            offers={
+                "upsert_from_provider": self._fail('relation "provider_routes" does not exist')
+            },
+        )
+        syncer = _syncer({"lw-eu": _AccountProvider(account_id="lw-eu", serves=(FRA,))})
+        result = await syncer.sync_all()
+        products = result["products"]
+        assert products.persistence_ok is False
+        assert products.offers_failed == 1
+        assert products.offers_persisted == 0
+        assert products.offer_persistence_failures
+        assert products.total_fetched == 1
+
+    async def test_a_route_write_failure_fails_the_run(self, monkeypatch: Any) -> None:
+        _patch_sync_repos(
+            monkeypatch,
+            routes={"upsert_observations": self._fail("provider_routes is missing")},
+        )
+        syncer = _syncer({"lw-eu": _AccountProvider(account_id="lw-eu", serves=(FRA,))})
+        result = await syncer.sync_all()
+        products = result["products"]
+        assert products.persistence_ok is False
+        assert products.routes_persisted == 0
+        assert products.route_persistence_failures
+        # Offers themselves were persisted: the run is still not successful,
+        # because checkout cannot pin a fulfillment account without routes.
+        assert products.offers_persisted == 1
+
+    async def test_a_failed_persistence_phase_never_retires_offers(self, monkeypatch: Any) -> None:
+        repos = _patch_sync_repos(
+            monkeypatch,
+            offers={"upsert_from_provider": self._fail("schema is behind the image")},
+            list_all=AsyncMock(
+                return_value=[
+                    MagicMock(
+                        provider_key="leaseweb",
+                        product_id="VPS02_1",
+                        location_id=FRA,
+                        provider_available=True,
+                    )
+                ]
+            ),
+        )
+        syncer = _syncer({"lw-eu": _AccountProvider(account_id="lw-eu", serves=(AMS,))})
+        result = await syncer.sync_all()
+        repos["offers"].mark_unavailable.assert_not_awaited()
+        assert result["products"].availability_reconciled is False
+        assert any("skipped mark_unavailable" in warning for warning in result["products"].warnings)
+
+    async def test_a_successful_sync_persists_routes_and_every_location_product(
+        self, monkeypatch: Any
+    ) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        products = tuple(f"VPS0{index}_1" for index in range(1, 7))
+        syncer = _syncer(
+            {"lw-eu": _AccountProvider(account_id="lw-eu", products=products, serves=(FRA, LON))}
+        )
+        result = await syncer.sync_all()
+        step = result["products"]
+        assert step.persistence_ok is True
+        assert step.total_fetched == 12
+        assert step.offers_persisted == 12
+        # One routing observation per (credential account, location, product).
+        assert step.routes_persisted == 12
+        assert set(_offered_pairs(repos)) == {
+            (pid, location) for pid in products for location in (FRA, LON)
+        }
+        observations = repos["routes"].upsert_observations.await_args.kwargs["observations"]
+        # Every probed location is recorded (including negative verdicts, so the
+        # router never has to rediscover them); the two SERVING ones carry this
+        # account's product ids.
+        serving = {
+            observation.location_id: observation
+            for observation in observations
+            if observation.location_id in {FRA, LON}
+        }
+        assert set(serving) == {FRA, LON}
+        for observation in serving.values():
+            assert observation.credential_account_id == "lw-eu"
+            assert set(observation.product_ids) == set(products)
+
+    async def test_a_detail_failure_keeps_every_list_product(self, monkeypatch: Any) -> None:
+        """LIST is the catalog; DETAIL is optional enrichment (production: 5xx)."""
+        from cloud_platform.providers.leaseweb.errors import LeasewebServerError
+
+        repos = _patch_sync_repos(monkeypatch)
+        products = tuple(f"VPS0{index}_1" for index in range(1, 7))
+        syncer = _syncer(
+            {
+                "lw-eu": _AccountProvider(
+                    account_id="lw-eu",
+                    products=products,
+                    serves=(FRA,),
+                    detail_error=LeasewebServerError("detail endpoint returned HTTP 500"),
+                )
+            }
+        )
+        result = await syncer.sync_all()
+        step = result["products"]
+        # Six list products DISCOVERED, six persisted offers, one recorded
+        # detail warning each — and NOTHING retired, and no persistence
+        # failure, because a detail outage is not a catalog problem.
+        assert step.total_fetched == 6
+        assert step.offers_persisted == 6
+        assert {pair[0] for pair in _offered_pairs(repos)} == set(products)
+        assert step.persistence_ok is True
+        assert step.marked_unavailable == 0
+        assert len([error for error in step.errors if error.startswith("detail ")]) == 6
+        assert repos["offers"].mark_unavailable.await_count == 1
+        assert all(update.provider_available is True for update in _offered_updates(repos))
+
+    async def test_the_command_exits_non_zero_when_persistence_fails(
+        self, monkeypatch: Any, capsys: Any
+    ) -> None:
+        from types import SimpleNamespace
+
+        from cloud_platform import cli
+
+        repos = _patch_sync_repos(
+            monkeypatch,
+            offers={
+                "upsert_from_provider": self._fail('relation "provider_routes" does not exist')
+            },
+        )
+        router = SimpleNamespace(
+            account_ids=["lw-eu"],
+            ordered_providers={"lw-eu": _AccountProvider(account_id="lw-eu", serves=(FRA,))},
+            priorities={"lw-eu": 10},
+            account_states={},
+            locations=(FRA,),
+        )
+        monkeypatch.setattr(
+            "cloud_platform.providers.leaseweb.accounts.build_leaseweb_account_router",
+            lambda settings: router,
+        )
+        rc = await cli.leaseweb_sync_offers()
+        out = capsys.readouterr().out
+        assert rc == 1
+        assert "FAIL: the catalog was read from the provider but NOT persisted" in out
+        assert "PERSISTENCE FAILURE" in out
+        assert "alembic current" in out
+        # The storefront was NOT described as ready, and nothing was retired.
+        assert "Storefront readiness" not in out
+        repos["offers"].mark_unavailable.assert_not_awaited()
+
+
+class TestCredentialProvenanceIsRecorded:
+    """A sync must name the account that SUPPLIED each observation.
+
+    Production context: the 36 Leaseweb offers in the repaired database carry
+    the legacy ``default`` provenance that migration 0037 backfilled. A
+    successful sync is what replaces it — per location, with the account that
+    actually answered for it.
+    """
+
+    async def test_every_observation_records_its_supplying_account(self, monkeypatch: Any) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "sales-org-north": _AccountProvider(account_id="sales-org-north", serves=(FRA,)),
+                "sales-org-uk": _AccountProvider(
+                    account_id="sales-org-uk", serves=(LON,), currency="GBP"
+                ),
+            }
+        )
+        await syncer.sync_all()
+        pinned = {
+            call.kwargs["location_id"]: call.kwargs["provider_account_id"]
+            for call in repos["offers"].upsert_from_provider.await_args_list
+        }
+        assert pinned == {FRA: "sales-org-north", LON: "sales-org-uk"}
+        assert "default" not in set(pinned.values())
+
+    async def test_routing_observations_also_name_their_account(self, monkeypatch: Any) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "sales-org-north": _AccountProvider(account_id="sales-org-north", serves=(FRA,)),
+                "sales-org-uk": _AccountProvider(
+                    account_id="sales-org-uk", serves=(LON,), currency="GBP"
+                ),
+            }
+        )
+        await syncer.sync_all()
+        observations = repos["routes"].upsert_observations.await_args.kwargs["observations"]
+        serving = {
+            (observation.credential_account_id, observation.location_id)
+            for observation in observations
+            if observation.location_id in {FRA, LON}
+            and observation.state is RouteState.ELIGIBLE_AVAILABLE
+        }
+        # Each account is recorded ONLY for the locations it really served: the
+        # UK key was probed at FRA-01 too (a discovery seed) and is recorded as
+        # ineligible there, never as a supplier.
+        assert serving == {("sales-org-north", FRA), ("sales-org-uk", LON)}
+        assert all(observation.credential_account_id != "default" for observation in observations)
+
+
+class TestCurrencyIsProviderEvidence:
+    """Currency must come from provider data — never from a hard-coded default.
+
+    Production evidence: UK offers are GBP, yet a list-based sync attempted to
+    write EUR for LON-11/LON-12 because the parser defaulted a missing currency
+    to EUR. Sales Organizations bill in different currencies; a response that
+    omits the currency is NOT evidence of EUR.
+    """
+
+    def test_parsed_currency_comes_from_the_response(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering import _parse_product
+
+        eur = _parse_product({"id": "VPS02_1", "price": {"total": "4.49", "currency": "EUR"}}, FRA)
+        gbp = _parse_product({"id": "VPS02_1", "price": {"total": "4.49", "currency": "GBP"}}, LON)
+        assert eur is not None and eur.currency == "EUR"
+        assert gbp is not None and gbp.currency == "GBP"
+
+    def test_the_same_product_can_bill_in_two_currencies(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering import _parse_product
+
+        german = _parse_product(
+            {"id": "VPS02_1", "price": {"total": "4.49", "currency": "EUR"}}, "FRA-01"
+        )
+        british = _parse_product(
+            {"id": "VPS02_1", "price": {"total": "4.49", "currency": "GBP"}}, "LON-11"
+        )
+        assert german is not None and british is not None
+        assert german.currency != british.currency
+
+    def test_a_missing_price_currency_is_not_euro(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering import _parse_product
+
+        product = _parse_product({"id": "VPS02_1", "price": {"total": "4.49"}}, LON)
+        assert product is not None
+        assert product.currency == ""
+
+    def test_a_missing_option_currency_is_not_euro(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering import _parse_option
+
+        option = _parse_option({"name": "Ubuntu 24.04", "price": "0.00"})
+        assert option.currency == ""
+        assert _parse_option({"name": "x", "price": "1.00", "currency": "GBP"}).currency == ("GBP")
+
+    def test_the_price_models_have_no_euro_default(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering_api import (
+            ProductPrice,
+            ProductPriceList,
+        )
+
+        assert ProductPrice().currency == ""
+        assert ProductPriceList().currency == ""
+
+    async def test_a_currency_less_observation_never_overwrites_a_known_currency(
+        self, monkeypatch: Any
+    ) -> None:
+        """The dangerous case, driven end to end through the sync write path."""
+        repos = _patch_sync_repos(
+            monkeypatch,
+            list_all=AsyncMock(
+                return_value=[
+                    MagicMock(
+                        provider_key="leaseweb",
+                        product_id="VPS02_1",
+                        location_id=LON,
+                        provider_available=True,
+                    )
+                ]
+            ),
+        )
+        from cloud_platform.providers.leaseweb.errors import LeasewebServerError
+
+        syncer = _syncer(
+            {
+                "lw-uk": _AccountProvider(
+                    account_id="lw-uk",
+                    serves=(LON,),
+                    currency="",
+                    # Production shape: the LIST answered, the DETAIL read hit
+                    # HTTP 500, so the list row (no currency) is all we have.
+                    detail_error=LeasewebServerError("detail endpoint returned HTTP 500"),
+                )
+            }
+        )
+        result = await syncer.sync_all()
+        step = result["products"]
+        # Nothing was written with an unproven currency...
+        repos["offers"].upsert_from_provider.assert_not_awaited()
+        assert any("currency not reported" in warning for warning in step.warnings)
+        # ...and that is a PROVIDER-DATA advisory, not a persistence failure:
+        # the run is still usable, and the location is not retired.
+        assert step.persistence_ok is True
+        assert step.offers_persisted == 0
+        repos["offers"].mark_unavailable.assert_awaited_once()
+        assert ("VPS02_1", LON) in repos["offers"].mark_unavailable.await_args.args[1]
+
+    async def test_a_gbp_account_writes_gbp(self, monkeypatch: Any) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {"lw-uk": _AccountProvider(account_id="lw-uk", serves=(LON,), currency="GBP")}
+        )
+        await syncer.sync_all()
+        updates = _offered_updates(repos)
+        assert [update.provider_cost_currency for update in updates] == ["GBP"]
+        assert [update.provider_cost_minor for update in updates] == [999]
+
+    async def test_two_sales_organizations_keep_their_own_currencies(
+        self, monkeypatch: Any
+    ) -> None:
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {
+                "lw-de": _AccountProvider(account_id="lw-de", serves=(FRA,), currency="EUR"),
+                "lw-uk": _AccountProvider(account_id="lw-uk", serves=(LON,), currency="GBP"),
+            }
+        )
+        await syncer.sync_all()
+        by_location = {
+            call.kwargs["location_id"]: call.kwargs["update"].provider_cost_currency
+            for call in repos["offers"].upsert_from_provider.await_args_list
+        }
+        assert by_location == {FRA: "EUR", LON: "GBP"}
+
+    async def test_the_sync_never_touches_a_selling_price_or_currency(
+        self, monkeypatch: Any
+    ) -> None:
+        """SYNC != PRICE: the offer update carries provider observations only."""
+        repos = _patch_sync_repos(monkeypatch)
+        syncer = _syncer(
+            {"lw-uk": _AccountProvider(account_id="lw-uk", serves=(LON,), currency="GBP")}
+        )
+        await syncer.sync_all()
+        updates = _offered_updates(repos)
+        assert updates
+        for update in updates:
+            fields = {field.name for field in dataclasses.fields(update)}
+            assert not {name for name in fields if name.startswith("selling_")}
+            assert "enabled" not in fields

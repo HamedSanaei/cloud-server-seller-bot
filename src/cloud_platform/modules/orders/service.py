@@ -119,13 +119,18 @@ from cloud_platform.modules.wallet.domain import (
 from cloud_platform.modules.wallet.repository import HoldService
 from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
+    CloudProvider,
     CreateServerRequest,
     OrderingProvider,
     OrderRecoveryResult,
     OrderRecoveryVerdict,
     ProviderServer,
+    ProvisioningMode,
     ProvisioningTicket,
+    offer_options_support_of,
     ordering_support_of,
+    provisioning_mode_of,
+    server_recovery_support_of,
 )
 from cloud_platform.providers.errors import (
     ProviderAuthError,
@@ -163,6 +168,15 @@ MAX_SETTLEMENT_ATTEMPTS = 5
 #: before the reconciler escalates to NEEDS_REVIEW instead of guessing a
 #: VPS from account-wide similarity.
 MAX_EQUIPMENT_WAIT = timedelta(hours=72)
+
+#: Bounded wait for a DIRECT_CREATE resource to become readable after the
+#: create call returned: the provider's read path is eventually consistent, so
+#: an unreadable resource is retried read-only before it is escalated.
+MAX_DIRECT_DISCOVERY_WAIT = timedelta(hours=72)
+
+#: Provider statuses that mean a directly-created resource is usable (Hetzner
+#: reports ``running`` once the server is up; ``off`` is still provisioned).
+DIRECT_READY_STATUSES = frozenset({"running", "off"})
 
 MONTHLY_ESTIMATE_DAYS = 30
 
@@ -287,9 +301,14 @@ class OrderActivator:
         order: ProviderOrder,
         offer: SellableOffer,
         vps_id: str,
-        ordering: OrderingProvider,
+        ordering: OrderingProvider | CloudProvider,
     ) -> RenewalInfo:
-        """Write the provider resource onto the server and finalize."""
+        """Write the provider resource onto the server and finalize.
+
+        ``ordering`` is whatever port can READ a provider server: an ordering
+        provider (order-based) or the plain provider port (direct-create).
+        Activation therefore needs no knowledge of how the server was made.
+        """
         remote: ProviderServer | None = None
         try:
             remote = await ordering.get_server(vps_id)
@@ -763,8 +782,14 @@ class OrderWorker:
             )
         ordering = ordering_support_of(provider)
         if ordering is None:
+            # Two legitimate provisioning modes, distinguished by the PROVIDER
+            # PORT (never by a provider name): an order-based provider goes
+            # through place-order/poll, a direct-create provider through
+            # ordinary compute creation.
+            if provisioning_mode_of(provider) is ProvisioningMode.DIRECT_CREATE:
+                return await self._provision_direct(server, order, claimed, offer, provider)
             return await self._fail_permanent(
-                server, order, f"provider {server.provider_key!r} has no ordering port"
+                server, order, f"provider {server.provider_key!r} cannot provision a server"
             )
 
         # Pre-POST availability revalidation (READ-ONLY): the catalog may
@@ -978,6 +1003,242 @@ class OrderWorker:
             },
         )
         return OrderWorkerOutcome.SUBMITTED
+
+    async def _provision_direct(
+        self,
+        server: CloudServer,
+        order: ProviderOrder,
+        claimed: Operation,
+        offer: SellableOffer,
+        provider: CloudProvider,
+    ) -> OrderWorkerOutcome:
+        """Provision through DIRECT server creation (no ordering pipeline).
+
+        Same financial invariants as the order-based path, in the same order:
+
+        1. READ-ONLY revalidation of the sellable offer + selected OS (the
+           catalog may have moved since checkout) - no POST yet;
+        2. the POST-attempt instant is persisted BEFORE the billable call;
+        3. the provider resource id is persisted BEFORE any money moves;
+        4. settlement (hold capture + exactly one ledger charge) is the
+           EXISTING idempotent barrier - never a provider call;
+        5. the server is handed to the reconciler for activation.
+
+        Ambiguity is the dangerous part: a timeout/drop after the POST must
+        never become a second POST, so an unknown outcome is recorded and
+        resolved READ-ONLY through the provider's own operation identity.
+        """
+        if not offer.sellable:
+            return await self._fail_permanent(
+                server, order, f"offer {offer.ref} is no longer sellable (availability changed)"
+            )
+        snapshot_price = order.provider_cost_minor or offer.provider_cost_minor
+        snapshot_currency = order.provider_cost_currency or offer.provider_cost_currency
+        options = offer_options_support_of(provider)
+        if options is not None:
+            try:
+                await options.validate_offer_for_checkout(
+                    location_id=order.location_id or offer.location_id,
+                    product_id=order.product_id or offer.product_id,
+                    os_name=server.os or "",
+                    expected_cost_minor=snapshot_price,
+                    currency=snapshot_currency,
+                )
+            except (ProviderAuthError, ProviderNotFound) as exc:
+                return await self._fail_permanent(
+                    server,
+                    order,
+                    f"selection no longer available for {offer.ref} "
+                    f"(availability changed: {type(exc).__name__})",
+                )
+            except (ProviderRateLimited, ProviderUnavailable) as exc:
+                claimed.requeue(f"catalog revalidation transient: {exc}")
+                await self._ops.save(claimed)
+                order.attempts += 1
+                order.error = str(exc)
+                await self._orders.save(order)
+                logger.warning("order %s revalidation requeued (retryable): %s", order.id, exc)
+                return OrderWorkerOutcome.REQUEUED
+            except ProviderError as exc:
+                return await self._fail_permanent(
+                    server,
+                    order,
+                    f"selection no longer available for {offer.ref} "
+                    f"(availability changed: {type(exc).__name__})",
+                )
+
+        # PROVIDER-side facts only. The customer selling price is never sent
+        # to the provider and never used to identify a provider resource.
+        request = CreateServerRequest(
+            name=f"srv-{server.id.hex[:8]}",
+            plan_id=order.product_id or offer.product_id,
+            image_id=server.os or "",
+            location_id=order.location_id or offer.location_id,
+            labels={
+                "provider_price_minor": str(snapshot_price),
+                "provider_currency": snapshot_currency,
+                "contract_term": order.contract_term or "1_MONTH",
+                "billing_cycle": order.billing_cycle or "1_MONTH",
+                "platform_server_id": str(server.id),
+            },
+        )
+        # Persist the POST-attempt instant BEFORE the chargeable call: the
+        # read-only recovery scan window starts here (durable across crashes).
+        order.post_attempted_at = claimed.updated_at or self._now()
+        await self._orders.save(order)
+        try:
+            created = await provider.create_server(request, IdempotencyKey(claimed.operation_key))
+        except ProviderOutcomeUnknown as exc:
+            # The POST may have created a server. NEVER re-POST: try to claim
+            # it through the platform's own operation identity first, and only
+            # then record the outcome as unknown (the hold stays reserved).
+            recovered = await self._recover_direct_server(provider, order, claimed.operation_key)
+            if recovered is None:
+                await self._mark_outcome_unknown(server, order, claimed, str(exc))
+                return OrderWorkerOutcome.OUTCOME_UNKNOWN
+            created = recovered
+        except ProviderError as exc:
+            if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                claimed.requeue(str(exc))
+                await self._ops.save(claimed)
+                order.attempts += 1
+                order.error = str(exc)
+                await self._orders.save(order)
+                logger.warning("order %s requeued (retryable): %s", order.id, exc)
+                return OrderWorkerOutcome.REQUEUED
+            return await self._fail_permanent(server, order, str(exc))
+
+        # Accepted: the resource EXISTS. Persist its identity before money.
+        server.provider_server_id = created.id
+        if created.ipv4:
+            server.ipv4 = created.ipv4
+        if created.ipv6:
+            server.ipv6 = created.ipv6
+        await self._servers.save(server)
+        order.mark_submitted(created.id)
+        order.attempts += 1
+        order.error = None
+        await self._orders.save(order)
+        claimed.complete(
+            {
+                "provider_server_id": created.id,
+                "provider_state": created.status,
+                "idempotency_key": claimed.operation_key,
+            }
+        )
+        await self._ops.save(claimed)
+
+        await emit_safe(
+            self._events,
+            provider_accepted_event(
+                user=await _load_user(self._users, server.user_id),
+                server_id=server.id,
+                order_id=order.id,
+                provider_key=server.provider_key,
+                provider_order_id=created.id,
+                product_id=order.product_id or offer.product_id,
+                location_id=order.location_id or offer.location_id,
+                plan_name=offer.name,
+                provider_cost_minor=offer.provider_cost_minor,
+                currency=offer.provider_cost_currency,
+                operation_key=claimed.operation_key,
+            ),
+        )
+
+        verdict = await self._settlement.ensure_order_payment_settled(order, server)
+        if verdict is SettlementVerdict.NEEDS_REVIEW:
+            order.mark_needs_review(
+                order.settlement_error or "payment settlement requires manual review"
+            )
+            await self._orders.save(order)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                actor_id=None,
+                action="direct.order_settlement_review",
+                resource_type="server_order",
+                resource_id=str(order.id),
+                reason=order.settlement_error or "settlement requires review",
+                metadata={"server_id": str(server.id), "provider_server_id": created.id},
+            )
+            logger.error(
+                "direct order %s accepted but settlement NEEDS_REVIEW: %s",
+                order.id,
+                order.settlement_error,
+            )
+            await emit_safe(
+                self._events,
+                purchase_failed_event(
+                    user=await _load_user(self._users, server.user_id),
+                    server_id=server.id,
+                    order_id=order.id,
+                    provider_key=server.provider_key,
+                    provider_order_id=created.id,
+                    operation_key=claimed.operation_key,
+                    category="settlement_review",
+                    reason=order.settlement_error or "payment settlement needs review",
+                ),
+            )
+            return OrderWorkerOutcome.SUBMITTED
+        if verdict is SettlementVerdict.RETRY_LATER:
+            logger.warning(
+                "direct order %s accepted but settlement pending: %s",
+                order.id,
+                order.settlement_error,
+            )
+            return OrderWorkerOutcome.SUBMITTED
+
+        if server.state is ServerLifecycleState.REQUESTED:
+            server.transition_to(ServerLifecycleState.PROVISIONING)
+            await self._servers.save(server)
+        logger.info(
+            "direct server created: server=%s provider_server=%s settlement=complete",
+            server.id,
+            created.id,
+        )
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            actor_id=None,
+            action="direct.server_created",
+            resource_type="server_order",
+            resource_id=str(order.id),
+            reason=f"provider server {created.id} created and settled",
+            metadata={
+                "server_id": str(server.id),
+                "provider_server_id": created.id,
+                "operation_key": claimed.operation_key,
+            },
+        )
+        return OrderWorkerOutcome.SUBMITTED
+
+    async def _recover_direct_server(
+        self, provider: CloudProvider, order: ProviderOrder, operation_key: str
+    ) -> ProviderServer | None:
+        """READ-ONLY: claim a server this operation may have created.
+
+        Only a PROVEN match is returned. Zero matches leaves the outcome
+        unknown (absence cannot be proven), and several matches is exactly the
+        situation a human must resolve - the platform never guesses, because
+        guessing here means paying for two servers.
+        """
+        recovery = server_recovery_support_of(provider)
+        if recovery is None:
+            return None
+        result = await recovery.recover_server_by_operation(operation_key)
+        if result.verdict is OrderRecoveryVerdict.MATCHED and result.provider_order_id:
+            logger.warning(
+                "order %s: ambiguous create resolved READ-ONLY to provider server %s",
+                order.id,
+                result.provider_order_id,
+            )
+            return await provider.get_server(result.provider_order_id)
+        if result.verdict is OrderRecoveryVerdict.AMBIGUOUS:
+            logger.error(
+                "order %s: %d candidate servers for operation %s; escalating for review",
+                order.id,
+                result.candidate_count,
+                operation_key,
+            )
+        return None
 
     async def _mark_outcome_unknown(
         self,
@@ -1222,6 +1483,8 @@ class OrderReconciler:
             return ReconciliationOutcome.LEFT_UNCHANGED
         ordering = ordering_support_of(provider)
         if ordering is None:
+            if provisioning_mode_of(provider) is ProvisioningMode.DIRECT_CREATE:
+                return await self._reconcile_direct(order, server, offer, provider)
             return ReconciliationOutcome.LEFT_UNCHANGED
 
         try:
@@ -1246,35 +1509,9 @@ class OrderReconciler:
             return ReconciliationOutcome.LEFT_UNCHANGED
 
         order.last_polled_at = self._now()
-
-        # Settlement barrier: an accepted provider order whose LOCAL charge
-        # is not settled must not be activated or delivered. Repair the
-        # local settlement (never a provider POST); escalate financially
-        # unsafe states for a human.
-        if order.settlement_status is not SettlementStatus.COMPLETE:
-            verdict = await self._settlement.ensure_order_payment_settled(order, server)
-            if verdict is SettlementVerdict.NEEDS_REVIEW:
-                order.mark_needs_review(
-                    order.settlement_error or "payment settlement requires manual review"
-                )
-                await self._orders.save(order)
-                await self._audit.record_mutation(
-                    actor_type=ActorType.SYSTEM,
-                    actor_id=None,
-                    action="leaseweb.order_settlement_review",
-                    resource_type="server_order",
-                    resource_id=str(order.id),
-                    reason=order.settlement_error or "settlement requires review",
-                    metadata={"server_id": str(order.server_id)},
-                )
-                return ReconciliationOutcome.MARKED_FOR_REVIEW
-            if verdict is SettlementVerdict.RETRY_LATER:
-                # Local-only repair continues on the next poll; the server
-                # stays un-delivered and the provider order id stays attached.
-                return ReconciliationOutcome.LEFT_UNCHANGED
-            if server.state is ServerLifecycleState.REQUESTED:
-                server.transition_to(ServerLifecycleState.PROVISIONING)
-                await self._servers.save(server)
+        settled = await self._ensure_settled(order, server)
+        if settled is not None:
+            return settled
 
         if ticket.state == "provisioned":
             return await self._activate(order, server, offer, ordering)
@@ -1300,6 +1537,126 @@ class OrderReconciler:
             )
             return ReconciliationOutcome.MARKED_FOR_REVIEW
         return ReconciliationOutcome.STILL_PROVISIONING
+
+    async def _ensure_settled(
+        self, order: ProviderOrder, server: CloudServer
+    ) -> ReconciliationOutcome | None:
+        """The LOCAL settlement barrier; None when the order is settled.
+
+        An accepted provider order whose charge is not settled must never be
+        activated or delivered. Repair is local only (never a provider call);
+        financially unsafe states escalate to a human. Shared by every
+        provisioning mode so the barrier cannot drift between them.
+        """
+        if order.settlement_status is SettlementStatus.COMPLETE:
+            return None
+        verdict = await self._settlement.ensure_order_payment_settled(order, server)
+        if verdict is SettlementVerdict.NEEDS_REVIEW:
+            order.mark_needs_review(
+                order.settlement_error or "payment settlement requires manual review"
+            )
+            await self._orders.save(order)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                actor_id=None,
+                action="order.settlement_review",
+                resource_type="server_order",
+                resource_id=str(order.id),
+                reason=order.settlement_error or "settlement requires review",
+                metadata={"server_id": str(order.server_id)},
+            )
+            return ReconciliationOutcome.MARKED_FOR_REVIEW
+        if verdict is SettlementVerdict.RETRY_LATER:
+            # Local-only repair continues on the next poll; the server stays
+            # un-delivered and the provider resource id stays attached.
+            return ReconciliationOutcome.LEFT_UNCHANGED
+        if server.state is ServerLifecycleState.REQUESTED:
+            server.transition_to(ServerLifecycleState.PROVISIONING)
+            await self._servers.save(server)
+        return None
+
+    def _activator(self) -> OrderActivator:
+        """The shared activation collaborator (same wiring as the worker)."""
+        return OrderActivator(
+            server_repo=self._servers,
+            offers_repo=self._offers,
+            orders_repo=self._orders,
+            renewal_repo=self._renewals,
+            audit_trail=self._audit,
+            provider_registry=self._registry,
+            delivery_notifier=self._delivery,
+            event_sink=self._events,
+            user_repo=self._users,
+        )
+
+    async def _reconcile_direct(
+        self,
+        order: ProviderOrder,
+        server: CloudServer,
+        offer: SellableOffer,
+        provider: CloudProvider,
+    ) -> ReconciliationOutcome:
+        """READ-ONLY reconciliation for a DIRECT_CREATE provider.
+
+        The provider resource id IS the order reference and was persisted
+        BEFORE any money moved, so existence is proven by reading that exact
+        resource. There is no similarity matching and no second POST: a
+        resource that cannot be read is retried read-only for a bounded period
+        and then escalated to a human.
+        """
+        reference = order.provider_order_id or ""
+        try:
+            remote = await provider.get_server(reference)
+        except ProviderError:
+            # Transient read failure: retry next round, never guess.
+            return ReconciliationOutcome.LEFT_UNCHANGED
+        order.last_polled_at = self._now()
+
+        if remote is None:
+            since = order.post_attempted_at or order.created_at or datetime.now(UTC)
+            if self._now() - since <= MAX_DIRECT_DISCOVERY_WAIT:
+                return ReconciliationOutcome.STILL_PROVISIONING
+            order.mark_needs_review(
+                f"provider server {reference} is not readable; verify manually "
+                "before releasing funds"
+            )
+            await self._orders.save(order)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                actor_id=None,
+                action="direct.order_review",
+                resource_type="server_order",
+                resource_id=str(order.id),
+                reason="created provider server never became readable",
+                metadata={"server_id": str(order.server_id)},
+            )
+            return ReconciliationOutcome.MARKED_FOR_REVIEW
+
+        settled = await self._ensure_settled(order, server)
+        if settled is not None:
+            return settled
+
+        if server.provider_server_id is None:
+            server.provider_server_id = remote.id
+        if server.state is ServerLifecycleState.REQUESTED:
+            server.transition_to(ServerLifecycleState.PROVISIONING)
+            await self._servers.save(server)
+
+        if str(remote.status) not in DIRECT_READY_STATUSES:
+            order.mark_provisioning()
+            await self._orders.save(order)
+            return ReconciliationOutcome.STILL_PROVISIONING
+
+        order.mark_provisioning()
+        await self._orders.save(order)
+        await self._activator().activate(
+            server=server,
+            order=order,
+            offer=offer,
+            vps_id=remote.id,
+            ordering=provider,
+        )
+        return ReconciliationOutcome.PROVISIONED
 
     def _stuck(self, order: ProviderOrder) -> bool:
         """True when the order outlived its delivery estimate + grace."""
@@ -1365,18 +1722,7 @@ class OrderReconciler:
 
         order.mark_provisioning()
         await self._orders.save(order)
-        activator = OrderActivator(
-            server_repo=self._servers,
-            offers_repo=self._offers,
-            orders_repo=self._orders,
-            renewal_repo=self._renewals,
-            audit_trail=self._audit,
-            provider_registry=self._registry,
-            delivery_notifier=self._delivery,
-            event_sink=self._events,
-            user_repo=self._users,
-        )
-        await activator.activate(
+        await self._activator().activate(
             server=server, order=order, offer=offer, vps_id=vps_id, ordering=ordering
         )
         return ReconciliationOutcome.PROVISIONED

@@ -93,7 +93,11 @@ from cloud_platform.providers.leaseweb.client import (
 from cloud_platform.providers.leaseweb.errors import (
     LeasewebAmbiguousMutationError,
     LeasewebAuthenticationError,
+    LeasewebError,
     LeasewebForbiddenError,
+    LeasewebNotFoundError,
+    LeasewebUnavailableError,
+    LeasewebValidationError,
     error_for_response,
     parse_error_payload,
 )
@@ -155,6 +159,10 @@ ORDER_SCAN_PAGE = 100
 #: Price tolerance (minor units) when comparing provider price snapshots to
 #: the order's ``pricePerFrequency`` (the API returns major-unit floats).
 PRICE_TOLERANCE_MINOR = 1
+
+#: Upper bound on credential-verification probes: bounded work even when an
+#: account is configured with dozens of seeds.
+_MAX_VERIFY_LOCATIONS = 6
 
 #: Well-known Leaseweb VPS datacenter codes. DISCOVERY SEEDS ONLY: every
 #: code listed here is worth probing, but the probe result alone decides
@@ -354,6 +362,10 @@ class LeasewebProduct:
     ram_gb: int
     disk_gb: int
     traffic: str
+    #: Currency reported by the provider, or an EMPTY string when the response
+    #: did not carry one. Sales Organizations bill in different currencies
+    #: (EUR, GBP, ...), so a missing value is NEVER inferred to EUR: the write
+    #: path fails closed instead of corrupting a known-correct price.
     currency: str
     monthly_price_minor: int
     provider_price_minor: int  # raw ``price.total`` (may include term discounts)
@@ -384,7 +396,9 @@ def _parse_product(item: dict[str, Any], location: str) -> LeasewebProduct | Non
         return None
     price = item.get("price")
     price_dict = price if isinstance(price, dict) else {}
-    currency = str(price_dict.get("currency") or "EUR")
+    # PROVIDER EVIDENCE ONLY: the product-level price currency, else the row's
+    # own currency, else "not reported" (never a hard-coded EUR fallback).
+    currency = str(price_dict.get("currency") or item.get("currency") or "").strip().upper()
     return LeasewebProduct(
         id=raw_id,
         name=str(item.get("name") or raw_id),
@@ -424,7 +438,9 @@ def _parse_option(item: dict[str, Any]) -> LeasewebProductOption:
     return LeasewebProductOption(
         name=str(item.get("name") or ""),
         price_minor=_minor(item.get("price")),
-        currency=str(item.get("currency") or "EUR"),
+        # Never inferred: an option whose currency the provider omitted stays
+        # "not reported" rather than silently becoming EUR.
+        currency=str(item.get("currency") or "").strip().upper(),
         selected=bool(item.get("selected", False)),
     )
 
@@ -1220,21 +1236,64 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
         del idempotency_key
         await self._request("POST", f"/publicCloud/v1/vps/{provider_server_id}/reboot")
 
-    async def verify_credential(self, candidate: str) -> None:
-        """Read-only connectivity check with a CANDIDATE key.
+    async def verify_credential(
+        self, candidate: str, *, candidates: Iterable[str] | None = None
+    ) -> None:
+        """Read-only authentication check with a CANDIDATE key.
 
-        The candidate is sent only for this one request through the shared
-        transport; the live credential is untouched and neither value is
-        ever logged. Uses the unscoped catalog read (``location`` is
-        optional), so verification never depends on configured locations.
+        A location-LESS ordering read is NOT a valid authentication probe in
+        real Leaseweb production: the unscoped catalog may be refused while
+        every location-scoped read for the same key succeeds. The credential
+        is therefore judged by SCOPED reads against a bounded candidate set,
+        and the outcome is classified:
+
+        * any successful scoped read -> the credential authenticates;
+        * 403/404/422 on a location -> the account simply may not order there
+          (an eligibility fact, NOT an invalid credential);
+        * 401 on a scoped read -> invalid credential;
+        * nothing conclusive (transport/5xx/timeout) -> indeterminate, raised
+          as an unavailable/transient error, NEVER as an invalid credential.
+
+        The candidate is sent only for these requests; the live key is
+        untouched and neither value is ever logged.
         """
-        response = await self._transport.request_raw(
-            "GET",
-            "/ordering/v1/products/vps",
-            params={"limit": 1},
-            headers={"X-LSW-Auth": candidate},
+        locations = [code for code in (candidates or self.discovery_seeds) if code]
+        if not locations:
+            locations = list(KNOWN_VPS_DATACENTERS)
+        conclusive = False
+        inconclusive_error: LeasewebError | None = None
+        for location in locations[:_MAX_VERIFY_LOCATIONS]:
+            try:
+                response = await self._transport.request_raw(
+                    "GET",
+                    "/ordering/v1/products/vps",
+                    params={"location": location, "limit": 1},
+                    headers={"X-LSW-Auth": candidate},
+                )
+                self._raise_for_status(response)
+            except LeasewebAuthenticationError:
+                raise
+            except (
+                LeasewebForbiddenError,
+                LeasewebNotFoundError,
+                LeasewebValidationError,
+            ):
+                # The endpoint ANSWERED about this location: the credential
+                # itself is accepted, it just may not order here.
+                conclusive = True
+                continue
+            except LeasewebError as exc:
+                inconclusive_error = exc
+                continue
+            conclusive = True
+            break
+        if conclusive:
+            return
+        if inconclusive_error is not None:
+            raise inconclusive_error
+        raise LeasewebUnavailableError(
+            "credential probe was inconclusive for every candidate location"
         )
-        self._raise_for_status(response)
 
     # ------------------------------------------------------------------
     # Transport

@@ -45,8 +45,9 @@
 #   STABILIZE_SECONDS      default: 15 (worker/bot restart-stability window)
 #
 # Sequence: validate files -> save rollback image -> switch PLATFORM_IMAGE ->
-# pull -> postgres/redis healthy -> migrate (alembic upgrade head) -> api,
-# worker, exactly one bot -> health/readiness -> report. On failure the
+# pull -> postgres/redis healthy -> migrate (alembic upgrade head) ->
+# database migration head == image head -> database PHYSICAL schema matches the
+# release -> api, worker, exactly one bot -> health/readiness -> report. On failure the
 # previous image is restored and restarted (the database is NEVER downgraded:
 # migrations stay forward-compatible so image rollback is always possible).
 # A successful rollback is still a FAILED deployment (exit 1).
@@ -186,6 +187,31 @@ rollback() {
     log "ROLLBACK: previous application image restarted (database left at the new migration revision)"
 }
 
+# The alembic head the RELEASE IMAGE ships with, read from the image itself.
+# A CI variable can drift from the built artifact; the artifact cannot drift
+# from itself, so this — not EXPECTED_HEAD — is the authority.
+#
+# PLATFORM_IMAGE is pinned for BOTH probes: deploy.env still records the
+# PREVIOUS image at preflight time, and reading the head from that image would
+# compare the database against the schema of the release we are replacing.
+# (`run SERVICE COMMAND` REPLACES the service command, so `migrate alembic
+# heads` execs `alembic heads` directly and touches no database.)
+image_head() {
+    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        alembic heads 2>/dev/null \
+        | awk 'NF && $0 !~ /^(INFO|WARN|DEBUG|ERROR)/ { print $1 }' \
+        | grep -E '^[0-9a-zA-Z_]+$' | sort -u | tr '\n' ' ' | sed 's/ *$//'
+}
+
+# The revision the DATABASE currently reports, read with the release image
+# whose migrations the database is required to have reached.
+db_head() {
+    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        alembic current 2>/dev/null \
+        | awk 'NF && $0 !~ /^(INFO|WARN|DEBUG|ERROR)/ { print $1 }' \
+        | grep -E '^[0-9a-zA-Z_]+$' | head -n 1
+}
+
 verify_application_configuration() {
     # Configuration preflight: the NEW release image must accept the
     # server-owned configuration BEFORE anything is mutated (no image switch,
@@ -208,6 +234,28 @@ verify_application_configuration() {
         return 1
     fi
     log "server configuration accepted by the release image"
+
+    # Migration-head preflight (still before ANY mutation). Application code and
+    # the database schema must be released together: code that queries a table
+    # the database does not have must never reach a running service. The head is
+    # read from the IMAGE, and EXPECTED_HEAD (when the pipeline provides it) is
+    # cross-checked against it so CI/artifact drift is caught here too.
+    IMAGE_HEAD="$(image_head)"
+    [ -n "${IMAGE_HEAD}" ] || {
+        fail "cannot determine the alembic head shipped in ${PLATFORM_IMAGE_NEW}"
+        return 1
+    }
+    case "${IMAGE_HEAD}" in
+        *" "*) 
+            fail "the release image ships MULTIPLE alembic heads (${IMAGE_HEAD}); merge them before deploying"
+            return 1
+            ;;
+    esac
+    if [ -n "${EXPECTED_HEAD}" ] && [ "${EXPECTED_HEAD}" != "${IMAGE_HEAD}" ]; then
+        fail "EXPECTED_HEAD ${EXPECTED_HEAD} does not match the head shipped in the image ${IMAGE_HEAD} (pipeline/artifact drift); nothing was changed"
+        return 1
+    fi
+    log "release image alembic head: ${IMAGE_HEAD}"
 }
 
 deploy() {
@@ -331,6 +379,49 @@ deploy() {
     fi
     log "migrations applied"
 
+    # GATE: the database must now BE at the image's head, BEFORE any
+    # schema-dependent service starts. This is the check whose absence let a
+    # production deployment run code (provider_routes) against a database that
+    # did not contain the table.
+    DB_HEAD="$(db_head)"
+    if [ "${DB_HEAD}" != "${IMAGE_HEAD}" ]; then
+        log "alembic current: ${DB_HEAD:-<empty>} (image head: ${IMAGE_HEAD})"
+        fail "database is NOT at the image alembic head ${IMAGE_HEAD}; refusing to start api/worker/bot on a mismatched schema"
+        # Nothing schema-dependent started, so the previous release is still
+        # the correct one: restore the recorded image reference.
+        if [ -n "${PREV_IMAGE}" ]; then
+            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
+            log "restored previous image reference (database left as-is)"
+        fi
+        return 1
+    fi
+    log "database migration head verified: ${DB_HEAD} (== image head)"
+
+    # GATE: the revision is NOT evidence of a compatible schema.
+    #
+    # Production proved it: the database reported revision 0037 while objects
+    # created by migration 0035 (provider_routes) and the credential-account
+    # columns were physically ABSENT. The head comparison above PASSES on such
+    # a database, and the release then fails at runtime with
+    # `relation "provider_routes" does not exist`. So the release verifies the
+    # physical schema its own code queries - tables, columns and the uniqueness
+    # its upserts rely on - read-only, with the release image, BEFORE any
+    # schema-dependent service is replaced. A drifted database is repaired
+    # forward by the migration step above (see migration 0038); if it is still
+    # missing objects, nothing was started and this deploy stops here.
+    if ! PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        python -m cloud_platform.db.schema_parity; then
+        fail "database physical schema does not support the release (missing objects listed above); refusing to start api/worker/bot"
+        # Nothing schema-dependent started, so the previous release is still
+        # the correct one: restore the recorded image reference.
+        if [ -n "${PREV_IMAGE}" ]; then
+            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
+            log "restored previous image reference (database left as-is)"
+        fi
+        return 1
+    fi
+    log "database physical schema verified against the release"
+
     log "starting api + worker + bot (bot replicas = 1)"
     compose_candidate up -d api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
 
@@ -413,12 +504,15 @@ deploy() {
     log "verifying migration revision"
     local current
     current="$(compose_candidate exec -T api alembic current 2>/dev/null || true)"
-    if [ -n "${EXPECTED_HEAD}" ]; then
+    # Defence in depth: the running API must report the SAME head that the
+    # image ships (the pre-start gate above already proved the database matches).
+    local expected="${IMAGE_HEAD:-${EXPECTED_HEAD}}"
+    if [ -n "${expected}" ]; then
         case "${current}" in
-            *"${EXPECTED_HEAD}"*) log "alembic current reports expected head ${EXPECTED_HEAD}" ;;
+            *"${expected}"*) log "alembic current reports expected head ${expected}" ;;
             *)
                 log "alembic current output: ${current:-<empty>}"
-                fail "database is not at expected head ${EXPECTED_HEAD}"
+                fail "database is not at expected head ${expected}"
                 return 1
                 ;;
         esac

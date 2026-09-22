@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, cast
 
 import httpx
 
@@ -10,6 +12,9 @@ from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.base import (
     Capability,
     CreateServerRequest,
+    OfferOsOption,
+    OrderRecoveryResult,
+    OrderRecoveryVerdict,
     ProviderImage,
     ProviderLocation,
     ProviderPlan,
@@ -22,11 +27,13 @@ from cloud_platform.providers.errors import (
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
+    ProviderOutcomeUnknown,
     ProviderRateLimited,
     ProviderUnavailable,
 )
 from cloud_platform.providers.health import AccountHealth
 from cloud_platform.providers.hetzner.backoff import RateLimitBackoff, RateLimitPolicy
+from cloud_platform.providers.hetzner.sync import CURRENCY
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,8 +450,196 @@ class HetznerCloudProvider:
         }
         if request.user_data is not None:
             body["user_data"] = request.user_data
-        payload = await self._request("POST", "/servers", json=body)
+        try:
+            payload = await self._request("POST", "/servers", json=body)
+        except ProviderUnavailable as exc:
+            # A timeout/drop/5xx AFTER the POST body left us: the server may
+            # exist. Re-raising the transient error would invite a blind
+            # second POST (and a second billable server), so the outcome is
+            # classified UNKNOWN instead — the caller must resolve it with a
+            # READ-ONLY scan (``recover_server_by_operation``) or a human.
+            raise ProviderOutcomeUnknown(
+                f"server creation outcome unknown (may have been accepted): {exc}"
+            ) from exc
         return self._map_server(payload["server"])
+
+    # --- Offer options / checkout revalidation (provider-neutral port) ---
+
+    async def _server_type_at_location(
+        self, location_id: str, product_id: str
+    ) -> dict[str, Any] | None:
+        """The LIST entry for one server type at one location, or None.
+
+        The location-scoped LIST endpoint is authoritative: the per-id detail
+        endpoint is not required (and is not used) here.
+        """
+        payload = await self._request(
+            "GET", "/server_types", params={"name": product_id, "location": location_id}
+        )
+        entries = payload.get("server_types")
+        if not isinstance(entries, list):
+            return None
+        for raw in entries:
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("name")) == product_id or str(raw.get("id")) == product_id:
+                return cast("dict[str, Any]", raw)
+        return None
+
+    @staticmethod
+    def _monthly_minor_for_location(item: dict[str, Any], location_id: str) -> int | None:
+        """Provider monthly price at one location in integer minor units.
+
+        Decimal -> minor only: the provider string is never parsed as float.
+        """
+        for raw in item.get("prices", []):
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("location") or raw.get("location_name") or "") != location_id:
+                continue
+            gross = (raw.get("monthly") or {}).get("gross")
+            if gross is None:
+                return None
+            value = Decimal(str(gross))
+            return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
+        return None
+
+    async def get_os_options(self, location_id: str, product_id: str) -> list[OfferOsOption]:
+        """Selectable system images for one server type at one location.
+
+        Only images the provider currently offers for CREATION are exposed
+        (``type=system``, deprecated images excluded), filtered to the server
+        type's architecture so an incompatible image cannot be selected.
+        """
+        architecture = await self._server_type_architecture(product_id)
+        params: dict[str, Any] = {
+            "type": "system",
+            "include_deprecated": "false",
+            "per_page": 50,
+        }
+        if architecture:
+            params["architecture"] = architecture
+        payload = await self._request("GET", "/images", params=params)
+        options = [
+            OfferOsOption(
+                name=str(item.get("name") or item.get("description") or item["id"]),
+                image_id=str(item["id"]),
+            )
+            for item in payload.get("images", [])
+            if item.get("name") or item.get("id")
+        ]
+        return sorted(options, key=lambda option: option.name)
+
+    async def _server_type_architecture(self, product_id: str) -> str | None:
+        """Best-effort architecture of a server type (image filtering only)."""
+        try:
+            payload = await self._request("GET", f"/server_types/{product_id}")
+        except ProviderError:
+            return None
+        server_type = payload.get("server_type") or {}
+        architecture = server_type.get("architecture")
+        return str(architecture) if architecture else None
+
+    async def validate_offer_for_checkout(
+        self,
+        *,
+        location_id: str,
+        product_id: str,
+        os_name: str,
+        expected_cost_minor: int,
+        currency: str,
+    ) -> None:
+        """READ-ONLY revalidation immediately before a billable create.
+
+        Raises when the provider no longer offers the server type at the
+        location, when its monthly price/currency moved away from the
+        catalog snapshot this order was priced from, or when the selected OS
+        image is no longer a creatable system image.
+        """
+        if currency != CURRENCY:
+            raise ProviderConflict(
+                f"server type {product_id} is billed in {CURRENCY}, not {currency}"
+            )
+        item = await self._server_type_at_location(location_id, product_id)
+        if item is None:
+            raise ProviderNotFound(f"server type {product_id} is not offered at {location_id}")
+        observed = self._monthly_minor_for_location(item, location_id)
+        if observed is None:
+            raise ProviderNotFound(
+                f"server type {product_id} has no monthly price at {location_id}"
+            )
+        if observed != expected_cost_minor:
+            raise ProviderConflict(
+                f"provider price changed for {product_id} at {location_id} since catalog sync"
+            )
+        if not await self._is_creatable_image(os_name):
+            raise ProviderNotFound(f"image {os_name!r} is no longer available for creation")
+
+    async def _is_creatable_image(self, os_name: str) -> bool:
+        """Whether ``os_name`` still resolves to a creatable system image.
+
+        Matches by image id first, then by name: the platform persists the
+        stable provider reference it was given, and the provider accepts
+        either form for creation.
+        """
+        payload = await self._request(
+            "GET",
+            "/images",
+            params={"type": "system", "include_deprecated": "false", "per_page": 50},
+        )
+        for item in payload.get("images", []):
+            if str(item.get("id")) == os_name or str(item.get("name") or "") == os_name:
+                return True
+        return False
+
+    # --- Read-only recovery for an ambiguous direct create ---
+
+    async def recover_server_by_operation(
+        self, operation_key: str, since: datetime | None = None
+    ) -> OrderRecoveryResult:
+        """READ-ONLY: find the ONE server a previous create POST may have made.
+
+        The correlation identity is the platform's own ``platform-operation``
+        label, stamped onto the server at creation time — not a heuristic
+        (name/price/time) guess. Exactly one match is required to claim
+        ownership; zero means the POST left no server (absence is not treated
+        as proof by the caller, which may scan again), and several means a
+        human must decide.
+
+        ``since`` is accepted for interface symmetry but unused: the provider
+        filters by label, not by creation time.
+        """
+        del since
+        selector = f"platform-operation={operation_key}"
+        try:
+            payload = await self._request(
+                "GET", "/servers", params={"label_selector": selector, "per_page": 50}
+            )
+        except ProviderError as exc:
+            return OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.SCAN_FAILED,
+                reason=f"{type(exc).__name__}",
+            )
+        servers = [
+            item
+            for item in payload.get("servers", [])
+            # Defence in depth: never trust the selector alone.
+            if (item.get("labels") or {}).get("platform-operation") == operation_key
+        ]
+        if not servers:
+            return OrderRecoveryResult(verdict=OrderRecoveryVerdict.NO_MATCH, reason=selector)
+        if len(servers) > 1:
+            return OrderRecoveryResult(
+                verdict=OrderRecoveryVerdict.AMBIGUOUS,
+                candidate_count=len(servers),
+                reason=f"{len(servers)} servers share {selector}",
+            )
+        return OrderRecoveryResult(
+            verdict=OrderRecoveryVerdict.MATCHED,
+            provider_order_id=str(servers[0]["id"]),
+            candidate_count=1,
+            reason=selector,
+        )
 
     async def delete_server(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
         del idempotency_key

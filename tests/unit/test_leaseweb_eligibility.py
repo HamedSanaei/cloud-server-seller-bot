@@ -239,12 +239,21 @@ class TestProbeBehavior:
         assert probe.eligibility is LocationEligibility.ELIGIBLE_AVAILABLE
         assert probe.products[0].location == "NEW-99"
 
-    async def test_verify_credential_needs_no_configured_location(self) -> None:
-        seen: dict[str, Any] = {}
+    async def test_verify_credential_scopes_the_read_when_nothing_is_configured(self) -> None:
+        """An unscoped probe is NOT a valid authentication test for this provider.
+
+        Production evidence: with no location configured the old probe issued a
+        location-LESS catalog read, which real Leaseweb can refuse (403) while
+        every location-scoped read for the same key succeeds. That reported two
+        perfectly working credentials as invalid. With no candidates, the probe
+        therefore falls back to the built-in datacenter seeds — still read-only,
+        still bounded — and judges the key on scoped reads.
+        """
+        seen: list[dict[str, Any]] = []
 
         class _Transport(_ScriptedTransport):
             async def request_raw(self, method: str, path: str, **kwargs: Any) -> Any:
-                seen.update(kwargs.get("params") or {})
+                seen.append(dict(kwargs.get("params") or {}))
 
                 class _Response:
                     is_success = True
@@ -259,7 +268,10 @@ class TestProbeBehavior:
         provider = _provider(locations=())
         provider._transport = _Transport({})  # type: ignore[attr-defined]
         await provider.verify_credential("candidate")
-        assert "location" not in seen
+        assert seen, "the credential probe must issue at least one read"
+        assert all("location" in params for params in seen)
+        # One success is conclusive, so the probe stops immediately.
+        assert len(seen) == 1
 
 
 class TestProbeResultShape:

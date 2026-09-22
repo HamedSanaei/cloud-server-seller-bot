@@ -1031,3 +1031,97 @@ class TestGetOrderAndMatching:
             since=datetime.now(UTC) - timedelta(minutes=5),
         )
         assert matches == []
+
+
+class TestCredentialVerification:
+    """Read-only authentication probing (regression: production false negative).
+
+    Production evidence: ``leaseweb accounts doctor`` reported BOTH configured
+    credentials as invalid while those same credentials read their scoped
+    product catalogs successfully (FRA-01/10/14 and LON-01/11/12, six products
+    each). The probe judged a location-LESS ordering read as proof of
+    authentication; for this provider it is not. A location-scoped read is, and
+    ineligibility at one location is NOT an invalid credential.
+    """
+
+    async def test_a_scoped_read_is_the_authority_when_the_unscoped_read_is_refused(
+        self,
+    ) -> None:
+        """403 for every candidate => the key is accepted, just not there."""
+        seen: list[dict[str, Any]] = []
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            seen.append(dict(kw.get("params") or {}))
+            assert (kw.get("headers") or {}).get("X-LSW-Auth") == "candidate-key"
+            return _response(403, {"errorMessage": "not allowed for this location"})
+
+        provider = _provider(handler)
+        # Does not raise: a refused LOCATION is an eligibility fact, never an
+        # authentication failure.
+        await provider.verify_credential("candidate-key")
+        assert seen, "the probe must actually read a scoped catalog"
+        assert all("location" in params for params in seen)
+        assert "limit" in seen[0]
+
+    async def test_successful_scoped_read_authenticates(self) -> None:
+        provider = _provider(lambda m, p, **kw: _response(200, {"vpss": []}))
+        await provider.verify_credential("candidate-key")
+
+    async def test_one_ineligible_location_does_not_invalidate_the_credential(self) -> None:
+        """First candidate 422, second answers 200 => healthy credential."""
+        calls: list[str] = []
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            location = str((kw.get("params") or {}).get("location") or "")
+            calls.append(location)
+            if len(calls) == 1:
+                return _response(422, {"errorMessage": "unknown location"})
+            return _response(200, {"vpss": []})
+
+        provider = _provider(handler)
+        await provider.verify_credential("candidate-key", candidates=("AMS-01", "FRA-01"))
+        assert calls == ["AMS-01", "FRA-01"]
+
+    async def test_unauthorized_is_an_invalid_credential(self) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebAuthenticationError
+
+        provider = _provider(lambda m, p, **kw: _response(401, {"errorMessage": "invalid key"}))
+        with pytest.raises(LeasewebAuthenticationError):
+            await provider.verify_credential("candidate-key")
+
+    async def test_unavailable_everywhere_is_transient_not_invalid(self) -> None:
+        """5xx/timeouts can NEVER be reported as an invalid credential."""
+        from cloud_platform.providers.leaseweb.errors import (
+            LeasewebAuthenticationError,
+            LeasewebError,
+        )
+
+        provider = _provider(lambda m, p, **kw: _response(503, {"errorMessage": "down"}))
+        with pytest.raises(LeasewebError) as excinfo:
+            await provider.verify_credential("candidate-key", candidates=("AMS-01",))
+        assert not isinstance(excinfo.value, LeasewebAuthenticationError)
+
+    async def test_the_probe_is_bounded_regardless_of_configured_seeds(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering import _MAX_VERIFY_LOCATIONS
+
+        seeds = tuple(f"XXX-{index:02d}" for index in range(1, 21))
+        probed: list[str] = []
+
+        def handler(m: str, p: str, **kw: Any) -> httpx.Response:
+            probed.append(str((kw.get("params") or {}).get("location") or ""))
+            return _response(403, {"errorMessage": "not allowed"})
+
+        provider = _provider(handler)
+        await provider.verify_credential("candidate-key", candidates=seeds)
+        assert len(probed) <= _MAX_VERIFY_LOCATIONS
+        assert len(probed) < len(seeds)
+
+    async def test_the_candidate_key_never_appears_in_the_failure(self) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebAuthenticationError
+
+        secret = "LSW-SUPER-SECRET-CANDIDATE"
+        provider = _provider(lambda m, p, **kw: _response(401, {"errorMessage": "invalid key"}))
+        with pytest.raises(LeasewebAuthenticationError) as excinfo:
+            await provider.verify_credential(secret)
+        assert secret not in str(excinfo.value)
+        assert secret not in repr(excinfo.value)

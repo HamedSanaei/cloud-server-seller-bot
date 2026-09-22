@@ -138,6 +138,11 @@ class AccountCatalogProbe:
     products_by_location: dict[str, int] = field(default_factory=dict)
     detail_warnings: tuple[str, ...] = ()
     error_class: str | None = None
+    #: Whether the location-LESS catalog read was accepted. Advisory only: the
+    #: unscoped endpoint can be refused while every scoped read succeeds, so it
+    #: never decides this credential's verdict (it is reported for diagnosis).
+    unscoped_available: bool = True
+    unscoped_error_class: str | None = None
 
     @property
     def location_count(self) -> int:
@@ -166,19 +171,29 @@ async def probe_account_catalog(
     built-in datacenter seeds and previously observed routes) — never assumed
     to be globally available, and never hard-coded per account.
     """
+    unscoped_available = True
+    unscoped_error_class: str | None = None
     try:
         unscoped = await provider.list_products_unscoped()
-    except LeasewebAuthenticationError:
-        return AccountCatalogProbe(
-            account_id=account_id,
-            authenticated=False,
-            error_class="AuthenticationError",
+    except LeasewebAuthenticationError as exc:
+        # Advisory, NOT fatal: the scoped probes below are the authority. Some
+        # Sales Organizations are simply not allowed the unscoped listing.
+        logger.info(
+            "leaseweb account %s: unscoped catalog refused (%s); judging the "
+            "credential by scoped reads only",
+            account_id,
+            type(exc).__name__,
         )
+        unscoped = []
+        unscoped_available = False
+        unscoped_error_class = type(exc).__name__
     except Exception as exc:
         # A transport failure is not proof of a bad credential; the per-location
         # probes below still decide what is sellable.
         logger.info("leaseweb account %s unscoped catalog unavailable: %s", account_id, exc)
         unscoped = []
+        unscoped_available = False
+        unscoped_error_class = type(exc).__name__
 
     candidates = merge_candidates(
         tuple(seeds or getattr(provider, "discovery_seeds", ())),
@@ -236,6 +251,8 @@ async def probe_account_catalog(
         authenticated=True,
         products_by_location=products_by_location,
         detail_warnings=tuple(detail_warnings),
+        unscoped_available=unscoped_available,
+        unscoped_error_class=unscoped_error_class,
     )
 
 
@@ -271,11 +288,44 @@ class SyncResult:
     #: (``{account_id: {location_id: products}}``) — operator evidence that a
     #: credential really does serve the locations it was probed for.
     account_locations: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: Provider-data advisories (an observation we deliberately did NOT write,
+    #: e.g. a response that omitted the currency). NOT persistence failures.
+    warnings: list[str] = field(default_factory=list)
+    #: Durable-write failures (offer upserts, provider routes). Any entry here
+    #: means the run is NOT a successful sync and must not be reported as one.
+    persistence_failures: list[str] = field(default_factory=list)
+    #: How many routing observations were written this run.
+    routes_persisted: int = 0
+    #: Offers successfully written / rejected by a durable write.
+    offers_persisted: int = 0
+    offers_failed: int = 0
+    #: Set when availability reconciliation ran; False means it was SKIPPED.
+    availability_reconciled: bool = False
+    marked_unavailable: int = 0
 
     @property
     def location_count(self) -> int:
         """Distinct (credential, location) pairs observed this run."""
         return sum(len(locations) for locations in self.account_locations.values())
+
+    @property
+    def persistence_ok(self) -> bool:
+        """Whether every durable write this run succeeded."""
+        return not self.persistence_failures
+
+    @property
+    def offer_persistence_failures(self) -> list[str]:
+        """Offer upserts that failed (each is a durable-write failure)."""
+        return [failure for failure in self.persistence_failures if failure.startswith("upsert ")]
+
+    @property
+    def route_persistence_failures(self) -> list[str]:
+        """Routing observations that could not be persisted."""
+        return [
+            failure
+            for failure in self.persistence_failures
+            if failure.startswith("provider routes")
+        ]
 
 
 @dataclass(slots=True)
@@ -400,6 +450,11 @@ class LeaseWebOrderingCatalogSyncer:
         offers_repo = SqlAlchemySellableOfferRepository(self._session_factory)
         route_repo = SqlAlchemyProviderRouteRepository(self._session_factory)
         errors: list[str] = []
+        # Provider-data advisories vs DURABLE-WRITE failures are different
+        # facts with different consequences: only the latter make the run
+        # unusable, and only the latter suppress availability reconciliation.
+        warnings: list[str] = []
+        persistence_failures: list[str] = []
         fetched = 0
         upserted = 0
         skipped = 0
@@ -460,7 +515,16 @@ class LeaseWebOrderingCatalogSyncer:
                 account_id, provider, loc_repo, prior_states, errors
             )
             discoveries[account_id] = discovery
-            fetched += len(discovery.details)
+            # DISCOVERED counts the provider's own LIST observations — the
+            # authoritative catalog source. The per-product DETAIL reads are
+            # optional enrichment, so counting THOSE would report "0 products"
+            # for a sync that listed six products per location while every
+            # detail read hit HTTP 500 (the production outage).
+            fetched += sum(
+                len(probe.products)
+                for probe in discovery.probes.values()
+                if probe.eligibility is LocationEligibility.ELIGIBLE_AVAILABLE
+            )
 
         # --- Aggregate per location -----------------------------------
         candidates: dict[str, list[str]] = {}
@@ -501,6 +565,8 @@ class LeaseWebOrderingCatalogSyncer:
                     available,
                     current_available,
                     errors,
+                    warnings,
+                    persistence_failures,
                 )
             elif (
                 verdicts
@@ -527,17 +593,25 @@ class LeaseWebOrderingCatalogSyncer:
         skipped = max(0, len(prior_available_locations - resolved))
 
         # --- Persist the routing observations -------------------------
+        observations = self._route_observations(discoveries)
+        routes_persisted = 0
         try:
             await route_repo.upsert_observations(
                 provider_key=PROVIDER_KEY,
-                observations=self._route_observations(discoveries),
+                observations=observations,
                 priority_of=self._priority_of,
                 account_state_of=self._state_of,
             )
+            routes_persisted = len(observations)
         except Exception as exc:
-            errors.append(f"provider routes write failed: {exc}")
+            # A durable-write failure is NOT a normal sync outcome: without
+            # routes, checkout cannot pin a fulfillment account, so the run
+            # must be reported as failed (and must not retire offers).
+            persistence_failures.append(f"provider routes write failed: {exc}")
 
         # --- Hide what is definitively gone ---------------------------
+        availability_reconciled = False
+        marked_count = 0
         if not any(discovery.probes for discovery in discoveries.values()):
             # NO credential account produced a usable view this run (every key
             # rejected, or the transport is down). With no provider evidence at
@@ -548,18 +622,28 @@ class LeaseWebOrderingCatalogSyncer:
                 "availability left untouched"
             )
         elif current_available is None:
-            errors.append("skipped mark_unavailable: current availability unreadable")
+            warnings.append("skipped mark_unavailable: current availability unreadable")
+        elif persistence_failures:
+            # A failed persistence phase must NEVER turn previously healthy
+            # offers unavailable: this run's view of the catalog is incomplete.
+            warnings.append(
+                "skipped mark_unavailable: the persistence phase of this run failed "
+                f"({len(persistence_failures)} error(s)); no offer was retired"
+            )
         else:
             for pair in current_available:
                 if pair[1] not in resolved:
                     available.add(pair)
+            availability_reconciled = True
             try:
-                marked = await offers_repo.mark_unavailable(PROVIDER_KEY, available)
+                marked_count = await offers_repo.mark_unavailable(PROVIDER_KEY, available)
             except Exception as exc:
-                errors.append(f"mark_unavailable: {exc}")
+                persistence_failures.append(f"mark_unavailable: {exc}")
             else:
-                if marked:
-                    logger.info("leaseweb ordering sync marked %d products unavailable", marked)
+                if marked_count:
+                    logger.info(
+                        "leaseweb ordering sync marked %d products unavailable", marked_count
+                    )
         return SyncResult(
             fetched,
             upserted,
@@ -569,6 +653,15 @@ class LeaseWebOrderingCatalogSyncer:
                 account_id: discovery.product_counts()
                 for account_id, discovery in discoveries.items()
             },
+            warnings=warnings,
+            persistence_failures=persistence_failures,
+            routes_persisted=routes_persisted,
+            offers_persisted=upserted,
+            offers_failed=sum(
+                1 for failure in persistence_failures if failure.startswith("upsert ")
+            ),
+            availability_reconciled=availability_reconciled,
+            marked_unavailable=marked_count,
         )
 
     # ------------------------------------------------------------------
@@ -628,6 +721,8 @@ class LeaseWebOrderingCatalogSyncer:
         available: set[tuple[str, str]],
         current_available: set[tuple[str, str]] | None,
         errors: list[str],
+        warnings: list[str],
+        persistence_failures: list[str],
     ) -> int:
         """Upsert every product a serving account reports at one location.
 
@@ -697,6 +792,8 @@ class LeaseWebOrderingCatalogSyncer:
                             provider_available=False,
                         ),
                         errors=errors,
+                        warnings=warnings,
+                        persistence_failures=persistence_failures,
                     )
                     continue
                 if await self._write_offer(
@@ -727,6 +824,8 @@ class LeaseWebOrderingCatalogSyncer:
                         provider_available=True,
                     ),
                     errors=errors,
+                    warnings=warnings,
+                    persistence_failures=persistence_failures,
                 ):
                     written += 1
         return written
@@ -773,8 +872,28 @@ class LeaseWebOrderingCatalogSyncer:
         location: str,
         update: OfferSpecUpdate,
         errors: list[str],
+        warnings: list[str] | None = None,
+        persistence_failures: list[str] | None = None,
     ) -> bool:
-        """Persist one provider observation; ``True`` when it succeeded."""
+        """Persist one provider observation; ``True`` when it succeeded.
+
+        FAIL CLOSED on an unproven currency: Sales Organizations bill in
+        different currencies (EUR, GBP, ...), so a response that omitted the
+        currency must never overwrite a known-correct stored price. The
+        observation is skipped as an advisory warning; the caller has already
+        recorded the pair as available, so a skipped write cannot retire it.
+
+        A DURABLE-WRITE failure (schema error, connection error) is recorded
+        separately from provider-data advisories: it makes the whole run
+        unusable and must be reported as a failed sync.
+        """
+        if not str(update.provider_cost_currency or "").strip():
+            target = warnings if warnings is not None else errors
+            target.append(
+                f"currency not reported for {product.id}/{location}: keeping the "
+                "last-known provider cost/currency (never inferred)"
+            )
+            return False
         try:
             await offers_repo.upsert_from_provider(
                 provider_key=PROVIDER_KEY,
@@ -784,7 +903,8 @@ class LeaseWebOrderingCatalogSyncer:
                 update=update,
             )
         except Exception as exc:
-            errors.append(f"upsert {product.id}/{location}: {exc}")
+            target_failures = persistence_failures if persistence_failures is not None else errors
+            target_failures.append(f"upsert {product.id}/{location}: {exc}")
             return False
         return True
 

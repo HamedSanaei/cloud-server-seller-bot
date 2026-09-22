@@ -137,7 +137,10 @@ class ProductPrice(LeasewebModel):
     ``details`` preserves the provider's per-component breakdown verbatim.
     """
 
-    currency: str = "EUR"
+    #: Empty means the provider did not report a currency. It is NEVER inferred:
+    #: Sales Organizations bill in different currencies (EUR, GBP, ...), and a
+    #: hard-coded default would silently reprice another organization's stock.
+    currency: str = ""
     base_price: Money = Decimal(0)
     tax: Money = Decimal(0)
     setup_fee: Money = Decimal(0)
@@ -166,9 +169,12 @@ class ProductPrice(LeasewebModel):
 
 
 class ProductPriceList(LeasewebModel):
-    """``price`` of a product LIST row (``currency``/``basePrice``/...)."""
+    """``price`` of a product LIST row (``currency``/``basePrice``/...).
 
-    currency: str = "EUR"
+    ``currency`` is empty when the response omitted it — never defaulted.
+    """
+
+    currency: str = ""
     base_price: Money = Decimal(0)
     discount: Money = Decimal(0)
     total: Money = Decimal(0)
@@ -185,7 +191,7 @@ class VpsConfigurationOption(LeasewebModel):
     name: str
     selected: bool = False
     price: Money = Decimal(0)
-    currency: str = "EUR"
+    currency: str = ""
 
     @property
     def is_free(self) -> bool:

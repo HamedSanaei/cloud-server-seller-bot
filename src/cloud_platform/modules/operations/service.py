@@ -274,6 +274,24 @@ class ProvisioningWorker:
             created: ProviderServer = await provider.create_server(
                 request, IdempotencyKey(claimed.operation_key)
             )
+        except ProviderOutcomeUnknown as exc:
+            # The POST may have landed. This worker re-sends the SAME operation
+            # key (the ``platform-operation`` label), which is the platform's
+            # idempotency identity for a participating provider (M07-003): the
+            # retry carries the same intent, so a provider that deduplicates on
+            # it can only ever yield ONE resource. The marketplace checkout
+            # path is stricter still (it never re-POSTs; see OrderWorker).
+            claimed.requeue(str(exc))
+            await self._ops.save(claimed)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                action="server.provisioning_requeued",
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=str(server_id),
+                reason=str(exc),
+                metadata={"operation_id": str(claimed.id), "attempts": claimed.attempts},
+            )
+            return ProvisioningOutcome.REQUEUED
         except ProviderError as exc:
             if classify_provider_error(exc) is ErrorClass.RETRYABLE:
                 claimed.requeue(str(exc))
@@ -732,6 +750,20 @@ class CreateTimeoutReconciler:
             created: ProviderServer = await provider.create_server(
                 request, IdempotencyKey(op.operation_key)
             )
+        except ProviderOutcomeUnknown as exc:
+            # Same contract as the worker: the re-send carries the SAME
+            # operation key, so it is the same intent, never a new one.
+            op.requeue(str(exc))
+            await self._ops.save(op)
+            await self._audit.record_mutation(
+                actor_type=ActorType.SYSTEM,
+                action="server.provisioning_requeued",
+                resource_type=RESOURCE_TYPE_SERVER,
+                resource_id=str(server.id),
+                reason=str(exc),
+                metadata={"operation_id": str(op.id)},
+            )
+            return ReconciliationOutcome.REQUEUED
         except ProviderError as exc:
             if classify_provider_error(exc) is ErrorClass.RETRYABLE:
                 op.requeue(str(exc))

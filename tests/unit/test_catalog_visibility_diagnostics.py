@@ -83,8 +83,13 @@ def _patch_offers_repo(monkeypatch: pytest.MonkeyPatch, rows: list[SellableOffer
 
 
 class _FakeRegistry:
-    def __init__(self, providers: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        providers: dict[str, Any],
+        account_ids: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
         self._providers = providers
+        self._account_ids = account_ids or {}
 
     def keys(self) -> tuple[str, ...]:
         return tuple(sorted(self._providers))
@@ -92,13 +97,27 @@ class _FakeRegistry:
     def get(self, key: str) -> Any:
         return self._providers[key]
 
+    def accounts(self, key: str) -> tuple[Any, ...]:
+        """Credential accounts of a provider (empty when it is not scoped)."""
+        if not self._account_ids:
+            raise AttributeError("accounts")
+        return tuple(
+            SimpleNamespace(account_id=account_id, provider_key=key)
+            for account_id in self._account_ids.get(key, ())
+        )
+
 
 class _FakeContainer:
     """Minimal container stand-in exposing only what the doctor reads."""
 
-    def __init__(self, catalog: Any, providers: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        catalog: Any,
+        providers: dict[str, Any],
+        account_ids: dict[str, tuple[str, ...]] | None = None,
+    ) -> None:
         self._catalog = catalog
-        self.provider_registry = _FakeRegistry(providers)
+        self.provider_registry = _FakeRegistry(providers, account_ids)
         self.initialized = False
         self.closed = False
 
@@ -117,11 +136,12 @@ def _patch_container(
     *,
     markets: dict[str, str],
     providers: dict[str, Any],
+    account_ids: dict[str, tuple[str, ...]] | None = None,
 ) -> _FakeContainer:
     catalog = ProviderCatalog(
         markets=markets, display_names={}, enabled=dict.fromkeys(markets, True)
     )
-    container = _FakeContainer(catalog, providers)
+    container = _FakeContainer(catalog, providers, account_ids=account_ids)
     monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
     return container
 
@@ -375,6 +395,114 @@ class TestOffersDoctor:
         text = "\n".join(result.lines)
         assert FAKE_KEY not in text
         assert FAKE_LEASEWEB_KEY not in text
+
+
+def _patch_routes(
+    monkeypatch: pytest.MonkeyPatch,
+    routes: Any,
+) -> None:
+    """Stand in for the durable routing table the doctor reads."""
+
+    class _Repo:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def list_for_provider(self, provider_key: str) -> Any:
+            if isinstance(routes, Exception):
+                raise routes
+            return routes
+
+    monkeypatch.setattr(
+        "cloud_platform.modules.provider_routes.repository.SqlAlchemyProviderRouteRepository",
+        _Repo,
+    )
+
+
+class TestCredentialProvenanceDiagnostic:
+    """An available offer must name the credential account that supplies it.
+
+    Production context: 36 Leaseweb offers arrived from the multi-account era
+    pinned to the legacy id ``default`` (migration 0037's backfill), while the
+    provider really is served by ``sales-org-north`` (FRA) and ``sales-org-uk``
+    (LON). The doctor is the surface that has to say so — and it must never
+    rewrite the row: the catalog sync owns provenance.
+    """
+
+    @staticmethod
+    def _stale() -> list[SellableOffer]:
+        return [
+            _offer(provider_account_id="default", selling_price_minor=899),
+            _offer(id=uuid4(), location_id="BBB-02", provider_account_id="default"),
+        ]
+
+    async def test_stale_provenance_is_reported_with_the_fix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_offers_repo(monkeypatch, self._stale())
+        _patch_routes(
+            monkeypatch,
+            [SimpleNamespace(location_id="AAA-01", credential_account_id="sales-org-north")],
+        )
+        _patch_container(
+            monkeypatch,
+            markets={"leaseweb": "foreign"},
+            providers={"leaseweb": _ordering_capable()},
+            account_ids={"leaseweb": ("sales-org-north", "sales-org-uk")},
+        )
+        result = await cli.offers_doctor()
+        text = "\n".join(result.lines)
+        assert "[WARN] leaseweb: 2 available offer(s) still carry the legacy" in text
+        assert "a supplying account is already known for 1 of them" in text
+        assert "cloud_platform.cli leaseweb sync-offers" in text
+        # Provenance is reported, never silently repaired, and never fatal.
+        assert result.ok is True
+
+    async def test_a_single_legacy_credential_is_not_stale_provenance(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The deprecated single-key install IS account ``default``."""
+        _patch_offers_repo(monkeypatch, self._stale())
+        _patch_container(
+            monkeypatch,
+            markets={"leaseweb": "foreign"},
+            providers={"leaseweb": _ordering_capable()},
+            account_ids={"leaseweb": ("default",)},
+        )
+        result = await cli.offers_doctor()
+        assert not any("legacy credential provenance" in line for line in result.lines)
+
+    async def test_offers_that_name_their_account_are_not_reported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_offers_repo(
+            monkeypatch,
+            [_offer(provider_account_id="sales-org-north", selling_price_minor=899)],
+        )
+        _patch_container(
+            monkeypatch,
+            markets={"leaseweb": "foreign"},
+            providers={"leaseweb": _ordering_capable()},
+            account_ids={"leaseweb": ("sales-org-north", "sales-org-uk")},
+        )
+        result = await cli.offers_doctor()
+        assert not any("legacy credential provenance" in line for line in result.lines)
+
+    async def test_unreadable_routes_are_reported_without_crashing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_offers_repo(monkeypatch, self._stale())
+        _patch_routes(monkeypatch, RuntimeError('relation "provider_routes" does not exist'))
+        _patch_container(
+            monkeypatch,
+            markets={"leaseweb": "foreign"},
+            providers={"leaseweb": _ordering_capable()},
+            account_ids={"leaseweb": ("sales-org-north",)},
+        )
+        result = await cli.offers_doctor()
+        text = "\n".join(result.lines)
+        assert "credential routes unreadable (RuntimeError)" in text
+        assert "does not exist" not in text
+        assert result.ok is True
 
 
 class TestSyncReadiness:

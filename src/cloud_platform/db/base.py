@@ -55,7 +55,9 @@ class User(Base):
     terms_accepted_at = Column(DateTime, nullable=True)
     telegram_user_id = Column(BigInteger, nullable=True, unique=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
     # Relationships
     account_providers = relationship("ProviderAccount", back_populates="user")
@@ -82,7 +84,9 @@ class Wallet(Base):
     balance = Column(BigInteger, default=0, nullable=False)
     currency = Column(String(3), nullable=False, server_default="EUR")
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
     # Relationships
     user = relationship("User", back_populates="wallet")
@@ -130,7 +134,9 @@ class ProviderAccount(Base):
     status = Column(String, default="active", nullable=False)
     credentials_encrypted = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
     # Relationships
     provider = relationship("Provider", back_populates="accounts")
@@ -177,7 +183,9 @@ class Catalog(Base):
     enabled = Column(Boolean, nullable=False, server_default="true")
     extra_metadata = Column(JSONB, nullable=False, server_default="{}")
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
     # Relationships
     provider = relationship("Provider", back_populates="catalog_entries")
@@ -215,7 +223,9 @@ class ProviderLocation(Base):
     country_code = Column(String(2), nullable=True)
     city = Column(String, nullable=True)
     network_zone = Column(String, nullable=True)
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
     # Relationships
     provider = relationship("Provider", back_populates="locations")
@@ -323,7 +333,9 @@ class CostLimit(Base):
     )
     limit_minor = Column(BigInteger, nullable=False)
     enabled = Column(Boolean, nullable=False, server_default="true")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
 
 class Server(Base):
@@ -380,7 +392,9 @@ class Server(Base):
     os = Column(String, nullable=True)
     idempotency_key = Column(String, unique=True, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
     deleted_at = Column(DateTime, nullable=True)
     last_accrued_at = Column(DateTime(timezone=True), nullable=True)
     low_balance_since = Column(DateTime(timezone=True), nullable=True)
@@ -456,7 +470,9 @@ class SellableOffer(Base):
     enabled = Column(Boolean, nullable=False, server_default="false")
     provider_account_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
 
 class ProviderOrder(Base):
@@ -529,7 +545,9 @@ class ProviderOrder(Base):
     settlement_attempts = Column(Integer, nullable=False, server_default="0")
     settlement_error = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
 
 class ProviderRoute(Base):
@@ -580,7 +598,9 @@ class ProviderRoute(Base):
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
     last_success_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
 
 class RenewalRecord(Base):
@@ -616,7 +636,9 @@ class RenewalRecord(Base):
     grace_until = Column(DateTime(timezone=True), nullable=True)
     last_checked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
-    updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
 
 
 class RenewalNotification(Base):
@@ -1127,7 +1149,9 @@ class FirewallRow(Base):
     provider_firewall_id = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP")
     updated_at = Column(
-        DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", onupdate="CURRENT_TIMESTAMP"
+        DateTime(timezone=True),
+        server_default="CURRENT_TIMESTAMP",
+        onupdate=sa.text("CURRENT_TIMESTAMP"),
     )
 
 

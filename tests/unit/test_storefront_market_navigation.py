@@ -139,18 +139,33 @@ def _product_detail() -> Any:
 
 
 class FakeRegistry:
-    """Provider registry double; ``ordering_capable`` mirrors the real probe."""
+    """Provider registry double mirroring the real port probes.
 
-    def __init__(self, ordering_capable: dict[str, bool]) -> None:
+    ``ordering_capable`` models the order-based mode and ``compute_capable``
+    the direct-create mode: a provider is sellable when it can provision by
+    EITHER route, and the storefront must learn that from the port, never from
+    a provider name.
+    """
+
+    def __init__(
+        self,
+        ordering_capable: dict[str, bool],
+        compute_capable: dict[str, bool] | None = None,
+    ) -> None:
         self._capable = ordering_capable
+        self._compute = compute_capable or {}
 
     def get(self, key: str) -> Any:
+        from cloud_platform.providers.base import Capability
+
         if key not in self._capable:
             raise KeyError(key)
         detail = _product_detail()
 
         class _Provider:
-            """Implements the ordering port only when configured capable."""
+            """Ordering port + compute capability, per configuration."""
+
+            capabilities = frozenset()
 
             async def get_product(self, location_id: str, product_id: str) -> Any:
                 return detail
@@ -162,7 +177,9 @@ class FakeRegistry:
 
         provider = _Provider()
         provider.key = key
+        capabilities: set[Any] = set()
         if self._capable[key]:
+            capabilities.add(Capability.COMPUTE)
 
             async def place_order(request: Any, idempotency_key: Any) -> Any:
                 raise AssertionError("the storefront UI must never place an order")
@@ -172,6 +189,9 @@ class FakeRegistry:
 
             provider.place_order = place_order  # type: ignore[attr-defined]
             provider.get_order = get_order  # type: ignore[attr-defined]
+        if self._compute.get(key):
+            capabilities.add(Capability.COMPUTE)
+        provider.capabilities = frozenset(capabilities)
         return provider
 
 
@@ -224,6 +244,7 @@ def _view_service(
     *,
     offers: list[SellableOffer] | None = None,
     catalog: ProviderCatalog | None = None,
+    compute_capable: dict[str, bool] | None = None,
 ) -> OfferCatalogViewService:
     return OfferCatalogViewService(
         offers_repo=FakeOffersRepo(offers if offers is not None else OFFERS),
@@ -234,7 +255,8 @@ def _view_service(
                 FOREIGN_PROVIDER: True,
                 NOT_CAPABLE_PROVIDER: False,
                 DISABLED_PROVIDER: True,
-            }
+            },
+            compute_capable,
         ),
         wallet_repo=FakeWalletRepo(50_000),
         signing_key=SIGNING_KEY,
@@ -424,7 +446,8 @@ class TestProviderListing:
         assert any("Global Host — 2" in label for label in labels)
         assert not any("Iran Cloud" in label for label in labels)
 
-    async def test_provider_without_ordering_port_is_not_buyable(self, ui: MonthlyBotUi) -> None:
+    async def test_provider_that_cannot_provision_is_not_buyable(self, ui: MonthlyBotUi) -> None:
+        """Legacy Host implements NEITHER provisioning mode, so it is not sold."""
         screen = await _press(ui, ui._callback("store", "providers", "foreign"))
         rows = screen.keyboard.inline_keyboard
         soon = [b for b in _buttons(screen) if "به‌زودی" in b.text]
@@ -434,6 +457,14 @@ class TestProviderListing:
         index = next(i for i, row in enumerate(rows) if soon[0] in row)
         target = _decode(rows[index][0].callback_data)
         assert (target.flow, target.screen) == ("store", "market")
+
+    async def test_direct_create_provider_is_buyable_without_an_ordering_port(self) -> None:
+        """The other legitimate mode: create a server directly, no order to poll."""
+        service = _view_service(compute_capable={NOT_CAPABLE_PROVIDER: True})
+        views, _back = await service.providers_screen("foreign")
+        legacy = next(v for v in views if v.provider_key == NOT_CAPABLE_PROVIDER)
+        assert legacy.buyable is True
+        assert legacy.select_callback is not None
 
     async def test_operator_disabled_provider_is_hidden(self, ui: MonthlyBotUi) -> None:
         screen = await _press(ui, ui._callback("store", "providers", "foreign"))

@@ -349,3 +349,70 @@ the normal customer-facing flows, and only then remove the entry.
 
 Both columns hold the stable non-secret account id. No API key is ever
 persisted. Existing rows are backfilled to `default` by migration `0035`.
+
+## 14. Schema drift repair and offer provenance (migration `0038`)
+
+A database can drift: report a newer revision while missing objects that
+migration `0035` creates. That is not hypothetical — production reported
+`relation "provider_routes" does not exist` while routing code was running, and
+every offer upsert failed at the same time.
+
+Migration `0038` repairs drift **forward**, never by recreating or re-stamping:
+
+| Object | Healthy database | Drifted database |
+| --- | --- | --- |
+| `provider_routes` (+ unique constraint, + index) | already there -> untouched | created, empty |
+| `provider_orders.credential_account_id` | already there -> untouched | added, NULLable |
+| `servers.credential_account_id` | already there -> untouched | added, NULLable |
+
+It never drops or recreates a populated table, never touches
+`sellable_offers`, and has **no automatic downgrade** (it cannot know which
+objects it created).
+
+### It never guesses ownership
+
+Adding a credential-account column leaves those rows NULL, which the platform
+reads as "no proven owner" and fails closed on
+(`UnknownCredentialAccountError`). When `0038` has to add such a column to a
+table that already holds rows for a **multi-account provider**, it refuses
+before touching the schema and tells you what to do — it will not assign
+`default`:
+
+```
+[deploy] FAIL: 0038 must add credential_account_id to provider_orders, but 12 row(s)
+belong to a multi-account provider (leaseweb). Their owning credential account cannot
+be derived from this database, and this revision will NOT guess …
+```
+
+Operator path for such an installation:
+
+1. record ownership for those resources from **provider evidence** (the
+   Leaseweb console states which Sales Organization owns them);
+2. acknowledge the rest **once**, in the server-owned configuration file:
+
+   ```toml
+   [database]
+   acknowledge_unproven_credential_accounts = true
+   ```
+
+   (the application ignores keys it does not know, so this changes no runtime
+   behaviour);
+3. redeploy: the columns are added, no ownership value is written, and those
+   resources stay fail-closed until an account is recorded explicitly;
+4. remove the key.
+
+### Offer provenance is re-pinned by a sync, not by a migration
+
+Offers written before multi-account routing carry the legacy id `default`
+(`0037`'s backfill). `0038` deliberately leaves them alone: the authority on
+provenance is the **catalog sync**, which records the account that actually
+supplied each observation on the next successful read-only run:
+
+```
+FRA-01 -> sales-org-north      LON-01 -> sales-org-uk
+```
+
+`offers doctor` reports any remaining legacy pin that has a known supplying
+account, and names the command that fixes it. `leaseweb sync-offers` prints
+DISCOVERED and PERSISTED separately and exits non-zero when a durable write
+fails, so a run that could not record provenance can never look successful.

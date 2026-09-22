@@ -550,6 +550,7 @@ async def leaseweb_sync_offers() -> int:
     # Per-credential, per-location evidence: an operator must be able to see
     # that EACH key really served the locations it was probed for, and that a
     # failure in one key did not disturb the others.
+    persistence_failures: list[str] = []
     for name, step in result.items():
         print(
             f"{name}: fetched={step.total_fetched} upserted={step.total_upserted} "
@@ -560,10 +561,149 @@ async def leaseweb_sync_offers() -> int:
                 f"{location}: {count} products" for location, count in sorted(locations.items())
             )
             print(f"  account {account_id}: {served or 'no sellable locations'}")
+        if name == "products":
+            # DISCOVERED and PERSISTED are different facts: a run that read the
+            # provider but failed to write must never look like a good sync.
+            print(f"  discovered: {step.total_fetched} product observation(s)")
+            print(f"  persisted : {step.offers_persisted} offer(s) written")
+            print(f"  routes    : {step.routes_persisted} routing observation(s) written")
+            if step.availability_reconciled:
+                print(
+                    f"  retired   : {step.marked_unavailable} offer(s) marked provider-unavailable"
+                )
+            else:
+                print("  retired   : none (availability left untouched this run)")
+        for warning in step.warnings:
+            print(f"  warning: {warning}")
+        for failure in step.persistence_failures:
+            print(f"  PERSISTENCE FAILURE: {failure}")
+            persistence_failures.append(f"{name}: {failure}")
         for error in step.errors:
             print(f"  warning/error: {error}")
+
+    if persistence_failures:
+        print()
+        print("FAIL: the catalog was read from the provider but NOT persisted.")
+        print(f"  {len(persistence_failures)} durable-write failure(s):")
+        for failure in persistence_failures:
+            print(f"    - {failure}")
+        print("  This run is NOT a successful sync; nothing was retired and the")
+        print("  storefront still shows the last known state.")
+        print("  The usual cause is a database schema that is BEHIND the image:")
+        print("    python -m alembic current   # inside the migrate image")
+        print("    python -m alembic heads")
+        print("    scripts/deploy-production.sh  # applies migrations, then verifies head")
+        return 1
+
     await _print_storefront_readiness("leaseweb")
     return 0
+
+
+async def hetzner_sync_offers() -> int:
+    """Refresh the sellable-offer price book from the Hetzner API.
+
+    READ-ONLY at the provider: it lists locations and the server types offered
+    at each one, and writes provider COST + specs into the offer rows. It never
+    prices anything for sale and never enables an offer — SYNC != PRICE !=
+    ENABLE (see docs/payments/HETZNER.md).
+    """
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
+
+    settings = get_settings()
+    if not settings.hetzner_api_token:
+        print("No Hetzner API token is configured; cannot sync.")
+        return 1
+    syncer = HetznerCatalogSyncer(
+        SessionFactory,
+        token=settings.hetzner_api_token,
+        base_url=settings.hetzner_api_base_url,
+    )
+    try:
+        result = await syncer.sync_offers()
+    finally:
+        await syncer.close()
+
+    print(f"offers written: {result.offers_written}")
+    for report in result.locations:
+        if report.error:
+            print(f"  [WARN] {report.location_id}: {report.error}")
+        else:
+            print(f"  [OK  ] {report.location_id}: {report.products} product(s)")
+    for warning in result.warnings:
+        print(f"  warning: {warning}")
+    print(f"marked provider-unavailable: {result.marked_unavailable}")
+    await _print_storefront_readiness("hetzner")
+    return 0
+
+
+async def hetzner_doctor() -> DoctorResult:
+    """Read-only Hetzner pre-flight: credentials, catalog and storefront.
+
+    Answers, without mutating anything, WHY the Hetzner storefront is empty:
+    is the token configured, does the API answer, which locations does this
+    token see, does each location offer server types, and which offer gate is
+    still closed. Counts and class names only — never a token, never a price.
+    """
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
+
+    settings = get_settings()
+    lines: list[str] = ["Hetzner doctor (read-only)"]
+    ok = True
+    if not settings.hetzner_api_token:
+        lines.append("[FAIL] hetzner_api_token is not configured")
+        return DoctorResult(False, lines)
+    lines.append("[OK  ] hetzner_api_token configured")
+
+    syncer = HetznerCatalogSyncer(
+        SessionFactory,
+        token=settings.hetzner_api_token,
+        base_url=settings.hetzner_api_base_url,
+    )
+    try:
+        try:
+            locations, location_errors = await syncer.probe_locations()
+        except Exception as exc:  # pragma: no cover - transport guard
+            lines.append(f"[FAIL] locations unreachable ({type(exc).__name__})")
+            return DoctorResult(False, lines)
+        for error in location_errors:
+            lines.append(f"[WARN] {error}")
+        lines.append(f"[OK  ] locations visible to this credential: {len(locations)}")
+        total = 0
+        for location_id in locations:
+            try:
+                items = await syncer.probe_server_types(location_id)
+            except Exception as exc:
+                lines.append(f"[WARN] {location_id}: list endpoint failed ({type(exc).__name__})")
+                ok = False
+                continue
+            total += len(items)
+            lines.append(f"[OK  ] {location_id} products: {len(items)}")
+        lines.append(f"Summary: locations={len(locations)} products observed={total}")
+    finally:
+        await syncer.close()
+
+    try:
+        from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
+
+        rows = [
+            row
+            for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+            if row.provider_key == "hetzner"
+        ]
+        counts = _offer_gate_counts(rows)
+        lines.append("Storefront gates: " + _visibility_line("customer-visible", counts))
+        if not counts["sellable"]:
+            ok = False
+            lines.append(
+                "[WARN] nothing is on sale yet — SYNC != PRICE != ENABLE: "
+                "run 'hetzner sync-offers', then 'offers price-book --provider hetzner', "
+                "then 'offers enable <offer_id>'"
+            )
+    except Exception as exc:
+        lines.append(f"[WARN] offer rows unavailable ({type(exc).__name__})")
+    return DoctorResult(ok, lines)
 
 
 async def _print_storefront_readiness(provider_key: str) -> None:
@@ -749,26 +889,49 @@ async def leaseweb_accounts_doctor() -> DoctorResult:
                 "nothing was probed and it receives no new traffic"
             )
             continue
-        if not entry.ok:
+        # The authentication probe is ADVISORY. Real, location-scoped catalog
+        # reads are the authority on whether this credential actually works:
+        # the unscoped probe can be refused while every scoped read succeeds,
+        # and reporting that as "invalid credential" is a false negative.
+        auth_failed = not entry.ok
+        if auth_failed:
             lines.append(
-                f"[FAIL] credential {account.display_name} authentication "
-                f"({entry.error_class or 'unknown'})"
+                f"[WARN] credential {account.display_name} authentication probe "
+                f"inconclusive ({entry.error_class or 'unknown'}) — verifying with "
+                "scoped catalog reads"
             )
-            continue
-        healthy += 1
-        lines.append(f"[OK ] credential {account.display_name} authenticated")
+        else:
+            lines.append(f"[OK ] credential {account.display_name} authenticated")
         if not router.has_provider(entry.account_id):
+            if not auth_failed:
+                healthy += 1
             continue
         probe = await probe_account_catalog(
             router.client_for(entry.account_id), entry.account_id, seeds=router.locations
         )
         probes.append(probe)
         if not probe.authenticated:
-            lines.append(
-                f"[WARN] credential {account.display_name} catalog discovery "
-                f"failed ({probe.error_class or 'unknown'})"
-            )
+            if auth_failed:
+                # Both probes agree the credential is unusable, so say so
+                # plainly instead of leaving the account without a verdict.
+                lines.append(
+                    f"[FAIL] credential {account.display_name} — the authentication "
+                    "probe AND the scoped catalog reads failed "
+                    f"({probe.error_class or entry.error_class or 'unknown'})"
+                )
+            else:
+                lines.append(
+                    f"[WARN] credential {account.display_name} catalog discovery "
+                    f"failed ({probe.error_class or 'unknown'})"
+                )
             continue
+        if auth_failed:
+            lines.append(
+                f"[OK ] credential {account.display_name} authenticated — scoped "
+                f"catalog reads succeed ({probe.location_count} location(s)); the "
+                "unscoped probe was not a valid authentication test"
+            )
+        healthy += 1
         for location_id, count in sorted(probe.products_by_location.items()):
             lines.append(f"[OK ] {location_id} products: {count}")
         for location_id in probe.detail_warnings:
@@ -1011,13 +1174,15 @@ async def offers_doctor() -> DoctorResult:
 
     catalog: Any = None
     providers: dict[str, Any] = {}
+    registry: Any = None
     container = None
     try:
         container = create_container()
         await container.initialize()
         catalog = container.market_catalog()
-        for key in container.provider_registry.keys():
-            providers[key] = container.provider_registry.get(key)
+        registry = container.provider_registry
+        for key in registry.keys():
+            providers[key] = registry.get(key)
     except Exception as exc:  # pragma: no cover - depends on local settings
         lines.append(f"[WARN] provider registry unavailable ({type(exc).__name__})")
     finally:
@@ -1079,12 +1244,95 @@ async def offers_doctor() -> DoctorResult:
         else:
             lines.append(f"[WARN] market {market.value}: no provider configured")
 
+    # 3) credential provenance. A provider served by several credential accounts
+    #    records WHICH key supplied each observation; offers written before that
+    #    (or repaired forward by a migration) can still carry the legacy account
+    #    id. A refresh is the authority on provenance and a diagnostic must not
+    #    rewrite it, so a stale pin is REPORTED with the command that fixes it.
+    lines.extend(await _credential_provenance_notes(by_provider, providers, registry))
+
     if not rows:
         fail(
             "the offer price book is EMPTY — no catalog sync has ever landed; "
             "run: python -m cloud_platform.cli leaseweb sync-offers"
         )
     return DoctorResult(ok, lines)
+
+
+async def _credential_provenance_notes(
+    by_provider: dict[str, list[Any]],
+    providers: dict[str, Any],
+    registry: Any | None,
+) -> list[str]:
+    """Report available offers whose supplying credential account is unproven.
+
+    Read-only. It never rewrites a row: the catalog sync owns provenance. Silent
+    for providers that are not served by credential accounts (they are routed
+    logically and have no account to record), and for offers that already name
+    the account that supplied them.
+    """
+    from cloud_platform.providers.routing import DEFAULT_CREDENTIAL_ACCOUNT
+
+    notes: list[str] = []
+    if registry is None:
+        return notes
+    for provider_key in sorted(by_provider):
+        try:
+            views = registry.accounts(provider_key)
+        except Exception:
+            continue
+        real_accounts = {
+            str(view.account_id)
+            for view in views
+            if str(view.account_id) != DEFAULT_CREDENTIAL_ACCOUNT
+        }
+        if not real_accounts:
+            # A single legacy credential IS account ``default``: not stale.
+            continue
+        stale = [
+            row
+            for row in by_provider[provider_key]
+            if row.provider_available
+            and str(getattr(row, "provider_account_id", None) or DEFAULT_CREDENTIAL_ACCOUNT)
+            == DEFAULT_CREDENTIAL_ACCOUNT
+        ]
+        if not stale:
+            continue
+        locations = sorted({str(row.location_id) for row in stale})
+        routed: set[str] = set()
+        try:
+            from cloud_platform.db.session import SessionFactory
+            from cloud_platform.modules.provider_routes.repository import (
+                SqlAlchemyProviderRouteRepository,
+            )
+
+            routes = await SqlAlchemyProviderRouteRepository(SessionFactory).list_for_provider(
+                provider_key
+            )
+            routed = {
+                str(route.location_id)
+                for route in routes
+                if str(route.credential_account_id) != DEFAULT_CREDENTIAL_ACCOUNT
+            }
+        except Exception as exc:
+            notes.append(
+                f"[WARN] {provider_key}: credential routes unreadable "
+                f"({type(exc).__name__}) — provenance of {len(stale)} offer(s) "
+                "cannot be confirmed"
+            )
+        known = [location for location in locations if location in routed]
+        evidence = (
+            f" — a supplying account is already known for {len(known)} of them" if known else ""
+        )
+        notes.append(
+            f"[WARN] {provider_key}: {len(stale)} available offer(s) still carry the "
+            f"legacy credential provenance ('{DEFAULT_CREDENTIAL_ACCOUNT}') across "
+            f"{len(locations)} location(s){evidence}; run 'python -m "
+            f"cloud_platform.cli {provider_key} sync-offers' to record which "
+            "credential account supplies each offer — a refresh updates provider "
+            "cost, never the selling price or the enable state"
+        )
+    return notes
 
 
 def _visibility_line(label: str, counts: dict[str, int]) -> str:
@@ -1628,6 +1876,11 @@ def _parser() -> argparse.ArgumentParser:
     lsw_sub.add_parser("auth-check", help="read-only API key check")
     lsw_sub.add_parser("coverage", help="print the VPS API coverage matrix")
 
+    htz = sub.add_parser("hetzner", help="Hetzner catalog operations")
+    htz_sub = htz.add_subparsers(dest="subcommand", required=True)
+    htz_sub.add_parser("doctor", help="read-only pre-flight diagnostics")
+    htz_sub.add_parser("sync-offers", help="refresh the sellable-offer price book")
+
     accounts = lsw_sub.add_parser("accounts", help="read-only credential accounts")
     accounts_sub = accounts.add_subparsers(dest="leaseweb_accounts", required=True)
     accounts_sub.add_parser("list", help="safe per-account inventory (never a key)")
@@ -1806,6 +2059,15 @@ async def _dispatch(args: argparse.Namespace) -> int:
                 return await leaseweb_vps_snapshots(args.vps_id)
             return await leaseweb_vps_monitoring(args.vps_id)
         print(f"unknown leaseweb subcommand {args.subcommand}")  # pragma: no cover
+        return 2
+    if args.command == "hetzner":
+        if args.subcommand == "doctor":
+            result = await hetzner_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
+        if args.subcommand == "sync-offers":
+            return await hetzner_sync_offers()
+        print(f"unknown hetzner subcommand {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "offers":
         if args.subcommand == "list":

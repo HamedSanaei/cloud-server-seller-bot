@@ -143,7 +143,19 @@ class SqlAlchemySellableOfferRepository:
         ``provider_account_id`` records WHICH credential account supplied this
         observation; omitting it leaves the existing provenance untouched so a
         caller that does not know about credential accounts cannot erase it.
+
+        A provider observation WITHOUT a proven currency is refused here as
+        well as at the sync boundary: the columns carry a database default of
+        EUR, so storing an observation that omitted its currency would silently
+        reprice inventory that bills in GBP (or anything else). Sales
+        Organizations bill in different currencies — this fails CLOSED.
         """
+        currency = str(update.provider_cost_currency or "").strip()
+        if not currency:
+            raise ValueError(
+                f"refusing to store {provider_key}/{product_id}/{location_id} without a "
+                "provider currency: a database default would silently reprice it"
+            )
         account_id = provider_account_id or update.provider_account_id
         async with self._session_factory() as session:
             row = (
@@ -170,10 +182,10 @@ class SqlAlchemySellableOfferRepository:
                     disk_gb=update.disk_gb,
                     traffic=update.traffic,
                     provider_cost_minor=update.provider_cost_minor,
-                    provider_cost_currency=update.provider_cost_currency,
+                    provider_cost_currency=currency,
                     billing_parameters=update.billing_parameters,
                     provider_available=update.provider_available,
-                    selling_currency=update.provider_cost_currency,
+                    selling_currency=currency,
                     provider_account_id=account_id,
                 )
                 session.add(row)
@@ -185,7 +197,9 @@ class SqlAlchemySellableOfferRepository:
                 cast_any.disk_gb = update.disk_gb
                 cast_any.traffic = update.traffic
                 cast_any.provider_cost_minor = update.provider_cost_minor
-                cast_any.provider_cost_currency = update.provider_cost_currency
+                # The operator's selling price and currency are NEVER written
+                # here: a catalog refresh must not reprice the storefront.
+                cast_any.provider_cost_currency = currency
                 cast_any.billing_parameters = update.billing_parameters
                 cast_any.provider_available = update.provider_available
                 if account_id:

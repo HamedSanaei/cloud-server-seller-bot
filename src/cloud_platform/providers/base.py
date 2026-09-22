@@ -322,6 +322,81 @@ def ordering_support_of(provider: CloudProvider) -> OrderingProvider | None:
     return None
 
 
+class ProvisioningMode(StrEnum):
+    """How a provider provisions compute resources.
+
+    - ``ORDER_BASED``: Asynchronous ordering pipeline (e.g. Leaseweb:
+      place_order -> poll order -> match VPS).
+    - ``DIRECT_CREATE``: Direct compute provisioning (e.g. Hetzner:
+      create_server -> idempotent label reconciliation -> activate).
+    """
+
+    ORDER_BASED = "order_based"
+    DIRECT_CREATE = "direct_create"
+
+
+def provisioning_mode_of(provider: CloudProvider) -> ProvisioningMode | None:
+    """Determine the provider-neutral provisioning mode of a provider.
+
+    Domain and application code call this to decide fulfillment flow without
+    ever branching on a concrete provider key.
+    """
+    if ordering_support_of(provider) is not None:
+        return ProvisioningMode.ORDER_BASED
+    if supports(provider, Capability.COMPUTE):
+        return ProvisioningMode.DIRECT_CREATE
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class OfferOsOption:
+    """One selectable OS for an offer (provider-neutral)."""
+
+    name: str
+    price_minor: int = 0
+    image_id: str | None = None
+
+
+class OfferOptionsProvider(Protocol):
+    """Optional capability: live OS options and checkout validation for an offer."""
+
+    async def get_os_options(self, location_id: str, product_id: str) -> list[OfferOsOption]: ...
+
+    async def validate_offer_for_checkout(
+        self,
+        *,
+        location_id: str,
+        product_id: str,
+        os_name: str,
+        expected_cost_minor: int,
+        currency: str,
+    ) -> None: ...
+
+
+def offer_options_support_of(provider: CloudProvider) -> OfferOptionsProvider | None:
+    """The provider's offer-options capability, or None."""
+    if callable(getattr(provider, "get_os_options", None)) and callable(
+        getattr(provider, "validate_offer_for_checkout", None)
+    ):
+        return cast(OfferOptionsProvider, provider)
+    return None
+
+
+class DirectServerRecoveryProvider(Protocol):
+    """Optional capability: read-only server recovery for ambiguous direct create."""
+
+    async def recover_server_by_operation(
+        self, operation_key: str, since: datetime | None = None
+    ) -> OrderRecoveryResult: ...
+
+
+def server_recovery_support_of(provider: CloudProvider) -> DirectServerRecoveryProvider | None:
+    """The provider's direct server recovery port, or None."""
+    if callable(getattr(provider, "recover_server_by_operation", None)):
+        return cast(DirectServerRecoveryProvider, provider)
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderSnapshot:
     """One server snapshot (disk image) known to a provider (M13-004).
