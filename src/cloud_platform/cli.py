@@ -1396,7 +1396,10 @@ async def offers_preview(market: str | None) -> int:
                         f"{group.disk_gb} GB disk"
                     )
                     locations, _lb, _lc = await view.product_locations_screen(
-                        provider.provider_key, group.product_id, group.monthly_price_minor
+                        provider.provider_key,
+                        group.product_id,
+                        group.monthly_price_minor,
+                        group.currency,
                     )
                     for location in locations:
                         line_price = format_minor(location.monthly_price_minor, location.currency)

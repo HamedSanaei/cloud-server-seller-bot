@@ -287,9 +287,15 @@ class FakeView:
         return await self._service.products_screen(provider_key)
 
     async def product_locations_screen(
-        self, provider_key: str, product_id: str, price_minor: int | None = None
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int | None = None,
+        currency: str | None = None,
     ) -> tuple[list[Any], str, str]:
-        return await self._service.product_locations_screen(provider_key, product_id, price_minor)
+        return await self._service.product_locations_screen(
+            provider_key, product_id, price_minor, currency
+        )
 
     async def plans_screen(
         self, location_id: str, provider_key: str | None = None

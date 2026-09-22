@@ -796,14 +796,15 @@ class OfferCatalogViewService:
                     monthly_price_minor=head.selling_price_minor,
                     currency=head.selling_currency,
                     locations=locations,
-                    # The card is identified by product AND price: two cards
-                    # that differ only by price (different provider cost per
-                    # credential account) must not lead to the same list.
+                    # The card is identified by product AND price AND currency:
+                    # equal minor-unit values in different currencies are
+                    # different cards and must never cross-match.
                     select_callback=self._store_callback(
                         "product_locations",
                         provider_key,
                         head.product_id,
                         str(head.selling_price_minor),
+                        head.selling_currency,
                     ),
                 )
             )
@@ -812,21 +813,57 @@ class OfferCatalogViewService:
         return views, back, self._store_callback("market")
 
     async def product_locations_screen(
-        self, provider_key: str, product_id: str, price_minor: int | None = None
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int | None = None,
+        currency: str | None = None,
     ) -> tuple[list[ProductLocationView], str, str]:
         """Where one product is available, each row its own sellable offer.
 
-        ``price_minor`` narrows to the product card the customer tapped (the
-        same product can, in principle, carry different prices in different
-        locations); omitting it lists every availability of the product.
+        The product card is identified by product AND price AND currency:
+        ``price_minor`` together with ``currency`` narrow to the exact card
+        the customer tapped. A legacy callback that omits ``currency`` is
+        only honoured when it resolves to exactly one currency; an ambiguous
+        legacy callback is rejected instead of silently crossing currencies.
+        No currency is ever inferred or converted here.
         """
-        offers = [
+        candidates = [
             o
             for o in await self._offers.list_sellable(provider_key)
-            if o.sellable
-            and o.product_id == product_id
-            and (price_minor is None or o.selling_price_minor == price_minor)
+            if o.sellable and o.product_id == product_id
         ]
+        if not candidates:
+            raise OfferUnavailableError(
+                f"no sellable offers for product {product_id!r} of provider {provider_key!r}"
+            )
+        if currency is not None:
+            wanted = currency.strip().upper()
+            if not wanted:
+                raise OfferUnavailableError(
+                    f"no sellable offers for product {product_id!r} of provider {provider_key!r}"
+                )
+            offers = [
+                o
+                for o in candidates
+                if (price_minor is None or o.selling_price_minor == price_minor)
+                and o.selling_currency.upper() == wanted
+            ]
+        else:
+            scoped = [
+                o for o in candidates if price_minor is None or o.selling_price_minor == price_minor
+            ]
+            if not scoped:
+                raise OfferUnavailableError(
+                    f"no sellable offers for product {product_id!r} of provider {provider_key!r}"
+                )
+            distinct = {(o.selling_price_minor, o.selling_currency.upper()) for o in scoped}
+            if len(distinct) > 1:
+                raise OfferUnavailableError(
+                    f"ambiguous product card for {product_id!r} of provider {provider_key!r}: "
+                    "a legacy callback without currency must not cross currencies"
+                )
+            offers = scoped
         if not offers:
             raise OfferUnavailableError(
                 f"no sellable offers for product {product_id!r} of provider {provider_key!r}"
@@ -990,7 +1027,11 @@ class OfferCatalogViewService:
         # Back returns to the product's availability list, so the customer
         # stays in product-first navigation (market -> provider -> product).
         back_callback = self._store_callback(
-            "product_locations", offer.provider_key, offer.product_id
+            "product_locations",
+            offer.provider_key,
+            offer.product_id,
+            str(offer.selling_price_minor),
+            offer.selling_currency,
         )
         cancel_callback = self._store_callback("market")
         return self._view(offer), options, back_callback, cancel_callback

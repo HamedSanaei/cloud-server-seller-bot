@@ -514,18 +514,30 @@ class MonthlyBotUi:
         )
 
     async def store_product_locations_screen(
-        self, provider_key: str, product_id: str, price_minor: int | None = None
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int | None = None,
+        currency: str | None = None,
     ) -> BotScreen:
-        """store.product_locations:{provider}:{product}:{price}: availability.
+        """store.product_locations:{provider}:{product}:{price}:{currency}: availability.
 
         Every row is its own sellable offer (own price, own fulfillment
         credential behind it), so choosing a location is a real choice.
+        Currency is part of the card identity: equal minor-unit values in
+        different currencies never mix. A legacy callback without currency
+        falls back to the product cards instead of guessing a currency.
         """
         try:
             locations, back_callback, cancel_callback = await self._view.product_locations_screen(
-                provider_key, product_id, price_minor
+                provider_key, product_id, price_minor, currency
             )
         except OfferUnavailableError:
+            if currency is None:
+                try:
+                    return await self.store_products_screen(provider_key)
+                except OfferUnavailableError:
+                    pass
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         if not locations:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
@@ -1127,9 +1139,23 @@ class MonthlyBotUi:
             return await self.store_plans_screen(cb.args[0], cb.args[1])
         if cb.screen == "products" and len(cb.args) == 1:
             return await self.store_products_screen(cb.args[0])
+        if cb.screen == "product_locations" and len(cb.args) == 4:
+            try:
+                priced: int = int(cb.args[2])
+            except (TypeError, ValueError):
+                return await self.store_products_screen(cb.args[0])
+            currency = cb.args[3]
+            if not currency:
+                return await self.store_products_screen(cb.args[0])
+            return await self.store_product_locations_screen(
+                cb.args[0], cb.args[1], priced, currency
+            )
         if cb.screen == "product_locations" and len(cb.args) in (2, 3):
-            price = int(cb.args[2]) if len(cb.args) == 3 else None
-            return await self.store_product_locations_screen(cb.args[0], cb.args[1], price)
+            try:
+                price: int | None = int(cb.args[2]) if len(cb.args) == 3 else None
+            except (TypeError, ValueError):
+                return await self.store_products_screen(cb.args[0])
+            return await self.store_product_locations_screen(cb.args[0], cb.args[1], price, None)
         if cb.screen == "os" and len(cb.args) == 1:
             return await self.os_screen(UUID(cb.args[0]))
         if cb.screen == "confirm" and len(cb.args) == 2:

@@ -576,7 +576,11 @@ class _FakeView:
         return list(self._groups.get(provider_key, [])), "back", "cancel"
 
     async def product_locations_screen(
-        self, provider_key: str, product_id: str, price_minor: int | None = None
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int | None = None,
+        currency: str | None = None,
     ) -> tuple[list[Any], str, str]:
         return list(self._locations.get(product_id, [])), "back", "cancel"
 
