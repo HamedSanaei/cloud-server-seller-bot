@@ -172,12 +172,10 @@ class CatalogAutoSyncCoordinator:
         prices_updated = 0
         published = 0
         if report.ok and not report.persistence_failures:
-            policy = self._policies.get(provider_key)
-            if policy is None:
+            if self._policy_for(provider_key, report.billing_model) is None:
                 warnings.append("no automatic pricing policy configured; costs refreshed only")
-            else:
-                prices_updated = await self._auto_price(provider_key, policy, report, warnings)
-                published = await self._auto_publish(provider_key, policy, report, warnings)
+            prices_updated = await self._auto_price(provider_key, report, warnings)
+            published = await self._auto_publish(provider_key, report, warnings)
         elif not report.ok:
             logger.warning(
                 "catalog auto-sync for %s: no pricing/publication (sync not usable)",
@@ -231,10 +229,16 @@ class CatalogAutoSyncCoordinator:
         )
         return outcome
 
+    def _policy_for(self, provider_key: str, billing_model: str) -> PricingPolicy | None:
+        # Family-specific policy first (``leaseweb.hourly``), then the
+        # provider-wide one (``leaseweb``); absent means costs-only.
+        return self._policies.get(f"{provider_key}.{billing_model}") or self._policies.get(
+            provider_key
+        )
+
     async def _auto_price(
         self,
         provider_key: str,
-        policy: PricingPolicy,
         report: CatalogSyncReport,
         warnings: list[str],
     ) -> int:
@@ -243,6 +247,12 @@ class CatalogAutoSyncCoordinator:
         for product_id, location_id in sorted(report.verified):
             row = await self._offers.get_by_ref(provider_key, product_id, location_id)
             if row is None or not row.provider_available:
+                continue
+            if row.billing_model != report.billing_model:
+                warnings.append(f"{row.ref}: billing model changed; left untouched")
+                continue
+            policy = self._policy_for(provider_key, row.billing_model)
+            if policy is None:
                 continue
             if row.operator_disabled:
                 # Explicit operator block: automation leaves the row alone
@@ -277,17 +287,19 @@ class CatalogAutoSyncCoordinator:
     async def _auto_publish(
         self,
         provider_key: str,
-        policy: PricingPolicy,
         report: CatalogSyncReport,
         warnings: list[str],
     ) -> int:
         """Put verified, eligible rows on sale (never over an operator block)."""
-        if not policy.auto_publish:
-            return 0
         published = 0
         for product_id, location_id in sorted(report.verified):
             row = await self._offers.get_by_ref(provider_key, product_id, location_id)
             if row is None:
+                continue
+            if row.billing_model != report.billing_model:
+                continue
+            policy = self._policy_for(provider_key, row.billing_model)
+            if policy is None or not policy.auto_publish:
                 continue
             if not row.provider_available or row.selling_price_minor <= 0:
                 continue

@@ -42,6 +42,7 @@ def _to_domain(row: _SellableOfferModel) -> SellableOffer:
         selling_currency=str(_attr(row, "selling_currency") or "EUR"),
         billing_parameters=dict(_attr(row, "billing_parameters") or {}),
         technical_metadata=dict(_attr(row, "technical_metadata") or {}),
+        billing_model=str(_attr(row, "billing_model") or "prepaid_monthly_fixed"),
         provider_available=bool(_attr(row, "provider_available")),
         enabled=bool(_attr(row, "enabled")),
         operator_disabled=bool(_attr(row, "operator_disabled")),
@@ -190,6 +191,7 @@ class SqlAlchemySellableOfferRepository:
                     provider_cost_currency=currency,
                     billing_parameters=update.billing_parameters,
                     technical_metadata=dict(update.technical_metadata or {}),
+                    billing_model=update.billing_model or "prepaid_monthly_fixed",
                     provider_available=update.provider_available,
                     selling_currency=currency,
                     provider_account_id=account_id,
@@ -209,6 +211,8 @@ class SqlAlchemySellableOfferRepository:
                 cast_any.billing_parameters = update.billing_parameters
                 if update.technical_metadata is not None:
                     cast_any.technical_metadata = dict(update.technical_metadata)
+                if update.billing_model:
+                    cast_any.billing_model = update.billing_model
                 cast_any.provider_available = update.provider_available
                 if account_id:
                     cast_any.provider_account_id = account_id
@@ -216,19 +220,19 @@ class SqlAlchemySellableOfferRepository:
             await session.refresh(row)
             return _to_domain(row)
 
-    async def mark_unavailable(self, provider_key: str, available: set[tuple[str, str]]) -> int:
+    async def mark_unavailable(
+        self,
+        provider_key: str,
+        available: set[tuple[str, str]],
+        billing_model: str | None = None,
+    ) -> int:
         async with self._session_factory() as session:
-            rows = (
-                (
-                    await session.execute(
-                        select(_SellableOfferModel).where(
-                            _SellableOfferModel.provider_key == provider_key
-                        )
-                    )
-                )
-                .scalars()
-                .all()
+            stmt = select(_SellableOfferModel).where(
+                _SellableOfferModel.provider_key == provider_key
             )
+            if billing_model is not None:
+                stmt = stmt.where(_SellableOfferModel.billing_model == billing_model)
+            rows = (await session.execute(stmt)).scalars().all()
             changed = 0
             for row in rows:
                 if (str(row.product_id), str(row.location_id)) not in available and bool(

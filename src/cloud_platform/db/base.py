@@ -470,6 +470,10 @@ class SellableOffer(Base):
     #: adapters (architecture, storage type, ...). Never secrets, credential
     #: ids, order ids or raw API payloads.
     technical_metadata = Column(JSONB, nullable=False, server_default="{}")
+    #: Commercial terms of the offer: ``prepaid_monthly_fixed`` (monthly VPS,
+    #: ordered through the ordering API) or ``hourly`` (usage-based cloud
+    #: instances, created through the instance API and billed by accrual).
+    billing_model = Column(String(32), nullable=False, server_default="prepaid_monthly_fixed")
     provider_available = Column(Boolean, nullable=False, server_default="true")
     enabled = Column(Boolean, nullable=False, server_default="false")
     #: Explicit operator block: automatic publishing may enable an offer only
@@ -566,6 +570,10 @@ class ProviderOrder(Base):
     product_id = Column(String(64), nullable=True)
     location_id = Column(String(32), nullable=True)
     os_name = Column(String, nullable=True)
+    #: Free control-panel option chosen during configuration (NULL = no
+    #: panel). Informational: the ordering POST carries no verified panel
+    #: field, so the worker does not transmit it.
+    control_panel = Column(String(128), nullable=True)
     contract_term = Column(String(32), nullable=True)
     billing_cycle = Column(String(32), nullable=True)
     provider_cost_minor = Column(BigInteger, nullable=True)

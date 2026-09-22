@@ -23,10 +23,10 @@ marked ERROR — a failed command never leaves an orphaned reservation.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 from uuid import UUID, uuid4
 
 from cloud_platform.core.config import get_settings
@@ -44,12 +44,18 @@ from cloud_platform.modules.compute.domain import (
     ServerRepository,
 )
 from cloud_platform.modules.markets.domain import (
+    FAMILY_BILLINGS,
+    FAMILY_ORDER,
     MARKET_ORDER,
     ProviderCatalog,
+    ProviderProductFamily,
     UnknownMarketError,
     parse_market,
 )
 from cloud_platform.modules.offers.domain import (
+    BILLING_MODEL_HOURLY,
+    BILLING_MODEL_MONTHLY,
+    HOURLY_MONTHLY_ESTIMATE_HOURS,
     SellableOffer,
     SellableOfferRepository,
 )
@@ -285,6 +291,7 @@ class MonthlyCheckoutService:
         os_name: str,
         idempotency_key: str,
         at: datetime | None = None,
+        panel_name: str | None = None,
     ) -> MonthlyCheckoutResult:
         """Validate everything and persist the order intent (no provider calls)."""
         # 1. User.
@@ -297,6 +304,11 @@ class MonthlyCheckoutService:
         offer = await self._offers.get(offer_id)
         if offer is None or not offer.sellable:
             raise OfferUnavailableError(f"offer {offer_id} is not sellable")
+        # 2b. Billing model: this command sells prepaid-monthly products
+        # only. Hourly products go through the hourly creation command, so a
+        # misrouted hourly offer fails here instead of taking a monthly hold.
+        if offer.billing_model != BILLING_MODEL_MONTHLY:
+            raise OfferUnavailableError(f"offer {offer_id} is not a monthly plan")
 
         # 2.5 Replay: same command key -> the original intent, nothing new.
         existing = await self._servers.get_by_idempotency_key(idempotency_key)
@@ -399,6 +411,7 @@ class MonthlyCheckoutService:
                 product_id=offer.product_id,
                 location_id=offer.location_id,
                 os_name=os_name,
+                control_panel=panel_name,
                 contract_term=get_settings().leaseweb_contract_term,
                 billing_cycle=get_settings().leaseweb_billing_cycle,
                 provider_cost_minor=offer.provider_cost_minor,
@@ -436,6 +449,7 @@ class MonthlyCheckoutService:
                 "currency": offer.selling_currency,
                 "provider_cost_minor": str(offer.provider_cost_minor),
                 "os": os_name,
+                "control_panel": panel_name or "",
                 "order_id": str(order.id),
                 "hold_id": str(hold.id) if hold.id is not None else "",
                 "billing_model": BILLING_MODEL_PREPAID_MONTHLY,
@@ -542,6 +556,8 @@ class OfferConfirmView:
     confirm_callback: str
     back_callback: str
     cancel_callback: str
+    #: Free control panel chosen during configuration (None = no panel).
+    panel_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,14 +637,33 @@ PRODUCTS_PAGE_SIZE = 6
 
 
 @dataclass(frozen=True, slots=True)
-class ProductPageView:
-    """One page of a provider's product cards with pager navigation."""
-
+class FamilyOptionView:
+    # One commercial product line of a provider on the family screen.
     provider_key: str
-    items: tuple[ProductGroupView, ...]
+    family_key: str
+    billing_model: str
+    display_name: str
+    select_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyLocationView:
+    # One location button with normalized display metadata.
+    location_id: str
+    name: str
+    country_code: str | None
+    city: str | None
+    select_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocationPageView:
+    # One page of a provider's locations with pager navigation.
+    provider_key: str
+    items: tuple[FamilyLocationView, ...]
     page: int
     total_pages: int
-    total_cards: int
+    total_count: int
     back_callback: str
     cancel_callback: str
     prev_callback: str | None
@@ -636,10 +671,9 @@ class ProductPageView:
 
 
 @dataclass(frozen=True, slots=True)
-class ProductDetailView:
-    """One product card opened: full spec plus its per-location offers."""
-
-    provider_key: str
+class FamilyPlanView:
+    # One plan row at one location: specs, exact price, its own offer.
+    offer_id: UUID
     product_id: str
     name: str
     vcpu: int
@@ -648,9 +682,63 @@ class ProductDetailView:
     traffic: str | None
     monthly_price_minor: int
     currency: str
-    #: Normalized technical facts of the card's offer (adapters own content).
+    select_callback: str
+    # Normalized technical facts (storage type for the row label, ...).
+    technical_metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanPageView:
+    # One page of plans at one location with pager navigation.
+    provider_key: str
+    location_id: str
+    items: tuple[FamilyPlanView, ...]
+    page: int
+    total_pages: int
+    total_count: int
+    back_callback: str
+    cancel_callback: str
+    prev_callback: str | None
+    next_callback: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlanDetailView:
+    # One exact offer opened: full spec, proven technical facts, and the
+    # continue action. The location is already fixed — no location choice
+    # remains at this point.
+    offer: OfferCatalogView
     technical_metadata: dict[str, object]
-    locations: tuple[ProductLocationView, ...]
+    location_name: str
+    location_country: str | None
+    continue_callback: str
+    back_callback: str
+    cancel_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class PanelOptionView:
+    # One free control-panel choice (None = no panel), leading to confirm.
+    name: str | None
+    index: int
+    select_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class CloudConfirmView:
+    # Hourly creation confirmation: exact hourly price, monthly estimate,
+    # wallet balance and the create action. Billed per quantum by accrual;
+    # nothing is charged upfront, so there is no sufficiency gate here —
+    # non-payment is handled by the existing low-balance suspension.
+    offer: OfferCatalogView
+    image_label: str
+    hourly_price_minor: int
+    monthly_estimate_minor: int
+    currency: str
+    balance_minor: int
+    location_name: str
+    location_country: str | None
+    confirm_callback: str
     back_callback: str
     cancel_callback: str
 
@@ -683,6 +771,7 @@ class OfferCatalogViewService:
         signing_key: str,
         market_catalog: ProviderCatalog | None = None,
         location_repo: LocationRepository | None = None,
+        cloud_providers: Mapping[str, Any] | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
@@ -692,6 +781,7 @@ class OfferCatalogViewService:
         self._wallets = wallet_repo
         self._signing_key = signing_key
         self._markets = market_catalog or ProviderCatalog()
+        self._cloud = dict(cloud_providers or {})
 
     # -- storefront: markets / providers / locations -----------------------
 
@@ -779,7 +869,7 @@ class OfferCatalogViewService:
                     buyable=capable,
                     offer_count=counts[provider_key],
                     select_callback=(
-                        self._store_nav_callback("products", provider_key) if capable else None
+                        self._store_nav_callback("families", provider_key) if capable else None
                     ),
                 )
             )
@@ -806,6 +896,149 @@ class OfferCatalogViewService:
         back = self._store_nav_callback("providers", market.value if market else "")
         cancel = self._store_nav_callback("market")
         return views, back, cancel
+
+    # -- storefront: product families ------------------------------------
+
+    # Implicit family keys for providers without configured families, keyed
+    # by billing model (short, callback-safe).
+    _IMPLICIT_FAMILY_KEYS: ClassVar[dict[str, str]] = {
+        BILLING_MODEL_MONTHLY: "monthly",
+        BILLING_MODEL_HOURLY: "hourly",
+    }
+
+    def _sellable_families(
+        self, provider_key: str, offers: list[SellableOffer]
+    ) -> list[ProviderProductFamily]:
+        # Families with sellable offers: configured ones first (by billing),
+        # then implicit ones for billing models without configuration.
+        present = sorted({o.billing_model for o in offers if o.sellable})
+        configured = {f.billing_model: f for f in self._markets.families_of(provider_key)}
+        out: list[ProviderProductFamily] = []
+        for billing in present:
+            family = configured.get(billing)
+            if family is None:
+                if billing not in FAMILY_BILLINGS:
+                    continue
+                family = ProviderProductFamily(
+                    provider_key=provider_key,
+                    family_key=self._IMPLICIT_FAMILY_KEYS.get(billing, billing),
+                    billing_model=billing,
+                    display_name=self._markets.display_name_of(provider_key),
+                )
+            out.append(family)
+        order = {billing: index for index, billing in enumerate(FAMILY_ORDER)}
+        return sorted(out, key=lambda fam: order.get(fam.billing_model, len(order)))
+
+    async def families_screen(self, provider_key: str) -> tuple[list[FamilyOptionView], str, str]:
+        # Commercial product lines of one provider that have sellable offers
+        # (monthly VPS vs hourly cloud). Back goes to the market providers.
+        offers = [o for o in await self._offers.list_sellable(provider_key) if o.sellable]
+        if not offers:
+            raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
+        views = [
+            FamilyOptionView(
+                provider_key=provider_key,
+                family_key=family.family_key,
+                billing_model=family.billing_model,
+                display_name=family.display_name,
+                select_callback=self._store_nav_callback("family", provider_key, family.family_key),
+            )
+            for family in self._sellable_families(provider_key, offers)
+        ]
+        if not views:
+            raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
+        market = self._markets.market_of(provider_key)
+        back = self._store_nav_callback("providers", market.value if market else "")
+        return views, back, self._store_nav_callback("market")
+
+    async def resolve_family(self, provider_key: str, family_key: str) -> ProviderProductFamily:
+        # One family by key, validated against sellable offers (an in-flight
+        # button for a sold-out family resolves to nothing instead of an
+        # empty screen).
+        offers = [o for o in await self._offers.list_sellable(provider_key) if o.sellable]
+        for family in self._sellable_families(provider_key, offers):
+            if family.family_key == family_key:
+                return family
+        raise OfferUnavailableError(
+            f"no sellable {family_key!r} offers for provider {provider_key!r}"
+        )
+
+    async def family_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1, page_size: int = 6
+    ) -> LocationPageView:
+        # Locations with sellable offers of one family, paginated, with
+        # normalized display metadata. Only locations the configured
+        # account(s) can actually discover products for ever appear.
+        family = await self.resolve_family(provider_key, family_key)
+        counts: dict[str, int] = {}
+        for offer in await self._offers.list_sellable(provider_key):
+            if offer.sellable and offer.billing_model == family.billing_model:
+                counts[offer.location_id] = counts.get(offer.location_id, 0) + 1
+        if not counts:
+            raise OfferUnavailableError(
+                f"no sellable {family_key!r} offers for provider {provider_key!r}"
+            )
+        names = await self._location_metadata(provider_key)
+        ordered = sorted(counts)
+        total = len(ordered)
+        size = max(1, page_size)
+        total_pages = max(1, -(-total // size))
+        current = min(max(1, page), total_pages)
+        items = tuple(
+            FamilyLocationView(
+                location_id=code,
+                name=names.get(code, (code, None))[0],
+                country_code=names.get(code, (code, None))[1],
+                city=None,
+                select_callback=self._family_location_callback(family, provider_key, code),
+            )
+            for code in ordered[(current - 1) * size : current * size]
+        )
+        market = self._markets.market_of(provider_key)
+        return LocationPageView(
+            provider_key=provider_key,
+            items=items,
+            page=current,
+            total_pages=total_pages,
+            total_count=total,
+            # Back skips the family screen: for a single family it would
+            # auto-forward straight back here (a loop); multi-family users
+            # re-enter families through the provider.
+            back_callback=self._store_nav_callback("providers", market.value if market else ""),
+            cancel_callback=self._store_nav_callback("market"),
+            prev_callback=(
+                self._family_locations_callback(family, provider_key, current - 1)
+                if current > 1
+                else None
+            ),
+            next_callback=(
+                self._family_locations_callback(family, provider_key, current + 1)
+                if current < total_pages
+                else None
+            ),
+        )
+
+    def _family_location_callback(
+        self, family: ProviderProductFamily, provider_key: str, location_id: str
+    ) -> str:
+        # Next step depends on billing, never on provider: monthly lists
+        # plans, hourly lists plan families.
+        if family.billing_model == BILLING_MODEL_HOURLY:
+            return self._store_nav_callback(
+                "cloud_families", provider_key, family.family_key, location_id
+            )
+        return self._store_nav_callback(
+            "vps_plans", provider_key, family.family_key, location_id, "1"
+        )
+
+    def _family_locations_callback(
+        self, family: ProviderProductFamily, provider_key: str, page: int
+    ) -> str:
+        if family.billing_model == BILLING_MODEL_HOURLY:
+            return self._store_nav_callback(
+                "cloud_locations", provider_key, family.family_key, str(page)
+            )
+        return self._store_nav_callback("vps_locations", provider_key, family.family_key, str(page))
 
     # -- storefront: product-centric catalog -----------------------------
 
@@ -883,107 +1116,497 @@ class OfferCatalogViewService:
         back = self._store_nav_callback("providers", market.value if market else "")
         return views, back, self._store_nav_callback("market")
 
-    async def products_page(
-        self, provider_key: str, page: int = 1, page_size: int = PRODUCTS_PAGE_SIZE
-    ) -> ProductPageView:
-        """One page of a provider's product cards (6 per page by default).
-
-        Cards point at the plan-detail screen. Out-of-range pages clamp to
-        the nearest valid page instead of erroring on a stale pager button.
-        The detail callback carries no page (the return address would cost
-        wire bytes every card pays): detail back returns to page one.
-        """
-        products, back, cancel = await self.products_screen(provider_key)
-        total = len(products)
+    async def family_plans_screen(
+        self,
+        provider_key: str,
+        family_key: str,
+        location_id: str,
+        page: int = 1,
+        page_size: int = 6,
+    ) -> PlanPageView:
+        # Monthly plans at one location, cheapest first, paginated. Each row
+        # is its own sellable offer (its own credential account behind it).
+        family = await self.resolve_family(provider_key, family_key)
+        if family.billing_model != BILLING_MODEL_MONTHLY:
+            raise OfferUnavailableError(
+                f"family {family_key!r} of provider {provider_key!r} is not monthly"
+            )
+        offers = sorted(
+            (
+                o
+                for o in await self._offers.list_sellable(provider_key)
+                if o.sellable
+                and o.location_id == location_id
+                and o.billing_model == BILLING_MODEL_MONTHLY
+            ),
+            key=lambda o: (o.selling_price_minor, o.name, str(o.id)),
+        )
+        if not offers:
+            raise OfferUnavailableError(
+                f"no sellable monthly plans at {location_id!r} of provider {provider_key!r}"
+            )
+        total = len(offers)
         size = max(1, page_size)
         total_pages = max(1, -(-total // size))
         current = min(max(1, page), total_pages)
-        start = (current - 1) * size
-        items = tuple(products[start : start + size])
-        cards: list[ProductGroupView] = []
-        for card in items:
-            cards.append(
-                ProductGroupView(
-                    product_id=card.product_id,
-                    name=card.name,
-                    vcpu=card.vcpu,
-                    ram_gb=card.ram_gb,
-                    disk_gb=card.disk_gb,
-                    traffic=card.traffic,
-                    monthly_price_minor=card.monthly_price_minor,
-                    currency=card.currency,
-                    locations=card.locations,
-                    select_callback=self._store_nav_callback(
-                        "product_detail",
-                        provider_key,
-                        card.product_id,
-                        str(card.monthly_price_minor),
-                        card.currency,
-                    ),
-                    country_codes=card.country_codes,
-                )
+        items = tuple(
+            FamilyPlanView(
+                offer_id=offer.id,
+                product_id=offer.product_id,
+                name=offer.name,
+                vcpu=offer.vcpu,
+                ram_gb=offer.ram_gb,
+                disk_gb=offer.disk_gb,
+                traffic=offer.traffic,
+                monthly_price_minor=offer.selling_price_minor,
+                currency=offer.selling_currency,
+                select_callback=self._store_nav_callback(
+                    "plan_detail", provider_key, location_id, offer.product_id
+                ),
+                technical_metadata=dict(offer.technical_metadata or {}),
             )
-        return ProductPageView(
+            for offer in offers[(current - 1) * size : current * size]
+        )
+        return PlanPageView(
             provider_key=provider_key,
-            items=tuple(cards),
+            location_id=location_id,
+            items=items,
             page=current,
             total_pages=total_pages,
-            total_cards=total,
-            back_callback=back,
-            cancel_callback=cancel,
+            total_count=total,
+            back_callback=self._store_nav_callback("vps_locations", provider_key, family_key, "1"),
+            cancel_callback=self._store_nav_callback("market"),
             prev_callback=(
-                self._store_nav_callback("products", provider_key, str(current - 1))
+                self._store_nav_callback(
+                    "vps_plans", provider_key, family_key, location_id, str(current - 1)
+                )
                 if current > 1
                 else None
             ),
             next_callback=(
-                self._store_nav_callback("products", provider_key, str(current + 1))
+                self._store_nav_callback(
+                    "vps_plans", provider_key, family_key, location_id, str(current + 1)
+                )
                 if current < total_pages
                 else None
             ),
         )
 
-    async def product_detail_screen(
+    async def plan_detail_screen(
+        self, provider_key: str, location_id: str, product_id: str
+    ) -> PlanDetailView:
+        # One exact plan opened: full spec, proven technical facts, and the
+        # continue action into OS selection. The location is already fixed.
+        # Monthly offers only — an hourly row never belongs on this screen.
+        matches = [
+            o
+            for o in await self._offers.list_sellable(provider_key)
+            if o.sellable
+            and o.location_id == location_id
+            and o.product_id == product_id
+            and o.billing_model == BILLING_MODEL_MONTHLY
+        ]
+        if len(matches) != 1:
+            raise OfferUnavailableError(
+                f"no unique monthly plan {product_id!r} at {location_id!r} "
+                f"of provider {provider_key!r}"
+            )
+        offer = matches[0]
+        names = await self._location_metadata(provider_key)
+        location_name = names.get(location_id, (location_id, None))[0]
+        location_country = names.get(location_id, (location_id, None))[1]
+        family_key = self._family_key_for_billing(provider_key, offer.billing_model)
+        return PlanDetailView(
+            offer=self._view(offer),
+            technical_metadata=dict(offer.technical_metadata or {}),
+            location_name=location_name,
+            location_country=location_country,
+            continue_callback=self._store_nav_callback("os", self._offer_ref(offer.id)),
+            back_callback=self._store_nav_callback(
+                "vps_plans", provider_key, family_key, location_id, "1"
+            ),
+            cancel_callback=self._store_nav_callback("market"),
+        )
+
+    def _family_key_for_billing(self, provider_key: str, billing_model: str) -> str:
+        # Family key owning one billing model (configured or implicit).
+        for family in self._markets.families_of(provider_key):
+            if family.billing_model == billing_model:
+                return family.family_key
+        return self._IMPLICIT_FAMILY_KEYS.get(billing_model, billing_model)
+
+    async def panel_names(self, offer: SellableOffer) -> list[str | None]:
+        # Free control panels of one offer plus the explicit no-panel choice
+        # (index 0). The provider payload carries no OS-to-panel
+        # compatibility mapping, so none is fabricated: every free panel is
+        # offered and the customer picks.
+        panels: list[str] = []
+        try:
+            provider = self._registry.get(offer.provider_key)
+        except KeyError:
+            provider = None
+        if provider is not None:
+            ordering = ordering_support_of(provider)
+            if ordering is not None:
+                try:
+                    detail = await ordering.get_product(offer.location_id, offer.product_id)
+                    panels = [o.name for o in detail.control_panels if o.is_free and o.name]
+                except Exception:
+                    panels = []
+        return [None, *panels]
+
+    def _panel_select_callback(self, offer_id: UUID, os_index: int, panel_index: int) -> str:
+        # Selecting a panel leads to confirmation (panel 0 = no panel).
+        return self._store_nav_callback(
+            "confirm", self._offer_ref(offer_id), str(os_index), str(panel_index)
+        )
+
+    async def panel_screen(
+        self, *, offer_id: UUID, os_index: int
+    ) -> tuple[OfferCatalogView, list[PanelOptionView], str, str]:
+        # Configuration step between OS and confirmation (free panels only,
+        # so the confirmed price never moves).
+        offer = await self._offers.get(offer_id)
+        if offer is None or not offer.sellable:
+            raise OfferUnavailableError(f"offer {offer_id} is not sellable")
+        if offer.billing_model != BILLING_MODEL_MONTHLY:
+            raise OfferUnavailableError(f"offer {offer_id} is not a monthly plan")
+        await self.os_by_index(offer, os_index)
+        names = await self.panel_names(offer)
+        options = [
+            PanelOptionView(
+                name=name,
+                index=index,
+                select_callback=self._panel_select_callback(offer_id, os_index, index),
+            )
+            for index, name in enumerate(names)
+        ]
+        back_callback = self._store_nav_callback("os", self._offer_ref(offer_id))
+        cancel_callback = self._store_nav_callback("market")
+        return self._view(offer), options, back_callback, cancel_callback
+
+    async def panel_name_by_index(self, offer: SellableOffer, index: int) -> str | None:
+        # Resolve a callback-encoded panel index (re-validated server-side).
+        names = await self.panel_names(offer)
+        if index < 0 or index >= len(names):
+            raise OsUnavailableError(f"panel option {index} is not available for {offer.ref}")
+        return names[index]
+
+    # -- storefront: hourly cloud ----------------------------------------
+
+    def _hourly_provider(self, provider_key: str) -> Any:
+        # Hourly cloud adapter for live image reads (screens only; sync and
+        # creation resolve their own adapter from configuration).
+        try:
+            return self._cloud[provider_key]
+        except KeyError:
+            raise OfferUnavailableError(
+                f"provider {provider_key!r} has no hourly cloud adapter"
+            ) from None
+
+    def _plan_family_of(self, offer: SellableOffer) -> tuple[str, str]:
+        # Normalized instance family from the synced technical metadata
+        # (adapter-classified, never invented by the storefront).
+        meta = offer.technical_metadata or {}
+        key = str(meta.get("plan_family") or "other")
+        name = str(meta.get("plan_family_name") or key)
+        return key, name
+
+    async def cloud_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1, page_size: int = 6
+    ) -> LocationPageView:
+        # Hourly locations with sellable offers, paginated, with normalized
+        # display metadata. Only API-discovered regions ever appear.
+        family = await self.resolve_family(provider_key, family_key)
+        if family.billing_model != BILLING_MODEL_HOURLY:
+            raise OfferUnavailableError(
+                f"family {family_key!r} of provider {provider_key!r} is not hourly"
+            )
+        counts: dict[str, int] = {}
+        for offer in await self._offers.list_sellable(provider_key):
+            if offer.sellable and offer.billing_model == BILLING_MODEL_HOURLY:
+                counts[offer.location_id] = counts.get(offer.location_id, 0) + 1
+        if not counts:
+            raise OfferUnavailableError(f"no sellable hourly offers for provider {provider_key!r}")
+        names = await self._location_metadata(provider_key)
+        ordered = sorted(counts)
+        total = len(ordered)
+        size = max(1, page_size)
+        total_pages = max(1, -(-total // size))
+        current = min(max(1, page), total_pages)
+        items = tuple(
+            FamilyLocationView(
+                location_id=code,
+                name=names.get(code, (code, None))[0],
+                country_code=names.get(code, (code, None))[1],
+                city=None,
+                select_callback=self._store_nav_callback(
+                    "cloud_families", provider_key, family_key, code
+                ),
+            )
+            for code in ordered[(current - 1) * size : current * size]
+        )
+        return LocationPageView(
+            provider_key=provider_key,
+            items=items,
+            page=current,
+            total_pages=total_pages,
+            total_count=total,
+            back_callback=self._store_nav_callback("families", provider_key),
+            cancel_callback=self._store_nav_callback("market"),
+            prev_callback=(
+                self._store_nav_callback(
+                    "cloud_locations", provider_key, family_key, str(current - 1)
+                )
+                if current > 1
+                else None
+            ),
+            next_callback=(
+                self._store_nav_callback(
+                    "cloud_locations", provider_key, family_key, str(current + 1)
+                )
+                if current < total_pages
+                else None
+            ),
+        )
+
+    async def cloud_plan_families_screen(
+        self, provider_key: str, family_key: str, location_id: str
+    ) -> tuple[list[FamilyOptionView], str, str]:
+        # Instance-type families at one region, as the provider classified
+        # them (plus the explicit other bucket). Never invented here.
+        family = await self.resolve_family(provider_key, family_key)
+        if family.billing_model != BILLING_MODEL_HOURLY:
+            raise OfferUnavailableError(
+                f"family {family_key!r} of provider {provider_key!r} is not hourly"
+            )
+        groups: dict[str, tuple[str, int]] = {}
+        for offer in await self._offers.list_sellable(provider_key):
+            if (
+                offer.sellable
+                and offer.location_id == location_id
+                and offer.billing_model == BILLING_MODEL_HOURLY
+            ):
+                key, name = self._plan_family_of(offer)
+                _seen_name, count = groups.get(key, (name, 0))
+                groups[key] = (name, count + 1)
+        if not groups:
+            raise OfferUnavailableError(
+                f"no sellable hourly plans at {location_id!r} of provider {provider_key!r}"
+            )
+        views = [
+            FamilyOptionView(
+                provider_key=provider_key,
+                family_key=key,
+                billing_model=BILLING_MODEL_HOURLY,
+                display_name=name,
+                select_callback=self._store_nav_callback(
+                    "cloud_plans", provider_key, location_id, key, "1"
+                ),
+            )
+            for key, (name, _count) in sorted(groups.items())
+        ]
+        return (
+            views,
+            self._store_nav_callback("cloud_locations", provider_key, family_key, "1"),
+            self._store_nav_callback("market"),
+        )
+
+    async def cloud_plans_screen(
         self,
         provider_key: str,
-        product_id: str,
-        price_minor: int,
-        currency: str,
-    ) -> ProductDetailView:
-        """One opened product card: full spec plus its per-location offers.
-
-        The same strict card identity as the locations list (product AND
-        price AND currency). Back returns to the first products page.
-        """
-        offers = await self._card_offers(provider_key, product_id, price_minor, currency)
-        head = offers[0]
-        names = await self._location_metadata(provider_key)
-        locations = tuple(
-            ProductLocationView(
-                location_id=offer.location_id,
+        location_id: str,
+        plan_family: str,
+        page: int = 1,
+        page_size: int = 6,
+    ) -> PlanPageView:
+        # Hourly plans of one instance family at one region, cheapest first,
+        # paginated. Hourly price is authoritative; the monthly figure shown
+        # beside it is a display estimate only. The commercial family rides
+        # along implicitly: every cloud_* screen is hourly by construction.
+        offers = sorted(
+            (
+                o
+                for o in await self._offers.list_sellable(provider_key)
+                if o.sellable
+                and o.location_id == location_id
+                and o.billing_model == BILLING_MODEL_HOURLY
+                and self._plan_family_of(o)[0] == plan_family
+            ),
+            key=lambda o: (o.selling_price_minor, o.name, str(o.id)),
+        )
+        if not offers:
+            raise OfferUnavailableError(
+                f"no sellable hourly plans at {location_id!r} of provider {provider_key!r}"
+            )
+        total = len(offers)
+        size = max(1, page_size)
+        total_pages = max(1, -(-total // size))
+        current = min(max(1, page), total_pages)
+        items = tuple(
+            FamilyPlanView(
                 offer_id=offer.id,
-                name=names.get(offer.location_id, (offer.location_id, None))[0],
-                country_code=names.get(offer.location_id, (offer.location_id, None))[1],
-                product_name=offer.name,
+                product_id=offer.product_id,
+                name=offer.name,
+                vcpu=offer.vcpu,
+                ram_gb=offer.ram_gb,
+                disk_gb=offer.disk_gb,
+                traffic=offer.traffic,
                 monthly_price_minor=offer.selling_price_minor,
                 currency=offer.selling_currency,
-                select_callback=self._store_nav_callback("os", self._offer_ref(offer.id)),
+                select_callback=self._store_nav_callback(
+                    "cloud_detail", provider_key, location_id, offer.product_id
+                ),
+                technical_metadata=dict(offer.technical_metadata or {}),
             )
-            for offer in sorted(offers, key=lambda o: o.location_id)
+            for offer in offers[(current - 1) * size : current * size]
         )
-        return ProductDetailView(
+        back_family = self._family_key_for_billing(provider_key, BILLING_MODEL_HOURLY)
+        return PlanPageView(
             provider_key=provider_key,
-            product_id=head.product_id,
-            name=head.name,
-            vcpu=head.vcpu,
-            ram_gb=head.ram_gb,
-            disk_gb=head.disk_gb,
-            traffic=head.traffic,
-            monthly_price_minor=head.selling_price_minor,
-            currency=head.selling_currency,
-            technical_metadata=dict(head.technical_metadata or {}),
-            locations=locations,
-            back_callback=self._store_nav_callback("products", provider_key),
+            location_id=location_id,
+            items=items,
+            page=current,
+            total_pages=total_pages,
+            total_count=total,
+            back_callback=self._store_nav_callback(
+                "cloud_families", provider_key, back_family, location_id
+            ),
+            cancel_callback=self._store_nav_callback("market"),
+            prev_callback=(
+                self._store_nav_callback(
+                    "cloud_plans",
+                    provider_key,
+                    location_id,
+                    plan_family,
+                    str(current - 1),
+                )
+                if current > 1
+                else None
+            ),
+            next_callback=(
+                self._store_nav_callback(
+                    "cloud_plans",
+                    provider_key,
+                    location_id,
+                    plan_family,
+                    str(current + 1),
+                )
+                if current < total_pages
+                else None
+            ),
+        )
+
+    async def cloud_detail_screen(
+        self, provider_key: str, location_id: str, product_id: str
+    ) -> PlanDetailView:
+        # One exact hourly plan: full specs, hourly price plus the monthly
+        # estimate (display only), then the continue action into images.
+        matches = [
+            o
+            for o in await self._offers.list_sellable(provider_key)
+            if o.sellable
+            and o.location_id == location_id
+            and o.product_id == product_id
+            and o.billing_model == BILLING_MODEL_HOURLY
+        ]
+        if len(matches) != 1:
+            raise OfferUnavailableError(
+                f"no unique hourly plan {product_id!r} at {location_id!r} "
+                f"of provider {provider_key!r}"
+            )
+        offer = matches[0]
+        names = await self._location_metadata(provider_key)
+        return PlanDetailView(
+            offer=self._view(offer),
+            technical_metadata=dict(offer.technical_metadata or {}),
+            location_name=names.get(location_id, (location_id, None))[0],
+            location_country=names.get(location_id, (location_id, None))[1],
+            continue_callback=self._store_nav_callback("cloud_images", self._offer_ref(offer.id)),
+            back_callback=self._store_nav_callback(
+                "cloud_plans",
+                provider_key,
+                location_id,
+                self._plan_family_of(offer)[0],
+                "1",
+            ),
+            cancel_callback=self._store_nav_callback("market"),
+        )
+
+    async def cloud_images_screen(
+        self, offer_id: UUID
+    ) -> tuple[OfferCatalogView, list[PanelOptionView], str, str]:
+        # Supported images, read live from the provider (label and provider
+        # id stay separate; selection travels as an index and is re-resolved
+        # server-side, like OS options).
+        offer = await self._offers.get(offer_id)
+        if offer is None or not offer.sellable:
+            raise OfferUnavailableError(f"offer {offer_id} is not sellable")
+        if offer.billing_model != BILLING_MODEL_HOURLY:
+            raise OfferUnavailableError(f"offer {offer_id} is not an hourly plan")
+        provider = self._hourly_provider(offer.provider_key)
+        try:
+            images = await provider.list_images(offer.location_id)
+        except Exception as exc:
+            raise OfferUnavailableError(f"images currently unavailable for {offer.ref}") from exc
+        if not images:
+            raise OfferUnavailableError(f"no images for {offer.ref}")
+        options = [
+            PanelOptionView(
+                name=f"{image.label} ({image.architecture})" if image.architecture else image.label,
+                index=index,
+                select_callback=self._store_nav_callback(
+                    "cloud_confirm", self._offer_ref(offer.id), str(index)
+                ),
+            )
+            for index, image in enumerate(images)
+        ]
+        back_callback = self._store_nav_callback(
+            "cloud_detail", offer.provider_key, offer.location_id, offer.product_id
+        )
+        cancel_callback = self._store_nav_callback("market")
+        return self._view(offer), options, back_callback, cancel_callback
+
+    async def cloud_image_by_index(self, offer: SellableOffer, index: int) -> Any:
+        # Resolve a callback-encoded image index back to its record
+        # (re-fetched live, so a stale index simply fails).
+        provider = self._hourly_provider(offer.provider_key)
+        try:
+            images = await provider.list_images(offer.location_id)
+        except Exception as exc:
+            raise OfferUnavailableError(f"images currently unavailable for {offer.ref}") from exc
+        if index < 0 or index >= len(images):
+            raise OsUnavailableError(f"image option {index} is not available for {offer.ref}")
+        return images[index]
+
+    async def cloud_confirmation(
+        self, *, user_id: UUID, offer_id: UUID, image_index: int
+    ) -> CloudConfirmView:
+        # Hourly creation confirmation: exact hourly price, monthly estimate,
+        # wallet balance and the explicit delete-to-stop-billing warning
+        # (rendered by the UI). Nothing is charged upfront.
+        offer = await self._offers.get(offer_id)
+        if offer is None or not offer.sellable:
+            raise OfferUnavailableError(f"offer {offer_id} is not sellable")
+        if offer.billing_model != BILLING_MODEL_HOURLY:
+            raise OfferUnavailableError(f"offer {offer_id} is not an hourly plan")
+        image = await self.cloud_image_by_index(offer, image_index)
+        wallet = await self._wallets.get(user_id)
+        balance = wallet.balance if wallet is not None else 0
+        names = await self._location_metadata(offer.provider_key)
+        return CloudConfirmView(
+            offer=self._view(offer),
+            image_label=image.label,
+            hourly_price_minor=offer.selling_price_minor,
+            monthly_estimate_minor=offer.selling_price_minor * HOURLY_MONTHLY_ESTIMATE_HOURS,
+            currency=offer.selling_currency,
+            balance_minor=balance,
+            location_name=names.get(offer.location_id, (offer.location_id, None))[0],
+            location_country=names.get(offer.location_id, (offer.location_id, None))[1],
+            confirm_callback=self._store_nav_callback(
+                "cloud_buy", self._offer_ref(offer.id), str(image_index)
+            ),
+            back_callback=self._store_nav_callback("cloud_images", self._offer_ref(offer.id)),
             cancel_callback=self._store_nav_callback("market"),
         )
 
@@ -1159,8 +1782,8 @@ class OfferCatalogViewService:
         ]
 
     def _os_select_callback(self, offer_id: UUID, index: int) -> str:
-        """The signed callback that SELECTING this OS leads to (confirm)."""
-        return self._store_nav_callback("confirm", self._offer_ref(offer_id), str(index))
+        """The signed callback that SELECTING this OS leads to (panels)."""
+        return self._store_nav_callback("panel", self._offer_ref(offer_id), str(index))
 
     async def os_by_index(self, offer: SellableOffer, index: int) -> str:
         """Resolve a callback-encoded OS index back to its name (re-validated)."""
@@ -1175,22 +1798,34 @@ class OfferCatalogViewService:
         user_id: UUID,
         offer_id: UUID,
         os_index: int,
+        panel_index: int | None = None,
     ) -> OfferConfirmView:
         """The exact-price confirmation view (enforcement lives in checkout).
 
-        The OS index is re-resolved against the live product API — a stale
-        or tampered index simply fails.
+        The OS and panel indexes are re-resolved against the live product
+        API — a stale or tampered index simply fails. Monthly offers only:
+        hourly products confirm through their own screen.
         """
         offer = await self._offers.get(offer_id)
         if offer is None or not offer.sellable:
             raise OfferUnavailableError(f"offer {offer_id} is not sellable")
+        if offer.billing_model != BILLING_MODEL_MONTHLY:
+            raise OfferUnavailableError(f"offer {offer_id} is not a monthly plan")
         os_name = await self.os_by_index(offer, os_index)
+        panel_name = (
+            await self.panel_name_by_index(offer, panel_index) if panel_index is not None else None
+        )
 
         wallet = await self._wallets.get(user_id)
         balance = wallet.balance if wallet is not None else 0
 
-        confirm_callback = self._store_nav_callback("buy", self._offer_ref(offer_id), str(os_index))
-        back_callback = self._store_nav_callback("os", self._offer_ref(offer_id))
+        confirm_callback = self._store_nav_callback(
+            "buy",
+            self._offer_ref(offer_id),
+            str(os_index),
+            str(panel_index if panel_index is not None else 0),
+        )
+        back_callback = self._store_nav_callback("panel", self._offer_ref(offer_id), str(os_index))
         cancel_callback = self._store_nav_callback("market")
         return OfferConfirmView(
             offer=self._view(offer),
@@ -1201,6 +1836,7 @@ class OfferCatalogViewService:
             confirm_callback=confirm_callback,
             back_callback=back_callback,
             cancel_callback=cancel_callback,
+            panel_name=panel_name,
         )
 
     async def os_screen(
@@ -1216,14 +1852,13 @@ class OfferCatalogViewService:
         if not options:
             raise OsUnavailableError(f"no free OS options for {offer.ref}")
 
-        # Back returns to the product's detail screen, so the customer
-        # stays in product-first navigation (market -> provider -> product).
+        # Back returns to the plan's detail screen (location is fixed by
+        # the offer itself, so no card identity is needed).
         back_callback = self._store_nav_callback(
-            "product_detail",
+            "plan_detail",
             offer.provider_key,
+            offer.location_id,
             offer.product_id,
-            str(offer.selling_price_minor),
-            offer.selling_currency,
         )
         cancel_callback = self._store_nav_callback("market")
         return self._view(offer), options, back_callback, cancel_callback
@@ -1249,6 +1884,3 @@ class OfferCatalogViewService:
         cancel_callback = self._store_nav_callback("market")
         views = [self._view(o) for o in sorted(offers, key=lambda o: o.name)]
         return views, back_callback, cancel_callback
-
-    def plan_callback(self, offer_id: UUID) -> str:
-        return self._store_nav_callback("os", self._offer_ref(offer_id))

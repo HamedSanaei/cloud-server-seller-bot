@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cloud_platform.modules.catalog.domain import LocationRecord
-from cloud_platform.modules.offers.domain import OfferSpecUpdate
+from cloud_platform.modules.offers.domain import BILLING_MODEL_MONTHLY, OfferSpecUpdate
 from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 from cloud_platform.modules.provider_routes.domain import RouteObservation, RouteState
 from cloud_platform.modules.provider_routes.repository import (
@@ -642,7 +642,9 @@ class LeaseWebOrderingCatalogSyncer:
                     available.add(pair)
             availability_reconciled = True
             try:
-                marked_count = await offers_repo.mark_unavailable(PROVIDER_KEY, available)
+                marked_count = await offers_repo.mark_unavailable(
+                    PROVIDER_KEY, available, billing_model=BILLING_MODEL_MONTHLY
+                )
             except Exception as exc:
                 persistence_failures.append(f"mark_unavailable: {exc}")
             else:

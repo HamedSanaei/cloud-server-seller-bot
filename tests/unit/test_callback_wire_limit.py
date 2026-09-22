@@ -192,19 +192,29 @@ class FakeView:
             provider_key, product_id, price_minor, currency
         )
 
-    async def products_page(self, provider_key: str, page: int = 1) -> Any:
-        return await self._service.products_page(provider_key, page)
+    async def families_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
+        return await self._service.families_screen(provider_key)
 
-    async def product_detail_screen(
-        self,
-        provider_key: str,
-        product_id: str,
-        price_minor: int,
-        currency: str,
+    async def family_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1
     ) -> Any:
-        return await self._service.product_detail_screen(
-            provider_key, product_id, price_minor, currency
-        )
+        return await self._service.family_locations_screen(provider_key, family_key, page)
+
+    async def family_plans_screen(
+        self, provider_key: str, family_key: str, location_id: str, page: int = 1
+    ) -> Any:
+        return await self._service.family_plans_screen(provider_key, family_key, location_id, page)
+
+    async def plan_detail_screen(self, provider_key: str, location_id: str, product_id: str) -> Any:
+        return await self._service.plan_detail_screen(provider_key, location_id, product_id)
+
+    async def panel_screen(
+        self, *, offer_id: UUID, os_index: int
+    ) -> tuple[Any, list[Any], str, str]:
+        return await self._service.panel_screen(offer_id=offer_id, os_index=os_index)
+
+    async def panel_name_by_index(self, offer: SellableOffer, index: int) -> str | None:
+        return await self._service.panel_name_by_index(offer, index)
 
     async def plans_screen(
         self, location_id: str, provider_key: str | None = None
@@ -217,7 +227,9 @@ class FakeView:
     async def os_by_index(self, offer: SellableOffer, index: int) -> str:
         return await self._service.os_by_index(offer, index)
 
-    async def confirmation(self, *, user_id: UUID, offer_id: UUID, os_index: int) -> Any:
+    async def confirmation(
+        self, *, user_id: UUID, offer_id: UUID, os_index: int, panel_index: int | None = None
+    ) -> Any:
         return await self._service.confirmation(
             user_id=user_id, offer_id=offer_id, os_index=os_index
         )
@@ -473,27 +485,33 @@ class TestRepresentativeScreensInvariant:
                 ]
             )
         )
-        visited: list[str] = [bot._callback("store", "market")]
-        market = await _press(bot, visited[0])
+        market = await _press(bot, bot._callback("store", "market"))
         providers = await _press(bot, bot._callback("store", "providers", "foreign"))
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "VPS 1" in b.text)
-        availability = await _press(bot, card.callback_data or "")
-        locations = await _press(bot, bot._callback("store", "locations", PROVIDER))
+        # Single implicit family enters its locations directly.
+        locations = await _press(bot, bot._callback("store", "families", PROVIDER))
+        location_button = next(b for b in _buttons(locations) if "FRA-01" in b.text)
+        plans = await _press(bot, location_button.callback_data or "")
+        plan_button = next(
+            b for b in _buttons(plans) if _decode(b.callback_data or "").screen == "plan_detail"
+        )
+        detail = await _press(bot, plan_button.callback_data or "")
+        os_entry = next(
+            b for b in _buttons(detail) if _decode(b.callback_data or "").screen == "os"
+        )
+        await _press(bot, os_entry.callback_data or "")
         menu = bot.menu_screen()
         wallet = await _press(bot, bot._callback("wallet", "balance"))
         recharge = await _press(bot, bot._callback("recharge", "amounts"))
         servers = await _press(bot, bot._callback("servers", "list"))
         support = bot.support_screen()
-        # Offer-identity buttons (os/confirm/buy with full UUIDs) are the
-        # known pre-existing exception documented in TestCallbackAudit;
-        # every navigation button must fit.
+        # Offer-identity buttons (os/confirm/buy with compact refs) fit by
+        # construction; assert every button fits without exceptions.
         for screen in (
             market,
             providers,
-            products,
-            availability,
             locations,
+            plans,
+            detail,
             menu,
             wallet,
             recharge,
@@ -503,9 +521,6 @@ class TestRepresentativeScreensInvariant:
             for button in _buttons(screen):
                 if button.callback_data is None:
                     continue
-                target = _decode(button.callback_data)
-                if target.screen in ("os", "confirm", "buy"):
-                    continue
                 _assert_fits(button.callback_data)
 
 
@@ -513,27 +528,22 @@ class TestCallbackAudit:
     """Central audit: bounded navigation fits; report the overall maximum."""
 
     def test_bounded_navigation_shapes_fit(self) -> None:
+        ref = encode_offer_ref(UUID(OFFER_UUID))
         shapes = {
             "store.market": ("store", "market", ()),
             "store.providers": ("store", "providers", ("foreign",)),
+            "store.families": ("store", "families", (PROVIDER,)),
+            "store.family": ("store", "family", (PROVIDER, "vps")),
+            "store.vps_locations": ("store", "vps_locations", (PROVIDER, "vps", "1")),
+            "store.vps_plans": ("store", "vps_plans", (PROVIDER, "vps", "FRA-01", "1")),
+            "store.plan_detail": ("store", "plan_detail", (PROVIDER, "FRA-01", PRODUCT)),
+            "store.panel": ("store", "panel", (ref, "0")),
+            "store.os": ("store", "os", (ref,)),
+            "store.confirm": ("store", "confirm", (ref, "0", "0")),
+            "store.buy": ("store", "buy", (ref, "0", "0")),
             "store.locations": ("store", "locations", (PROVIDER,)),
             "store.plans": ("store", "plans", (PROVIDER, "FRA-01")),
-            "store.products": ("store", "products", (PROVIDER,)),
-            "store.product_locations.EUR": (
-                "store",
-                "product_locations",
-                (PROVIDER, PRODUCT, "624", "EUR"),
-            ),
-            "store.product_locations.GBP": (
-                "store",
-                "product_locations",
-                (PROVIDER, PRODUCT, "624", "GBP"),
-            ),
-            "store.product_locations.big": (
-                "store",
-                "product_locations",
-                (PROVIDER, PRODUCT, "999999", "EUR"),
-            ),
+            "store.product_locations": ("store", "product_locations", (PROVIDER, PRODUCT, "624")),
             "main.menu": ("main", "menu", ()),
             "recharge.start": ("recharge", "start", ("10000", "stripe")),
             "wallet.history": ("wallet", "history", ()),
@@ -552,8 +562,8 @@ class TestCallbackAudit:
         # Offer-identity callbacks now carry compact refs and fit.
         for flow, screen, args in [
             ("store", "os", (encode_offer_ref(UUID(OFFER_UUID)),)),
-            ("store", "confirm", (encode_offer_ref(UUID(OFFER_UUID)), "0")),
-            ("store", "buy", (encode_offer_ref(UUID(OFFER_UUID)), "0")),
+            ("store", "confirm", (encode_offer_ref(UUID(OFFER_UUID)), "0", "0")),
+            ("store", "buy", (encode_offer_ref(UUID(OFFER_UUID)), "0", "0")),
         ]:
             encoded = encode_callback(Callback(flow, screen, args), SIGNING_KEY)
             assert _size(encoded) <= TELEGRAM_CALLBACK_DATA_LIMIT_BYTES, (flow, screen)

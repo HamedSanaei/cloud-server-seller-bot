@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Protocol
+from typing import Any, ClassVar, Protocol
 from uuid import UUID
 
 from aiogram.types import (
@@ -70,6 +70,7 @@ from cloud_platform.modules.checkout.service import (
     UserNotActiveError,
 )
 from cloud_platform.modules.compute.domain import ServerLifecycleState, ServerRepository
+from cloud_platform.modules.hourly.service import HourlyError
 from cloud_platform.modules.navigation.domain import (
     Callback,
     CallbackError,
@@ -78,7 +79,11 @@ from cloud_platform.modules.navigation.domain import (
     encode_offer_ref,
     resolve_offer_id_arg,
 )
-from cloud_platform.modules.offers.domain import SellableOfferRepository, TechnicalSpec
+from cloud_platform.modules.offers.domain import (
+    HOURLY_MONTHLY_ESTIMATE_HOURS,
+    SellableOfferRepository,
+    TechnicalSpec,
+)
 from cloud_platform.modules.orders.domain import ProviderOrderRepository
 from cloud_platform.modules.payments.domain import (
     session_credit_amount,
@@ -211,12 +216,14 @@ class MonthlyBotUi:
         server_page_size: int = 5,
         fx_resolver: object | None = None,
         fx_display_currency: str = "IRT",
+        hourly: Any | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
         self._key = signing_key
         self._view = offers_view
         self._checkout = checkout
+        self._hourly = hourly
         self._servers = servers
         self._orders = orders
         self._renewals = renewals
@@ -480,60 +487,156 @@ class MonthlyBotUi:
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
-    # -- store flow: product card -> locations (aggregated inventory) ------─
+    # -- store flow: families -> locations -> plans -> detail ----------
 
-    async def store_products_screen(self, provider_key: str, page: int = 1) -> BotScreen:
-        """store.products:{provider}[:{page}]: one readable card per product.
+    _FAMILY_ICONS: ClassVar[dict[str, str]] = {
+        "prepaid_monthly_fixed": "\U0001f5a5\ufe0f",
+        "hourly": "\U0001f558",
+    }
 
-        Cards show the country flag (from synced location rows, once per
-        country), the spec and the exact price — never a bare location
-        count. Six cards per page with pager navigation.
-        """
+    async def store_families_screen(self, provider_key: str) -> BotScreen:
+        # Commercial product lines of one provider (monthly VPS vs hourly
+        # cloud). A single family enters directly so one-family providers
+        # keep their short path; several render the product selector.
         try:
-            view = await self._view.products_page(provider_key, page)
+            families, back_callback, cancel_callback = await self._view.families_screen(
+                provider_key
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not families:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if len(families) == 1:
+            return await self._enter_family(
+                provider_key, families[0].family_key, families[0].billing_model
+            )
+        rows: list[list[InlineKeyboardButton]] = []
+        for family in families:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t(
+                            "store.family_row",
+                            icon=self._FAMILY_ICONS.get(family.billing_model, ""),
+                            name=family.display_name,
+                            billing=self._t.t(f"store.billing.{family.billing_model}"),
+                        ),
+                        callback_data=family.select_callback,
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=back_callback),
+                InlineKeyboardButton(text=self._t.t("nav.cancel"), callback_data=cancel_callback),
+            ]
+        )
+        return BotScreen(
+            self._t.t(
+                "store.families_title",
+                provider=self._provider_name(provider_key),
+            ),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def _enter_family(
+        self, provider_key: str, family_key: str, billing_model: str
+    ) -> BotScreen:
+        # Family entry by billing model (never by provider): monthly lists
+        # VPS locations, hourly lists cloud locations.
+        if billing_model == "hourly":
+            return await self.store_cloud_locations_screen(provider_key, family_key)
+        return await self.store_vps_locations_screen(provider_key, family_key)
+
+    async def store_vps_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1
+    ) -> BotScreen:
+        # Monthly VPS locations with sellable offers: flag + friendly city,
+        # never a raw code as the only label.
+        try:
+            view = await self._view.family_locations_screen(provider_key, family_key, page)
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         if not view.items:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         rows: list[list[InlineKeyboardButton]] = []
-        for product in view.items:
-            price = await self._price_label(product.monthly_price_minor, product.currency)
+        for location in view.items:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._location_label(
+                            location.name, location.location_id, location.country_code
+                        ),
+                        callback_data=location.select_callback,
+                    )
+                ]
+            )
+        rows.extend(self._pager_rows(view))
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=view.back_callback),
+                InlineKeyboardButton(
+                    text=self._t.t("nav.cancel"), callback_data=view.cancel_callback
+                ),
+            ]
+        )
+        return BotScreen(
+            self._t.t("store.vps_locations_title"),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    def _pager_rows(self, view: Any) -> list[list[InlineKeyboardButton]]:
+        # Prev | page X/Y | next pager (absent on a single page).
+        if view.prev_callback is None and view.next_callback is None:
+            return []
+        pager: list[InlineKeyboardButton] = []
+        if view.prev_callback is not None:
+            pager.append(
+                InlineKeyboardButton(text=self._t.t("nav.prev"), callback_data=view.prev_callback)
+            )
+        pager.append(
+            InlineKeyboardButton(
+                text=self._t.t("store.products_page", page=view.page, pages=view.total_pages),
+                callback_data=view.next_callback or view.prev_callback or "",
+            )
+        )
+        if view.next_callback is not None:
+            pager.append(
+                InlineKeyboardButton(text=self._t.t("nav.next"), callback_data=view.next_callback)
+            )
+        return [pager]
+
+    async def store_vps_plans_screen(
+        self, provider_key: str, family_key: str, location_id: str, page: int = 1
+    ) -> BotScreen:
+        # Monthly plans at one location: concise provider-sourced specs with
+        # the exact native price plus the display equivalent.
+        try:
+            view = await self._view.family_plans_screen(provider_key, family_key, location_id, page)
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not view.items:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        rows: list[list[InlineKeyboardButton]] = []
+        for plan in view.items:
+            price = await self._price_label(plan.monthly_price_minor, plan.currency)
+            storage = TechnicalSpec.from_metadata(plan.technical_metadata).storage_type
+            disk = f"{plan.disk_gb}GB" + (f" {storage}" if storage else "")
             rows.append(
                 [
                     InlineKeyboardButton(
                         text=self._t.t(
-                            "store.product_row",
-                            flags=self._card_flags(product.country_codes),
-                            name=product.name,
-                            vcpu=product.vcpu,
-                            ram=product.ram_gb,
+                            "store.plan_row",
+                            vcpu=plan.vcpu,
+                            ram=plan.ram_gb,
+                            disk=disk,
                             price=price,
                         ),
-                        callback_data=product.select_callback,
+                        callback_data=plan.select_callback,
                     )
                 ]
             )
-        if view.prev_callback is not None or view.next_callback is not None:
-            pager: list[InlineKeyboardButton] = []
-            if view.prev_callback is not None:
-                pager.append(
-                    InlineKeyboardButton(
-                        text=self._t.t("nav.prev"), callback_data=view.prev_callback
-                    )
-                )
-            pager.append(
-                InlineKeyboardButton(
-                    text=self._t.t("store.products_page", page=view.page, pages=view.total_pages),
-                    callback_data=self._callback("store", "products", provider_key, str(view.page)),
-                )
-            )
-            if view.next_callback is not None:
-                pager.append(
-                    InlineKeyboardButton(
-                        text=self._t.t("nav.next"), callback_data=view.next_callback
-                    )
-                )
-            rows.append(pager)
+        rows.extend(self._pager_rows(view))
         rows.append(
             [
                 InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=view.back_callback),
@@ -544,87 +647,56 @@ class MonthlyBotUi:
         )
         return BotScreen(
             self._t.t(
-                "store.products_title",
+                "store.plans_title",
+                location=location_id,
                 provider=self._provider_name(provider_key),
-                count=view.total_cards,
-                page=view.page,
-                pages=view.total_pages,
             ),
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
 
-    async def store_product_detail_screen(
-        self,
-        provider_key: str,
-        product_id: str,
-        price_minor: int,
-        currency: str,
+    async def store_plan_detail_screen(
+        self, provider_key: str, location_id: str, product_id: str
     ) -> BotScreen:
-        """store.product_detail:{provider}:{product}:{price}:{currency}[:{page}].
-
-        The plan-detail screen: full readable spec, availability with country
-        flags, exact monthly price plus the display equivalent — then one
-        button per exact location leading to OS selection. Technical facts
-        render only when the provider catalog stated them; anything unknown
-        renders neutrally, never guessed.
-        """
+        # One exact monthly plan: full spec, proven facts only, then the
+        # continue action into OS selection.
         try:
-            detail = await self._view.product_detail_screen(
-                provider_key, product_id, price_minor, currency
-            )
+            detail = await self._view.plan_detail_screen(provider_key, location_id, product_id)
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
-        if not detail.locations:
-            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        offer = detail.offer
         spec = TechnicalSpec.from_metadata(detail.technical_metadata)
         unknown = self._t.t("store.detail_unknown")
-        disk = f"{detail.disk_gb} GB" + (f" {spec.storage_type}" if spec.storage_type else "")
+        disk = f"{offer.disk_gb} GB" + (f" {spec.storage_type}" if spec.storage_type else "")
         lines = [
-            self._t.t("store.detail_title", name=detail.name),
+            self._t.t("store.detail_title", name=offer.name),
             "",
-            self._t.t("store.detail_cpu", vcpu=detail.vcpu),
-            self._t.t("store.detail_ram", ram=detail.ram_gb),
+            self._t.t(
+                "store.detail_location",
+                location=self._location_label(
+                    detail.location_name, offer.location_id, detail.location_country
+                ),
+            ),
+            "",
+            self._t.t("store.detail_cpu", vcpu=offer.vcpu),
+            self._t.t("store.detail_ram", ram=offer.ram_gb),
             self._t.t("store.detail_disk", disk=disk),
-            self._t.t("store.detail_traffic", traffic=detail.traffic or unknown),
+            self._t.t("store.detail_traffic", traffic=offer.traffic or unknown),
             self._t.t("store.detail_arch", arch=spec.architecture or unknown),
-            "",
             self._t.t("store.detail_ipv4", value=self._present(spec.ipv4)),
             self._t.t("store.detail_ipv6", value=self._present(spec.ipv6)),
             "",
-            self._t.t("store.detail_locations"),
-        ]
-        for item in detail.locations:
-            lines.append(
-                self._t.t(
-                    "store.detail_location_row",
-                    location=self._location_label(item.name, item.location_id, item.country_code),
-                )
-            )
-        lines += [
-            "",
             self._t.t(
                 "store.detail_price",
-                price=await self._price_label(detail.monthly_price_minor, detail.currency),
+                price=await self._price_label(offer.monthly_price_minor, offer.currency),
             ),
         ]
-        rows: list[list[InlineKeyboardButton]] = []
-        for item in detail.locations:
-            price = await self._price_label(item.monthly_price_minor, item.currency)
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=self._t.t(
-                            "store.product_location_row",
-                            location=self._location_label(
-                                item.name, item.location_id, item.country_code
-                            ),
-                            price=price,
-                        ),
-                        callback_data=item.select_callback,
-                    )
-                ]
-            )
-        rows.append(
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("store.detail_continue"),
+                    callback_data=detail.continue_callback,
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text=self._t.t("nav.back"), callback_data=detail.back_callback
@@ -632,9 +704,43 @@ class MonthlyBotUi:
                 InlineKeyboardButton(
                     text=self._t.t("nav.cancel"), callback_data=detail.cancel_callback
                 ),
+            ],
+        ]
+        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def store_panel_screen(self, offer_ref: str, os_index: int) -> BotScreen:
+        # Configuration step between OS and confirmation (free panels only,
+        # so the confirmed price never moves).
+        try:
+            offer_id = resolve_offer_id_arg(offer_ref)
+        except CallbackError:
+            return self._expired_screen()
+        try:
+            _offer, options, back_callback, cancel_callback = await self._view.panel_screen(
+                offer_id=offer_id, os_index=os_index
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        except OsUnavailableError:
+            return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=option.name if option.name else self._t.t("offers.panel_none"),
+                    callback_data=option.select_callback,
+                )
+            ]
+            for option in options
+        ]
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=back_callback),
+                InlineKeyboardButton(text=self._t.t("nav.cancel"), callback_data=cancel_callback),
             ]
         )
-        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+        return BotScreen(
+            self._t.t("offers.panel_title"), InlineKeyboardMarkup(inline_keyboard=rows)
+        )
 
     def _present(self, value: bool | None) -> str:
         """YES/NO for a proven technical fact, neutral when the catalog is silent."""
@@ -643,6 +749,330 @@ class MonthlyBotUi:
         if value is False:
             return self._t.t("store.detail_no")
         return self._t.t("store.detail_unknown")
+
+    # -- store flow: hourly cloud -----------------------------------------
+
+    async def store_cloud_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1
+    ) -> BotScreen:
+        """Hourly cloud regions, API-discovered only, with country flags."""
+        try:
+            view = await self._view.cloud_locations_screen(provider_key, family_key, page)
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not view.items:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        rows: list[list[InlineKeyboardButton]] = []
+        for location in view.items:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._location_label(
+                            location.name, location.location_id, location.country_code
+                        ),
+                        callback_data=location.select_callback,
+                    )
+                ]
+            )
+        rows.extend(self._pager_rows(view))
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=view.back_callback),
+                InlineKeyboardButton(
+                    text=self._t.t("nav.cancel"), callback_data=view.cancel_callback
+                ),
+            ]
+        )
+        return BotScreen(
+            self._t.t(
+                "store.cloud_locations_title",
+                provider=self._provider_name(provider_key),
+            ),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def store_cloud_families_screen(
+        self, provider_key: str, family_key: str, location_id: str
+    ) -> BotScreen:
+        """Instance-type families at one region (provider-classified only)."""
+        try:
+            families, back_callback, cancel_callback = await self._view.cloud_plan_families_screen(
+                provider_key, family_key, location_id
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not families:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text=family.display_name, callback_data=family.select_callback)]
+            for family in families
+        ]
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=back_callback),
+                InlineKeyboardButton(text=self._t.t("nav.cancel"), callback_data=cancel_callback),
+            ]
+        )
+        return BotScreen(
+            self._t.t("store.cloud_families_title") + "\n" + self._t.t("store.cloud_families_text"),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def store_cloud_plans_screen(
+        self,
+        provider_key: str,
+        location_id: str,
+        plan_family: str,
+        page: int = 1,
+    ) -> BotScreen:
+        """Hourly plans of one instance family: specs plus the hourly price."""
+        try:
+            view = await self._view.cloud_plans_screen(provider_key, location_id, plan_family, page)
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not view.items:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        rows: list[list[InlineKeyboardButton]] = []
+        for plan in view.items:
+            price = await self._price_label(plan.monthly_price_minor, plan.currency)
+            storage = TechnicalSpec.from_metadata(plan.technical_metadata).storage_type
+            disk = f"{plan.disk_gb}GB" + (f" {storage}" if storage else "")
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t(
+                            "store.plan_row",
+                            vcpu=plan.vcpu,
+                            ram=plan.ram_gb,
+                            disk=disk,
+                            price=self._t.t("store.price_per_hour", price=price),
+                        ),
+                        callback_data=plan.select_callback,
+                    )
+                ]
+            )
+        rows.extend(self._pager_rows(view))
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=view.back_callback),
+                InlineKeyboardButton(
+                    text=self._t.t("nav.cancel"), callback_data=view.cancel_callback
+                ),
+            ]
+        )
+        return BotScreen(
+            self._t.t(
+                "store.cloud_plans_title",
+                location=location_id,
+                provider=self._provider_name(provider_key),
+            ),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def store_cloud_detail_screen(
+        self, provider_key: str, location_id: str, product_id: str
+    ) -> BotScreen:
+        """One hourly plan: full specs, hourly price plus the monthly
+        estimate (display only), then continue into images."""
+        try:
+            detail = await self._view.cloud_detail_screen(provider_key, location_id, product_id)
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        offer = detail.offer
+        spec = TechnicalSpec.from_metadata(detail.technical_metadata)
+        unknown = self._t.t("store.detail_unknown")
+        disk = f"{offer.disk_gb} GB" + (f" {spec.storage_type}" if spec.storage_type else "")
+        hourly = self._t.t(
+            "store.price_per_hour",
+            price=await self._price_label(offer.monthly_price_minor, offer.currency),
+        )
+        monthly = self._t.t(
+            "store.price_per_month",
+            price=await self._price_label(
+                offer.monthly_price_minor * HOURLY_MONTHLY_ESTIMATE_HOURS, offer.currency
+            ),
+        )
+        lines = [
+            self._t.t("store.cloud_detail_title", name=offer.name),
+            "",
+            self._t.t(
+                "store.detail_location",
+                location=self._location_label(
+                    detail.location_name, offer.location_id, detail.location_country
+                ),
+            ),
+            self._t.t(
+                "store.cloud_detail_family",
+                family=str(detail.technical_metadata.get("plan_family_name") or "?"),
+            ),
+            "",
+            self._t.t("store.detail_cpu", vcpu=offer.vcpu),
+            self._t.t("store.detail_ram", ram=offer.ram_gb),
+            self._t.t("store.detail_disk", disk=disk),
+            self._t.t("store.detail_traffic", traffic=offer.traffic or unknown),
+            self._t.t("store.detail_arch", arch=spec.architecture or unknown),
+            self._t.t("store.detail_ipv4", value=self._present(spec.ipv4)),
+            self._t.t("store.detail_ipv6", value=self._present(spec.ipv6)),
+            "",
+            self._t.t("store.cloud_detail_price", hourly=hourly, monthly=monthly),
+        ]
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("store.detail_continue"),
+                    callback_data=detail.continue_callback,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("nav.back"), callback_data=detail.back_callback
+                ),
+                InlineKeyboardButton(
+                    text=self._t.t("nav.cancel"), callback_data=detail.cancel_callback
+                ),
+            ],
+        ]
+        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def store_cloud_images_screen(self, offer_ref: str) -> BotScreen:
+        """Supported images, read live (label and provider id stay apart)."""
+        offer_id = self._resolve_offer_id(offer_ref)
+        if offer_id is None:
+            return self._expired_screen()
+        try:
+            _offer, options, back_callback, cancel_callback = await self._view.cloud_images_screen(
+                offer_id
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=option.name or "",
+                    callback_data=option.select_callback,
+                )
+            ]
+            for option in options
+        ]
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=back_callback),
+                InlineKeyboardButton(text=self._t.t("nav.cancel"), callback_data=cancel_callback),
+            ]
+        )
+        return BotScreen(
+            self._t.t("store.cloud_images_title"), InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+
+    async def store_cloud_buy_screen(
+        self, user: User | None, offer_ref: str, image_index: int, cb_key: str
+    ) -> BotScreen:
+        # Hourly creation intent (terminal action): no provider call and no
+        # charge here — the worker POSTs once under the operation ledger and
+        # accrual bills per quantum from the price snapshot.
+        if user is None or user.id is None:
+            return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
+        if self._hourly is None:
+            return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        offer_id = self._resolve_offer_id(offer_ref)
+        if offer_id is None:
+            return self._expired_screen()
+        idempotency_key = f"bot-hourly:{cb_key}"
+        try:
+            image = await self._resolve_cloud_image(offer_id, image_index)
+            result = await self._hourly.create_instance(
+                user=user,
+                offer_id=offer_id,
+                image_id=image.id,
+                image_label=image.label,
+                idempotency_key=idempotency_key,
+            )
+        except (OfferUnavailableError, OsUnavailableError, HourlyError) as exc:
+            logger.warning("hourly create rejected: %s", exc)
+            return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        except Exception as exc:
+            logger.warning("hourly create rejected: %s", exc)
+            return BotScreen(self._t.t("error.unknown"), self._menu_only())
+        text = self._t.t("store.cloud_created", server_id=str(result.server.id)[:8])
+        if result.replayed:
+            text += "\n" + self._t.t("offers.order_replayed")
+        return BotScreen(text, self._menu_only())
+
+    async def _resolve_cloud_image(self, offer_id: UUID, image_index: int) -> Any:
+        from cloud_platform.modules.offers.domain import OfferNotFoundError, SellableOffer
+
+        offer: SellableOffer | None = await self._offers_repo.get(offer_id)
+        if offer is None:
+            raise OfferNotFoundError(f"offer {offer_id} not found")
+        return await self._view.cloud_image_by_index(offer, image_index)
+
+    async def store_cloud_confirm_screen(
+        self, user: User, offer_ref: str, image_index: int
+    ) -> BotScreen:
+        """Hourly creation confirmation: per-hour charge basis, explicit
+        delete-to-stop-billing warning, never 'stop billing' language."""
+        if user.id is None:
+            return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
+        offer_id = self._resolve_offer_id(offer_ref)
+        if offer_id is None:
+            return self._expired_screen()
+        try:
+            view = await self._view.cloud_confirmation(
+                user_id=user.id, offer_id=offer_id, image_index=image_index
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        except OsUnavailableError:
+            return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
+        hourly = self._t.t(
+            "store.price_per_hour",
+            price=await self._price_label(view.hourly_price_minor, view.currency),
+        )
+        monthly = self._t.t(
+            "store.price_per_month",
+            price=await self._price_label(view.monthly_estimate_minor, view.currency),
+        )
+        lines = [
+            self._t.t("store.cloud_confirm_title"),
+            "",
+            self._t.t(
+                "store.cloud_confirm_provider",
+                provider=self._provider_name(view.offer.provider_key),
+            ),
+            self._t.t("store.cloud_confirm_plan", plan=view.offer.name),
+            self._t.t(
+                "store.cloud_confirm_location",
+                location=self._location_label(
+                    view.location_name, view.offer.location_id, view.location_country
+                ),
+            ),
+            self._t.t(
+                "store.cloud_confirm_specs",
+                vcpu=view.offer.vcpu,
+                ram=view.offer.ram_gb,
+                disk=view.offer.disk_gb,
+            ),
+            self._t.t("store.cloud_confirm_os", os=view.image_label),
+            "",
+            self._t.t("store.cloud_confirm_cost", hourly=hourly, monthly=monthly),
+            "",
+            self._t.t("store.cloud_confirm_warning"),
+        ]
+        rows: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("store.cloud_confirm_create"),
+                    callback_data=view.confirm_callback,
+                )
+            ],
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=view.back_callback),
+                InlineKeyboardButton(
+                    text=self._t.t("nav.cancel"), callback_data=view.cancel_callback
+                ),
+            ],
+        ]
+        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def store_product_locations_screen(
         self,
@@ -666,7 +1096,7 @@ class MonthlyBotUi:
         except OfferUnavailableError:
             if currency is None:
                 try:
-                    return await self.store_products_screen(provider_key)
+                    return await self.store_families_screen(provider_key)
                 except OfferUnavailableError:
                     pass
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
@@ -1025,13 +1455,18 @@ class MonthlyBotUi:
         )
         return BotScreen(self._t.t("offers.os_title"), InlineKeyboardMarkup(inline_keyboard=rows))
 
-    async def confirm_screen(self, user: User, offer_id: UUID, os_index: int) -> BotScreen:
-        """offers.confirm:{offer_id}:{os_index}: exact monthly price + wallet."""
+    async def confirm_screen(
+        self, user: User, offer_id: UUID, os_index: int, panel_index: int | None = None
+    ) -> BotScreen:
+        """offers.confirm:{offer_id}:{os_index}[:{panel}]: exact price + wallet."""
         if user.id is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
         try:
             view: OfferConfirmView = await self._view.confirmation(
-                user_id=user.id, offer_id=offer_id, os_index=os_index
+                user_id=user.id,
+                offer_id=offer_id,
+                os_index=os_index,
+                panel_index=panel_index,
             )
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
@@ -1048,6 +1483,10 @@ class MonthlyBotUi:
                 traffic=f" — {view.offer.traffic}" if view.offer.traffic else "",
             ),
             self._t.t("offers.confirm_os", os=view.os_name),
+            self._t.t(
+                "offers.confirm_panel",
+                panel=view.panel_name or self._t.t("offers.panel_none"),
+            ),
             self._t.t("offers.confirm_location", location=view.offer.location_id),
             self._t.t(
                 "offers.confirm_price",
@@ -1077,7 +1516,12 @@ class MonthlyBotUi:
         return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def buy_screen(
-        self, user: User | None, offer_id: UUID, os_index: int, cb_key: str
+        self,
+        user: User | None,
+        offer_id: UUID,
+        os_index: int,
+        panel_index: int | None,
+        cb_key: str,
     ) -> BotScreen:
         """offers.buy: the idempotent checkout command (terminal action)."""
         if user is None or user.id is None:
@@ -1091,6 +1535,7 @@ class MonthlyBotUi:
                 offer_id=offer_id,
                 os_name=await self._resolve_os_name(offer_id, os_index),
                 idempotency_key=idempotency_key,
+                panel_name=await self._resolve_panel_name(offer_id, panel_index),
             )
         except InsufficientHoldBalanceError as exc:
             return BotScreen(
@@ -1112,6 +1557,16 @@ class MonthlyBotUi:
         if offer is None:
             raise OfferNotFoundError(f"offer {offer_id} not found")
         return await self._view.os_by_index(offer, os_index)
+
+    async def _resolve_panel_name(self, offer_id: UUID, panel_index: int | None) -> str | None:
+        from cloud_platform.modules.offers.domain import OfferNotFoundError, SellableOffer
+
+        if panel_index is None:
+            return None
+        offer: SellableOffer | None = await self._offers_repo.get(offer_id)
+        if offer is None:
+            raise OfferNotFoundError(f"offer {offer_id} not found")
+        return await self._view.panel_name_by_index(offer, panel_index)
 
     def order_screen(self, result: MonthlyCheckoutResult) -> BotScreen:
         text = self._t.t("offers.order_created", order_id=str(result.order.id)[:8])
@@ -1280,31 +1735,54 @@ class MonthlyBotUi:
             return await self.store_locations_screen(cb.args[0])
         if cb.screen == "plans" and len(cb.args) == 2:
             return await self.store_plans_screen(cb.args[0], cb.args[1])
-        if cb.screen == "products" and len(cb.args) == 1:
-            return await self.store_products_screen(cb.args[0])
-        if cb.screen == "products" and len(cb.args) == 2:
+        if cb.screen == "families" and len(cb.args) == 1:
+            return await self.store_families_screen(cb.args[0])
+        if cb.screen == "family" and len(cb.args) == 2:
             try:
-                numbered = int(cb.args[1])
-            except (TypeError, ValueError):
-                return await self.store_products_screen(cb.args[0])
-            return await self.store_products_screen(cb.args[0], numbered)
-        if cb.screen == "product_detail" and len(cb.args) in (4, 5):
+                families, _back, _cancel = await self._view.families_screen(cb.args[0])
+            except OfferUnavailableError:
+                return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+            family = next((f for f in families if f.family_key == cb.args[1]), None)
+            if family is None:
+                return await self.store_families_screen(cb.args[0])
+            return await self._enter_family(cb.args[0], family.family_key, family.billing_model)
+        if cb.screen == "products":
+            # Legacy product-first callbacks re-enter through the family
+            # screen instead of guessing a removed route.
+            if len(cb.args) >= 1:
+                return await self.store_families_screen(cb.args[0])
+            return self._menu_screen()
+        if cb.screen == "vps_locations" and len(cb.args) == 3:
             try:
-                amount = int(cb.args[2])
+                numbered = int(cb.args[2])
             except (TypeError, ValueError):
-                return await self.store_products_screen(cb.args[0])
-            currency = cb.args[3]
-            if not currency:
-                return await self.store_products_screen(cb.args[0])
-            return await self.store_product_detail_screen(cb.args[0], cb.args[1], amount, currency)
+                numbered = 1
+            return await self.store_vps_locations_screen(cb.args[0], cb.args[1], numbered)
+        if cb.screen == "vps_plans" and len(cb.args) in (3, 4):
+            try:
+                numbered = int(cb.args[3]) if len(cb.args) == 4 else 1
+            except (TypeError, ValueError):
+                numbered = 1
+            return await self.store_vps_plans_screen(cb.args[0], cb.args[1], cb.args[2], numbered)
+        if cb.screen == "plan_detail" and len(cb.args) == 3:
+            return await self.store_plan_detail_screen(cb.args[0], cb.args[1], cb.args[2])
+        if cb.screen == "panel" and len(cb.args) == 2:
+            try:
+                os_index = int(cb.args[1])
+            except (TypeError, ValueError):
+                return self._menu_screen()
+            offer_ref = cb.args[0]
+            if self._resolve_offer_id(offer_ref) is None:
+                return self._expired_screen()
+            return await self.store_panel_screen(offer_ref, os_index)
         if cb.screen == "product_locations" and len(cb.args) == 4:
             try:
                 priced: int = int(cb.args[2])
             except (TypeError, ValueError):
-                return await self.store_products_screen(cb.args[0])
+                return await self.store_families_screen(cb.args[0])
             currency = cb.args[3]
             if not currency:
-                return await self.store_products_screen(cb.args[0])
+                return await self.store_families_screen(cb.args[0])
             return await self.store_product_locations_screen(
                 cb.args[0], cb.args[1], priced, currency
             )
@@ -1312,25 +1790,73 @@ class MonthlyBotUi:
             try:
                 price: int | None = int(cb.args[2]) if len(cb.args) == 3 else None
             except (TypeError, ValueError):
-                return await self.store_products_screen(cb.args[0])
+                return await self.store_families_screen(cb.args[0])
             return await self.store_product_locations_screen(cb.args[0], cb.args[1], price, None)
         if cb.screen == "os" and len(cb.args) == 1:
             offer_id = self._resolve_offer_id(cb.args[0])
             if offer_id is None:
                 return self._expired_screen()
             return await self.os_screen(offer_id)
-        if cb.screen == "confirm" and len(cb.args) == 2:
+        if cb.screen == "confirm" and len(cb.args) in (2, 3):
             if user is None:
                 return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
             offer_id = self._resolve_offer_id(cb.args[0])
             if offer_id is None:
                 return self._expired_screen()
-            return await self.confirm_screen(user, offer_id, int(cb.args[1]))
-        if cb.screen == "buy" and len(cb.args) == 2:
+            try:
+                os_index = int(cb.args[1])
+                panel_index = int(cb.args[2]) if len(cb.args) == 3 else None
+            except (TypeError, ValueError):
+                return self._expired_screen()
+            return await self.confirm_screen(user, offer_id, os_index, panel_index)
+        if cb.screen == "buy" and len(cb.args) in (2, 3):
             offer_id = self._resolve_offer_id(cb.args[0])
             if offer_id is None:
                 return self._expired_screen()
-            return await self.buy_screen(user, offer_id, int(cb.args[1]), cb.key)
+            try:
+                os_index = int(cb.args[1])
+                panel_index = int(cb.args[2]) if len(cb.args) == 3 else None
+            except (TypeError, ValueError):
+                return self._expired_screen()
+            return await self.buy_screen(user, offer_id, os_index, panel_index, cb.key)
+        if cb.screen == "cloud_locations" and len(cb.args) == 3:
+            try:
+                numbered = int(cb.args[2])
+            except (TypeError, ValueError):
+                numbered = 1
+            return await self.store_cloud_locations_screen(cb.args[0], cb.args[1], numbered)
+        if cb.screen == "cloud_families" and len(cb.args) == 3:
+            return await self.store_cloud_families_screen(cb.args[0], cb.args[1], cb.args[2])
+        if cb.screen == "cloud_plans" and len(cb.args) in (3, 4):
+            try:
+                numbered = int(cb.args[3]) if len(cb.args) == 4 else 1
+            except (TypeError, ValueError):
+                numbered = 1
+            return await self.store_cloud_plans_screen(cb.args[0], cb.args[1], cb.args[2], numbered)
+        if cb.screen == "cloud_detail" and len(cb.args) == 3:
+            return await self.store_cloud_detail_screen(cb.args[0], cb.args[1], cb.args[2])
+        if cb.screen == "cloud_images" and len(cb.args) == 1:
+            if self._resolve_offer_id(cb.args[0]) is None:
+                return self._expired_screen()
+            return await self.store_cloud_images_screen(cb.args[0])
+        if cb.screen == "cloud_confirm" and len(cb.args) == 2:
+            if user is None:
+                return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
+            if self._resolve_offer_id(cb.args[0]) is None:
+                return self._expired_screen()
+            try:
+                image_index = int(cb.args[1])
+            except (TypeError, ValueError):
+                return self._expired_screen()
+            return await self.store_cloud_confirm_screen(user, cb.args[0], image_index)
+        if cb.screen == "cloud_buy" and len(cb.args) == 2:
+            if self._resolve_offer_id(cb.args[0]) is None:
+                return self._expired_screen()
+            try:
+                image_index = int(cb.args[1])
+            except (TypeError, ValueError):
+                return self._expired_screen()
+            return await self.store_cloud_buy_screen(user, cb.args[0], image_index, cb.key)
         return self._menu_screen()
 
     async def _offers(self, cb: Callback, user: User | None) -> BotScreen:
@@ -1349,12 +1875,12 @@ class MonthlyBotUi:
             offer_id = self._resolve_offer_id(cb.args[0])
             if offer_id is None:
                 return self._expired_screen()
-            return await self.confirm_screen(user, offer_id, int(cb.args[1]))
+            return await self.confirm_screen(user, offer_id, int(cb.args[1]), None)
         if cb.screen == "buy" and len(cb.args) == 2:
             offer_id = self._resolve_offer_id(cb.args[0])
             if offer_id is None:
                 return self._expired_screen()
-            return await self.buy_screen(user, offer_id, int(cb.args[1]), cb.key)
+            return await self.buy_screen(user, offer_id, int(cb.args[1]), None, cb.key)
         return self._menu_screen()
 
     async def _servers_cb(self, cb: Callback, user: User | None) -> BotScreen:

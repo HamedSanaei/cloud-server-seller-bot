@@ -114,6 +114,7 @@ class TestCatalogAutoSyncJob:
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         settings.leaseweb_api_key = ""
+        settings.leaseweb_accounts = []
         settings.hetzner_api_token = ""
         monkeypatch.setattr(
             "cloud_platform.providers.leaseweb.accounts.build_leaseweb_account_router",
@@ -164,7 +165,7 @@ class TestCatalogAutoSyncDoctor:
     ) -> None:
         import cloud_platform.cli as cli_module
 
-        settings.leaseweb_api_key = "TEST-CREDENTIAL"
+        settings.leaseweb_api_key = "TEST-CREDENTIAL"  # pragma: allowlist secret
         settings.hetzner_api_token = ""
         settings.storefront_pricing = {
             "leaseweb": {"mode": "markup", "markup_percent": 25, "auto_publish": True}

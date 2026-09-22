@@ -231,6 +231,7 @@ async def main() -> None:
         settings.callback_signing_key,
         offers_view=container.offer_catalog_view_service(),
         checkout=container.monthly_checkout_service(),
+        hourly=container.hourly_cloud_service(),
         servers=container.server_repository(),
         orders=container.provider_order_repository(),
         renewals=container.renewal_repository(),

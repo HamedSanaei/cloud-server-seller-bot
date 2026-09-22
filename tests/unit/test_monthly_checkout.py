@@ -28,6 +28,7 @@ from cloud_platform.modules.compute.domain import (
     CloudServer,
     ServerLifecycleState,
 )
+from cloud_platform.modules.navigation.domain import decode_callback
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.operations.domain import Operation, OperationStatus
 from cloud_platform.modules.users.domain import User, UserStatus
@@ -874,11 +875,14 @@ class TestOfferCatalogViews:
         assert [v.name for v in views] == ["VPS L", "VPS S"]
         assert back and cancel
 
-    async def test_plan_callback_returns_signed_store_callback(self) -> None:
+    async def test_plan_rows_lead_to_the_plan_detail(self) -> None:
         service = _view_service()
-        callback = service.plan_callback(OFFER_ID)
-        # The storefront callback goes to the OS picker of the store flow.
-        assert "store:os" in callback
+        page = await service.family_plans_screen("leaseweb", "monthly", "AMS-01")
+        assert page.items
+        target = decode_callback(page.items[0].select_callback, "test-signing-key")
+        # Plan rows open the plan detail (never jump blindly to OS).
+        assert (target.flow, target.screen) == ("store", "plan_detail")
+        assert target.args == ("leaseweb", "AMS-01", "VPS02_1")
 
 
 class _RecordingSink:

@@ -112,6 +112,7 @@ class ProviderOrder:
     product_id: str | None = None
     location_id: str | None = None
     os_name: str | None = None
+    control_panel: str | None = None
     contract_term: str | None = None
     billing_cycle: str | None = None
     provider_cost_minor: int | None = None
@@ -280,6 +281,7 @@ class ProviderOrderRepository(Protocol):
         product_id: str | None = None,
         location_id: str | None = None,
         os_name: str | None = None,
+        control_panel: str | None = None,
         contract_term: str | None = None,
         billing_cycle: str | None = None,
         provider_cost_minor: int | None = None,

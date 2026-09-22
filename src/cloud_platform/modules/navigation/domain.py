@@ -57,7 +57,11 @@ TELEGRAM_CALLBACK_DATA_LIMIT_BYTES = 64
 #: currency-neutral by construction.
 _SCREEN_WIRE_ALIASES: dict[str, str] = {
     "product_locations": "pl",
-    "product_detail": "pd",
+    "plan_detail": "pland",
+    "cloud_detail": "cdet",
+    "cloud_confirm": "cc",
+    "cloud_families": "cfam",
+    "cloud_plans": "cp",
 }
 _WIRE_SCREEN_CANONICAL: dict[str, str] = {
     wire: canonical for canonical, wire in _SCREEN_WIRE_ALIASES.items()

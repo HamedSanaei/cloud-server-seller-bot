@@ -491,6 +491,26 @@ def toml_to_settings(data: Mapping[str, Any]) -> dict[str, Any]:
             if pricing:
                 values["storefront_pricing"] = pricing
 
+    # --- Commercial product families --------------------------------------
+    # ``[providers.<key>.families.<family>]`` sections (any provider key):
+    # ``billing_model`` + ``display_name`` per family. Stored raw; the
+    # market catalog validates billing models when it is built.
+    families: dict[str, dict[str, dict[str, str]]] = {}
+    for provider_key, section in _provider_sections(data).items():
+        raw_families = section.get("families")
+        if not isinstance(raw_families, Mapping):
+            continue
+        parsed: dict[str, dict[str, str]] = {}
+        for family_key, attrs in raw_families.items():
+            if isinstance(attrs, Mapping):
+                parsed[str(family_key)] = {
+                    str(name): str(value) for name, value in dict(attrs).items()
+                }
+        if parsed:
+            families[str(provider_key)] = parsed
+    if families:
+        values["provider_families"] = families
+
     if enabled:
         values["providers_enabled"] = enabled
     if markets:
@@ -621,6 +641,12 @@ class Settings(BaseSettings):
         default_factory=lambda: dict(DEFAULT_PROVIDER_DISPLAY_NAMES)
     )
     providers_enabled: dict[str, bool] = Field(default_factory=dict)
+    # Commercial product families per provider
+    # (``[providers.<key>.families.<family>]`` sections): each family names
+    # its billing model and customer-facing product name, e.g. leaseweb
+    # ``vps`` (monthly) and ``cloud`` (hourly). Absent = one implicit family
+    # per billing model found in the provider's sellable offers.
+    provider_families: dict[str, dict[str, dict[str, str]]] = Field(default_factory=dict)
     # --- Automatic catalog sync + pricing policy (server-owned) --------------
     # The periodic coordinator refreshes provider costs, reprices auto-priced
     # offers with the configured markup and publishes eligible ones — no

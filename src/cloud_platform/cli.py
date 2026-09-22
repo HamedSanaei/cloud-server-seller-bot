@@ -1506,6 +1506,173 @@ async def catalog_auto_sync_doctor() -> int:
     return 0
 
 
+async def _hourly_cloud_provider_or_error() -> Any:
+    """Hourly cloud adapter from settings, or an explanatory failure."""
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.providers.leaseweb.cloud import hourly_provider_from_settings
+
+    provider = hourly_provider_from_settings(get_settings())
+    if provider is None:
+        print("error: leaseweb hourly cloud has no credential configured")
+        return None
+    return provider
+
+
+async def leaseweb_cloud_doctor() -> int:
+    """Read-only: hourly regions, instance types and images per region."""
+    provider = await _hourly_cloud_provider_or_error()
+    if provider is None:
+        return 1
+    try:
+        regions = await provider.list_regions()
+    except Exception as exc:
+        print(f"error: regions unreadable ({type(exc).__name__})")
+        return 1
+    print(f"regions: {len(regions)}")
+    total_types = 0
+    total_images = 0
+    for region in sorted(regions, key=lambda r: r.id):
+        country = f" ({region.country_code})" if region.country_code else " (country unknown)"
+        try:
+            types = await provider.list_instance_types(region.id)
+        except Exception as exc:
+            print(f"  {region.id}{country}: types unreadable ({type(exc).__name__})")
+            continue
+        try:
+            images = await provider.list_images(region.id)
+        except Exception as exc:
+            print(f"  {region.id}{country}: images unreadable ({type(exc).__name__})")
+            images = []
+        families: dict[str, int] = {}
+        for item in types:
+            families[item.family_name] = families.get(item.family_name, 0) + 1
+        total_types += len(types)
+        total_images += len(images)
+        print(
+            f"  {region.id}{country}: {len(types)} instance type(s) "
+            f"[{', '.join(f'{name} x{count}' for name, count in sorted(families.items()))}], "
+            f"{len(images)} image(s)"
+        )
+    print(f"total: {total_types} instance type(s), {total_images} image(s)")
+    try:
+        await provider.close()
+    except Exception:
+        pass
+    return 0
+
+
+async def leaseweb_cloud_catalog(region: str | None) -> int:
+    """Read-only: normalized hourly catalog (regions, types, prices, images)."""
+    provider = await _hourly_cloud_provider_or_error()
+    if provider is None:
+        return 1
+    try:
+        regions = await provider.list_regions()
+    except Exception as exc:
+        print(f"error: regions unreadable ({type(exc).__name__})")
+        return 1
+    wanted = [r for r in regions if region is None or r.id == region]
+    if region is not None and not wanted:
+        print(f"error: unknown region {region!r}")
+        return 1
+    for item in sorted(wanted, key=lambda r: r.id):
+        print(f"== {item.id} ({item.country_code or '??'}) — {item.name}")
+        try:
+            types = await provider.list_instance_types(item.id)
+        except Exception as exc:
+            print(f"   types unreadable ({type(exc).__name__})")
+            continue
+        for entry in sorted(types, key=lambda e: (e.hourly_cost_minor, e.name)):
+            print(
+                f"   {entry.id} [{entry.family_name}]: "
+                f"{entry.vcpu} vCPU / {entry.ram_gb} GB RAM / {entry.disk_gb} GB disk / "
+                f"{entry.hourly_cost_minor} {entry.currency}/h"
+            )
+        try:
+            images = await provider.list_images(item.id)
+        except Exception as exc:
+            print(f"   images unreadable ({type(exc).__name__})")
+            continue
+        for image in sorted(images, key=lambda i: i.label):
+            print(f"   image {image.id}: {image.label}")
+    try:
+        await provider.close()
+    except Exception:
+        pass
+    return 0
+
+
+async def leaseweb_cloud_create_preview(
+    region: str, instance_type: str, image_id: str, reference: str
+) -> int:
+    """Print the exact hourly POST body WITHOUT sending it (never mutates)."""
+    import json
+
+    from cloud_platform.providers.leaseweb.cloud import build_create_body
+
+    body = build_create_body(
+        instance_type=instance_type,
+        image_id=image_id,
+        region=region,
+        reference=reference,
+        labels={"platform-operation": "preview-only"},
+    )
+    print("POST /publicCloud/v1/instances (NOT SENT — preview only):")
+    print(json.dumps(body, indent=2, sort_keys=True))
+    print("no provider mutation occurred")
+    return 0
+
+
+async def leaseweb_cloud_create(
+    user_id: str, offer_id: str, image_index: int, execute_live: bool
+) -> int:
+    """Create an hourly instance intent (worker POSTs under the ledger).
+
+    Refuses without ``--execute-live``: the intent leads to a BILLABLE
+    provider resource once the worker submits it. Never run casually.
+    """
+    if not execute_live:
+        print(
+            "refused: creating an hourly instance leads to a BILLABLE provider "
+            "resource. Re-run with --execute-live to proceed deliberately."
+        )
+        return 2
+    from uuid import UUID
+
+    from cloud_platform.core.container import create_container
+
+    print(
+        "WARNING: this creates a BILLABLE hourly cloud instance "
+        "(the worker submits the provider POST; delete the resource to stop billing)."
+    )
+    container = create_container()
+    try:
+        await container.initialize()
+        user = await container.user_repository().get(UUID(user_id))
+        if user is None:
+            print(f"error: unknown user {user_id}")
+            return 1
+        offers = container.sellable_offer_repository()
+        offer = await offers.get(UUID(offer_id))
+        if offer is None:
+            print(f"error: unknown offer {offer_id}")
+            return 1
+        service = container.hourly_cloud_service()
+        image = await service.cloud_image_by_index(offer, image_index)
+        result = await service.create_instance(
+            user=user,
+            offer_id=offer.id,
+            image_id=image.id,
+            image_label=image.label,
+            idempotency_key=f"cli-hourly:{offer.id}:{image.id}:{user.id}",
+        )
+    finally:
+        await container.close()
+    print(f"hourly create intent {result.server.id} (replayed={result.replayed})")
+    print("the worker will submit POST /publicCloud/v1/instances under the operation ledger")
+    return 0
+
+
 async def offers_price_book(
     provider: str,
     markup_percent: int,
@@ -2011,6 +2178,31 @@ def _parser() -> argparse.ArgumentParser:
     lsw_order_show = lsw_orders_sub.add_parser("show")
     lsw_order_show.add_argument("order_id")
 
+    lsw_cloud = lsw_sub.add_parser("cloud", help="hourly cloud operations")
+    lsw_cloud_sub = lsw_cloud.add_subparsers(dest="leaseweb_cloud", required=True)
+    lsw_cloud_sub.add_parser("doctor", help="read-only regions/types/images per region")
+    lsw_cloud_catalog = lsw_cloud_sub.add_parser(
+        "catalog", help="read-only normalized hourly catalog"
+    )
+    lsw_cloud_catalog.add_argument("--region", default=None)
+    lsw_cloud_preview = lsw_cloud_sub.add_parser(
+        "create-preview", help="print the exact POST body without sending it"
+    )
+    lsw_cloud_preview.add_argument("--region", required=True)
+    lsw_cloud_preview.add_argument("--type", required=True)
+    lsw_cloud_preview.add_argument("--image", required=True)
+    lsw_cloud_preview.add_argument("--reference", default="preview-only")
+    lsw_cloud_create = lsw_cloud_sub.add_parser(
+        "create", help="create an hourly instance intent (BILLABLE)"
+    )
+    lsw_cloud_create.add_argument("--user-id", required=True)
+    lsw_cloud_create.add_argument("--offer-id", required=True)
+    lsw_cloud_create.add_argument("--image-index", type=int, required=True)
+    lsw_cloud_create.add_argument(
+        "--execute-live",
+        action="store_true",
+        help="required deliberate flag: creates a BILLABLE resource",
+    )
     lsw_vps = lsw_sub.add_parser("vps", help="read-only VPS inspection")
     lsw_vps_sub = lsw_vps.add_subparsers(dest="leaseweb_vps", required=True)
     lsw_vps_sub.add_parser("list")
@@ -2156,6 +2348,21 @@ async def _dispatch(args: argparse.Namespace) -> int:
             if args.leaseweb_orders == "list":
                 return await leaseweb_orders_list(args.limit)
             return await leaseweb_order_show(args.order_id)
+        if args.subcommand == "cloud":
+            if args.leaseweb_cloud == "doctor":
+                return await leaseweb_cloud_doctor()
+            if args.leaseweb_cloud == "catalog":
+                return await leaseweb_cloud_catalog(args.region)
+            if args.leaseweb_cloud == "create-preview":
+                return await leaseweb_cloud_create_preview(
+                    args.region, args.type, args.image, args.reference
+                )
+            if args.leaseweb_cloud == "create":
+                return await leaseweb_cloud_create(
+                    args.user_id, args.offer_id, args.image_index, args.execute_live
+                )
+            print(f"unknown leaseweb cloud subcommand {args.leaseweb_cloud}")  # pragma: no cover
+            return 2
         if args.subcommand == "vps":
             if args.leaseweb_vps == "list":
                 return await leaseweb_vps_list()

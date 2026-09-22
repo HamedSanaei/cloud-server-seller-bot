@@ -1,11 +1,9 @@
-"""Plan-detail screen, paginated country-aware product list (STOREFRONT-V2).
+"""Monthly plan list, pagination and plan-detail screen (STOREFRONT-REWORK).
 
-- Product cards are readable: country flag (once per country), spec and
-  exact price — never a bare location count; 6 cards per page with pager.
-- Tapping a card opens a Persian plan-detail screen (full spec, only proven
-  technical facts, exact locations, exact price) before OS selection.
-- Full walk market -> provider -> product -> detail -> location -> OS ->
-  confirm -> buy keeps every callback within 64 bytes.
+Location-first flow: families -> VPS locations -> plans (paginated,
+concise spec rows) -> plan detail (full spec, proven facts only) ->
+continue -> OS -> panel -> confirm. Country flags come from synced
+location rows; every emitted callback fits 64 bytes.
 """
 
 from __future__ import annotations
@@ -231,22 +229,32 @@ class FakeView:
     async def locations_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
         return await self._service.locations_screen(provider_key)
 
+    async def families_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
+        return await self._service.families_screen(provider_key)
+
+    async def family_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1
+    ) -> Any:
+        return await self._service.family_locations_screen(provider_key, family_key, page)
+
+    async def family_plans_screen(
+        self, provider_key: str, family_key: str, location_id: str, page: int = 1
+    ) -> Any:
+        return await self._service.family_plans_screen(provider_key, family_key, location_id, page)
+
+    async def plan_detail_screen(self, provider_key: str, location_id: str, product_id: str) -> Any:
+        return await self._service.plan_detail_screen(provider_key, location_id, product_id)
+
+    async def panel_screen(
+        self, *, offer_id: UUID, os_index: int
+    ) -> tuple[Any, list[Any], str, str]:
+        return await self._service.panel_screen(offer_id=offer_id, os_index=os_index)
+
+    async def panel_name_by_index(self, offer: SellableOffer, index: int) -> str | None:
+        return await self._service.panel_name_by_index(offer, index)
+
     async def products_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
         return await self._service.products_screen(provider_key)
-
-    async def products_page(self, provider_key: str, page: int = 1) -> Any:
-        return await self._service.products_page(provider_key, page)
-
-    async def product_detail_screen(
-        self,
-        provider_key: str,
-        product_id: str,
-        price_minor: int,
-        currency: str,
-    ) -> Any:
-        return await self._service.product_detail_screen(
-            provider_key, product_id, price_minor, currency
-        )
 
     async def product_locations_screen(
         self,
@@ -270,9 +278,16 @@ class FakeView:
     async def os_by_index(self, offer: SellableOffer, index: int) -> str:
         return await self._service.os_by_index(offer, index)
 
-    async def confirmation(self, *, user_id: UUID, offer_id: UUID, os_index: int) -> Any:
+    async def confirmation(
+        self,
+        *,
+        user_id: UUID,
+        offer_id: UUID,
+        os_index: int,
+        panel_index: int | None = None,
+    ) -> Any:
         return await self._service.confirmation(
-            user_id=user_id, offer_id=offer_id, os_index=os_index
+            user_id=user_id, offer_id=offer_id, os_index=os_index, panel_index=panel_index
         )
 
     async def os_options(self, offer: SellableOffer) -> list[Any]:
@@ -356,137 +371,88 @@ async def _press(ui: MonthlyBotUi, callback: str) -> Any:
     return screen
 
 
-def _many_prices(count: int) -> list[SellableOffer]:
-    """Many distinct-price cards of one product (pagination shape)."""
-    return [_offer(location_id="FRA-01", price_minor=500 + i, currency="EUR") for i in range(count)]
+async def _open_detail(bot: MonthlyBotUi, location_id: str) -> Any:
+    locations = await _press(bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1"))
+    location_button = next(b for b in _buttons(locations) if location_id in b.text)
+    plans = await _press(bot, location_button.callback_data or "")
+    plan_button = next(
+        b for b in _buttons(plans) if _decode(b.callback_data or "").screen == "plan_detail"
+    )
+    return await _press(bot, plan_button.callback_data or "")
 
 
-class TestReadableProductCards:
-    async def test_card_row_shows_flag_spec_and_price(self) -> None:
+class TestVpsLocations:
+    async def test_locations_show_flags_not_raw_codes(self) -> None:
         bot = _ui(_service([_offer(location_id="FRA-10")], _locations("FRA-10")))
-        screen = await _press(bot, bot._callback("store", "products", PROVIDER))
-        cards = [b for b in _buttons(screen) if "Leaseweb VPS 1" in b.text]
-        assert len(cards) == 1
-        text = cards[0].text
-        assert "\U0001f1e9\U0001f1ea" in text  # 🇩🇪 from synced rows
-        assert "4C/6GB" in text
-        assert "€5.62" in text
-        assert "لوکیشن" not in text
-        assert "location" not in text.lower()
-
-    async def test_same_country_locations_show_the_flag_once(self) -> None:
-        service = _service(
-            [_offer(location_id="FRA-10"), _offer(location_id="FRA-14")],
-            _locations("FRA-10", "FRA-14"),
+        screen = await _press(
+            bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
         )
-        page = await service.products_page(PROVIDER)
-        assert len(page.items) == 1
-        assert page.items[0].country_codes == ("DE",)
+        labels = [b.text for b in _buttons(screen) if "FRA-10" in b.text]
+        assert len(labels) == 1
+        assert "🇩🇪" in labels[0]
+        assert "Frankfurt" in labels[0]
 
-    async def test_two_countries_show_both_flags(self) -> None:
+    async def test_unknown_country_renders_neutrally(self) -> None:
+        bot = _ui(_service([_offer(location_id="FRA-10")]))
+        screen = await _press(
+            bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
+        )
+        labels = [b.text for b in _buttons(screen) if "FRA-10" in b.text]
+        assert len(labels) == 1
+        assert "??" not in labels[0]
+
+    async def test_locations_paginate(self) -> None:
+        offers = [_offer(location_id=f"LOC-{i:02d}", price_minor=500 + i) for i in range(8)]
+        service = _service(offers)
+        first = await service.family_locations_screen(PROVIDER, "monthly", 1)
+        assert first.page == 1
+        assert first.total_pages == 2
+        assert len(first.items) == 6
+        assert first.next_callback is not None
+        second = await service.family_locations_screen(PROVIDER, "monthly", 2)
+        assert len(second.items) == 2
+        assert second.prev_callback is not None
+        assert {i.location_id for i in first.items}.isdisjoint(
+            {i.location_id for i in second.items}
+        )
+
+
+class TestVpsPlans:
+    def _many(self, count: int) -> list[SellableOffer]:
+        return [
+            _offer(location_id="FRA-01", price_minor=500 + i, product_id=f"VPS02_{i}")
+            for i in range(count)
+        ]
+
+    async def test_plans_show_specs_and_price(self) -> None:
+        bot = _ui(_service([_offer(location_id="FRA-01")], _locations("FRA-01")))
+        locations = await _press(
+            bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
+        )
+        location_button = next(b for b in _buttons(locations) if "FRA-01" in b.text)
+        plans = await _press(bot, location_button.callback_data or "")
+        rows = [b for b in _buttons(plans) if "€5.62" in b.text]
+        assert len(rows) == 1
+        assert "4" in rows[0].text and "6" in rows[0].text
+
+    async def test_plans_paginate_without_loss_or_duplicates(self) -> None:
+        service = _service(self._many(13))
+        seen: list[str] = []
+        for page_number in (1, 2, 3):
+            page = await service.family_plans_screen(PROVIDER, "monthly", "FRA-01", page_number)
+            seen.extend(str(item.offer_id) for item in page.items)
+        assert len(seen) == 13
+        assert len(set(seen)) == 13
+
+    async def test_plans_of_other_locations_are_excluded(self) -> None:
         service = _service(
             [
-                _offer(location_id="FRA-01", price_minor=624, currency="EUR"),
-                _offer(location_id="LON-01", price_minor=624, currency="GBP"),
-            ],
-            _locations("FRA-01", "LON-01"),
+                _offer(location_id="FRA-01", price_minor=562),
+                _offer(location_id="LON-01", price_minor=700),
+            ]
         )
-        products, _, _ = await service.products_screen(PROVIDER)
-        assert len(products) == 2
-        assert next(p for p in products if p.currency == "EUR").country_codes == ("DE",)
-        assert next(p for p in products if p.currency == "GBP").country_codes == ("GB",)
-
-    async def test_unknown_country_renders_a_neutral_globe(self) -> None:
-        bot = _ui(_service([_offer(location_id="FRA-10")]))
-        screen = await _press(bot, bot._callback("store", "products", PROVIDER))
-        cards = [b for b in _buttons(screen) if "Leaseweb VPS 1" in b.text]
-        assert len(cards) == 1
-        assert "\U0001f310" in cards[0].text  # 🌐, never ??
-        assert "??" not in cards[0].text
-
-    def test_storefront_handlers_stay_provider_neutral(self) -> None:
-        import ast
-        import importlib
-
-        path = importlib.import_module(MonthlyBotUi.__module__).__file__
-        assert path
-        with open(path, encoding="utf-8") as handle:
-            source = handle.read()
-        tree = ast.parse(source)
-        if (
-            tree.body
-            and isinstance(tree.body[0], ast.Expr)
-            and isinstance(tree.body[0].value, ast.Constant)
-            and isinstance(tree.body[0].value.value, str)
-        ):
-            tree.body = tree.body[1:]
-        code = ast.unparse(tree).lower()
-        for provider in ("leaseweb", "hetzner", "arvancloud"):
-            assert provider not in code
-        # Location-code prefixes (fra-/lon- normalization) live inside the
-        # provider adapters only; the generic UI maps ISO country codes.
-        assert "location_id.startswith" not in code
-        assert "location_id.split" not in code
-
-
-class TestProductPagination:
-    async def test_24_cards_render_as_four_pages_of_six(self) -> None:
-        service = _service(_many_prices(24))
-        seen: list[str] = []
-        for page_number in (1, 2, 3, 4):
-            page = await service.products_page(PROVIDER, page_number)
-            assert page.page == page_number
-            assert page.total_pages == 4
-            assert page.total_cards == 24
-            assert len(page.items) == 6
-            seen.extend(f"{c.product_id}:{c.monthly_price_minor}" for c in page.items)
-        assert len(set(seen)) == 24  # no lost or duplicated card
-
-    async def test_pager_navigation_buttons(self) -> None:
-        service = _service(_many_prices(24))
-        first = await service.products_page(PROVIDER, 1)
-        assert first.prev_callback is None
-        assert first.next_callback is not None
-        middle = await service.products_page(PROVIDER, 2)
-        assert middle.prev_callback is not None
-        assert middle.next_callback is not None
-        last = await service.products_page(PROVIDER, 4)
-        assert last.prev_callback is not None
-        assert last.next_callback is None
-        for callback in (
-            first.next_callback,
-            middle.prev_callback,
-            middle.next_callback,
-            last.prev_callback,
-            first.back_callback,
-            first.cancel_callback,
-            *[c.select_callback for c in first.items],
-        ):
-            assert callback is not None
-            _assert_fits(callback)
-
-    async def test_out_of_range_page_clamps(self) -> None:
-        service = _service(_many_prices(7))
-        assert (await service.products_page(PROVIDER, 99)).page == 2
-        assert (await service.products_page(PROVIDER, 0)).page == 1
-        assert len((await service.products_page(PROVIDER, 2)).items) == 1
-
-    async def test_pager_walk_in_the_bot(self) -> None:
-        bot = _ui(_service(_many_prices(13)))
-        screen = await _press(bot, bot._callback("store", "products", PROVIDER))
-        assert "3" in screen.text  # page 1 of 3 in the title
-        cards = [b for b in _buttons(screen) if "Leaseweb VPS 1" in b.text]
-        assert len(cards) == 6
-        nxt = next(b for b in _buttons(screen) if _decode(b.callback_data or "").args[-1] == "2")
-        second = await _press(bot, nxt.callback_data or "")
-        assert len([b for b in _buttons(second) if "Leaseweb VPS 1" in b.text]) == 6
-        prev = next(b for b in _buttons(second) if _decode(b.callback_data or "").args[-1] == "1")
-        first_again = await _press(bot, prev.callback_data or "")
-        assert len([b for b in _buttons(first_again) if "Leaseweb VPS 1" in b.text]) == 6
-        for visited in (screen, second, first_again):
-            for button in _buttons(visited):
-                assert button.callback_data is not None
-                _assert_fits(button.callback_data)
+        page = await service.family_plans_screen(PROVIDER, "monthly", "FRA-01")
+        assert [item.monthly_price_minor for item in page.items] == [562]
 
 
 class TestPlanDetailScreen:
@@ -497,9 +463,7 @@ class TestPlanDetailScreen:
                 _locations("FRA-10", "FRA-14"),
             )
         )
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "Leaseweb VPS 1" in b.text)
-        detail = await _press(bot, card.callback_data or "")
+        detail = await _open_detail(bot, "FRA-10")
         assert "Leaseweb VPS 1" in detail.text
         assert "4 vCPU" in detail.text
         assert "6 GB" in detail.text
@@ -507,7 +471,7 @@ class TestPlanDetailScreen:
         assert "5 TB" in detail.text
         assert "€5.62" in detail.text
         assert "FRA-10" in detail.text
-        assert "FRA-14" in detail.text
+        assert "FRA-14" not in detail.text
 
     async def test_detail_shows_known_technical_facts(self) -> None:
         bot = _ui(
@@ -524,46 +488,29 @@ class TestPlanDetailScreen:
                 _locations("FRA-10"),
             )
         )
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "Leaseweb VPS 1" in b.text)
-        detail = await _press(bot, card.callback_data or "")
+        detail = await _open_detail(bot, "FRA-10")
         assert "x86_64" in detail.text
         assert "NVMe" in detail.text
 
     async def test_unknown_ipv6_renders_neutrally(self) -> None:
         bot = _ui(_service([_offer(location_id="FRA-10")], _locations("FRA-10")))
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "Leaseweb VPS 1" in b.text)
-        detail = await _press(bot, card.callback_data or "")
+        detail = await _open_detail(bot, "FRA-10")
         assert "IPv6" in detail.text
         unknown = Translator().t("store.detail_unknown")
         assert unknown in detail.text
 
-    async def test_detail_location_labels_have_no_doubled_code(self) -> None:
-        bot = _ui(_service([_offer(location_id="FRA-10")], _locations("FRA-10")))
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "Leaseweb VPS 1" in b.text)
-        detail = await _press(bot, card.callback_data or "")
-        labels = [b.text for b in _buttons(detail) if "FRA-10" in b.text]
-        assert labels
-        for label in labels:
-            assert label.count("FRA-10") == 1
-
-    async def test_detail_location_buttons_lead_to_os(self) -> None:
+    async def test_detail_continue_leads_to_os(self) -> None:
         bot = _ui(
             _service(
                 [_offer(location_id="FRA-10"), _offer(location_id="FRA-14")],
                 _locations("FRA-10", "FRA-14"),
             )
         )
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "Leaseweb VPS 1" in b.text)
-        detail = await _press(bot, card.callback_data or "")
-        rows = [b for b in _buttons(detail) if _decode(b.callback_data or "").screen == "os"]
-        assert {b.text for b in rows} != set()
-        assert sum("FRA-10" in b.text for b in rows) == 1
-        assert sum("FRA-14" in b.text for b in rows) == 1
-        os_screen = await _press(bot, rows[0].callback_data or "")
+        detail = await _open_detail(bot, "FRA-10")
+        continuation = next(
+            b for b in _buttons(detail) if _decode(b.callback_data or "").screen == "os"
+        )
+        os_screen = await _press(bot, continuation.callback_data or "")
         assert "سیستم‌عامل" in os_screen.text
 
     async def test_english_detail_renders(self) -> None:
@@ -579,15 +526,13 @@ class TestPlanDetailScreen:
             wallet_history=FakeWalletHistory(),  # type: ignore[arg-type]
             translator=Translator(Locale.EN),
         )
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "Leaseweb VPS 1" in b.text)
-        detail = await _press(bot, card.callback_data or "")
+        detail = await _open_detail(bot, "FRA-10")
         assert "Leaseweb VPS 1" in detail.text
         assert "CPU" in detail.text
 
 
 class TestFullStorefrontWalk:
-    """market -> provider -> product -> detail -> location -> OS ->
+    """families -> locations -> plans -> detail -> OS -> panel ->
     confirmation; every emitted callback fits Telegram's budget."""
 
     async def test_complete_walk_with_byte_budget(self) -> None:
@@ -609,16 +554,23 @@ class TestFullStorefrontWalk:
         provider_button = next(b for b in _buttons(market) if "🌍" in b.text)
         providers = await _press(bot, _track(provider_button.callback_data))
         leaseweb_button = next(b for b in _buttons(providers) if "Leaseweb" in b.text)
-        products = await _press(bot, _track(leaseweb_button.callback_data))
-        card = next(b for b in _buttons(products) if "Leaseweb VPS 1" in b.text)
-        detail = await _press(bot, _track(card.callback_data))
-        location_button = next(
+        # Single family enters its locations directly (no selector tap).
+        locations = await _press(bot, _track(leaseweb_button.callback_data))
+        location_button = next(b for b in _buttons(locations) if "FRA-10" in b.text)
+        plans = await _press(bot, _track(location_button.callback_data))
+        plan_button = next(
+            b for b in _buttons(plans) if _decode(b.callback_data or "").screen == "plan_detail"
+        )
+        detail = await _press(bot, _track(plan_button.callback_data))
+        continuation = next(
             b for b in _buttons(detail) if _decode(b.callback_data or "").screen == "os"
         )
-        os_screen = await _press(bot, _track(location_button.callback_data))
+        os_screen = await _press(bot, _track(continuation.callback_data))
         assert "سیستم‌عامل" in os_screen.text
         os_button = _buttons(os_screen)[0]
-        confirm = await _press(bot, _track(os_button.callback_data))
+        panel = await _press(bot, _track(os_button.callback_data))
+        panel_button = _buttons(panel)[0]
+        confirm = await _press(bot, _track(panel_button.callback_data))
         assert "€5.62" in confirm.text
         buy_button = next(
             b for b in _buttons(confirm) if _decode(b.callback_data or "").screen == "buy"

@@ -74,6 +74,7 @@ class HetznerCatalogSyncSource:
             provider_key=PROVIDER_KEY,
             ok=ok,
             complete=complete,
+            billing_model="prepaid_monthly_fixed",
             discovered=offers_result.offers_written,
             persisted=offers_result.offers_written,
             retired=offers_result.marked_unavailable,

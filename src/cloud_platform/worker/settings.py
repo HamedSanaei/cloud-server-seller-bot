@@ -475,6 +475,25 @@ async def catalog_auto_sync(ctx: dict[str, object]) -> None:
                 logger.info("catalog auto-sync: leaseweb has no credential; skipping provider")
         else:
             logger.info("catalog auto-sync: leaseweb disabled by configuration; skipping")
+        if settings.providers_enabled.get("leaseweb", True):
+            from cloud_platform.providers.leaseweb.cloud import hourly_provider_from_settings
+            from cloud_platform.providers.leaseweb.cloud_auto_sync import (
+                LeasewebHourlyCloudSyncSource,
+            )
+            from cloud_platform.providers.leaseweb.cloud_sync import LeasewebHourlyCloudSyncer
+
+            hourly_provider = hourly_provider_from_settings(settings)
+            if hourly_provider is not None:
+                sources.append(
+                    LeasewebHourlyCloudSyncSource(
+                        LeasewebHourlyCloudSyncer(SessionFactory, hourly_provider)
+                    )
+                )
+            else:
+                logger.info(
+                    "catalog auto-sync: leaseweb hourly cloud has no credential; "
+                    "skipping hourly sync (VPS ordering is unaffected)"
+                )
         if settings.providers_enabled.get("hetzner", True):
             if settings.hetzner_api_token:
                 from cloud_platform.providers.hetzner.auto_sync import (
@@ -518,6 +537,66 @@ async def catalog_auto_sync(ctx: dict[str, object]) -> None:
                 len(provider.warnings),
                 len(provider.errors),
             )
+
+
+async def process_cloud_creates(ctx: dict[str, object]) -> None:
+    """Submit hourly cloud create intents (STOREFRONT-REWORK).
+
+    Picks up REQUESTED hourly servers, claims each ``server-create``
+    operation once, and POSTs the hourly instance exactly once per claimed
+    operation. Ambiguous outcomes become OUTCOME_UNKNOWN (never a blind
+    re-POST); the reconciler below attaches proven resources.
+    """
+    del ctx
+    async with metrics.job("process_cloud_creates"):
+        from cloud_platform.core.container import create_container
+
+        container = create_container()
+        try:
+            await container.initialize()
+            service = container.hourly_cloud_service()
+            outcomes: dict[str, int] = {}
+            for server in await service.servers_requested():
+                try:
+                    outcome = await service.process_server(server.id)
+                except Exception as exc:
+                    logger.warning("hourly create %s failed: %s", server.id, exc)
+                    outcome = "error"
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            if outcomes:
+                logger.info("hourly creates processed: %s", outcomes)
+        finally:
+            await container.close()
+
+
+async def reconcile_cloud_creates(ctx: dict[str, object]) -> None:
+    """Attach proven instances to ambiguous hourly creates (read-only).
+
+    For hourly servers stuck without a provider id, an exact reference
+    match proves the earlier POST landed and is attached; anything else
+    stays unknown for operator review (requeue re-POSTs safely through
+    get-before-create).
+    """
+    del ctx
+    async with metrics.job("reconcile_cloud_creates"):
+        from cloud_platform.core.container import create_container
+
+        container = create_container()
+        try:
+            await container.initialize()
+            service = container.hourly_cloud_service()
+            outcomes: dict[str, int] = {}
+            for server in await service.servers_for_reconcile():
+                try:
+                    outcome = await service.reconcile_server(server.id)
+                except Exception as exc:
+                    logger.warning("hourly reconcile %s failed: %s", server.id, exc)
+                    outcome = "error"
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            if outcomes:
+                logger.info("hourly creates reconciled: %s", outcomes)
+        finally:
+            await container.close()
 
 
 async def process_leaseweb_orders(ctx: dict[str, object]) -> None:
@@ -746,6 +825,9 @@ def _cron_jobs() -> list[Any]:
     every_fifteen_minutes = set(range(0, 60, 15))
     return [
         cron(catalog_auto_sync, minute=catalog_auto_sync_minutes(), run_at_startup=True),
+        cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
+        cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
+        cron(accrue_usage, minute={0}, run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
@@ -766,6 +848,8 @@ class WorkerSettings:
         reconcile_payments,
         sync_leaseweb_offers,
         catalog_auto_sync,
+        process_cloud_creates,
+        reconcile_cloud_creates,
         process_leaseweb_orders,
         reconcile_leaseweb_orders,
         reconcile_tetraminator_payments,

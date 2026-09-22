@@ -58,6 +58,7 @@ class LeasewebCatalogSyncSource:
             provider_key=PROVIDER_KEY,
             ok=ok,
             complete=products.availability_reconciled,
+            billing_model="prepaid_monthly_fixed",
             discovered=products.total_fetched,
             persisted=products.offers_persisted,
             retired=products.marked_unavailable,

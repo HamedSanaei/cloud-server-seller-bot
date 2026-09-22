@@ -139,8 +139,16 @@ class FakeOffersView:
     async def os_by_index(self, offer: SellableOffer, index: int) -> str:
         return "Ubuntu 24.04"
 
+    async def panel_name_by_index(self, offer: SellableOffer, index: int) -> str | None:
+        return None
+
     async def confirmation(
-        self, *, user_id: UUID, offer_id: UUID, os_index: int
+        self,
+        *,
+        user_id: UUID,
+        offer_id: UUID,
+        os_index: int,
+        panel_index: int | None = None,
     ) -> OfferConfirmView:
         view = OfferConfirmView(
             offer=OfferCatalogView(
@@ -174,7 +182,13 @@ class FakeCheckout:
         self.calls: list[tuple[User, UUID, str, str]] = []
 
     async def create_order(
-        self, *, user: User, offer_id: UUID, os_name: str, idempotency_key: str
+        self,
+        *,
+        user: User,
+        offer_id: UUID,
+        os_name: str,
+        idempotency_key: str,
+        panel_name: str | None = None,
     ) -> MonthlyCheckoutResult:
         self.calls.append((user, offer_id, os_name, idempotency_key))
         server = _server(user.id or uuid4())

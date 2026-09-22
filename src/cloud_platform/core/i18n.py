@@ -317,6 +317,39 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.products_page": "صفحه {page} از {pages}",
         "store.product_locations_title": "📍 {product} — انتخاب لوکیشن ({count}):",
         "store.product_location_row": "{location} — {price}",
+        "store.families_title": "\U0001f4ce {provider}\n\u0645\u062d\u0635\u0648\u0644 \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f:",  # noqa: E501
+        "store.family_row": "{icon} {name} ({billing})",
+        "store.billing.prepaid_monthly_fixed": "\u0645\u0627\u0647\u0627\u0646\u0647",
+        "store.billing.hourly": "\u0633\u0627\u0639\u062a\u06cc",
+        "store.vps_locations_title": "\U0001f4cd \u0644\u0648\u06a9\u06cc\u0634\u0646 \u0648\u06cc\u200c\u067e\u06cc\u200c\u0627\u0633 \u0645\u0627\u0647\u0627\u0646\u0647 \u062e\u0648\u062f \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f:",  # noqa: E501
+        "store.plan_row": "{vcpu} \u0647\u0633\u062a\u0647 | {ram}GB \u0631\u0645 | {disk} | {price}",  # noqa: E501
+        "store.detail_location": "\U0001f4cd \u0645\u0648\u0642\u0639\u06cc\u062a:\n{location}",
+        "store.detail_continue": "\u2705 \u0627\u062f\u0627\u0645\u0647 \u0648 \u0627\u0646\u062a\u062e\u0627\u0628 \u0633\u06cc\u0633\u062a\u0645\u200c\u0639\u0627\u0645\u0644",  # noqa: E501
+        "store.detail_panel": "\U0001f39b \u067e\u0646\u0644 \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc: {value}",  # noqa: E501
+        "offers.panel_title": "\U0001f39b \u067e\u0646\u0644 \u0645\u062f\u06cc\u0631\u06cc\u062a\u06cc \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f:",  # noqa: E501
+        "offers.panel_none": "\u0628\u062f\u0648\u0646 \u067e\u0646\u0644",
+        "offers.confirm_panel": "\U0001f39b \u067e\u0646\u0644: {panel}",
+        "store.cloud_locations_title": "\U0001f4cd \u06cc\u06a9 \u0644\u0648\u06a9\u06cc\u0634\u0646 \u0628\u0631\u0627\u06cc {provider} \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f:",  # noqa: E501
+        "store.cloud_families_title": "\U0001f9ec \u0646\u0648\u0639 \u067e\u0644\u0646 \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f:",  # noqa: E501
+        "store.cloud_families_text": "\u0647\u0631 \u0646\u0648\u0639 \u06cc\u06a9 \u062e\u0627\u0646\u0648\u0627\u062f\u0647 \u0645\u062a\u0641\u0627\u0648\u062a \u0627\u0632 \u0645\u0627\u0634\u06cc\u0646 \u0627\u0633\u062a.\n\u0628\u0631\u0627\u06cc \u062f\u06cc\u062f\u0646 \u067e\u0644\u0646\u200c\u0647\u0627 \u06cc\u06a9\u06cc \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.",  # noqa: E501
+        "store.cloud_plans_title": "\U0001f4be \u06cc\u06a9 \u067e\u0644\u0646 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f \u2014 {location}:",  # noqa: E501
+        "store.cloud_detail_title": "\u2601\ufe0f {name}",
+        "store.cloud_detail_family": "\U0001f9e9 {family}",
+        "store.cloud_detail_price": "\U0001f4b5 \u0642\u06cc\u0645\u062a:\n{hourly}\n\u0628\u0631\u0622\u0648\u0631\u062f \u0645\u0627\u0647\u0627\u0646\u0647:\n{monthly}",  # noqa: E501
+        "store.price_per_hour": "{price} / \u0633\u0627\u0639\u062a",
+        "store.price_per_month": "{price} / \u0645\u0627\u0647",
+        "store.cloud_images_title": "\U0001f4bf \u0627\u06cc\u0645\u06cc\u062c \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f:",  # noqa: E501
+        "store.cloud_confirm_title": "\u2601\ufe0f \u062a\u0627\u06cc\u06cc\u062f \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc",  # noqa: E501
+        "store.cloud_confirm_provider": "\u0627\u0631\u0627\u0626\u0647\u200c\u062f\u0647\u0646\u062f\u0647: {provider}",  # noqa: E501
+        "store.cloud_confirm_kind": "\u0646\u0648\u0639: {kind}",
+        "store.cloud_confirm_plan": "\u067e\u0644\u0646: {plan}",
+        "store.cloud_confirm_location": "\u0644\u0648\u06a9\u06cc\u0634\u0646: {location}",
+        "store.cloud_confirm_specs": "CPU: {vcpu} vCPU\nRAM: {ram} GB\nDisk: {disk} GB",
+        "store.cloud_confirm_os": "OS: {os}",
+        "store.cloud_confirm_cost": "\U0001f4b0 \u0647\u0632\u06cc\u0646\u0647:\n{hourly}\n{monthly}",  # noqa: E501
+        "store.cloud_confirm_warning": "\u26a0\ufe0f \u062a\u0627 \u0632\u0645\u0627\u0646\u06cc \u06a9\u0647 Resource \u062d\u0630\u0641 \u0646\u0634\u062f\u0647\u060c \u0647\u0632\u06cc\u0646\u0647 Cloud \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0627\u062f\u0627\u0645\u0647 \u062f\u0627\u0634\u062a\u0647 \u0628\u0627\u0634\u062f.",  # noqa: E501
+        "store.cloud_confirm_create": "\u2705 \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631",
+        "store.cloud_created": "\u2601\ufe0f \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0634\u062f! \u0634\u0646\u0627\u0633\u0647: {server_id}",  # noqa: E501
         "store.detail_title": "🖥 {name}",
         "store.detail_cpu": "⚙️ پردازنده: {vcpu} vCPU",
         "store.detail_ram": "🧠 رم: {ram} GB",
@@ -663,6 +696,39 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.products_page": "Page {page} of {pages}",
         "store.product_locations_title": "📍 {product} — choose a location ({count}):",
         "store.product_location_row": "{location} — {price}",
+        "store.families_title": "\U0001f4ce {provider}\nChoose a product:",
+        "store.family_row": "{icon} {name} ({billing})",
+        "store.billing.prepaid_monthly_fixed": "monthly",
+        "store.billing.hourly": "hourly",
+        "store.vps_locations_title": "\U0001f4cd Choose your monthly VPS location:",
+        "store.plan_row": "{vcpu} cores | {ram}GB RAM | {disk} | {price}",
+        "store.detail_location": "\U0001f4cd Location:\n{location}",
+        "store.detail_continue": "\u2705 Continue to OS selection",
+        "store.detail_panel": "\U0001f39b Control panel: {value}",
+        "offers.panel_title": "\U0001f39b Choose a control panel:",
+        "offers.panel_none": "No panel",
+        "offers.confirm_panel": "\U0001f39b Panel: {panel}",
+        "store.cloud_locations_title": "\U0001f4cd Choose a location for {provider}:",
+        "store.cloud_families_title": "\U0001f9ec Choose a plan type:",
+        "store.cloud_families_text": "Each type is a different machine family.\nPick one to see its plans.",  # noqa: E501
+        "store.cloud_plans_title": "\U0001f4be Choose a plan \u2014 {location}:",
+        "store.cloud_detail_title": "\u2601\ufe0f {name}",
+        "store.cloud_detail_family": "\U0001f9e9 {family}",
+        "store.cloud_detail_price": "\U0001f4b5 Price:\n{hourly}\nMonthly estimate:\n{monthly}",
+        "store.price_per_hour": "{price} / hour",
+        "store.price_per_month": "{price} / month",
+        "store.cloud_images_title": "\U0001f4bf Choose an image:",
+        "store.cloud_confirm_title": "\u2601\ufe0f Confirm hourly server creation",
+        "store.cloud_confirm_provider": "Provider: {provider}",
+        "store.cloud_confirm_kind": "Type: {kind}",
+        "store.cloud_confirm_plan": "Plan: {plan}",
+        "store.cloud_confirm_location": "Location: {location}",
+        "store.cloud_confirm_specs": "CPU: {vcpu} vCPU\nRAM: {ram} GB\nDisk: {disk} GB",
+        "store.cloud_confirm_os": "OS: {os}",
+        "store.cloud_confirm_cost": "\U0001f4b0 Cost:\n{hourly}\n{monthly}",
+        "store.cloud_confirm_warning": "\u26a0\ufe0f Until the resource is deleted, cloud charges can continue.",  # noqa: E501
+        "store.cloud_confirm_create": "\u2705 Create server",
+        "store.cloud_created": "\u2601\ufe0f Hourly server requested! ID: {server_id}",
         "store.detail_title": "🖥 {name}",
         "store.detail_cpu": "⚙️ CPU: {vcpu} vCPU",
         "store.detail_ram": "🧠 RAM: {ram} GB",

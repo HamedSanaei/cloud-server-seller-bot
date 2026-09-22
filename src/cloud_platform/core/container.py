@@ -441,6 +441,46 @@ class Container:
             market_catalog=self.market_catalog(),
             # Display names for the product card's availability list; optional.
             location_repo=SqlAlchemyLocationRepository(self.session_factory),
+            cloud_providers=self.hourly_cloud_providers(),
+        )
+
+    def hourly_cloud_provider(self) -> Any | None:
+        """Hourly cloud adapter for live image reads (None when unconfigured)."""
+        from cloud_platform.providers.leaseweb.cloud import hourly_provider_from_settings
+
+        return hourly_provider_from_settings(get_settings())
+
+    def hourly_cloud_providers(self) -> dict[str, Any]:
+        """Hourly adapters keyed by provider (the storefront image screens)."""
+        provider = self.hourly_cloud_provider()
+        return {"leaseweb": provider} if provider is not None else {}
+
+    def hourly_cloud_service(self) -> Any:
+        """The hourly instance creation command (no provider calls, no charge)."""
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.hourly.service import HourlyCloudService
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.pricing.repository import (
+            SqlAlchemyServerPriceSnapshotRepository,
+        )
+        from cloud_platform.modules.pricing.service import ServerPriceSnapshotService
+        from cloud_platform.modules.provider_accounts.repository import (
+            SqlAlchemyProviderAccountRepository,
+        )
+        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+
+        return HourlyCloudService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            offers_repo=self.sellable_offer_repository(),
+            account_repo=SqlAlchemyProviderAccountRepository(self.session_factory),
+            wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
+            snapshot_service=ServerPriceSnapshotService(
+                SqlAlchemyServerPriceSnapshotRepository(self.session_factory),
+                _audit_repository(self.session_factory),
+            ),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            audit_repo=_audit_repository(self.session_factory),
+            cloud_providers=self.hourly_cloud_providers(),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:
@@ -603,6 +643,7 @@ class Container:
             markets=settings.provider_markets,
             display_names=settings.provider_display_names,
             enabled=settings.providers_enabled,
+            families=settings.provider_families,
         )
 
     def provider_market(self, provider_key: str) -> str:

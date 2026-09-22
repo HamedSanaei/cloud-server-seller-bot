@@ -493,6 +493,53 @@ class TestOperatorBlock:
         assert row.selling_price_minor == 0
         assert row.enabled is False
 
+    async def test_family_policy_wins_over_provider_policy(self) -> None:
+        from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY
+
+        repo = FakeOffersRepo(
+            [
+                _offer(
+                    provider_key="leaseweb",
+                    product_id="lsw.mini",
+                    location_id="eu-west-3",
+                    price_minor=0,
+                    enabled=False,
+                    auto_priced=True,
+                )
+            ]
+        )
+        # Fake rows default to monthly billing; flip this one to hourly.
+        import dataclasses
+
+        row = await repo.get_by_ref("leaseweb", "lsw.mini", "eu-west-3")
+        assert row is not None
+        repo._rows[("leaseweb", "lsw.mini", "eu-west-3")] = dataclasses.replace(
+            row,
+            billing_model=BILLING_MODEL_HOURLY,
+            provider_cost_minor=100,
+            provider_cost_currency="EUR",
+        )
+        source = FakeSource(
+            "leaseweb",
+            repo,
+            report=CatalogSyncReport(
+                provider_key="leaseweb",
+                ok=True,
+                complete=True,
+                billing_model=BILLING_MODEL_HOURLY,
+                verified=frozenset({("lsw.mini", "eu-west-3")}),
+            ),
+        )
+        policies = {
+            "leaseweb": PricingPolicy(markup_percent=25, auto_publish=True),
+            "leaseweb.hourly": PricingPolicy(markup_percent=10, auto_publish=True),
+        }
+        report = await _coordinator([source], repo, policies=policies).run()
+        assert report.providers[0].prices_updated == 1
+        priced = await repo.get_by_ref("leaseweb", "lsw.mini", "eu-west-3")
+        assert priced is not None
+        assert priced.selling_price_minor == 110  # 100 + 10%, not +25%
+
     async def test_auto_publish_off_prices_without_publishing(self) -> None:
         repo = FakeOffersRepo()
         source = FakeSource(
@@ -685,6 +732,26 @@ class TestPricingPolicyConfig:
 
     def test_missing_pricing_means_costs_only(self) -> None:
         assert pricing_policies_from_settings(_settings()) == {}
+
+    def test_quoted_family_toml_keys_parse(self, tmp_path: Any) -> None:
+        from cloud_platform.core.config import parse_config_file
+
+        path = tmp_path / "t.toml"
+        path.write_text(
+            "[storefront.catalog_sync]\nenabled = true\ninterval_seconds = 900\n\n"
+            '[storefront.pricing.leaseweb]\nmode = "markup"\nmarkup_percent = 25\n'
+            "auto_publish = true\n\n"
+            '[storefront.pricing."leaseweb.hourly"]\nmode = "markup"\nmarkup_percent = 10\n'
+            "auto_publish = false\n",
+            encoding="utf-8",
+        )
+        values = parse_config_file(str(path))
+        assert values["storefront_pricing"]["leaseweb"]["markup_percent"] == 25
+        assert values["storefront_pricing"]["leaseweb.hourly"]["markup_percent"] == 10
+        policies = pricing_policies_from_settings(_settings(**values))
+        assert policies["leaseweb"].markup_percent == 25
+        assert policies["leaseweb.hourly"].markup_percent == 10
+        assert policies["leaseweb.hourly"].auto_publish is False
 
     def test_non_mapping_pricing_config_is_ignored(self) -> None:
         from types import SimpleNamespace

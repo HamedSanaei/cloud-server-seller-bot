@@ -30,6 +30,18 @@ from uuid import UUID
 #: Billing model of every offer in this module (fixed prepaid monthly).
 BILLING_MODEL_PREPAID_MONTHLY = "prepaid_monthly_fixed"
 
+#: Commercial billing models a sellable offer can carry. Monthly VPS
+#: products are ordered through the ordering API and prepaid per month;
+#: hourly cloud products are created through the instance API and billed by
+#: time accrual. Checkout branches on this value, never on a provider name.
+BILLING_MODEL_MONTHLY = "prepaid_monthly_fixed"
+BILLING_MODEL_HOURLY = "hourly"
+VALID_BILLING_MODELS = frozenset({BILLING_MODEL_MONTHLY, BILLING_MODEL_HOURLY})
+
+#: Display-only monthly equivalent of an hourly rate (730h), for estimates
+#: next to the authoritative hourly price. Never used for charging.
+HOURLY_MONTHLY_ESTIMATE_HOURS = 730
+
 #: Monthly period used for renewal estimates when the provider gives no date.
 ESTIMATED_MONTH_DAYS = 30
 
@@ -139,7 +151,10 @@ class SellableOffer:
     #: is durable in ``provider_routes`` (per account+location product list),
     #: and checkout pins the fulfillment account from there.
     provider_account_id: str | None = None
-    #: Normalized customer-visible technical facts (adapters own the content;
+    #: Commercial terms: monthly VPS vs hourly cloud (checkout branches on
+    #: this, never on a provider name).
+    billing_model: str = BILLING_MODEL_MONTHLY
+    #: Normalized customer-visible technical facts (adapters own content;
     #: never secrets, credential ids or raw API payloads).
     technical_metadata: dict[str, object] = field(default_factory=dict)
     #: Explicit operator publication block (automatic publishing respects it;
@@ -228,6 +243,8 @@ class OfferSpecUpdate:
     billing_parameters: dict[str, object]
     #: Normalized technical facts (None = leave the stored value untouched).
     technical_metadata: dict[str, object] | None = None
+    #: Commercial terms of the observation (None = leave stored untouched).
+    billing_model: str | None = None
     provider_available: bool = True
     #: Credential account this observation came from (provenance, not a price).
     provider_account_id: str | None = None
@@ -285,6 +302,10 @@ class CatalogSyncReport:
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
     verified: frozenset[tuple[str, str]] = frozenset()
+    #: Billing model of the verified observations (monthly vs hourly). The
+    #: coordinator only prices/publishes rows carrying this model, so two
+    #: product lines can never cross-contaminate.
+    billing_model: str = BILLING_MODEL_MONTHLY
 
 
 class OfferCatalogSyncSource(Protocol):
@@ -373,9 +394,19 @@ class SellableOfferRepository(Protocol):
         """
         ...
 
-    async def mark_unavailable(self, provider_key: str, available: set[tuple[str, str]]) -> int:
+    async def mark_unavailable(
+        self,
+        provider_key: str,
+        available: set[tuple[str, str]],
+        billing_model: str | None = None,
+    ) -> int:
         """Set provider_available=False for rows of ``provider_key`` whose
-        (product_id, location_id) is not in ``available``; returns count."""
+        (product_id, location_id) is not in ``available``; returns count.
+
+        ``billing_model`` scopes the retirement to one commercial product
+        line (a monthly sync must never retire hourly rows and vice versa);
+        omitting it keeps the legacy provider-wide behavior.
+        """
         ...
 
     async def set_enabled(self, offer_id: UUID, enabled: bool) -> SellableOffer:

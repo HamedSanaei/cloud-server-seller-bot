@@ -248,19 +248,29 @@ class FakeView:
             provider_key, product_id, price_minor, currency
         )
 
-    async def products_page(self, provider_key: str, page: int = 1) -> Any:
-        return await self._service.products_page(provider_key, page)
+    async def families_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
+        return await self._service.families_screen(provider_key)
 
-    async def product_detail_screen(
-        self,
-        provider_key: str,
-        product_id: str,
-        price_minor: int,
-        currency: str,
+    async def family_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1
     ) -> Any:
-        return await self._service.product_detail_screen(
-            provider_key, product_id, price_minor, currency
-        )
+        return await self._service.family_locations_screen(provider_key, family_key, page)
+
+    async def family_plans_screen(
+        self, provider_key: str, family_key: str, location_id: str, page: int = 1
+    ) -> Any:
+        return await self._service.family_plans_screen(provider_key, family_key, location_id, page)
+
+    async def plan_detail_screen(self, provider_key: str, location_id: str, product_id: str) -> Any:
+        return await self._service.plan_detail_screen(provider_key, location_id, product_id)
+
+    async def panel_screen(
+        self, *, offer_id: UUID, os_index: int
+    ) -> tuple[Any, list[Any], str, str]:
+        return await self._service.panel_screen(offer_id=offer_id, os_index=os_index)
+
+    async def panel_name_by_index(self, offer: SellableOffer, index: int) -> str | None:
+        return await self._service.panel_name_by_index(offer, index)
 
     async def plans_screen(
         self, location_id: str, provider_key: str | None = None
@@ -273,9 +283,11 @@ class FakeView:
     async def os_by_index(self, offer: SellableOffer, index: int) -> str:
         return await self._service.os_by_index(offer, index)
 
-    async def confirmation(self, *, user_id: UUID, offer_id: UUID, os_index: int) -> Any:
+    async def confirmation(
+        self, *, user_id: UUID, offer_id: UUID, os_index: int, panel_index: int | None = None
+    ) -> Any:
         return await self._service.confirmation(
-            user_id=user_id, offer_id=offer_id, os_index=os_index
+            user_id=user_id, offer_id=offer_id, os_index=os_index, panel_index=panel_index
         )
 
     async def os_options(self, offer: SellableOffer) -> list[Any]:
@@ -417,18 +429,17 @@ class TestCurrencyCardIdentity:
         for offer in offers:
             _view, _options, back_callback, _cancel = await service.os_screen(offer_id=offer.id)
             target = _decode(back_callback)
-            assert (target.flow, target.screen) == ("store", "product_detail")
+            assert (target.flow, target.screen) == ("store", "plan_detail")
             assert target.args == (
                 offer.provider_key,
+                offer.location_id,
                 offer.product_id,
-                str(offer.selling_price_minor),
-                offer.selling_currency,
             )
-            detail = await service.product_detail_screen(
-                target.args[0], target.args[1], int(target.args[2]), target.args[3]
+            detail = await service.plan_detail_screen(
+                target.args[0], target.args[1], target.args[2]
             )
-            assert [view.offer_id for view in detail.locations] == [offer.id]
-            assert {view.currency for view in detail.locations} == {offer.selling_currency}
+            assert detail.offer.offer_id == offer.id
+            assert detail.offer.currency == offer.selling_currency
 
     async def test_confirmation_uses_the_exact_selected_offer_and_currency(self) -> None:
         offers = _currency_pair_offers()
@@ -520,13 +531,15 @@ class TestLegacyCallbacks:
         bot = _ui(_service())
         legacy = bot._callback("store", "product_locations", PROVIDER, PRODUCT, str(PRICE))
         screen = await _press(bot, legacy)
-        # Re-rendered products screen: forward buttons are product cards
-        # (4-arg product_detail), never OS rows of a mixed location list.
+        # Safe fallback: never OS rows of a mixed location list and never a
+        # guessed currency. A single-family provider re-enters its locations
+        # directly; multi-family providers show the family selector.
         targets = [_decode(b.callback_data) for b in _buttons(screen)]
-        forward = [t for t in targets if t.screen == "product_detail"]
-        assert forward, "legacy callback must fall back to the product cards"
-        assert all(len(t.args) == 4 for t in forward)
         assert not any(t.screen == "os" for t in targets)
+        # Single-family provider: straight back into its locations list.
+        assert any(t.screen in ("family", "vps_plans", "providers") for t in targets), (
+            "legacy callback must fall back to family navigation"
+        )
 
     async def test_unambiguous_legacy_ui_callback_still_lists_locations(self) -> None:
         offers = [_offer(location_id="ONLY-01", price_minor=1899, currency="EUR")]
@@ -539,47 +552,46 @@ class TestLegacyCallbacks:
 class TestUiNavigation:
     """End-to-end button navigation keeps each currency isolated."""
 
-    async def test_pressing_each_card_shows_only_its_location(self) -> None:
+    async def test_each_location_lists_only_its_currency_offer(self) -> None:
         bot = _ui(_service())
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        cards = [b for b in _buttons(products) if "VPS 1" in b.text]
-        assert len(cards) == 2
-        seen: dict[str, list[str]] = {}
-        for card in cards:
-            availability = await _press(bot, card.callback_data)
-            labels = [b.text for b in _buttons(availability)]
-            target = _decode(card.callback_data)
-            if target.args[3] == "EUR":
-                assert any(EUR_LOCATION in label for label in labels)
-                assert not any(GBP_LOCATION in label for label in labels)
-                seen["EUR"] = labels
-            else:
-                assert any(GBP_LOCATION in label for label in labels)
-                assert not any(EUR_LOCATION in label for label in labels)
-                seen["GBP"] = labels
-        assert set(seen) == {"EUR", "GBP"}
+        locations = await _press(
+            bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
+        )
+        buttons = [b for b in _buttons(locations) if "FRA-01" in b.text or "LON-01" in b.text]
+        assert len(buttons) == 2
+        eur_plans = await _press(
+            bot, next(b for b in buttons if EUR_LOCATION in b.text).callback_data
+        )
+        eur_labels = [b.text for b in _buttons(eur_plans)]
+        assert any("€" in label for label in eur_labels)
+        assert not any("GBP" in label for label in eur_labels)
+        gbp_plans = await _press(
+            bot, next(b for b in buttons if GBP_LOCATION in b.text).callback_data
+        )
+        gbp_labels = [b.text for b in _buttons(gbp_plans)]
+        assert any("GBP" in label for label in gbp_labels)
+        assert not any("€" in label for label in gbp_labels)
 
     async def test_os_back_button_preserves_currency_in_ui(self) -> None:
         bot = _ui(_service())
-        products = await _press(bot, bot._callback("store", "products", PROVIDER))
-        card = next(b for b in _buttons(products) if "VPS 1" in b.text)
-        card_target = _decode(card.callback_data)
-        availability = await _press(bot, card.callback_data)
-        location_button = next(
-            b for b in _buttons(availability) if _decode(b.callback_data).screen == "os"
+        locations = await _press(
+            bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
         )
-        os_screen = await _press(bot, location_button.callback_data)
+        location_button = next(b for b in _buttons(locations) if EUR_LOCATION in b.text)
+        plans = await _press(bot, location_button.callback_data)
+        plan_button = next(
+            b for b in _buttons(plans) if _decode(b.callback_data).screen == "plan_detail"
+        )
+        detail = await _press(bot, plan_button.callback_data)
+        assert "€" in detail.text
+        assert "GBP" not in detail.text
+        continuation = next(b for b in _buttons(detail) if _decode(b.callback_data).screen == "os")
+        os_screen = await _press(bot, continuation.callback_data)
         back = next(
-            b for b in _buttons(os_screen) if _decode(b.callback_data).screen == "product_detail"
+            b for b in _buttons(os_screen) if _decode(b.callback_data).screen == "plan_detail"
         )
         back_target = _decode(back.callback_data)
-        assert back_target.args == card_target.args
-        assert back_target.args[3] == card_target.args[3]
+        assert back_target.args[1] == EUR_LOCATION
         again = await _press(bot, back.callback_data)
-        labels = [b.text for b in _buttons(again)]
-        if card_target.args[3] == "EUR":
-            assert any(EUR_LOCATION in label for label in labels)
-            assert not any(GBP_LOCATION in label for label in labels)
-        else:
-            assert any(GBP_LOCATION in label for label in labels)
-            assert not any(EUR_LOCATION in label for label in labels)
+        assert "€" in again.text
+        assert "GBP" not in again.text

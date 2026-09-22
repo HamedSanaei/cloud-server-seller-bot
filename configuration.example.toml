@@ -143,6 +143,19 @@ display_name = "Hetzner"
 api_token = "CHANGE_ME"
 base_url = "https://api.hetzner.cloud/v1"
 
+# Commercial product families (STOREFRONT-REWORK): one provider can sell
+# more than one product type. Each family names its billing model
+# ("prepaid_monthly_fixed" or "hourly") and its customer-facing product
+# name. Providers without a families section expose one implicit family
+# per billing model found in their sellable offers.
+[providers.leaseweb.families.vps]
+billing_model = "prepaid_monthly_fixed"
+display_name = "وی‌پی‌اس"
+
+[providers.leaseweb.families.cloud]
+billing_model = "hourly"
+display_name = "کلود"
+
 # ---------------------------------------------------------------------------
 # Automatic catalog sync + pricing (STOREFRONT-V2, one-time setup)
 #
@@ -160,6 +173,13 @@ enabled = true
 interval_seconds = 900
 
 [storefront.pricing.leaseweb]
+mode = "markup"
+markup_percent = 25
+auto_publish = true
+
+# Family-specific policy wins over the provider-wide one when both exist
+# (key "provider.billing", e.g. hourly cloud priced apart from monthly VPS).
+[storefront.pricing."leaseweb.hourly"]
 mode = "markup"
 markup_percent = 25
 auto_publish = true

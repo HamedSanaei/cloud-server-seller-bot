@@ -12,7 +12,10 @@ driven by operator configuration (``[providers.<key>] market`` /
 
 - :class:`Market` — the two sellable markets (``iran`` / ``foreign``);
 - :class:`ProviderCatalog` — the configured provider metadata;
-- :class:`ProviderListing` — one provider as the storefront shows it.
+- :class:`ProviderListing` — one provider as the storefront shows it;
+- :class:`ProviderProductFamily` — one commercial product line of a provider
+  (monthly VPS vs hourly cloud), configured per provider so other providers
+  can expose more than one sellable product type in the future.
 
 Ordering capability is deliberately NOT modelled here: whether a provider can
 actually take an order for a monthly offer is a *capability* question that the
@@ -65,6 +68,31 @@ def parse_market(value: str) -> Market:
         raise UnknownMarketError(f"unknown market {value!r}") from exc
 
 
+#: Commercial billing models a family can carry (mirrors the offer
+#: price book; checkout branches on these, never on a provider name).
+FAMILY_BILLING_MONTHLY = "prepaid_monthly_fixed"
+FAMILY_BILLING_HOURLY = "hourly"
+FAMILY_BILLINGS = frozenset({FAMILY_BILLING_MONTHLY, FAMILY_BILLING_HOURLY})
+
+#: Render order of families (monthly first).
+FAMILY_ORDER: tuple[str, ...] = (FAMILY_BILLING_MONTHLY, FAMILY_BILLING_HOURLY)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderProductFamily:
+    """One commercial product line of a provider (family screen entry).
+
+    ``family_key`` is the short stable handle used in callbacks (``vps``,
+    ``cloud``); ``billing_model`` drives which flow and pricing apply;
+    ``display_name`` is the customer-facing product name from configuration.
+    """
+
+    provider_key: str
+    family_key: str
+    billing_model: str
+    display_name: str
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderListing:
     """One provider as the storefront presents it."""
@@ -90,10 +118,58 @@ class ProviderCatalog:
         markets: Mapping[str, str] | None = None,
         display_names: Mapping[str, str] | None = None,
         enabled: Mapping[str, bool] | None = None,
+        families: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
     ) -> None:
         self._markets = {str(k): str(v) for k, v in (markets or {}).items()}
         self._display_names = {str(k): str(v) for k, v in (display_names or {}).items()}
         self._enabled = {str(k): bool(v) for k, v in (enabled or {}).items()}
+        self._families = self._validated_families(families or {})
+
+    @staticmethod
+    def _validated_families(
+        families: Mapping[str, Mapping[str, Mapping[str, str]]],
+    ) -> dict[tuple[str, str], ProviderProductFamily]:
+        # Normalized configured families (fail fast on bad configuration).
+        # One family per (provider, billing model): two entries for the same
+        # billing would make family routing ambiguous.
+        out: dict[tuple[str, str], ProviderProductFamily] = {}
+        seen_billing: set[tuple[str, str]] = set()
+        for provider_key, provider_families in families.items():
+            if not isinstance(provider_families, Mapping):
+                raise ValueError(f"invalid families for provider {provider_key!r}")
+            for family_key, attrs in provider_families.items():
+                if not isinstance(attrs, Mapping):
+                    raise ValueError(f"invalid family {family_key!r} for provider {provider_key!r}")
+                billing = str(attrs.get("billing_model", "")).strip()
+                if billing not in FAMILY_BILLINGS:
+                    raise ValueError(
+                        f"family {family_key!r} of provider {provider_key!r} has "
+                        f"unknown billing_model {billing!r}"
+                    )
+                if (provider_key, billing) in seen_billing:
+                    raise ValueError(
+                        f"provider {provider_key!r} declares two families for billing {billing!r}"
+                    )
+                seen_billing.add((provider_key, billing))
+                out[(str(provider_key), str(family_key))] = ProviderProductFamily(
+                    provider_key=str(provider_key),
+                    family_key=str(family_key),
+                    billing_model=billing,
+                    display_name=str(attrs.get("display_name") or family_key).strip()
+                    or str(family_key),
+                )
+        return out
+
+    def families_of(self, provider_key: str) -> tuple[ProviderProductFamily, ...]:
+        # Configured families of one provider, monthly first.
+        found = [
+            fam for (provider, _key), fam in self._families.items() if provider == provider_key
+        ]
+        return tuple(sorted(found, key=lambda fam: FAMILY_ORDER.index(fam.billing_model)))
+
+    def family_of(self, provider_key: str, family_key: str) -> ProviderProductFamily | None:
+        # One configured family by provider and family key.
+        return self._families.get((provider_key, family_key))
 
     # -- lookups -----------------------------------------------------------
 
@@ -136,11 +212,16 @@ class ProviderCatalog:
 
 
 __all__ = [
+    "FAMILY_BILLINGS",
+    "FAMILY_BILLING_HOURLY",
+    "FAMILY_BILLING_MONTHLY",
+    "FAMILY_ORDER",
     "MARKET_ORDER",
     "Market",
     "MarketError",
     "ProviderCatalog",
     "ProviderListing",
+    "ProviderProductFamily",
     "UnknownMarketError",
     "parse_market",
 ]
