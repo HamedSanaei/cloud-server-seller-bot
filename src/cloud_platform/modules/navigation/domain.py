@@ -18,6 +18,16 @@ Callback scheme (stable and tamper-resistant):
 - Fields must match ``[A-Za-z0-9._-]+`` (UUIDs/hex ids and slugs); anything
   else is rejected.
 
+Wire aliases (Telegram's 64-byte button limit):
+
+- Application code always uses canonical screen names (``Callback.screen``).
+  The codec maps long screens to compact wire aliases on encode and back on
+  decode, so navigation semantics never change while ``callback_data`` stays
+  within :data:`TELEGRAM_CALLBACK_DATA_LIMIT_BYTES`.
+- The HMAC always covers the CANONICAL key, so an aliased callback and its
+  literal pre-alias form verify identically: callbacks signed before an
+  alias existed keep working, and no signature strength is lost.
+
 Every screen supports **cancel** (back to the main menu, except the main
 menu and the terminal done screen). Screens inside a flow also support
 **back** (to their parent). Forward actions are declared explicitly per
@@ -35,6 +45,25 @@ from enum import StrEnum
 CALLBACK_VERSION = "v1"
 _CALLBACK_FIELD = re.compile(r"^[A-Za-z0-9._-]+$")
 _SIGNATURE_LEN = 16  # truncated HMAC-SHA256 (64 bits) - ample for bot buttons
+
+#: Hard byte limit of Telegram's ``InlineKeyboardButton.callback_data``.
+TELEGRAM_CALLBACK_DATA_LIMIT_BYTES = 64
+
+#: Canonical screen -> compact wire alias. Screen segments only: args are
+#: never shortened, converted, or inferred here. Provider-neutral and
+#: currency-neutral by construction.
+_SCREEN_WIRE_ALIASES: dict[str, str] = {
+    "product_locations": "pl",
+}
+_WIRE_SCREEN_CANONICAL: dict[str, str] = {
+    wire: canonical for canonical, wire in _SCREEN_WIRE_ALIASES.items()
+}
+
+for _wire_alias in _SCREEN_WIRE_ALIASES.values():
+    if not _CALLBACK_FIELD.fullmatch(_wire_alias):
+        raise ValueError(f"invalid wire alias: {_wire_alias!r}")
+if len(_WIRE_SCREEN_CANONICAL) != len(_SCREEN_WIRE_ALIASES):
+    raise ValueError("wire aliases must be unique")
 
 
 class CallbackError(ValueError):
@@ -104,35 +133,75 @@ def _sign(key: str, signing_key: str) -> str:
 
 
 def encode_callback(callback: Callback, signing_key: str) -> str:
-    """Encode a callback into its stable, signed wire form."""
+    """Encode a callback into its stable, signed wire form.
+
+    Long canonical screens travel under their wire alias so the emitted
+    ``callback_data`` fits Telegram's button limit; the signature still
+    covers the canonical key, so aliased and literal forms verify
+    identically. Use :func:`encode_telegram_callback` when the payload must
+    be guaranteed to fit on a Telegram button.
+    """
     if not signing_key:
         raise ValueError("signing_key must not be empty")
     for value in (callback.flow, callback.screen, *callback.args):
         if not value or not _CALLBACK_FIELD.fullmatch(value):
             raise CallbackError(f"invalid callback field: {value!r}")
-    return f"{CALLBACK_VERSION}|{callback.key}|{_sign(callback.key, signing_key)}"
+    wire_screen = _SCREEN_WIRE_ALIASES.get(callback.screen, callback.screen)
+    wire_key = ":".join((callback.flow, wire_screen, *callback.args))
+    return f"{CALLBACK_VERSION}|{wire_key}|{_sign(callback.key, signing_key)}"
+
+
+def ensure_telegram_callback_size(encoded: str) -> str:
+    """Fail fast when generated ``callback_data`` exceeds Telegram's limit.
+
+    The limit applies to newly generated button payloads only; decoding
+    stays permissive so previously issued callbacks keep working.
+    """
+    size = len(encoded.encode("utf-8"))
+    if size > TELEGRAM_CALLBACK_DATA_LIMIT_BYTES:
+        raise CallbackError(
+            "telegram callback_data exceeds "
+            f"{TELEGRAM_CALLBACK_DATA_LIMIT_BYTES} bytes (got {size}): {encoded!r}"
+        )
+    return encoded
+
+
+def encode_telegram_callback(callback: Callback, signing_key: str) -> str:
+    """Encode a callback guaranteed to fit on a Telegram button.
+
+    Raises :class:`CallbackError` when the wire form exceeds
+    :data:`TELEGRAM_CALLBACK_DATA_LIMIT_BYTES` instead of emitting a
+    button Telegram would reject.
+    """
+    return ensure_telegram_callback_size(encode_callback(callback, signing_key))
 
 
 def decode_callback(data: str, signing_key: str) -> Callback:
-    """Decode and verify a callback string; raises CallbackError on any fault."""
+    """Decode and verify a callback string; raises CallbackError on any fault.
+
+    Wire aliases map back to their canonical screen, and the literal
+    pre-alias form keeps decoding: the signature covers the canonical key
+    either way, so both forms verify through the same path.
+    """
     if not signing_key:
         raise ValueError("signing_key must not be empty")
     parts = data.split("|")
     if len(parts) != 3:
         raise CallbackError("malformed callback")
-    version, key, signature = parts
+    version, wire_key, signature = parts
     if version != CALLBACK_VERSION:
         raise CallbackError("unsupported callback version")
-    expected = _sign(key, signing_key)
-    if not hmac.compare_digest(signature, expected):
-        raise CallbackError("callback signature mismatch")
-    fields = key.split(":")
+    fields = wire_key.split(":")
     if len(fields) < 2:
         raise CallbackError("callback needs flow and screen")
-    for field in fields:
-        if not _CALLBACK_FIELD.fullmatch(field):
+    flow, wire_screen, *args = fields
+    screen = _WIRE_SCREEN_CANONICAL.get(wire_screen, wire_screen)
+    for field in (flow, screen, *args):
+        if not field or not _CALLBACK_FIELD.fullmatch(field):
             raise CallbackError(f"invalid callback field: {field!r}")
-    flow, screen, *args = fields
+    expected = _sign(":".join((flow, screen, *args)), signing_key)
+    if not hmac.compare_digest(signature, expected):
+        raise CallbackError("callback signature mismatch")
     return Callback(flow=flow, screen=screen, args=tuple(args))
 
 

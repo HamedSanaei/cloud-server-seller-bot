@@ -48,6 +48,16 @@ NOT_CAPABLE_PROVIDER = "eu-legacy"
 DISABLED_PROVIDER = "eu-disabled"
 
 
+def _short_product_code(provider_key: str) -> str:
+    """Compact default product code (initials), production-shaped.
+
+    Real catalog product codes are short (``VPS02_1``); the product-card
+    callback must fit Telegram's 64-byte button limit, so fixtures must not
+    use long synthetic ids either.
+    """
+    return "".join(word[0] for word in provider_key.split("-")) + "-pd"
+
+
 def _offer(
     *,
     provider_key: str,
@@ -61,7 +71,7 @@ def _offer(
     return SellableOffer(
         id=offer_id or uuid4(),
         provider_key=provider_key,
-        product_id=product_id or f"{provider_key}-product",
+        product_id=product_id or _short_product_code(provider_key),
         location_id=location_id,
         name=name,
         vcpu=2,

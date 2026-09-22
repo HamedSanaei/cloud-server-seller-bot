@@ -658,6 +658,21 @@ class OfferCatalogViewService:
 
         return encode_callback(Callback(flow="store", screen=screen, args=args), self._signing_key)
 
+    def _store_nav_callback(self, screen: str, *args: str) -> str:
+        """Store navigation callback for Telegram buttons (size-enforced).
+
+        Bounded navigation callbacks (markets, providers, product cards and
+        their back/cancel chain) must fit Telegram's 64-byte button limit, so
+        they fail fast here instead of dying silently in Telegram.
+        Offer-identity callbacks (``os``/``confirm``/``buy``) carry full
+        offer UUIDs and stay on the raw ``_store_callback`` path.
+        """
+        from cloud_platform.modules.navigation.domain import Callback, encode_telegram_callback
+
+        return encode_telegram_callback(
+            Callback(flow="store", screen=screen, args=args), self._signing_key
+        )
+
     def markets_screen(self) -> list[MarketOptionView]:
         """The two markets the customer chooses between (always both)."""
         return [
@@ -665,7 +680,7 @@ class OfferCatalogViewService:
                 market=market.value,
                 label_key=market.label_key,
                 title_key=market.title_key,
-                select_callback=self._store_callback("providers", market.value),
+                select_callback=self._store_nav_callback("providers", market.value),
             )
             for market in MARKET_ORDER
         ]
@@ -716,11 +731,11 @@ class OfferCatalogViewService:
                     buyable=capable,
                     offer_count=counts[provider_key],
                     select_callback=(
-                        self._store_callback("products", provider_key) if capable else None
+                        self._store_nav_callback("products", provider_key) if capable else None
                     ),
                 )
             )
-        return views, self._store_callback("market")
+        return views, self._store_nav_callback("market")
 
     async def locations_screen(
         self, provider_key: str
@@ -735,13 +750,13 @@ class OfferCatalogViewService:
             LocationOptionView(
                 location_id=location_id,
                 offer_count=count,
-                select_callback=self._store_callback("plans", provider_key, location_id),
+                select_callback=self._store_nav_callback("plans", provider_key, location_id),
             )
             for location_id, count in sorted(counts.items())
         ]
         market = self._markets.market_of(provider_key)
-        back = self._store_callback("providers", market.value if market else "")
-        cancel = self._store_callback("market")
+        back = self._store_nav_callback("providers", market.value if market else "")
+        cancel = self._store_nav_callback("market")
         return views, back, cancel
 
     # -- storefront: product-centric catalog -----------------------------
@@ -799,7 +814,7 @@ class OfferCatalogViewService:
                     # The card is identified by product AND price AND currency:
                     # equal minor-unit values in different currencies are
                     # different cards and must never cross-match.
-                    select_callback=self._store_callback(
+                    select_callback=self._store_nav_callback(
                         "product_locations",
                         provider_key,
                         head.product_id,
@@ -809,8 +824,8 @@ class OfferCatalogViewService:
                 )
             )
         market = self._markets.market_of(provider_key)
-        back = self._store_callback("providers", market.value if market else "")
-        return views, back, self._store_callback("market")
+        back = self._store_nav_callback("providers", market.value if market else "")
+        return views, back, self._store_nav_callback("market")
 
     async def product_locations_screen(
         self,
@@ -884,8 +899,8 @@ class OfferCatalogViewService:
         ]
         return (
             views,
-            self._store_callback("products", provider_key),
-            self._store_callback("market"),
+            self._store_nav_callback("products", provider_key),
+            self._store_nav_callback("market"),
         )
 
     async def _location_metadata(self, provider_key: str) -> dict[str, tuple[str, str | None]]:
@@ -999,7 +1014,7 @@ class OfferCatalogViewService:
 
         confirm_callback = self._store_callback("buy", str(offer_id), str(os_index))
         back_callback = self._store_callback("os", str(offer_id))
-        cancel_callback = self._store_callback("market")
+        cancel_callback = self._store_nav_callback("market")
         return OfferConfirmView(
             offer=self._view(offer),
             os_name=os_name,
@@ -1026,14 +1041,14 @@ class OfferCatalogViewService:
 
         # Back returns to the product's availability list, so the customer
         # stays in product-first navigation (market -> provider -> product).
-        back_callback = self._store_callback(
+        back_callback = self._store_nav_callback(
             "product_locations",
             offer.provider_key,
             offer.product_id,
             str(offer.selling_price_minor),
             offer.selling_currency,
         )
-        cancel_callback = self._store_callback("market")
+        cancel_callback = self._store_nav_callback("market")
         return self._view(offer), options, back_callback, cancel_callback
 
     async def plans_screen(
@@ -1053,8 +1068,8 @@ class OfferCatalogViewService:
         if not offers:
             raise OfferUnavailableError(f"no sellable offers at {location_id}")
         resolved_provider = provider_key or offers[0].provider_key
-        back_callback = self._store_callback("locations", resolved_provider)
-        cancel_callback = self._store_callback("market")
+        back_callback = self._store_nav_callback("locations", resolved_provider)
+        cancel_callback = self._store_nav_callback("market")
         views = [self._view(o) for o in sorted(offers, key=lambda o: o.name)]
         return views, back_callback, cancel_callback
 
