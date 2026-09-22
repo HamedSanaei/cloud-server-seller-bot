@@ -307,6 +307,20 @@ class FakeView:
             provider_key, product_id, price_minor, currency
         )
 
+    async def products_page(self, provider_key: str, page: int = 1) -> Any:
+        return await self._service.products_page(provider_key, page)
+
+    async def product_detail_screen(
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int,
+        currency: str,
+    ) -> Any:
+        return await self._service.product_detail_screen(
+            provider_key, product_id, price_minor, currency
+        )
+
     async def plans_screen(
         self, location_id: str, provider_key: str | None = None
     ) -> tuple[list[OfferCatalogView], str, str]:
@@ -602,7 +616,8 @@ class TestAggregatedCatalog:
         cards = [b for b in _buttons(screen) if "Shared VPS" in b.text]
         assert len(cards) == 1
         assert "€18.99" in cards[0].text
-        assert "3" in cards[0].text
+        # Readable card: spec inline, no bare location count.
+        assert "2C/4GB" in cards[0].text
 
     async def test_each_location_is_its_own_offer_behind_one_card(self) -> None:
         service = self._multi_location_service()
@@ -725,20 +740,20 @@ class TestFlowAndBackChain:
         os_again = await _press(ui, back.callback_data)
         assert "سیستم‌عامل" in os_again.text
 
-        # OS -> back = the product's availability list
+        # OS -> back = the product's detail screen (plan first, then location)
         back = next(
-            b for b in _buttons(os_again) if _decode(b.callback_data).screen == "product_locations"
+            b for b in _buttons(os_again) if _decode(b.callback_data).screen == "product_detail"
         )
         target = _decode(back.callback_data)
-        assert target.args[0] == "eu-provider"
-        availability_again = await _press(ui, back.callback_data)
-        assert any("AMS-01" in b.text for b in _buttons(availability_again))
+        assert target.args == ("eu-provider", "ep-pd", "1899", "EUR")
+        detail_again = await _press(ui, back.callback_data)
+        assert any("AMS-01" in b.text for b in _buttons(detail_again))
 
-        # availability -> back = the provider's product cards
+        # detail -> back = the provider's product cards
         back = next(
-            b for b in _buttons(availability_again) if _decode(b.callback_data).screen == "products"
+            b for b in _buttons(detail_again) if _decode(b.callback_data).screen == "products"
         )
-        assert _decode(back.callback_data).args == ("eu-provider",)
+        assert _decode(back.callback_data).args[0] == "eu-provider"
         products_again = await _press(ui, back.callback_data)
         assert any("EU Small" in b.text for b in _buttons(products_again))
 

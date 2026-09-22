@@ -67,6 +67,7 @@ from enum import StrEnum
 from typing import Any
 
 from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.modules.offers.domain import TechnicalSpec
 from cloud_platform.providers.base import (
     Capability,
     CreateServerRequest,
@@ -316,6 +317,43 @@ LOCATION_DISPLAY: dict[str, tuple[str, str]] = {
     "SYD-12": ("AU", "Sydney"),
 }
 
+#: City prefix (the ``XXX`` in ``XXX-NN``) -> (country, city). Adapter-internal
+#: fallback ONLY: the ordering API exposes no location-list endpoint, so an
+#: ordering-discovered code with no exact ``LOCATION_DISPLAY`` entry (a newer
+#: hall in a known city, e.g. ``FRA-10``) would otherwise stay metadata-less.
+#: The prefix convention is the provider's own code scheme, and the exact
+#: table above always wins when present.
+LOCATION_PREFIX_DISPLAY: dict[str, tuple[str, str]] = {
+    "AMS": ("NL", "Amsterdam"),
+    "FRA": ("DE", "Frankfurt"),
+    "LAX": ("US", "Los Angeles"),
+    "LON": ("GB", "London"),
+    "MTL": ("CA", "Montreal"),
+    "SFO": ("US", "San Francisco"),
+    "SIN": ("SG", "Singapore"),
+    "SYD": ("AU", "Sydney"),
+    "TYO": ("JP", "Tokyo"),
+    "WDC": ("US", "Washington"),
+}
+
+
+def describe_location_code(code: str) -> tuple[str, str, str]:
+    """(country, city, source) for a location code, adapter-internal.
+
+    Exact ``LOCATION_DISPLAY`` first, then the city-prefix fallback, then the
+    verbatim code with no country. Never provider geography invented outside
+    these adapter tables.
+    """
+    normalized = (code or "").strip().upper()
+    if normalized in LOCATION_DISPLAY:
+        country, city = LOCATION_DISPLAY[normalized]
+        return country, city, "leaseweb-ordering-discovery"
+    prefix, _, _ = normalized.partition("-")
+    if prefix and prefix in LOCATION_PREFIX_DISPLAY:
+        country, city = LOCATION_PREFIX_DISPLAY[prefix]
+        return country, city, "leaseweb-ordering-prefix"
+    return "", normalized, "leaseweb-ordering-unknown"
+
 
 class VpsMatchAmbiguous(ProviderError):
     """More than one VPS plausibly matches an order; a human must decide."""
@@ -399,6 +437,12 @@ def _parse_product(item: dict[str, Any], location: str) -> LeasewebProduct | Non
     # PROVIDER EVIDENCE ONLY: the product-level price currency, else the row's
     # own currency, else "not reported" (never a hard-coded EUR fallback).
     currency = str(price_dict.get("currency") or item.get("currency") or "").strip().upper()
+    # The list payload names the storage key ``nvmeStorage``: its presence
+    # proves NVMe storage for the normalized technical spec (the parsed
+    # ``disk_gb`` alone cannot prove the storage technology).
+    storage_marker: dict[str, object] = (
+        {"storage_type": "NVMe"} if item.get("nvmeStorage") is not None else {}
+    )
     return LeasewebProduct(
         id=raw_id,
         name=str(item.get("name") or raw_id),
@@ -410,7 +454,23 @@ def _parse_product(item: dict[str, Any], location: str) -> LeasewebProduct | Non
         currency=currency,
         monthly_price_minor=_minor(price_dict.get("total")),
         provider_price_minor=_minor(price_dict.get("total")),
-        metadata={"base_price_minor": _minor(price_dict.get("basePrice"))},
+        metadata={"base_price_minor": _minor(price_dict.get("basePrice")), **storage_marker},
+    )
+
+
+def normalize_technical_spec(product: LeasewebProduct) -> TechnicalSpec:
+    """Provider facts about one ordering product as a normalized spec.
+
+    Only what the list/detail payloads actually state: the ordering VPS
+    family is x86_64 (same claim ``list_plans`` already makes), NVMe storage
+    when the payload carried the ``nvmeStorage`` key, and nothing else.
+    IPv4/IPv6, CPU model and backup stay unknown — never guessed.
+    """
+    metadata = getattr(product, "metadata", None) or {}
+    marker = metadata.get("storage_type") if isinstance(metadata, dict) else None
+    return TechnicalSpec(
+        architecture="x86_64",
+        storage_type=str(marker) if marker else None,
     )
 
 
@@ -574,13 +634,13 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
         provider response.
         """
         normalized = (code or "").strip().upper()
-        country, city = LOCATION_DISPLAY.get(normalized, ("", normalized))
+        country, city, source = describe_location_code(normalized)
         return ProviderLocation(
             id=normalized,
             name=normalized,
             country_code=country,
             city=city or None,
-            metadata={"source": "leaseweb-ordering-discovery"},
+            metadata={"source": source},
         )
 
     async def list_locations(self) -> list[ProviderLocation]:

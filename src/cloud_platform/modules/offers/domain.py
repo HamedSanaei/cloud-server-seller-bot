@@ -10,8 +10,11 @@ The row is the single gate for selling:
 
 1. ``provider_available`` — the provider currently reports the product
    (refreshed by catalog sync);
-2. ``enabled`` — the operator explicitly switched it on;
-3. ``selling_price_minor > 0`` — an explicit customer price exists.
+2. ``enabled`` — the operator explicitly switched it on (automatic
+   publishing may do this only while ``operator_disabled`` is false);
+3. ``selling_price_minor > 0`` — an explicit customer price exists
+   (owned by the automatic pricing policy while ``auto_priced`` is true,
+   otherwise by the operator).
 
 All three must hold for the customer to see and buy the offer.
 """
@@ -19,7 +22,7 @@ All three must hold for the customer to see and buy the offer.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
@@ -46,6 +49,64 @@ class OfferNotSellableError(OfferError):
 
 class OfferNotEnabledError(OfferNotSellableError):
     """The offer is not enabled for sale."""
+
+
+@dataclass(frozen=True, slots=True)
+class TechnicalSpec:
+    """Provider-neutral customer-visible technical facts about one plan.
+
+    Normalized by the provider adapters from their own read-only APIs; the
+    storefront only consumes these values and never branches on a provider.
+    Every fact is optional: ``None`` means the provider catalog did not state
+    it, and the UI must render a neutral "not provided" value — never guess
+    True or False. Only ``deprecated`` defaults to False (absence of a
+    deprecation flag is not a deprecation).
+    """
+
+    architecture: str | None = None
+    cpu_type: str | None = None
+    storage_type: str | None = None
+    bandwidth: str | None = None
+    ipv4: bool | None = None
+    ipv6: bool | None = None
+    backup: bool | None = None
+    deprecated: bool = False
+
+    def to_metadata(self) -> dict[str, object]:
+        """JSONB-safe mapping: only stated facts (``deprecated`` always)."""
+        data: dict[str, object] = {"deprecated": self.deprecated}
+        for name in (
+            "architecture",
+            "cpu_type",
+            "storage_type",
+            "bandwidth",
+            "ipv4",
+            "ipv6",
+            "backup",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                data[name] = value
+        return data
+
+    @classmethod
+    def from_metadata(cls, data: dict[str, object] | None) -> TechnicalSpec:
+        """Rebuild from a stored mapping; unknown keys are ignored."""
+        raw = dict(data or {})
+        kwargs: dict[str, object] = {}
+        for name in (
+            "architecture",
+            "cpu_type",
+            "storage_type",
+            "bandwidth",
+            "ipv4",
+            "ipv6",
+            "backup",
+        ):
+            if raw.get(name) is not None:
+                kwargs[name] = raw[name]
+        deprecated = raw.get("deprecated")
+        return cls(deprecated=bool(deprecated), **kwargs)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +139,15 @@ class SellableOffer:
     #: is durable in ``provider_routes`` (per account+location product list),
     #: and checkout pins the fulfillment account from there.
     provider_account_id: str | None = None
+    #: Normalized customer-visible technical facts (adapters own the content;
+    #: never secrets, credential ids or raw API payloads).
+    technical_metadata: dict[str, object] = field(default_factory=dict)
+    #: Explicit operator publication block (automatic publishing respects it;
+    #: catalog syncs never write it).
+    operator_disabled: bool = False
+    #: Whether the automatic pricing policy owns the selling price (a manual
+    #: price command clears it).
+    auto_priced: bool = True
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -156,6 +226,8 @@ class OfferSpecUpdate:
     provider_cost_minor: int
     provider_cost_currency: str
     billing_parameters: dict[str, object]
+    #: Normalized technical facts (None = leave the stored value untouched).
+    technical_metadata: dict[str, object] | None = None
     provider_available: bool = True
     #: Credential account this observation came from (provenance, not a price).
     provider_account_id: str | None = None
@@ -178,6 +250,94 @@ def markup_unit_price(cost_minor: int, markup_percent: int) -> int:
     if markup_percent < 0:
         raise ValueError("markup must not be negative")
     return -((-cost_minor * (100 + markup_percent)) // 100)
+
+
+#: Automatic pricing modes the coordinator understands. Only ``markup``
+#: exists: provider cost plus an integer percentage, same-currency.
+PRICING_MODE_MARKUP = "markup"
+
+
+@dataclass(frozen=True, slots=True)
+class PricingPolicy:
+    """Server-owned automatic pricing/publication policy for one provider."""
+
+    mode: str = PRICING_MODE_MARKUP
+    markup_percent: int = 0
+    auto_publish: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSyncReport:
+    """One provider's catalog sync outcome, provider-neutral.
+
+    ``verified`` holds the (product_id, location_id) pairs whose observations
+    were successfully AND durably persisted this run — the ONLY rows the
+    automatic pricing/publication step may touch.
+    """
+
+    provider_key: str
+    ok: bool
+    complete: bool
+    discovered: int = 0
+    persisted: int = 0
+    retired: int = 0
+    persistence_failures: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+    verified: frozenset[tuple[str, str]] = frozenset()
+
+
+class OfferCatalogSyncSource(Protocol):
+    """Port for one provider's sellable-catalog sync (adapter-implemented)."""
+
+    @property
+    def provider_key(self) -> str: ...
+
+    async def sync_catalog(self) -> CatalogSyncReport:
+        """Discover, persist and reconcile; never raise for provider errors.
+
+        A provider failure is reported in the returned report (``ok=False``),
+        never as an exception, so one provider can never break another's run.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSyncState:
+    """Persisted per-provider automatic-sync status (operator diagnostics)."""
+
+    provider_key: str
+    last_attempted_at: datetime | None = None
+    last_success_at: datetime | None = None
+    discovered: int = 0
+    persisted: int = 0
+    prices_updated: int = 0
+    published: int = 0
+    retired: int = 0
+    warnings: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+class CatalogSyncStateRepository(Protocol):
+    """Port for the per-provider sync status (one row per provider)."""
+
+    async def record_run(
+        self,
+        *,
+        provider_key: str,
+        ok: bool,
+        discovered: int,
+        persisted: int,
+        prices_updated: int,
+        published: int,
+        retired: int,
+        warnings: tuple[str, ...],
+        errors: tuple[str, ...],
+    ) -> CatalogSyncState: ...
+
+    async def get(self, provider_key: str) -> CatalogSyncState | None: ...
+
+    async def list_all(self) -> list[CatalogSyncState]: ...
 
 
 class SellableOfferRepository(Protocol):
@@ -220,6 +380,14 @@ class SellableOfferRepository(Protocol):
 
     async def set_enabled(self, offer_id: UUID, enabled: bool) -> SellableOffer:
         """Switch the operator visibility flag."""
+        ...
+
+    async def set_operator_disabled(self, offer_id: UUID, disabled: bool) -> SellableOffer:
+        """Persist the explicit operator publication block."""
+        ...
+
+    async def set_auto_priced(self, offer_id: UUID, auto_priced: bool) -> SellableOffer:
+        """Hand the selling price to (or take it back from) the auto policy."""
         ...
 
     async def set_selling_price(

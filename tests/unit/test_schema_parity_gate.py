@@ -142,7 +142,7 @@ class TestProductionDriftIsRejected:
 
     def test_the_gate_only_passes_once_the_repair_revision_ships(self) -> None:
         """The gate is meaningful only with 0038 in the release it guards."""
-        assert repo_head_revision() == "0038"
+        assert repo_head_revision() == "0040"
         assert REPAIR_MIGRATION.is_file()
         source = REPAIR_MIGRATION.read_text(encoding="utf-8")
         assert DRIFTED_TABLE in source

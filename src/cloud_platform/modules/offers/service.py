@@ -65,6 +65,8 @@ class OfferAdminService:
         if offer is None:
             raise OfferNotFoundError(f"offer {offer_id} not found")
         updated = await self._offers.set_selling_price(offer_id, selling_price_minor, currency)
+        # A manually set price opts out of the automatic pricing policy.
+        updated = await self._offers.set_auto_priced(offer_id, False)
         await self._audit.record_mutation(
             actor_type=ActorType.ADMIN,
             actor_id=actor.id,
@@ -86,16 +88,21 @@ class OfferAdminService:
     async def set_enabled(
         self, *, actor: User, offer_id: UUID, enabled: bool, reason: str
     ) -> SellableOffer:
-        """Show or hide one offer (idempotent; never deletes history)."""
+        """Show or hide one offer (idempotent; never deletes history).
+
+        Hiding records an explicit operator block that automatic publishing
+        never undoes; showing clears it.
+        """
         self._authorize(actor)
         self._require_reason(reason)
 
         offer = await self._offers.get(offer_id)
         if offer is None:
             raise OfferNotFoundError(f"offer {offer_id} not found")
-        if offer.enabled is enabled:
+        if offer.enabled is enabled and offer.operator_disabled is not enabled:
             return offer  # idempotent no-op
         updated = await self._offers.set_enabled(offer_id, enabled)
+        updated = await self._offers.set_operator_disabled(offer_id, not enabled)
         await self._audit.record_mutation(
             actor_type=ActorType.ADMIN,
             actor_id=actor.id,
@@ -103,7 +110,11 @@ class OfferAdminService:
             resource_type="sellable_offer",
             resource_id=str(offer_id),
             reason=reason,
-            metadata={"offer": updated.ref, "enabled": str(enabled).lower()},
+            metadata={
+                "offer": updated.ref,
+                "enabled": str(enabled).lower(),
+                "operator_disabled": str(not enabled).lower(),
+            },
         )
         logger.info("offer %s enabled=%s", updated.ref, enabled)
         return updated

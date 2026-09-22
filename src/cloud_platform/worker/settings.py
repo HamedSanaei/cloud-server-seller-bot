@@ -332,13 +332,36 @@ def _telegram_notifiers() -> tuple[Any, Any] | None:
     )
 
 
+def catalog_auto_sync_minutes() -> set[int]:
+    """Cron minute set from the configured sync interval (default: 15 min).
+
+    Only hour-dividing intervals are expressible as an arq minute set;
+    anything else falls back to the default with a warning instead of
+    silently running at an unexpected cadence.
+    """
+    from cloud_platform.core.config import get_settings
+
+    try:
+        interval = int(get_settings().storefront_catalog_sync_interval_seconds)
+    except Exception:
+        interval = 900
+    if interval < 60 or 3600 % interval != 0:
+        logger.warning(
+            "catalog auto-sync interval %ss is not an hour-dividing minute cadence; "
+            "using the 900s default",
+            interval,
+        )
+        interval = 900
+    return set(range(0, 60, interval // 60))
+
+
 async def sync_leaseweb_offers(ctx: dict[str, object]) -> None:
     """Refresh the sellable-offer price book from the Leaseweb ordering API.
 
-    Runs every 10 minutes (arq cron): dynamic eligibility discovery needs a
-    short freshness bound so newly enabled locations appear (and removed
-    ones disappear) without operator action. Never touches operator-owned
-    fields (enabled, selling price). Skipped when LEASEWEB_API_KEY is unset.
+    Kept for manual invocation; the periodic schedule runs
+    :func:`catalog_auto_sync` (all providers plus pricing/publication).
+    Never touches operator-owned fields (enabled, selling price). Skipped
+    when LEASEWEB_API_KEY is unset.
     """
     del ctx
     async with metrics.job("sync_leaseweb_offers"):
@@ -379,6 +402,121 @@ async def sync_leaseweb_offers(ctx: dict[str, object]) -> None:
                 step.total_fetched,
                 step.total_upserted,
                 step.errors,
+            )
+
+
+async def catalog_auto_sync(ctx: dict[str, object]) -> None:
+    """Provider-neutral periodic offer refresh: sync, price, publish.
+
+    One coordinator run over every configured provider (Leaseweb
+    multi-account ordering, Hetzner Cloud): official read-only APIs refresh
+    costs and availability, the server-owned markup policy reprices
+    auto-priced rows, and eligible rows are published unless the operator
+    blocked them. A provider failure is isolated (logged, never raised), an
+    operator-disabled provider is skipped, and overlapping runs serialize on
+    the catalog advisory lock. Runs at the configured interval with a prompt
+    initial pass (``run_at_startup``) that never blocks process readiness
+    (arq executes it as a job after startup).
+    """
+    del ctx
+    async with metrics.job("catalog_auto_sync"):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.catalog.repository import (
+            PostgresAdvisoryCatalogSyncLock,
+        )
+        from cloud_platform.modules.offers.auto_sync import (
+            CatalogAutoSyncCoordinator,
+            pricing_policies_from_settings,
+        )
+        from cloud_platform.modules.offers.repository import (
+            SqlAlchemyCatalogSyncStateRepository,
+            SqlAlchemySellableOfferRepository,
+        )
+
+        settings = get_settings()
+        if not settings.storefront_catalog_sync_enabled:
+            logger.info("catalog auto-sync disabled by configuration; skipping")
+            return
+        sources: list[Any] = []
+        if settings.providers_enabled.get("leaseweb", True):
+            from cloud_platform.providers.leaseweb.accounts import (
+                build_leaseweb_account_router,
+            )
+            from cloud_platform.providers.leaseweb.auto_sync import (
+                LeasewebCatalogSyncSource,
+            )
+            from cloud_platform.providers.leaseweb.ordering_sync import (
+                LeaseWebOrderingCatalogSyncer,
+                ordering_provider_from_settings,
+            )
+
+            router = build_leaseweb_account_router(settings)
+            if router is not None:
+                sources.append(
+                    LeasewebCatalogSyncSource(
+                        LeaseWebOrderingCatalogSyncer(
+                            SessionFactory,
+                            accounts=router.ordered_providers,
+                            account_priorities=router.priorities,
+                            account_states=router.account_states,
+                        )
+                    )
+                )
+            elif settings.leaseweb_api_key:
+                sources.append(
+                    LeasewebCatalogSyncSource(
+                        LeaseWebOrderingCatalogSyncer(
+                            SessionFactory, ordering_provider_from_settings(settings)
+                        )
+                    )
+                )
+            else:
+                logger.info("catalog auto-sync: leaseweb has no credential; skipping provider")
+        else:
+            logger.info("catalog auto-sync: leaseweb disabled by configuration; skipping")
+        if settings.providers_enabled.get("hetzner", True):
+            if settings.hetzner_api_token:
+                from cloud_platform.providers.hetzner.auto_sync import (
+                    HetznerCatalogSyncSource,
+                )
+                from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
+
+                sources.append(HetznerCatalogSyncSource(HetznerCatalogSyncer(SessionFactory)))
+            else:
+                logger.info(
+                    "catalog auto-sync: hetzner credential missing; skipping provider "
+                    "(leaseweb is unaffected)"
+                )
+        else:
+            logger.info("catalog auto-sync: hetzner disabled by configuration; skipping")
+        if not sources:
+            logger.info("catalog auto-sync: no providers configured; nothing to do")
+            return
+        coordinator = CatalogAutoSyncCoordinator(
+            sources=sources,
+            offers=SqlAlchemySellableOfferRepository(SessionFactory),
+            state=SqlAlchemyCatalogSyncStateRepository(SessionFactory),
+            lock=PostgresAdvisoryCatalogSyncLock(SessionFactory),
+            pricing_policies=pricing_policies_from_settings(settings),
+        )
+        report = await coordinator.run()
+        if not report.ran:
+            logger.info("catalog auto-sync skipped: %s", report.reason)
+            return
+        for provider in report.providers:
+            logger.info(
+                "catalog auto-sync %s: ok=%s discovered=%d persisted=%d prices=%d "
+                "published=%d retired=%d warnings=%d errors=%d",
+                provider.provider_key,
+                provider.ok,
+                provider.discovered,
+                provider.persisted,
+                provider.prices_updated,
+                provider.published,
+                provider.retired,
+                len(provider.warnings),
+                len(provider.errors),
             )
 
 
@@ -595,19 +733,19 @@ async def deliver_business_log_events(ctx: dict[str, object]) -> None:
 
 def _cron_jobs() -> list[Any]:
     """Cron schedule for the LEASEWEB-MVP jobs (periodic catalog discovery,
-    order worker/reconciler, daily renewal). Overlapping runs are safe: the
+    order worker/reconciler, daily renewal).     Overlapping runs are safe: the
     order worker claims through the operation ledger and the reconciler
-    never mutates. The catalog refresh runs every 10 minutes so account
-    eligibility changes surface without operator action."""
+    never mutates. The catalog auto-sync runs at the configured interval
+    (default 15 minutes) so account eligibility changes surface without
+    operator action."""
     from arq.cron import cron
 
     every_minute = set(range(0, 60))
     every_two_minutes = set(range(0, 60, 2))
     every_three_minutes = set(range(0, 60, 3))
-    every_ten_minutes = set(range(0, 60, 10))
     every_fifteen_minutes = set(range(0, 60, 15))
     return [
-        cron(sync_leaseweb_offers, minute=every_ten_minutes, run_at_startup=True),
+        cron(catalog_auto_sync, minute=catalog_auto_sync_minutes(), run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
@@ -627,6 +765,7 @@ class WorkerSettings:
         reconcile_deletes,
         reconcile_payments,
         sync_leaseweb_offers,
+        catalog_auto_sync,
         process_leaseweb_orders,
         reconcile_leaseweb_orders,
         reconcile_tetraminator_payments,

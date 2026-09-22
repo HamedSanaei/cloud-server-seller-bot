@@ -180,6 +180,11 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("fx", "abantether", "base_url"): "fx_abantether_base_url",
     ("fx", "abantether", "eur_symbol"): "fx_abantether_eur_symbol",
     ("fx", "abantether", "usd_proxy_symbol"): "fx_abantether_usd_proxy_symbol",
+    # --- Automatic catalog sync (the periodic offer-sync coordinator) -------
+    ("storefront", "catalog_sync", "enabled"): "storefront_catalog_sync_enabled",
+    ("storefront", "catalog_sync", "interval_seconds"): (
+        "storefront_catalog_sync_interval_seconds"
+    ),
 }
 
 #: TOML keys that are lists in the file but a comma-separated ``Settings``
@@ -467,6 +472,25 @@ def toml_to_settings(data: Mapping[str, Any]) -> dict[str, Any]:
             else:
                 values[field] = raw
 
+    # --- Per-provider automatic pricing/publication -------------------------
+    # ``[storefront.pricing.<provider>]`` sections (any provider key):
+    # ``mode`` (only "markup" is supported), ``markup_percent`` (integer,
+    # required for auto-pricing) and ``auto_publish`` (default true). Stored
+    # raw; validated where the policy is applied so a typo fails closed with
+    # a warning instead of mispricing the storefront.
+    storefront = data.get("storefront")
+    if isinstance(storefront, Mapping):
+        raw_pricing = storefront.get("pricing")
+        if isinstance(raw_pricing, Mapping):
+            pricing: dict[str, dict[str, Any]] = {}
+            for provider_key, section in raw_pricing.items():
+                if isinstance(section, Mapping):
+                    pricing[str(provider_key)] = {
+                        str(key): value for key, value in dict(section).items()
+                    }
+            if pricing:
+                values["storefront_pricing"] = pricing
+
     if enabled:
         values["providers_enabled"] = enabled
     if markets:
@@ -597,6 +621,17 @@ class Settings(BaseSettings):
         default_factory=lambda: dict(DEFAULT_PROVIDER_DISPLAY_NAMES)
     )
     providers_enabled: dict[str, bool] = Field(default_factory=dict)
+    # --- Automatic catalog sync + pricing policy (server-owned) --------------
+    # The periodic coordinator refreshes provider costs, reprices auto-priced
+    # offers with the configured markup and publishes eligible ones — no
+    # manual sync-offers / price-book / enable commands needed afterwards.
+    storefront_catalog_sync_enabled: bool = True
+    storefront_catalog_sync_interval_seconds: int = Field(default=900, ge=60)
+    # ``[storefront.pricing.<provider>]`` sections as parsed above, e.g.
+    # ``{"leaseweb": {"mode": "markup", "markup_percent": 25,
+    # "auto_publish": True}}``. Absent = no automatic pricing/publication
+    # for that provider (sync still refreshes its costs).
+    storefront_pricing: dict[str, dict[str, Any]] = Field(default_factory=dict)
     arvancloud_api_key: str = ""
     arvancloud_api_base_url: str = "https://napi.arvancloud.ir/ecc/v1"
     arvancloud_region: str = ""

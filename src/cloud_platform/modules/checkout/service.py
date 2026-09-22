@@ -595,6 +595,9 @@ class ProductGroupView:
     currency: str
     locations: tuple[str, ...]
     select_callback: str
+    #: Unique country codes of the card's locations (order-preserving);
+    #: empty when no synced location row states one. Presentation only.
+    country_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,6 +614,45 @@ class ProductLocationView:
     monthly_price_minor: int
     currency: str
     select_callback: str
+
+
+#: Products per rendered page (Telegram screens stay short and readable).
+PRODUCTS_PAGE_SIZE = 6
+
+
+@dataclass(frozen=True, slots=True)
+class ProductPageView:
+    """One page of a provider's product cards with pager navigation."""
+
+    provider_key: str
+    items: tuple[ProductGroupView, ...]
+    page: int
+    total_pages: int
+    total_cards: int
+    back_callback: str
+    cancel_callback: str
+    prev_callback: str | None
+    next_callback: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProductDetailView:
+    """One product card opened: full spec plus its per-location offers."""
+
+    provider_key: str
+    product_id: str
+    name: str
+    vcpu: int
+    ram_gb: int
+    disk_gb: int
+    traffic: str | None
+    monthly_price_minor: int
+    currency: str
+    #: Normalized technical facts of the card's offer (adapters own content).
+    technical_metadata: dict[str, object]
+    locations: tuple[ProductLocationView, ...]
+    back_callback: str
+    cancel_callback: str
 
 
 class OfferCatalogViewService:
@@ -659,19 +701,25 @@ class OfferCatalogViewService:
         return encode_callback(Callback(flow="store", screen=screen, args=args), self._signing_key)
 
     def _store_nav_callback(self, screen: str, *args: str) -> str:
-        """Store navigation callback for Telegram buttons (size-enforced).
+        """Store callback for Telegram buttons (size-enforced).
 
-        Bounded navigation callbacks (markets, providers, product cards and
-        their back/cancel chain) must fit Telegram's 64-byte button limit, so
-        they fail fast here instead of dying silently in Telegram.
-        Offer-identity callbacks (``os``/``confirm``/``buy``) carry full
-        offer UUIDs and stay on the raw ``_store_callback`` path.
+        Every callback emitted onto a Telegram button must fit the 64-byte
+        limit, so generation fails fast here instead of dying silently in
+        Telegram. Offer identity travels as a compact reversible reference
+        (see ``encode_offer_ref``), never as a full UUID.
         """
         from cloud_platform.modules.navigation.domain import Callback, encode_telegram_callback
 
         return encode_telegram_callback(
             Callback(flow="store", screen=screen, args=args), self._signing_key
         )
+
+    @staticmethod
+    def _offer_ref(offer_id: UUID) -> str:
+        """Compact reversible offer identity for Telegram callbacks."""
+        from cloud_platform.modules.navigation.domain import encode_offer_ref
+
+        return encode_offer_ref(offer_id)
 
     def markets_screen(self) -> list[MarketOptionView]:
         """The two markets the customer chooses between (always both)."""
@@ -795,11 +843,18 @@ class OfferCatalogViewService:
         groups: dict[tuple[object, ...], list[SellableOffer]] = {}
         for offer in sorted(offers, key=lambda o: (o.name, o.location_id, str(o.id))):
             groups.setdefault(self._product_signature(offer), []).append(offer)
+        names = await self._location_metadata(provider_key)
         views: list[ProductGroupView] = []
         for rows in groups.values():
             head = rows[0]
             # Order-preserving dedup: distinct locations, stable order.
             locations = tuple(dict.fromkeys(row.location_id for row in rows))
+            countries = tuple(
+                dict.fromkeys(
+                    (names.get(code, (code, None))[1] or "").strip().upper() for code in locations
+                )
+            )
+            countries = tuple(code for code in countries if code)
             views.append(
                 ProductGroupView(
                     product_id=head.product_id,
@@ -811,6 +866,7 @@ class OfferCatalogViewService:
                     monthly_price_minor=head.selling_price_minor,
                     currency=head.selling_currency,
                     locations=locations,
+                    country_codes=countries,
                     # The card is identified by product AND price AND currency:
                     # equal minor-unit values in different currencies are
                     # different cards and must never cross-match.
@@ -827,21 +883,123 @@ class OfferCatalogViewService:
         back = self._store_nav_callback("providers", market.value if market else "")
         return views, back, self._store_nav_callback("market")
 
-    async def product_locations_screen(
+    async def products_page(
+        self, provider_key: str, page: int = 1, page_size: int = PRODUCTS_PAGE_SIZE
+    ) -> ProductPageView:
+        """One page of a provider's product cards (6 per page by default).
+
+        Cards point at the plan-detail screen. Out-of-range pages clamp to
+        the nearest valid page instead of erroring on a stale pager button.
+        The detail callback carries no page (the return address would cost
+        wire bytes every card pays): detail back returns to page one.
+        """
+        products, back, cancel = await self.products_screen(provider_key)
+        total = len(products)
+        size = max(1, page_size)
+        total_pages = max(1, -(-total // size))
+        current = min(max(1, page), total_pages)
+        start = (current - 1) * size
+        items = tuple(products[start : start + size])
+        cards: list[ProductGroupView] = []
+        for card in items:
+            cards.append(
+                ProductGroupView(
+                    product_id=card.product_id,
+                    name=card.name,
+                    vcpu=card.vcpu,
+                    ram_gb=card.ram_gb,
+                    disk_gb=card.disk_gb,
+                    traffic=card.traffic,
+                    monthly_price_minor=card.monthly_price_minor,
+                    currency=card.currency,
+                    locations=card.locations,
+                    select_callback=self._store_nav_callback(
+                        "product_detail",
+                        provider_key,
+                        card.product_id,
+                        str(card.monthly_price_minor),
+                        card.currency,
+                    ),
+                    country_codes=card.country_codes,
+                )
+            )
+        return ProductPageView(
+            provider_key=provider_key,
+            items=tuple(cards),
+            page=current,
+            total_pages=total_pages,
+            total_cards=total,
+            back_callback=back,
+            cancel_callback=cancel,
+            prev_callback=(
+                self._store_nav_callback("products", provider_key, str(current - 1))
+                if current > 1
+                else None
+            ),
+            next_callback=(
+                self._store_nav_callback("products", provider_key, str(current + 1))
+                if current < total_pages
+                else None
+            ),
+        )
+
+    async def product_detail_screen(
         self,
         provider_key: str,
         product_id: str,
-        price_minor: int | None = None,
-        currency: str | None = None,
-    ) -> tuple[list[ProductLocationView], str, str]:
-        """Where one product is available, each row its own sellable offer.
+        price_minor: int,
+        currency: str,
+    ) -> ProductDetailView:
+        """One opened product card: full spec plus its per-location offers.
 
-        The product card is identified by product AND price AND currency:
-        ``price_minor`` together with ``currency`` narrow to the exact card
-        the customer tapped. A legacy callback that omits ``currency`` is
-        only honoured when it resolves to exactly one currency; an ambiguous
-        legacy callback is rejected instead of silently crossing currencies.
-        No currency is ever inferred or converted here.
+        The same strict card identity as the locations list (product AND
+        price AND currency). Back returns to the first products page.
+        """
+        offers = await self._card_offers(provider_key, product_id, price_minor, currency)
+        head = offers[0]
+        names = await self._location_metadata(provider_key)
+        locations = tuple(
+            ProductLocationView(
+                location_id=offer.location_id,
+                offer_id=offer.id,
+                name=names.get(offer.location_id, (offer.location_id, None))[0],
+                country_code=names.get(offer.location_id, (offer.location_id, None))[1],
+                product_name=offer.name,
+                monthly_price_minor=offer.selling_price_minor,
+                currency=offer.selling_currency,
+                select_callback=self._store_nav_callback("os", self._offer_ref(offer.id)),
+            )
+            for offer in sorted(offers, key=lambda o: o.location_id)
+        )
+        return ProductDetailView(
+            provider_key=provider_key,
+            product_id=head.product_id,
+            name=head.name,
+            vcpu=head.vcpu,
+            ram_gb=head.ram_gb,
+            disk_gb=head.disk_gb,
+            traffic=head.traffic,
+            monthly_price_minor=head.selling_price_minor,
+            currency=head.selling_currency,
+            technical_metadata=dict(head.technical_metadata or {}),
+            locations=locations,
+            back_callback=self._store_nav_callback("products", provider_key),
+            cancel_callback=self._store_nav_callback("market"),
+        )
+
+    async def _card_offers(
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int | None,
+        currency: str | None,
+    ) -> list[SellableOffer]:
+        """Offers of one exact product card (detail and locations screens share it).
+
+        The card identity is product AND price AND currency. A call that omits
+        ``currency`` is only honoured when it resolves to exactly one
+        (price, currency) pair; anything ambiguous is rejected instead of
+        silently crossing currencies. Nothing is ever inferred or converted.
         """
         candidates = [
             o
@@ -883,6 +1041,25 @@ class OfferCatalogViewService:
             raise OfferUnavailableError(
                 f"no sellable offers for product {product_id!r} of provider {provider_key!r}"
             )
+        return offers
+
+    async def product_locations_screen(
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int | None = None,
+        currency: str | None = None,
+    ) -> tuple[list[ProductLocationView], str, str]:
+        """Where one product is available, each row its own sellable offer.
+
+        The product card is identified by product AND price AND currency:
+        ``price_minor`` together with ``currency`` narrow to the exact card
+        the customer tapped. A legacy callback that omits ``currency`` is
+        only honoured when it resolves to exactly one currency; an ambiguous
+        legacy callback is rejected instead of silently crossing currencies.
+        No currency is ever inferred or converted here.
+        """
+        offers = await self._card_offers(provider_key, product_id, price_minor, currency)
         names = await self._location_metadata(provider_key)
         views = [
             ProductLocationView(
@@ -893,7 +1070,7 @@ class OfferCatalogViewService:
                 product_name=offer.name,
                 monthly_price_minor=offer.selling_price_minor,
                 currency=offer.selling_currency,
-                select_callback=self._store_callback("os", str(offer.id)),
+                select_callback=self._store_nav_callback("os", self._offer_ref(offer.id)),
             )
             for offer in sorted(offers, key=lambda o: o.location_id)
         ]
@@ -983,7 +1160,7 @@ class OfferCatalogViewService:
 
     def _os_select_callback(self, offer_id: UUID, index: int) -> str:
         """The signed callback that SELECTING this OS leads to (confirm)."""
-        return self._store_callback("confirm", str(offer_id), str(index))
+        return self._store_nav_callback("confirm", self._offer_ref(offer_id), str(index))
 
     async def os_by_index(self, offer: SellableOffer, index: int) -> str:
         """Resolve a callback-encoded OS index back to its name (re-validated)."""
@@ -1012,8 +1189,8 @@ class OfferCatalogViewService:
         wallet = await self._wallets.get(user_id)
         balance = wallet.balance if wallet is not None else 0
 
-        confirm_callback = self._store_callback("buy", str(offer_id), str(os_index))
-        back_callback = self._store_callback("os", str(offer_id))
+        confirm_callback = self._store_nav_callback("buy", self._offer_ref(offer_id), str(os_index))
+        back_callback = self._store_nav_callback("os", self._offer_ref(offer_id))
         cancel_callback = self._store_nav_callback("market")
         return OfferConfirmView(
             offer=self._view(offer),
@@ -1039,10 +1216,10 @@ class OfferCatalogViewService:
         if not options:
             raise OsUnavailableError(f"no free OS options for {offer.ref}")
 
-        # Back returns to the product's availability list, so the customer
+        # Back returns to the product's detail screen, so the customer
         # stays in product-first navigation (market -> provider -> product).
         back_callback = self._store_nav_callback(
-            "product_locations",
+            "product_detail",
             offer.provider_key,
             offer.product_id,
             str(offer.selling_price_minor),
@@ -1074,4 +1251,4 @@ class OfferCatalogViewService:
         return views, back_callback, cancel_callback
 
     def plan_callback(self, offer_id: UUID) -> str:
-        return self._store_callback("os", str(offer_id))
+        return self._store_nav_callback("os", self._offer_ref(offer_id))

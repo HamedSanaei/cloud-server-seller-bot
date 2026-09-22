@@ -69,6 +69,7 @@ from cloud_platform.providers.leaseweb.ordering import (
     LocationEligibility,
     LocationProbe,
     merge_candidates,
+    normalize_technical_spec,
 )
 from cloud_platform.providers.routing import DEFAULT_CREDENTIAL_ACCOUNT, CredentialAccountState
 
@@ -302,6 +303,9 @@ class SyncResult:
     #: Set when availability reconciliation ran; False means it was SKIPPED.
     availability_reconciled: bool = False
     marked_unavailable: int = 0
+    #: (product_id, location_id) pairs successfully persisted as AVAILABLE
+    #: this run — the only rows automatic pricing/publication may touch.
+    verified: frozenset[tuple[str, str]] = frozenset()
 
     @property
     def location_count(self) -> int:
@@ -532,6 +536,7 @@ class LeaseWebOrderingCatalogSyncer:
             for location in discovery.probes:
                 candidates.setdefault(location, []).append(account_id)
 
+        verified_pairs: set[tuple[str, str]] = set()
         for location, probing_accounts in candidates.items():
             verdicts: dict[str, LocationEligibility] = {}
             for account_id in self._accounts:
@@ -567,6 +572,7 @@ class LeaseWebOrderingCatalogSyncer:
                     errors,
                     warnings,
                     persistence_failures,
+                    verified_pairs,
                 )
             elif (
                 verdicts
@@ -662,6 +668,7 @@ class LeaseWebOrderingCatalogSyncer:
             ),
             availability_reconciled=availability_reconciled,
             marked_unavailable=marked_count,
+            verified=frozenset(verified_pairs),
         )
 
     # ------------------------------------------------------------------
@@ -723,6 +730,7 @@ class LeaseWebOrderingCatalogSyncer:
         errors: list[str],
         warnings: list[str],
         persistence_failures: list[str],
+        verified: set[tuple[str, str]],
     ) -> int:
         """Upsert every product a serving account reports at one location.
 
@@ -789,6 +797,7 @@ class LeaseWebOrderingCatalogSyncer:
                                 "billing_cycle": self._billing_cycle_of(account_id),
                                 "monthly_price_source": "contractTerms",
                             },
+                            technical_metadata=normalize_technical_spec(product).to_metadata(),
                             provider_available=False,
                         ),
                         errors=errors,
@@ -821,6 +830,7 @@ class LeaseWebOrderingCatalogSyncer:
                                 detail.available_locations if detail is not None else ()
                             ),
                         },
+                        technical_metadata=normalize_technical_spec(offer_product).to_metadata(),
                         provider_available=True,
                     ),
                     errors=errors,
@@ -828,6 +838,7 @@ class LeaseWebOrderingCatalogSyncer:
                     persistence_failures=persistence_failures,
                 ):
                     written += 1
+                    verified.add(pair)
         return written
 
     def _contract_term_of(self, account_id: str) -> str:

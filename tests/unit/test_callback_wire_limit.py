@@ -40,8 +40,10 @@ from cloud_platform.modules.navigation.domain import (
     CallbackError,
     decode_callback,
     encode_callback,
+    encode_offer_ref,
     encode_telegram_callback,
     ensure_telegram_callback_size,
+    resolve_offer_id_arg,
 )
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.users.domain import Role, User, UserStatus
@@ -187,6 +189,20 @@ class FakeView:
         currency: str | None = None,
     ) -> tuple[list[Any], str, str]:
         return await self._service.product_locations_screen(
+            provider_key, product_id, price_minor, currency
+        )
+
+    async def products_page(self, provider_key: str, page: int = 1) -> Any:
+        return await self._service.products_page(provider_key, page)
+
+    async def product_detail_screen(
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int,
+        currency: str,
+    ) -> Any:
+        return await self._service.product_detail_screen(
             provider_key, product_id, price_minor, currency
         )
 
@@ -436,14 +452,13 @@ class TestProductionShapedProductsScreen:
             availability = await _press(bot, card.callback_data or "")
             for button in _buttons(availability):
                 assert button.callback_data is not None
+                _assert_fits(button.callback_data)
                 target = _decode(button.callback_data)
                 if target.screen == "os":
-                    # Offer-identity row (full UUID, known pre-existing
-                    # exception): it must still point at the card's currency.
-                    offer = next(o for o in offers if str(o.id) == target.args[0])
+                    # Offer-identity row (compact ref): must point at the card's
+                    # currency and resolve to the exact offer UUID.
+                    offer = next(o for o in offers if o.id == resolve_offer_id_arg(target.args[0]))
                     assert offer.selling_currency == currency
-                else:
-                    _assert_fits(button.callback_data)
 
 
 class TestRepresentativeScreensInvariant:
@@ -533,21 +548,31 @@ class TestCallbackAudit:
             assert size <= TELEGRAM_CALLBACK_DATA_LIMIT_BYTES, label
         assert worst <= TELEGRAM_CALLBACK_DATA_LIMIT_BYTES
 
-    def test_audit_reports_overall_maximum(self) -> None:
-        # Full inventory including the known pre-existing over-limit
-        # offer-identity callbacks (full UUIDs in os/confirm/buy predate the
-        # wire alias and cannot fit without short references — tracked
-        # separately; generation of those stays permissive so the purchase
-        # flow and its tests keep working).
-        offer_shapes = [
+    def test_new_offer_callbacks_fit(self) -> None:
+        # Offer-identity callbacks now carry compact refs and fit.
+        for flow, screen, args in [
+            ("store", "os", (encode_offer_ref(UUID(OFFER_UUID)),)),
+            ("store", "confirm", (encode_offer_ref(UUID(OFFER_UUID)), "0")),
+            ("store", "buy", (encode_offer_ref(UUID(OFFER_UUID)), "0")),
+        ]:
+            encoded = encode_callback(Callback(flow, screen, args), SIGNING_KEY)
+            assert _size(encoded) <= TELEGRAM_CALLBACK_DATA_LIMIT_BYTES, (flow, screen)
+
+    def test_legacy_uuid_callbacks_still_decode(self) -> None:
+        # Callbacks signed before compact refs existed carry the plain UUID
+        # (over the old 64-byte budget, but decoding stays permissive) and
+        # must resolve to the exact same offer.
+        import hashlib
+        import hmac as hmac_lib
+
+        for flow, screen, args in [
             ("store", "os", (OFFER_UUID,)),
             ("store", "confirm", (OFFER_UUID, "0")),
             ("store", "buy", (OFFER_UUID, "0")),
-        ]
-        sizes = [
-            _size(encode_callback(Callback(flow, screen, args), SIGNING_KEY))
-            for flow, screen, args in offer_shapes
-        ]
-        maximum = max(sizes)
-        assert maximum == 72, f"audit maximum moved: {maximum} bytes"
-        assert maximum > TELEGRAM_CALLBACK_DATA_LIMIT_BYTES
+        ]:
+            key = ":".join((flow, screen, *args))
+            sig = hmac_lib.new(SIGNING_KEY.encode(), key.encode(), hashlib.sha256).hexdigest()[:16]
+            legacy = f"v1|{key}|{sig}"
+            decoded = _decode(legacy)
+            assert (decoded.flow, decoded.screen) == (flow, screen)
+            assert resolve_offer_id_arg(decoded.args[0]) == UUID(OFFER_UUID)

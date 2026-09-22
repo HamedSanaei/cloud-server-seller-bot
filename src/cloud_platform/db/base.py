@@ -466,12 +466,48 @@ class SellableOffer(Base):
     selling_price_minor = Column(BigInteger, nullable=False, server_default="0")
     selling_currency = Column(String(3), nullable=False, server_default="EUR")
     billing_parameters = Column(JSONB, nullable=False, server_default="{}")
+    #: Provider-neutral customer-visible technical facts normalized by the
+    #: adapters (architecture, storage type, ...). Never secrets, credential
+    #: ids, order ids or raw API payloads.
+    technical_metadata = Column(JSONB, nullable=False, server_default="{}")
     provider_available = Column(Boolean, nullable=False, server_default="true")
     enabled = Column(Boolean, nullable=False, server_default="false")
+    #: Explicit operator block: automatic publishing may enable an offer only
+    #: while this is false; catalog syncs never write it. ``offers disable``
+    #: sets it, ``offers enable`` clears it.
+    operator_disabled = Column(Boolean, nullable=False, server_default="false")
+    #: Whether the automatic pricing policy owns the selling price. A manual
+    #: ``offers price`` command clears it so the policy never overwrites an
+    #: operator-chosen price.
+    auto_priced = Column(Boolean, nullable=False, server_default="true")
     provider_account_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(
         DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
+
+
+class CatalogSyncState(Base):
+    """Latest automatic-sync outcome per provider (coordinator-owned).
+
+    Exactly one row per provider key, upserted after every coordinator run.
+    Operator diagnostics only — never customer-visible, never a sale gate.
+    """
+
+    __tablename__ = "catalog_sync_state"
+
+    provider_key = Column(String(32), primary_key=True)
+    last_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    last_success_at = Column(DateTime(timezone=True), nullable=True)
+    discovered = Column(Integer, nullable=False, server_default="0")
+    persisted = Column(Integer, nullable=False, server_default="0")
+    prices_updated = Column(Integer, nullable=False, server_default="0")
+    published = Column(Integer, nullable=False, server_default="0")
+    retired = Column(Integer, nullable=False, server_default="0")
+    warnings = Column(JSONB, nullable=False, server_default="[]")
+    errors = Column(JSONB, nullable=False, server_default="[]")
+    updated_at = Column(
+        DateTime(timezone=True), server_default=sa.text("CURRENT_TIMESTAMP"), nullable=True
     )
 
 

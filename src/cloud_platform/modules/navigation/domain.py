@@ -37,10 +37,13 @@ screen, so an undeclared action raises
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from uuid import UUID
 
 CALLBACK_VERSION = "v1"
 _CALLBACK_FIELD = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -54,6 +57,7 @@ TELEGRAM_CALLBACK_DATA_LIMIT_BYTES = 64
 #: currency-neutral by construction.
 _SCREEN_WIRE_ALIASES: dict[str, str] = {
     "product_locations": "pl",
+    "product_detail": "pd",
 }
 _WIRE_SCREEN_CANONICAL: dict[str, str] = {
     wire: canonical for canonical, wire in _SCREEN_WIRE_ALIASES.items()
@@ -149,6 +153,50 @@ def encode_callback(callback: Callback, signing_key: str) -> str:
     wire_screen = _SCREEN_WIRE_ALIASES.get(callback.screen, callback.screen)
     wire_key = ":".join((callback.flow, wire_screen, *callback.args))
     return f"{CALLBACK_VERSION}|{wire_key}|{_sign(callback.key, signing_key)}"
+
+
+#: Length of a compact offer reference: 16 UUID bytes as unpadded base64url.
+OFFER_REF_LEN = 22
+
+_OFFER_REF_RE = re.compile(r"^[A-Za-z0-9_-]{22}$")
+
+
+def encode_offer_ref(offer_id: UUID) -> str:
+    """Compact reversible offer identity for Telegram callbacks.
+
+    The 16 UUID bytes as unpadded base64url (~22 chars, URL-safe, restart-safe):
+    no server-side mapping is needed, so buttons survive bot restarts and
+    replicas resolve them identically. Tampering is still caught by the
+    callback HMAC, which covers the token string.
+    """
+    return base64.urlsafe_b64encode(offer_id.bytes).decode("ascii").rstrip("=")
+
+
+def decode_offer_ref(token: str) -> UUID:
+    """Reverse :func:`encode_offer_ref`; fails closed on malformed input."""
+    if not isinstance(token, str) or not _OFFER_REF_RE.fullmatch(token):
+        raise CallbackError(f"invalid offer reference: {token!r}")
+    try:
+        raw = base64.b64decode(token + "==", altchars=b"-_", validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CallbackError(f"invalid offer reference: {token!r}") from exc
+    if len(raw) != 16:
+        raise CallbackError(f"invalid offer reference: {token!r}")
+    return UUID(bytes=raw)
+
+
+def resolve_offer_id_arg(arg: str) -> UUID:
+    """Offer identity from a callback arg: legacy full UUID or compact ref.
+
+    Callbacks signed before compact refs existed carry the plain UUID and
+    must keep working; newly generated ones carry the token. Anything else
+    fails closed.
+    """
+    try:
+        return UUID(arg)
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return decode_offer_ref(arg)
 
 
 def ensure_telegram_callback_size(encoded: str) -> str:

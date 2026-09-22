@@ -36,7 +36,7 @@ from cloud_platform.modules.catalog.repository import (
     provider_key_to_uuid,
 )
 from cloud_platform.modules.catalog.service import PricingIngestionService
-from cloud_platform.modules.offers.domain import OfferSpecUpdate
+from cloud_platform.modules.offers.domain import OfferSpecUpdate, TechnicalSpec
 from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 from cloud_platform.providers.errors import (
     ProviderAuthError,
@@ -91,6 +91,12 @@ class OfferSyncResult:
     offers_written: int
     marked_unavailable: int
     warnings: tuple[str, ...]
+    #: (product_id, location_id) pairs successfully persisted this run — the
+    #: only rows automatic pricing/publication may touch.
+    verified: frozenset[tuple[str, str]] = frozenset()
+    #: Durable-write failures (never provider-data advisories). Any entry
+    #: here means the run is NOT a successful sync.
+    persistence_failures: tuple[str, ...] = ()
 
 
 class HetznerCatalogSyncer:
@@ -225,11 +231,14 @@ class HetznerCatalogSyncer:
                 result = await session.execute(stmt)
                 existing = result.scalars().first()
 
+                country = _normalize_country(item.get("country"))
+                city = str(item.get("city") or "").strip() or None
+                network_zone = str(item.get("network_zone") or "").strip() or None
                 if existing:
                     existing.name = str(item["name"])
-                    existing.country_code = item.get("country")
-                    existing.city = item.get("city")
-                    existing.network_zone = item.get("network_zone")
+                    existing.country_code = country
+                    existing.city = city
+                    existing.network_zone = network_zone
                     skipped += 1
                 else:
                     session.add(
@@ -237,9 +246,9 @@ class HetznerCatalogSyncer:
                             provider_id=provider_id,
                             location_id=loc_id,
                             name=str(item["name"]),
-                            country_code=item.get("country"),
-                            city=item.get("city"),
-                            network_zone=item.get("network_zone"),
+                            country_code=country,
+                            city=city,
+                            network_zone=network_zone,
                         )
                     )
                     upserted += 1
@@ -457,8 +466,10 @@ class HetznerCatalogSyncer:
         repo = SqlAlchemySellableOfferRepository(self._session_factory)
         locations, location_errors = await self._offer_locations()
         available: set[tuple[str, str]] = set()
+        verified: set[tuple[str, str]] = set()
         reports: list[LocationOfferReport] = []
         warnings: list[str] = list(location_errors)
+        persistence_failures: list[str] = []
         written = 0
 
         for location_id in locations:
@@ -476,6 +487,7 @@ class HetznerCatalogSyncer:
                 warnings.append(f"location {location_id}: {type(exc).__name__}")
                 continue
             counted = 0
+            location_failed = False
             for item in items:
                 spec = _offer_spec_from_hetzner(item, location_id)
                 if spec is None:
@@ -483,16 +495,36 @@ class HetznerCatalogSyncer:
                         f"{location_id}: server type {item.get('name')} has no monthly price"
                     )
                     continue
-                await repo.upsert_from_provider(
-                    provider_key=PROVIDER_KEY,
-                    product_id=spec.product_id,
-                    location_id=location_id,
-                    update=spec.update,
-                )
+                try:
+                    await repo.upsert_from_provider(
+                        provider_key=PROVIDER_KEY,
+                        product_id=spec.product_id,
+                        location_id=location_id,
+                        update=spec.update,
+                    )
+                except Exception as exc:
+                    # A durable-write failure fails this location closed: its
+                    # pairs stay out of ``available``/``verified`` (so they
+                    # are neither repriced nor retired) and the location
+                    # counts as errored (so nothing is retired globally).
+                    persistence_failures.append(f"upsert {spec.product_id}/{location_id}: {exc}")
+                    warnings.append(
+                        f"{location_id}: keeping last-known offers "
+                        f"({type(exc).__name__}); nothing retired"
+                    )
+                    location_failed = True
+                    continue
                 available.add((spec.product_id, location_id))
+                verified.add((spec.product_id, location_id))
                 counted += 1
                 written += 1
-            reports.append(LocationOfferReport(location_id=location_id, products=counted))
+            reports.append(
+                LocationOfferReport(
+                    location_id=location_id,
+                    products=counted,
+                    error="persistence failure" if location_failed else None,
+                )
+            )
 
         # Only reconcile availability when EVERY configured location synced: a
         # partial view of the catalog must not retire offers we simply could
@@ -508,6 +540,8 @@ class HetznerCatalogSyncer:
             offers_written=written,
             marked_unavailable=marked,
             warnings=tuple(warnings),
+            verified=frozenset(verified),
+            persistence_failures=tuple(persistence_failures),
         )
 
     async def probe_locations(self) -> tuple[list[str], list[str]]:
@@ -603,6 +637,10 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
     # an operator can match against the Hetzner console (and the provider
     # accepts it wherever an id is accepted).
     name = str(item.get("name") or item["id"])
+    raw_architecture = str(item.get("architecture") or "").strip()
+    architecture = raw_architecture if raw_architecture.lower() != "unknown" else ""
+    cpu_type = item.get("cpu_type")
+    storage_type = item.get("storage_type")
     return _OfferSpec(
         product_id=name,
         update=OfferSpecUpdate(
@@ -613,6 +651,12 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
             traffic=_traffic_label(item.get("included_traffic")),
             provider_cost_minor=monthly,
             provider_cost_currency=CURRENCY,
+            technical_metadata=TechnicalSpec(
+                architecture=architecture or None,
+                cpu_type=str(cpu_type) if cpu_type else None,
+                storage_type=str(storage_type) if storage_type else None,
+                deprecated=bool(item.get("deprecated", False)),
+            ).to_metadata(),
             billing_parameters={
                 "contract_term": "1_MONTH",
                 "billing_cycle": "1_MONTH",
@@ -655,6 +699,19 @@ def _monthly_minor(raw: dict[str, Any]) -> int | None:
     if value <= 0:
         return None
     return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _normalize_country(value: Any) -> str | None:
+    """ISO country from the provider's own location payload.
+
+    The /locations API is authoritative; this only trims case/whitespace so
+    a ragged payload cannot poison the flag lookup. Anything that is not a
+    2-letter code becomes unknown (None), never a guessed country.
+    """
+    code = str(value or "").strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return None
+    return code
 
 
 def _memory_gb(value: Any) -> int:

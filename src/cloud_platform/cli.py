@@ -1415,6 +1415,97 @@ async def offers_preview(market: str | None) -> int:
     return 0
 
 
+async def catalog_auto_sync_doctor() -> int:
+    """Read-only: automatic catalog sync configuration and per-provider status.
+
+    Shows whether the coordinator is enabled, at which interval, which
+    pricing/publication policy each provider has, whether its credential is
+    configured (presence only — never a secret), the last attempt/success
+    with the last run's counters, and how many offers are sellable right
+    now. After the one-time server configuration, plan changes need no
+    manual sync-offers / price-book / enable commands.
+    """
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+    from cloud_platform.modules.offers.repository import (
+        SqlAlchemyCatalogSyncStateRepository,
+        SqlAlchemySellableOfferRepository,
+    )
+
+    settings = get_settings()
+    policies = pricing_policies_from_settings(settings)
+    try:
+        states = {
+            state.provider_key: state
+            for state in await SqlAlchemyCatalogSyncStateRepository(SessionFactory).list_all()
+        }
+        rows = await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+    except Exception as exc:
+        print(f"error: catalog state unreadable ({type(exc).__name__})")
+        return 1
+
+    sellable: dict[str, int] = {}
+    stored: dict[str, int] = {}
+    for row in rows:
+        stored[row.provider_key] = stored.get(row.provider_key, 0) + 1
+        if row.sellable:
+            sellable[row.provider_key] = sellable.get(row.provider_key, 0) + 1
+
+    leaseweb_credential = bool(settings.leaseweb_api_key)
+    try:
+        from cloud_platform.providers.leaseweb.accounts import build_leaseweb_account_router
+
+        router = build_leaseweb_account_router(settings)
+        if router is not None:
+            leaseweb_credential = True
+    except Exception:
+        pass
+    credentials = {
+        "leaseweb": leaseweb_credential,
+        "hetzner": bool(settings.hetzner_api_token),
+    }
+
+    toggle = "enabled" if settings.storefront_catalog_sync_enabled else "disabled"
+    print(f"catalog auto-sync: {toggle}")
+    print(f"interval: {settings.storefront_catalog_sync_interval_seconds}s")
+    print("")
+    for provider_key in sorted(set(stored) | set(states) | set(policies) | set(credentials)):
+        enabled = settings.providers_enabled.get(provider_key, True)
+        policy = policies.get(provider_key)
+        state = states.get(provider_key)
+        print(f"{provider_key}:")
+        print(f"  enabled: {'yes' if enabled else 'no'}")
+        print(f"  credential configured: {'yes' if credentials.get(provider_key) else 'no'}")
+        if policy is not None:
+            print(
+                f"  auto pricing: {policy.mode} {policy.markup_percent}%\n"
+                f"  auto publish: {'yes' if policy.auto_publish else 'no'}"
+            )
+        else:
+            print("  auto pricing: not configured (costs refresh only)")
+        if state is not None and state.last_attempted_at is not None:
+            print(f"  last attempt: {state.last_attempted_at.isoformat()}")
+            print(
+                f"  last success: "
+                f"{state.last_success_at.isoformat() if state.last_success_at else 'never'}"
+            )
+            print(
+                f"  last run: discovered={state.discovered} persisted={state.persisted} "
+                f"prices={state.prices_updated} published={state.published} "
+                f"retired={state.retired}"
+            )
+            for warning in state.warnings[:5]:
+                print(f"    warning: {warning}")
+            for error in state.errors[:5]:
+                print(f"    error: {error}")
+        else:
+            print("  last success: never (no coordinator run recorded)")
+        print(f"  sellable: {sellable.get(provider_key, 0)} (stored={stored.get(provider_key, 0)})")
+        print("")
+    return 0
+
+
 async def offers_price_book(
     provider: str,
     markup_percent: int,
@@ -1475,6 +1566,9 @@ async def offers_price_book(
             priced += 1
             continue
         await repo.set_selling_price(row.id, price, currency)
+        # Operator-invoked bulk pricing is manual: the automatic policy must
+        # never overwrite a price the operator chose explicitly.
+        await repo.set_auto_priced(row.id, False)
         print(
             f"priced {row.ref}: {price} {currency} "
             f"(cost {row.provider_cost_minor}, +{markup_percent}%)"
@@ -1499,16 +1593,23 @@ async def offers_set(offer_id: str, action: str, price: str | None, currency: st
     repo = SqlAlchemySellableOfferRepository(SessionFactory)
     try:
         if action == "enable":
+            # Explicit enable clears the operator block so the offer may sell.
             offer = await repo.set_enabled(UUID(offer_id), True)
+            offer = await repo.set_operator_disabled(UUID(offer_id), False)
             print(f"enabled {offer.ref}")
         elif action == "disable":
+            # Explicit disable persists an operator block that automatic
+            # publishing never undoes (only another enable clears it).
             offer = await repo.set_enabled(UUID(offer_id), False)
-            print(f"disabled {offer.ref}")
+            offer = await repo.set_operator_disabled(UUID(offer_id), True)
+            print(f"disabled {offer.ref} (operator block recorded)")
         elif action == "price":
             if price is None:
                 print("price requires a minor-unit amount")
                 return 2
             offer = await repo.set_selling_price(UUID(offer_id), int(price), currency or "EUR")
+            # A manually set price opts out of the automatic pricing policy.
+            offer = await repo.set_auto_priced(UUID(offer_id), False)
             print(f"priced {offer.ref}: {offer.selling_price_minor} {offer.selling_currency}")
         else:  # pragma: no cover
             print(f"unknown action {action}")
@@ -1958,6 +2059,12 @@ def _parser() -> argparse.ArgumentParser:
     price.add_argument("minor", type=int, help="selling price in minor units (e.g. 1299 = 12.99)")
     price.add_argument("currency", nargs="?", default="EUR")
 
+    catalog = sub.add_parser("catalog", help="automatic catalog sync operations")
+    catalog_sub = catalog.add_subparsers(dest="subcommand", required=True)
+    auto_sync = catalog_sub.add_parser("auto-sync", help="periodic offer refresh")
+    auto_sync_sub = auto_sync.add_subparsers(dest="subsubcommand", required=True)
+    auto_sync_sub.add_parser("doctor", help="read-only sync configuration and status")
+
     users = sub.add_parser("users")
     users_sub = users.add_subparsers(dest="subcommand", required=True)
     find = users_sub.add_parser("find")
@@ -2091,6 +2198,11 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.subcommand == "price":
             return await offers_set(args.offer_id, "price", str(args.minor), args.currency)
         return await offers_set(args.offer_id, args.subcommand, None, None)
+    if args.command == "catalog":
+        if args.subcommand == "auto-sync" and args.subsubcommand == "doctor":
+            return await catalog_auto_sync_doctor()
+        print(f"unknown command catalog {args.subcommand}")  # pragma: no cover
+        return 2
     if args.command == "users":
         return await users_find(args.telegram_id)
     if args.command == "wallet":

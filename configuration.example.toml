@@ -143,6 +143,32 @@ display_name = "Hetzner"
 api_token = "CHANGE_ME"
 base_url = "https://api.hetzner.cloud/v1"
 
+# ---------------------------------------------------------------------------
+# Automatic catalog sync + pricing (STOREFRONT-V2, one-time setup)
+#
+# After this section, provider plan changes need NO manual
+# sync-offers / price-book / enable commands: the worker refreshes costs
+# from the official APIs every interval, reprices auto-priced rows with the
+# configured markup (same currency, integer minor units) and publishes
+# eligible rows — unless the operator blocked them (offers disable), which
+# the sync never undoes. Verify with:
+#   python -m cloud_platform.cli catalog auto-sync doctor
+# ---------------------------------------------------------------------------
+
+[storefront.catalog_sync]
+enabled = true
+interval_seconds = 900
+
+[storefront.pricing.leaseweb]
+mode = "markup"
+markup_percent = 25
+auto_publish = true
+
+[storefront.pricing.hetzner]
+mode = "markup"
+markup_percent = 25
+auto_publish = true
+
 [payments.zarinpal]
 enabled = true
 merchant_id = "CHANGE_ME"

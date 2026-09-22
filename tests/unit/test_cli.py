@@ -582,6 +582,10 @@ class TestOffersCommands:
         repo = AsyncMock()
         repo.set_selling_price = AsyncMock(return_value=_offer(selling_price_minor=1899))
         repo.set_enabled = AsyncMock(return_value=_offer(enabled=True))
+        repo.set_auto_priced = AsyncMock(
+            return_value=_offer(selling_price_minor=1899, auto_priced=False)
+        )
+        repo.set_operator_disabled = AsyncMock(return_value=_offer(enabled=True))
         monkeypatch.setattr(
             "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
             _fake_repo_class(repo),

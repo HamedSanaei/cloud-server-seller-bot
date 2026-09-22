@@ -137,7 +137,7 @@ class TestCronWiring:
         jobs = ws._cron_jobs()
         names = {getattr(job, "coroutine", getattr(job, "func", None)).__name__ for job in jobs}
         assert {
-            "sync_leaseweb_offers",
+            "catalog_auto_sync",
             "process_leaseweb_orders",
             "reconcile_leaseweb_orders",
             "check_renewals",
@@ -199,8 +199,8 @@ class TestWorkerLifecycleAndNotifiers:
         assert len(by_name) == 6
         assert by_name["process_leaseweb_orders"].minute == set(range(0, 60, 2))
         assert by_name["reconcile_leaseweb_orders"].minute == set(range(0, 60, 3))
-        # Dynamic eligibility discovery needs a short freshness bound.
-        assert by_name["sync_leaseweb_offers"].minute == set(range(0, 60, 10))
+        # Catalog auto-sync runs at the configured interval (15 min default).
+        assert by_name["catalog_auto_sync"].minute == set(range(0, 60, 15))
         assert by_name["check_renewals"].hour == {3}
         # Tetraminator pending-payment reconciliation is bounded polling.
         assert by_name["reconcile_tetraminator_payments"].minute == set(range(0, 60, 15))

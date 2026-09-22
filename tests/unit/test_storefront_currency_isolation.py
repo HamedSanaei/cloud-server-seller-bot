@@ -31,7 +31,11 @@ from cloud_platform.modules.checkout.service import (
     OfferUnavailableError,
 )
 from cloud_platform.modules.markets.domain import ProviderCatalog
-from cloud_platform.modules.navigation.domain import Callback, decode_callback
+from cloud_platform.modules.navigation.domain import (
+    Callback,
+    decode_callback,
+    resolve_offer_id_arg,
+)
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.users.domain import Role, User, UserStatus
 
@@ -244,6 +248,20 @@ class FakeView:
             provider_key, product_id, price_minor, currency
         )
 
+    async def products_page(self, provider_key: str, page: int = 1) -> Any:
+        return await self._service.products_page(provider_key, page)
+
+    async def product_detail_screen(
+        self,
+        provider_key: str,
+        product_id: str,
+        price_minor: int,
+        currency: str,
+    ) -> Any:
+        return await self._service.product_detail_screen(
+            provider_key, product_id, price_minor, currency
+        )
+
     async def plans_screen(
         self, location_id: str, provider_key: str | None = None
     ) -> tuple[list[Any], str, str]:
@@ -399,18 +417,18 @@ class TestCurrencyCardIdentity:
         for offer in offers:
             _view, _options, back_callback, _cancel = await service.os_screen(offer_id=offer.id)
             target = _decode(back_callback)
-            assert (target.flow, target.screen) == ("store", "product_locations")
+            assert (target.flow, target.screen) == ("store", "product_detail")
             assert target.args == (
                 offer.provider_key,
                 offer.product_id,
                 str(offer.selling_price_minor),
                 offer.selling_currency,
             )
-            locations, _, _ = await service.product_locations_screen(
+            detail = await service.product_detail_screen(
                 target.args[0], target.args[1], int(target.args[2]), target.args[3]
             )
-            assert [view.offer_id for view in locations] == [offer.id]
-            assert {view.currency for view in locations} == {offer.selling_currency}
+            assert [view.offer_id for view in detail.locations] == [offer.id]
+            assert {view.currency for view in detail.locations} == {offer.selling_currency}
 
     async def test_confirmation_uses_the_exact_selected_offer_and_currency(self) -> None:
         offers = _currency_pair_offers()
@@ -421,7 +439,7 @@ class TestCurrencyCardIdentity:
             assert view.currency == offer.selling_currency
             assert view.offer.monthly_price_minor == offer.selling_price_minor
             confirm = _decode(view.confirm_callback)
-            assert offer.id == UUID(confirm.args[0])
+            assert offer.id == resolve_offer_id_arg(confirm.args[0])
 
     async def test_isolation_is_provider_neutral(self) -> None:
         """Same shape with another provider and other currencies stays apart."""
@@ -503,9 +521,9 @@ class TestLegacyCallbacks:
         legacy = bot._callback("store", "product_locations", PROVIDER, PRODUCT, str(PRICE))
         screen = await _press(bot, legacy)
         # Re-rendered products screen: forward buttons are product cards
-        # (4-arg product_locations), never OS rows of a mixed location list.
+        # (4-arg product_detail), never OS rows of a mixed location list.
         targets = [_decode(b.callback_data) for b in _buttons(screen)]
-        forward = [t for t in targets if t.screen == "product_locations"]
+        forward = [t for t in targets if t.screen == "product_detail"]
         assert forward, "legacy callback must fall back to the product cards"
         assert all(len(t.args) == 4 for t in forward)
         assert not any(t.screen == "os" for t in targets)
@@ -552,7 +570,7 @@ class TestUiNavigation:
         )
         os_screen = await _press(bot, location_button.callback_data)
         back = next(
-            b for b in _buttons(os_screen) if _decode(b.callback_data).screen == "product_locations"
+            b for b in _buttons(os_screen) if _decode(b.callback_data).screen == "product_detail"
         )
         back_target = _decode(back.callback_data)
         assert back_target.args == card_target.args
