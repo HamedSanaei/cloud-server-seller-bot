@@ -179,6 +179,8 @@ KNOWN_VPS_DATACENTERS: tuple[str, ...] = (
     "FRA-14",
     "LAX-12",
     "LON-01",
+    "LON-11",
+    "LON-12",
     "MTL-02",
     "SFO-12",
     "SIN-01",
@@ -303,11 +305,17 @@ _ORDER_STATUS_MAP: dict[str, str] = {
 
 #: Datacenter code -> (country, city) display metadata. This is operator
 #: display data for the customer UI (geography, not pricing); unknown codes
-#: fall back to the code itself.
+#: fall back to the city-prefix table below, then to the code itself.
+#: Sibling halls in one city carry explicit rows so the normalized
+#: ProviderLocation record never depends on the fallback alone.
 LOCATION_DISPLAY: dict[str, tuple[str, str]] = {
     "AMS-01": ("NL", "Amsterdam"),
     "FRA-01": ("DE", "Frankfurt"),
+    "FRA-10": ("DE", "Frankfurt"),
+    "FRA-14": ("DE", "Frankfurt"),
     "LON-01": ("GB", "London"),
+    "LON-11": ("GB", "London"),
+    "LON-12": ("GB", "London"),
     "WDC-02": ("US", "Washington"),
     "SFO-12": ("US", "San Francisco"),
     "LAX-12": ("US", "Los Angeles"),
@@ -629,15 +637,17 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
     def describe_location(self, code: str) -> ProviderLocation:
         """Display metadata for a location code without authorizing it.
 
-        Unknown codes are retained verbatim (empty country, no city) so a
-        newly enabled datacenter keeps working the moment it appears in a
+        The friendly city is the display name when the adapter knows it, so
+        customer buttons read "Frankfurt" instead of a raw code; unknown
+        codes are retained verbatim (empty country, no city) so a newly
+        enabled datacenter keeps working the moment it appears in a
         provider response.
         """
         normalized = (code or "").strip().upper()
         country, city, source = describe_location_code(normalized)
         return ProviderLocation(
             id=normalized,
-            name=normalized,
+            name=city or normalized,
             country_code=country,
             city=city or None,
             metadata={"source": source},

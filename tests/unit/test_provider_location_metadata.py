@@ -1,9 +1,10 @@
 """Provider location metadata normalization (STOREFRONT-V2).
 
-- Leaseweb ordering discovery has no location-list endpoint, so an
-  ordering-discovered code with no exact display entry (FRA-10, FRA-14,
-  LON-11, LON-12) resolves through the adapter-internal city-prefix
-  fallback — never metadata-less, never guessed outside the adapter.
+- Leaseweb sibling halls (FRA-10/FRA-14/LON-11/LON-12) carry explicit
+  display entries so ordering-discovered locations never stay
+  metadata-less; any future hall in a known city still resolves through
+  the adapter-internal city-prefix fallback — never guessed outside the
+  adapter.
 - Hetzner normalizes its own /locations payload defensively (case,
   whitespace, non-codes become unknown, never a guessed country).
 """
@@ -37,10 +38,30 @@ class TestLeasewebLocationCodes:
         )
 
     def test_ordering_only_codes_resolve_by_prefix(self) -> None:
-        assert describe_location_code("FRA-10") == ("DE", "Frankfurt", "leaseweb-ordering-prefix")
-        assert describe_location_code("FRA-14") == ("DE", "Frankfurt", "leaseweb-ordering-prefix")
-        assert describe_location_code("LON-11") == ("GB", "London", "leaseweb-ordering-prefix")
-        assert describe_location_code("LON-12") == ("GB", "London", "leaseweb-ordering-prefix")
+        # Sibling halls carry explicit rows (exact source wins); a future
+        # hall with no explicit row still resolves via the city prefix.
+        assert describe_location_code("FRA-10") == (
+            "DE",
+            "Frankfurt",
+            "leaseweb-ordering-discovery",
+        )
+        assert describe_location_code("FRA-14") == (
+            "DE",
+            "Frankfurt",
+            "leaseweb-ordering-discovery",
+        )
+        assert describe_location_code("LON-11") == (
+            "GB",
+            "London",
+            "leaseweb-ordering-discovery",
+        )
+        assert describe_location_code("LON-12") == (
+            "GB",
+            "London",
+            "leaseweb-ordering-discovery",
+        )
+        assert describe_location_code("FRA-11") == ("DE", "Frankfurt", "leaseweb-ordering-prefix")
+        assert describe_location_code("LON-13") == ("GB", "London", "leaseweb-ordering-prefix")
 
     def test_codes_are_case_insensitive(self) -> None:
         assert describe_location_code("fra-10")[0] == "DE"

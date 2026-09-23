@@ -772,6 +772,7 @@ class OfferCatalogViewService:
         market_catalog: ProviderCatalog | None = None,
         location_repo: LocationRepository | None = None,
         cloud_providers: Mapping[str, Any] | None = None,
+        cloud_resolver: Any | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
@@ -782,6 +783,11 @@ class OfferCatalogViewService:
         self._signing_key = signing_key
         self._markets = market_catalog or ProviderCatalog()
         self._cloud = dict(cloud_providers or {})
+        # Provider-neutral hourly-cloud dispatch (multi-account): resolves
+        # (provider_key, credential_account_id) to the exact adapter that
+        # owns the observation. The plain dict stays as the legacy
+        # single-adapter fallback. No provider-name branching here.
+        self._cloud_resolver = cloud_resolver
 
     # -- storefront: markets / providers / locations -----------------------
 
@@ -1294,9 +1300,21 @@ class OfferCatalogViewService:
 
     # -- storefront: hourly cloud ----------------------------------------
 
-    def _hourly_provider(self, provider_key: str) -> Any:
+    def _hourly_provider(self, provider_key: str, credential_account_id: str | None = None) -> Any:
         # Hourly cloud adapter for live image reads (screens only; sync and
-        # creation resolve their own adapter from configuration).
+        # creation resolve their own adapter from configuration). The owning
+        # credential account selects the adapter — never a first-configured
+        # default — with the legacy dict as the single-adapter fallback.
+        resolver = getattr(self, "_cloud_resolver", None)
+        if resolver is not None:
+            try:
+                adapter = resolver.adapter_for(provider_key, credential_account_id)
+            except Exception as exc:
+                raise OfferUnavailableError(
+                    f"provider {provider_key!r} has no hourly cloud adapter"
+                ) from exc
+            if adapter is not None:
+                return adapter
         try:
             return self._cloud[provider_key]
         except KeyError:
@@ -1544,7 +1562,9 @@ class OfferCatalogViewService:
             raise OfferUnavailableError(f"offer {offer_id} is not sellable")
         if offer.billing_model != BILLING_MODEL_HOURLY:
             raise OfferUnavailableError(f"offer {offer_id} is not an hourly plan")
-        provider = self._hourly_provider(offer.provider_key)
+        provider = self._hourly_provider(
+            offer.provider_key, getattr(offer, "provider_account_id", None)
+        )
         try:
             images = await provider.list_images(offer.location_id)
         except Exception as exc:
@@ -1570,7 +1590,9 @@ class OfferCatalogViewService:
     async def cloud_image_by_index(self, offer: SellableOffer, index: int) -> Any:
         # Resolve a callback-encoded image index back to its record
         # (re-fetched live, so a stale index simply fails).
-        provider = self._hourly_provider(offer.provider_key)
+        provider = self._hourly_provider(
+            offer.provider_key, getattr(offer, "provider_account_id", None)
+        )
         try:
             images = await provider.list_images(offer.location_id)
         except Exception as exc:

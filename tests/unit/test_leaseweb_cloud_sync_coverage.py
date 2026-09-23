@@ -327,7 +327,13 @@ class _SyncOffersRepo:
         self._mark_error = mark_error
 
     async def upsert_from_provider(
-        self, *, provider_key: str, product_id: str, location_id: str, update: Any
+        self,
+        *,
+        provider_key: str,
+        product_id: str,
+        location_id: str,
+        update: Any,
+        provider_account_id: str | None = None,
     ) -> None:
         if f"{product_id}/{location_id}" in self._fail_on:
             raise RuntimeError(f"db write failed for {product_id}/{location_id}")
@@ -360,6 +366,11 @@ async def run_sync(provider: Any, repo: Any, locations: Any) -> Any:
     syncer = LeasewebHourlyCloudSyncer.__new__(LeasewebHourlyCloudSyncer)
     syncer._session_factory = None
     syncer._provider = provider
+    # Multi-account syncer reads _accounts/_priorities/_states; legacy
+    # single-provider tests set only _provider, so mirror it here.
+    syncer._accounts = {"default": provider}
+    syncer._priorities = {}
+    syncer._states = {}
     with (
         mock.patch.object(mod, "SqlAlchemySellableOfferRepository", lambda sf: repo),
         mock.patch(

@@ -560,13 +560,14 @@ class MonthlyBotUi:
         if not view.items:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         rows: list[list[InlineKeyboardButton]] = []
-        for location in view.items:
+        labels = self._location_button_labels(
+            [(item.name, item.location_id, item.country_code) for item in view.items]
+        )
+        for location, label in zip(view.items, labels, strict=True):
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=self._location_label(
-                            location.name, location.location_id, location.country_code
-                        ),
+                        text=label,
                         callback_data=location.select_callback,
                     )
                 ]
@@ -672,7 +673,7 @@ class MonthlyBotUi:
             "",
             self._t.t(
                 "store.detail_location",
-                location=self._location_label(
+                location=self._location_detail(
                     detail.location_name, offer.location_id, detail.location_country
                 ),
             ),
@@ -763,13 +764,14 @@ class MonthlyBotUi:
         if not view.items:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         rows: list[list[InlineKeyboardButton]] = []
-        for location in view.items:
+        labels = self._location_button_labels(
+            [(item.name, item.location_id, item.country_code) for item in view.items]
+        )
+        for location, label in zip(view.items, labels, strict=True):
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=self._location_label(
-                            location.name, location.location_id, location.country_code
-                        ),
+                        text=label,
                         callback_data=location.select_callback,
                     )
                 ]
@@ -897,7 +899,7 @@ class MonthlyBotUi:
             "",
             self._t.t(
                 "store.detail_location",
-                location=self._location_label(
+                location=self._location_detail(
                     detail.location_name, offer.location_id, detail.location_country
                 ),
             ),
@@ -1042,7 +1044,7 @@ class MonthlyBotUi:
             self._t.t("store.cloud_confirm_plan", plan=view.offer.name),
             self._t.t(
                 "store.cloud_confirm_location",
-                location=self._location_label(
+                location=self._location_detail(
                     view.location_name, view.offer.location_id, view.location_country
                 ),
             ),
@@ -1110,7 +1112,7 @@ class MonthlyBotUi:
                     InlineKeyboardButton(
                         text=self._t.t(
                             "store.product_location_row",
-                            location=self._location_label(
+                            location=self._location_detail(
                                 item.name, item.location_id, item.country_code
                             ),
                             price=price,
@@ -1135,29 +1137,51 @@ class MonthlyBotUi:
         )
 
     @staticmethod
-    def _location_label(name: str, location_id: str, country_code: str | None) -> str:
-        """Customer-facing availability label: ``🇩🇪 Frankfurt FRA-01``.
-
-        Presentation only — a location whose catalog row has not synced yet
-        still shows (as its code) instead of disappearing, and no provider is
-        special-cased: the flag comes from the synced ISO country code.
-        """
-        label = (name or "").strip() or location_id
-        if label == location_id:
-            return f"{_country_flag(country_code)}{location_id}".strip()
-        return f"{_country_flag(country_code)}{label} {location_id}".strip()
+    def _location_display_name(name: str | None, location_id: str) -> str:
+        """Friendly name if the catalog row states one, else the raw code."""
+        return (name or "").strip() or location_id
 
     @staticmethod
-    def _card_flags(country_codes: tuple[str, ...]) -> str:
-        """Compact flag prefix for a product card (presentation only).
+    def _location_button(
+        name: str | None, location_id: str, country_code: str | None, show_code: bool
+    ) -> str:
+        """Customer-facing location button: flag + friendly name.
 
-        One flag when every location shares a country, every distinct flag
-        when countries genuinely share a card, a neutral globe when no
-        synced row states a country. The codes come from synced location
-        rows — never inferred from provider or location names here.
+        The raw code is appended only when the caller asks (several halls of
+        one city would otherwise render identical buttons). The flag comes
+        from the synced ISO country code only — never inferred here.
         """
-        flags = "".join(_country_flag(code) for code in dict.fromkeys(country_codes))
-        return flags or "\U0001f310 "
+        base = MonthlyBotUi._location_display_name(name, location_id)
+        text = f"{_country_flag(country_code)}{base}"
+        if show_code and base != location_id:
+            text += f" — {location_id}"
+        return text.strip()
+
+    @staticmethod
+    def _location_detail(name: str | None, location_id: str, country_code: str | None) -> str:
+        """Customer-facing location line for message/detail text.
+
+        Always carries the code (``🇩🇪 Frankfurt — FRA-10``) so an exact
+        datacenter stays identifiable outside the button list.
+        """
+        return MonthlyBotUi._location_button(name, location_id, country_code, True)
+
+    @staticmethod
+    def _location_button_labels(
+        items: list[tuple[str | None, str, str | None]],
+    ) -> list[str]:
+        """Button labels for one location list, codes only on name collisions.
+
+        ``items`` are ``(name, location_id, country_code)`` triples in display
+        order; halls sharing one friendly name keep their code so every
+        button stays distinguishable.
+        """
+        names = [MonthlyBotUi._location_display_name(name, code) for name, code, _ in items]
+        crowded = {name for name in names if names.count(name) > 1}
+        return [
+            MonthlyBotUi._location_button(name, code, country, display in crowded)
+            for (name, code, country), display in zip(items, names, strict=True)
+        ]
 
     def _provider_name(self, provider_key: str) -> str:
         """Customer-facing provider name from configuration (never the key)."""

@@ -59,6 +59,26 @@ class HourlyNotAvailableError(HourlyError):
     """The hourly offer/image selection is not currently creatable."""
 
 
+class HourlyCloudResolver:
+    """Provider-neutral port for hourly cloud adapters (multi-account).
+
+    Resolves ``(provider_key, credential_account_id)`` to the exact cloud
+    adapter that owns the observation. ``credential_account_id`` is the
+    opaque, non-secret account id persisted on the hourly offer at sync
+    time (``SellableOffer.provider_account_id``) and pinned on the hourly
+    server at creation time. ``None`` resolves to the provider's logical
+    default adapter (single-credential deployments and legacy rows).
+
+    Implementations live in infrastructure (the container builds one from
+    the Leaseweb cloud account router); domain/application code depends
+    only on this port and never on a concrete provider name.
+    """
+
+    def adapter_for(self, provider_key: str, credential_account_id: str | None = None) -> Any:
+        """The cloud adapter for a pinned credential account."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class HourlyCreateResult:
     """Outcome of the hourly creation command."""
@@ -91,6 +111,7 @@ class HourlyCloudService:
         operation_repo: OperationRepository,
         audit_repo: AuditRepository,
         cloud_providers: dict[str, Any] | None = None,
+        cloud_resolver: HourlyCloudResolver | Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -100,6 +121,30 @@ class HourlyCloudService:
         self._ops = operation_repo
         self._audit = AuditTrail(audit_repo)
         self._cloud = dict(cloud_providers or {})
+        # Provider-neutral account-aware resolution (multi-account hourly):
+        # the resolver maps (provider_key, credential_account_id) to the
+        # exact adapter that owns the observation. The plain dict stays as
+        # the legacy fallback for single-credential deployments.
+        self._cloud_resolver = cloud_resolver
+
+    def _adapter_for(self, provider_key: str, credential_account_id: str | None) -> Any:
+        """Exact cloud adapter for a pinned credential account (fail closed).
+
+        The resolver owns account-aware dispatch; the legacy dict is only
+        the single-adapter fallback. No provider-name branching here: the
+        account id selects the adapter, never an ``if provider == ...``.
+        """
+        resolver = self._cloud_resolver
+        if resolver is not None:
+            adapter = resolver.adapter_for(provider_key, credential_account_id)
+            # The container resolver is synchronous; accept an awaitable too
+            # so test doubles may use either shape.
+            if adapter is not None:
+                return adapter
+        adapter = self._cloud.get(provider_key)
+        if adapter is None:
+            raise HourlyNotAvailableError(f"no hourly adapter for {provider_key!r}")
+        return adapter
 
     async def create_instance(
         self,
@@ -136,6 +181,11 @@ class HourlyCloudService:
 
         account = await self._accounts.get_or_create_active(user.id, offer.provider_key)
 
+        # Hourly offer provenance: the credential account that actually
+        # supplied/owns the observation (persisted by the multi-account
+        # cloud sync in ``SellableOffer.provider_account_id``) is pinned
+        # on the server now, before any provider call, so the worker POSTs
+        # through exactly that credential — never an arbitrary first key.
         server = CloudServer(
             id=uuid4(),
             user_id=user.id,
@@ -145,6 +195,7 @@ class HourlyCloudService:
             billing_model=BILLING_MODEL_HOURLY,
             quantum_seconds=3600,
             os=image_label,
+            credential_account_id=offer.provider_account_id,
         )
         intent = ServerCreateIntent(
             # No legacy-catalog pin (that FK points at the hourly catalog
@@ -239,11 +290,16 @@ class HourlyCloudService:
     async def cloud_image_by_index(self, offer: Any, index: int) -> Any:
         # Resolve a callback-encoded image index against a live listing
         # (a stale index simply fails; label and provider id stay apart).
-        adapter = self._cloud.get(offer.provider_key)
-        if adapter is None:
-            raise HourlyNotAvailableError(
-                f"provider {offer.provider_key!r} has no hourly cloud adapter"
+        # The owning credential account selects the adapter, never a
+        # first-configured default.
+        try:
+            adapter = self._adapter_for(
+                offer.provider_key, getattr(offer, "provider_account_id", None)
             )
+        except HourlyNotAvailableError:
+            raise
+        except Exception as exc:
+            raise HourlyNotAvailableError(f"images currently unavailable for {offer.ref}") from exc
         try:
             images = await adapter.list_images(offer.location_id)
         except Exception as exc:
@@ -292,11 +348,14 @@ class HourlyCloudService:
             snapshot = await self._snapshots.require_snapshot(server.id)
         except Exception as exc:
             return await self._fail_operation(claimed, server, f"no price snapshot: {exc}")
-        adapter = self._cloud.get(server.provider_key)
-        if adapter is None:
-            return await self._fail_operation(
-                claimed, server, f"no hourly adapter for {server.provider_key!r}"
+        # The exact credential account pinned at creation owns the POST —
+        # never an arbitrary configured key.
+        try:
+            adapter = self._adapter_for(
+                server.provider_key, getattr(server, "credential_account_id", None)
             )
+        except HourlyNotAvailableError as exc:
+            return await self._fail_operation(claimed, server, str(exc))
         try:
             images = await adapter.list_images(snapshot.offer.location_id)
         except Exception as exc:
@@ -373,8 +432,11 @@ class HourlyCloudService:
         operation = await self._ops.get_by_key(f"server-create:{server.id}")
         if operation is None or operation.status is not OperationStatus.OUTCOME_UNKNOWN:
             return "skipped"
-        adapter = self._cloud.get(server.provider_key)
-        if adapter is None:
+        try:
+            adapter = self._adapter_for(
+                server.provider_key, getattr(server, "credential_account_id", None)
+            )
+        except HourlyNotAvailableError:
             return "skipped"
         try:
             snapshot = await self._snapshots.require_snapshot(server.id)

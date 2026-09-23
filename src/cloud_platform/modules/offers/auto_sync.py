@@ -156,6 +156,8 @@ class CatalogAutoSyncCoordinator:
             return AutoSyncRunReport(ran=True, providers=tuple(reports))
 
     async def _run_provider(self, source: OfferCatalogSyncSource) -> ProviderAutoSyncReport:
+        from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY
+
         provider_key = source.provider_key
         try:
             report = await source.sync_catalog()
@@ -188,8 +190,18 @@ class CatalogAutoSyncCoordinator:
                 len(report.persistence_failures),
             )
             errors.extend(report.persistence_failures)
+        # Monthly and hourly product lines share one provider key
+        # ("leaseweb") but need SEPARATE sync status: the doctor must show
+        # "leaseweb monthly" and "leaseweb.hourly" independently instead of
+        # one row overwriting the other. Offers keep provider_key
+        # "leaseweb" (pricing/publication look them up by it); only the
+        # durable status row is billing-suffixed.
+        if report.billing_model == BILLING_MODEL_HOURLY:
+            state_key = f"{provider_key}.{report.billing_model}"
+        else:
+            state_key = provider_key
         outcome = ProviderAutoSyncReport(
-            provider_key=provider_key,
+            provider_key=state_key,
             ok=report.ok and not report.persistence_failures,
             discovered=report.discovered,
             persisted=report.persisted,
@@ -201,7 +213,7 @@ class CatalogAutoSyncCoordinator:
         )
         try:
             await self._state.record_run(
-                provider_key=provider_key,
+                provider_key=state_key,
                 ok=outcome.ok,
                 discovered=outcome.discovered,
                 persisted=outcome.persisted,
@@ -213,11 +225,11 @@ class CatalogAutoSyncCoordinator:
             )
         except Exception as exc:
             # Status persistence must never fail the catalog work itself.
-            logger.warning("catalog auto-sync state write failed for %s: %s", provider_key, exc)
+            logger.warning("catalog auto-sync state write failed for %s: %s", state_key, exc)
         logger.info(
             "catalog auto-sync %s: ok=%s discovered=%d persisted=%d prices=%d "
             "published=%d retired=%d warnings=%d errors=%d",
-            provider_key,
+            state_key,
             outcome.ok,
             outcome.discovered,
             outcome.persisted,

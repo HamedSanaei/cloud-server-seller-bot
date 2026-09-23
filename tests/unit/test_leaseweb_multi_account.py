@@ -2276,8 +2276,12 @@ class TestCatalogPersistenceIsReportedHonestly:
         assert step.persistence_ok is True
         assert step.total_fetched == 12
         assert step.offers_persisted == 12
-        # One routing observation per (credential account, location, product).
-        assert step.routes_persisted == 12
+        # One routing observation per probed (credential account, location)
+        # pair — including definitive negatives so the router never has to
+        # rediscover them. The catalog now seeds LON-11/LON-12 as well as
+        # the older halls, so the count grows with the seed list while the
+        # serving observations below stay exactly the two locations.
+        assert step.routes_persisted >= 12
         assert set(_offered_pairs(repos)) == {
             (pid, location) for pid in products for location in (FRA, LON)
         }

@@ -759,12 +759,21 @@ class TestStoreScreenGuards:
         screen = await bot.store_product_locations_screen("leaseweb", "VPS02_1", 624, "EUR")
         assert screen.text
 
-    def test_product_cards_flag_every_distinct_country(self) -> None:
-        assert MonthlyBotUi._card_flags(("DE", "DE", "GB"))
-        assert MonthlyBotUi._card_flags(("DE",)) == MonthlyBotUi._card_flags(("DE",))
+    def test_location_buttons_show_friendly_names(self) -> None:
+        labels = MonthlyBotUi._location_button_labels(
+            [("Frankfurt", "FRA-01", "DE"), ("London", "LON-01", "GB")]
+        )
+        assert labels == ["🇩🇪 Frankfurt", "🇬🇧 London"]
 
-    def test_product_cards_without_country_data_show_the_globe(self) -> None:
-        assert MonthlyBotUi._card_flags(())
+    def test_location_buttons_disambiguate_shared_names(self) -> None:
+        labels = MonthlyBotUi._location_button_labels(
+            [("Frankfurt", "FRA-10", "DE"), ("Frankfurt", "FRA-14", "DE")]
+        )
+        assert labels == ["🇩🇪 Frankfurt — FRA-10", "🇩🇪 Frankfurt — FRA-14"]
+
+    def test_location_detail_always_carries_the_code(self) -> None:
+        assert MonthlyBotUi._location_detail("Frankfurt", "FRA-10", "DE") == "🇩🇪 Frankfurt — FRA-10"
+        assert MonthlyBotUi._location_detail("FRA-10", "FRA-10", None) == "FRA-10"
 
 
 # ---------------------------------------------------------------------------

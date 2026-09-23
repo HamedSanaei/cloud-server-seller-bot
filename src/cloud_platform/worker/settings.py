@@ -476,17 +476,28 @@ async def catalog_auto_sync(ctx: dict[str, object]) -> None:
         else:
             logger.info("catalog auto-sync: leaseweb disabled by configuration; skipping")
         if settings.providers_enabled.get("leaseweb", True):
-            from cloud_platform.providers.leaseweb.cloud import hourly_provider_from_settings
+            from cloud_platform.providers.leaseweb.cloud_accounts import (
+                build_cloud_account_router,
+            )
             from cloud_platform.providers.leaseweb.cloud_auto_sync import (
                 LeasewebHourlyCloudSyncSource,
             )
             from cloud_platform.providers.leaseweb.cloud_sync import LeasewebHourlyCloudSyncer
 
-            hourly_provider = hourly_provider_from_settings(settings)
-            if hourly_provider is not None:
+            # Account-aware Public Cloud discovery: every ACTIVE credential
+            # account is probed; regions/types are attributed per account and
+            # the hourly offer pins the owning account. Never the first key
+            # by accident — the router owns the account set.
+            cloud_router = build_cloud_account_router(settings)
+            if cloud_router is not None:
                 sources.append(
                     LeasewebHourlyCloudSyncSource(
-                        LeasewebHourlyCloudSyncer(SessionFactory, hourly_provider)
+                        LeasewebHourlyCloudSyncer(
+                            SessionFactory,
+                            accounts=dict(cloud_router.providers),
+                            account_priorities=cloud_router.priorities,
+                            account_states=cloud_router.account_states,
+                        )
                     )
                 )
             else:

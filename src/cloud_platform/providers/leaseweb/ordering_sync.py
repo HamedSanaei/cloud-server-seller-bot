@@ -652,6 +652,18 @@ class LeaseWebOrderingCatalogSyncer:
                     logger.info(
                         "leaseweb ordering sync marked %d products unavailable", marked_count
                     )
+
+        # --- Guarantee normalized location metadata ---------------------
+        # Every definitively eligible location must have a normalized
+        # ProviderLocation row (the storefront flag/name path reads ONLY
+        # these rows): describe + upsert each resolved location, best effort
+        # per row. A metadata write failure is reported but never touches
+        # availability and never hides a valid product.
+        try:
+            metadata_warnings = await self._ensure_location_metadata(loc_repo, resolved)
+        except Exception as exc:  # pragma: no cover - defensive; per-row handling above
+            metadata_warnings = [f"location metadata pass failed: {type(exc).__name__}"]
+        warnings.extend(metadata_warnings)
         return SyncResult(
             fetched,
             upserted,
@@ -676,6 +688,33 @@ class LeaseWebOrderingCatalogSyncer:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    async def _ensure_location_metadata(self, loc_repo: Any, locations: set[str]) -> list[str]:
+        """Persist normalized metadata for definitively eligible locations.
+
+        The storefront flag/name path reads ONLY ProviderLocation rows, so
+        every location the sync proved eligible must have one with a usable
+        country and city. Normalization lives in the adapter
+        (``describe_location``: exact table, then city-prefix fallback).
+        Best effort per row: failures are reported as warnings and never
+        touch product availability.
+        """
+        warnings: list[str] = []
+        for location in sorted(locations):
+            try:
+                described = self._provider.describe_location(location)
+                await loc_repo.upsert(
+                    LocationRecord(
+                        provider_key=PROVIDER_KEY,
+                        location_id=described.id,
+                        name=described.name,
+                        country_code=described.country_code or None,
+                        city=described.city,
+                    )
+                )
+            except Exception as exc:
+                warnings.append(f"location metadata {location}: {type(exc).__name__}")
+        return warnings
 
     def _discovered_extras(
         self, discoveries: Mapping[str, _AccountDiscovery], location: str

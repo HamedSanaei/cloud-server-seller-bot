@@ -373,7 +373,9 @@ async def _press(ui: MonthlyBotUi, callback: str) -> Any:
 
 async def _open_detail(bot: MonthlyBotUi, location_id: str) -> Any:
     locations = await _press(bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1"))
-    location_button = next(b for b in _buttons(locations) if location_id in b.text)
+    location_button = next(
+        b for b in _buttons(locations) if _decode(b.callback_data or "").args[2] == location_id
+    )
     plans = await _press(bot, location_button.callback_data or "")
     plan_button = next(
         b for b in _buttons(plans) if _decode(b.callback_data or "").screen == "plan_detail"
@@ -387,10 +389,10 @@ class TestVpsLocations:
         screen = await _press(
             bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
         )
-        labels = [b.text for b in _buttons(screen) if "FRA-10" in b.text]
+        labels = [b.text for b in _buttons(screen) if "Frankfurt" in b.text]
         assert len(labels) == 1
         assert "🇩🇪" in labels[0]
-        assert "Frankfurt" in labels[0]
+        assert "FRA-10" not in labels[0]
 
     async def test_unknown_country_renders_neutrally(self) -> None:
         bot = _ui(_service([_offer(location_id="FRA-10")]))
@@ -429,7 +431,7 @@ class TestVpsPlans:
         locations = await _press(
             bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
         )
-        location_button = next(b for b in _buttons(locations) if "FRA-01" in b.text)
+        location_button = next(b for b in _buttons(locations) if "Frankfurt" in b.text)
         plans = await _press(bot, location_button.callback_data or "")
         rows = [b for b in _buttons(plans) if "€5.62" in b.text]
         assert len(rows) == 1

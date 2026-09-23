@@ -1452,6 +1452,36 @@ async def catalog_auto_sync_doctor() -> int:
         if row.sellable:
             sellable[row.provider_key] = sellable.get(row.provider_key, 0) + 1
 
+    # Leaseweb billing split (monthly VPS vs hourly Cloud share one
+    # provider key in the offer table but have SEPARATE sync states and
+    # pricing policies — never one opaque "leaseweb" status). Rows without
+    # a billing_model (older test doubles) count as monthly.
+    def _billing_of(row: Any) -> str:
+        return str(
+            getattr(row, "billing_model", "prepaid_monthly_fixed") or "prepaid_monthly_fixed"
+        )
+
+    leaseweb_monthly_stored = sum(
+        1
+        for row in rows
+        if row.provider_key == "leaseweb" and _billing_of(row) == "prepaid_monthly_fixed"
+    )
+    leaseweb_monthly_sellable = sum(
+        1
+        for row in rows
+        if row.provider_key == "leaseweb"
+        and _billing_of(row) == "prepaid_monthly_fixed"
+        and row.sellable
+    )
+    leaseweb_hourly_stored = sum(
+        1 for row in rows if row.provider_key == "leaseweb" and _billing_of(row) == "hourly"
+    )
+    leaseweb_hourly_sellable = sum(
+        1
+        for row in rows
+        if row.provider_key == "leaseweb" and _billing_of(row) == "hourly" and row.sellable
+    )
+
     leaseweb_credential = bool(settings.leaseweb_api_key)
     try:
         from cloud_platform.providers.leaseweb.accounts import build_leaseweb_account_router
@@ -1471,6 +1501,34 @@ async def catalog_auto_sync_doctor() -> int:
     print(f"interval: {settings.storefront_catalog_sync_interval_seconds}s")
     print("")
     for provider_key in sorted(set(stored) | set(states) | set(policies) | set(credentials)):
+        # Leaseweb is reported as TWO product lines (monthly + hourly),
+        # never one opaque status: the offer table shares the key but the
+        # sync states ("leaseweb" vs "leaseweb.hourly") and pricing
+        # policies are distinct.
+        if provider_key == "leaseweb":
+            _print_leaseweb_line(
+                settings,
+                policies,
+                states,
+                enabled=settings.providers_enabled.get("leaseweb", True),
+                credential=bool(credentials.get("leaseweb")),
+                billing="monthly",
+                state_key="leaseweb",
+                stored=leaseweb_monthly_stored,
+                sellable=leaseweb_monthly_sellable,
+            )
+            _print_leaseweb_line(
+                settings,
+                policies,
+                states,
+                enabled=settings.providers_enabled.get("leaseweb", True),
+                credential=bool(credentials.get("leaseweb")),
+                billing="hourly",
+                state_key="leaseweb.hourly",
+                stored=leaseweb_hourly_stored,
+                sellable=leaseweb_hourly_sellable,
+            )
+            continue
         enabled = settings.providers_enabled.get(provider_key, True)
         policy = policies.get(provider_key)
         state = states.get(provider_key)
@@ -1506,8 +1564,83 @@ async def catalog_auto_sync_doctor() -> int:
     return 0
 
 
+def _print_leaseweb_line(
+    settings: Any,
+    policies: dict[str, Any],
+    states: dict[str, Any],
+    *,
+    enabled: bool,
+    credential: bool,
+    billing: str,
+    state_key: str,
+    stored: int,
+    sellable: int,
+) -> None:
+    """One leaseweb product line (monthly VPS vs hourly Cloud), read-only."""
+    # Family policy first ("leaseweb.hourly"), then provider-wide
+    # ("leaseweb"); absent means costs-only. The lookup mirrors the
+    # coordinator's _policy_for so the doctor never disagrees with it.
+    if billing == "hourly":
+        policy = policies.get("leaseweb.hourly") or policies.get("leaseweb")
+        policy_source = (
+            "leaseweb.hourly"
+            if "leaseweb.hourly" in policies
+            else ("leaseweb" if "leaseweb" in policies else None)
+        )
+        label = "leaseweb.hourly: (hourly)"
+    else:
+        policy = policies.get("leaseweb")
+        policy_source = "leaseweb" if "leaseweb" in policies else None
+        # Bare "leaseweb:" prefix stays greppable for existing runbooks/tests.
+        label = "leaseweb: (monthly)"
+    # Back-compat: the bare "leaseweb:" prefix stays greppable for the
+    # monthly line (existing operator runbooks grep for it).
+    print(label)
+    print(f"  enabled: {'yes' if enabled else 'no'}")
+    print(f"  credential configured: {'yes' if credential else 'no'}")
+    if policy is not None:
+        print(
+            f"  auto pricing: {policy.mode} {policy.markup_percent}% "
+            f"(source: [{policy_source}])\n"
+            f"  auto publish: {'yes' if policy.auto_publish else 'no'}"
+        )
+    else:
+        print("  auto pricing: not configured (costs refresh only)")
+        if billing == "hourly":
+            print('  action: add [storefront.pricing."leaseweb.hourly"]')
+    state = states.get(state_key)
+    # Older deployments recorded hourly under "leaseweb": fall back to it
+    # for the hourly line rather than reporting "never" incorrectly.
+    if state is None and billing == "hourly":
+        state = states.get("leaseweb")
+    if state is not None and state.last_attempted_at is not None:
+        print(f"  last attempt: {state.last_attempted_at.isoformat()}")
+        print(
+            f"  last success: "
+            f"{state.last_success_at.isoformat() if state.last_success_at else 'never'}"
+        )
+        print(
+            f"  last run: discovered={state.discovered} persisted={state.persisted} "
+            f"prices={state.prices_updated} published={state.published} "
+            f"retired={state.retired}"
+        )
+        for warning in state.warnings[:5]:
+            print(f"    warning: {warning}")
+        for error in state.errors[:5]:
+            print(f"    error: {error}")
+    else:
+        print("  last success: never (no coordinator run recorded)")
+    print(f"  sellable: {sellable} (stored={stored})")
+    print("")
+
+
 async def _hourly_cloud_provider_or_error() -> Any:
-    """Hourly cloud adapter from settings, or an explanatory failure."""
+    """Hourly cloud adapter from settings, or an explanatory failure.
+
+    Legacy single-adapter path (kept for the catalog subcommand): the
+    account-aware doctor and sync use the cloud account router instead so
+    no single arbitrary key is assumed to own Public Cloud.
+    """
     from cloud_platform.core.config import get_settings
     from cloud_platform.providers.leaseweb.cloud import hourly_provider_from_settings
 
@@ -1519,45 +1652,170 @@ async def _hourly_cloud_provider_or_error() -> Any:
 
 
 async def leaseweb_cloud_doctor() -> int:
-    """Read-only: hourly regions, instance types and images per region."""
-    provider = await _hourly_cloud_provider_or_error()
-    if provider is None:
-        return 1
+    """Read-only multi-account hourly Cloud diagnostics (never mutates).
+
+    Reports, without secret values:
+
+    - credential accounts examined (ids only, deterministic priority order)
+    - which account(s) can access Public Cloud (regions + type counts)
+    - region count per account and instance-type count per region
+    - image count/read status per region (from the owning account)
+    - catalog sync status (last attempt/success + last run counters)
+    - hourly offers stored, split by every sellability gate
+      (provider_available, priced, auto-priced/manual, enabled,
+      operator_disabled, sellable)
+    - pricing-policy source (``leaseweb.hourly`` vs ``leaseweb`` vs missing,
+      with the exact non-secret TOML block when missing)
+    - last sync result and last successful sync
+
+    A 401/auth failure for one account never invalidates another; an
+    account with no Public Cloud entitlement is ineligible (not unknown);
+    a transient timeout/5xx is reported as unknown and never retires
+    inventory here (this command never writes).
+    """
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+
+    settings = get_settings()
     try:
-        regions = await provider.list_regions()
-    except Exception as exc:
-        print(f"error: regions unreadable ({type(exc).__name__})")
-        return 1
-    print(f"regions: {len(regions)}")
-    total_types = 0
-    total_images = 0
-    for region in sorted(regions, key=lambda r: r.id):
-        country = f" ({region.country_code})" if region.country_code else " (country unknown)"
-        try:
-            types = await provider.list_instance_types(region.id)
-        except Exception as exc:
-            print(f"  {region.id}{country}: types unreadable ({type(exc).__name__})")
-            continue
-        try:
-            images = await provider.list_images(region.id)
-        except Exception as exc:
-            print(f"  {region.id}{country}: images unreadable ({type(exc).__name__})")
-            images = []
-        families: dict[str, int] = {}
-        for item in types:
-            families[item.family_name] = families.get(item.family_name, 0) + 1
-        total_types += len(types)
-        total_images += len(images)
-        print(
-            f"  {region.id}{country}: {len(types)} instance type(s) "
-            f"[{', '.join(f'{name} x{count}' for name, count in sorted(families.items()))}], "
-            f"{len(images)} image(s)"
+        from cloud_platform.providers.leaseweb.cloud_accounts import (
+            build_cloud_account_router,
         )
-    print(f"total: {total_types} instance type(s), {total_images} image(s)")
+
+        cloud_router = build_cloud_account_router(settings)
+    except Exception as exc:
+        print(f"error: cloud account router unavailable ({type(exc).__name__})")
+        return 1
+    if cloud_router is None:
+        print("error: leaseweb hourly cloud has no credential configured")
+        print("action: configure [providers.leaseweb.accounts.*] api_key values,")
+        print("  or the deprecated [providers.leaseweb] api_key, then re-run")
+        return 1
+
+    accounts = list(cloud_router.accounts)
+    print(f"leaseweb cloud doctor (read-only, {len(accounts)} credential account(s))")
+    print(f"credential accounts examined: {', '.join(a.account_id for a in accounts) or '-'}")
+    ok_any = False
+    for account in accounts:
+        try:
+            capability = await cloud_router.probe_account(account.account_id)
+        except Exception as exc:
+            print(f"  account {account.account_id}: probe failed ({type(exc).__name__})")
+            continue
+        if capability.accessible:
+            ok_any = True
+            print(f"  account {account.account_id}: Public Cloud ACCESSIBLE")
+            print(f"    regions: {len(capability.regions)}")
+            for region_id, type_count in sorted(capability.regions):
+                # Image read status is per-region, from the OWNING account.
+                try:
+                    provider = cloud_router.client_for(account.account_id)
+                    images = await provider.list_images(region_id)
+                    print(
+                        f"    region {region_id}: {type_count} instance type(s), "
+                        f"{len(images)} image(s) readable"
+                    )
+                except Exception as exc:
+                    print(
+                        f"    region {region_id}: {type_count} instance type(s), "
+                        f"images unreadable ({type(exc).__name__})"
+                    )
+        else:
+            reason = capability.error_class or "no usable Cloud catalog"
+            print(f"  account {account.account_id}: Public Cloud UNAVAILABLE ({reason})")
+            if capability.regions:
+                for region_id, type_count in sorted(capability.regions):
+                    print(f"    region {region_id}: {type_count} instance type(s)")
     try:
-        await provider.close()
+        await cloud_router.aclose()
     except Exception:
         pass
+
+    # --- Stored hourly catalog (gates, never secrets) --------------------
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.offers.repository import (
+            SqlAlchemyCatalogSyncStateRepository,
+            SqlAlchemySellableOfferRepository,
+        )
+
+        rows = [
+            row
+            for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+            if row.provider_key == "leaseweb" and row.billing_model == "hourly"
+        ]
+        states = {
+            state.provider_key: state
+            for state in await SqlAlchemyCatalogSyncStateRepository(SessionFactory).list_all()
+        }
+    except Exception as exc:
+        print(f"catalog sync status: unreadable ({type(exc).__name__})")
+        return 0 if ok_any else 1
+    total = len(rows)
+    available = sum(1 for r in rows if r.provider_available)
+    priced = sum(1 for r in rows if r.selling_price_minor > 0)
+    auto_priced = sum(1 for r in rows if r.auto_priced)
+    manual = sum(1 for r in rows if not r.auto_priced)
+    enabled = sum(1 for r in rows if r.enabled)
+    operator_disabled = sum(1 for r in rows if r.operator_disabled)
+    sellable = sum(1 for r in rows if r.sellable)
+    print(f"hourly offers stored: {total}")
+    print(f"  provider_available: {available}")
+    print(f"  priced: {priced}")
+    print(f"  auto-priced: {auto_priced} / manual: {manual}")
+    print(f"  enabled: {enabled}")
+    print(f"  operator_disabled: {operator_disabled}")
+    print(f"  sellable: {sellable}")
+    if not sellable and total:
+        from cloud_platform.modules.offers.domain import visibility_summary
+
+        print(f"  gates: {visibility_summary(rows)}")
+
+    policies = pricing_policies_from_settings(settings)
+    policy = policies.get("leaseweb.hourly") or policies.get("leaseweb")
+    if policy is not None:
+        source = "leaseweb.hourly" if "leaseweb.hourly" in policies else "leaseweb"
+        print(
+            f"pricing-policy source: [{source}] "
+            f"mode={policy.mode} markup={policy.markup_percent}% "
+            f"auto_publish={'yes' if policy.auto_publish else 'no'}"
+        )
+    else:
+        print("pricing-policy source: MISSING (costs refresh only)")
+        print("action: add this non-secret block to the server-owned configuration.toml:")
+        print('  [storefront.pricing."leaseweb.hourly"]')
+        print('  mode = "markup"')
+        print("  markup_percent = 25")
+        print("  auto_publish = true")
+    # Monthly/hourly sync states are separate rows ("leaseweb" vs
+    # "leaseweb.hourly"); older deployments only have "leaseweb".
+    state = states.get("leaseweb.hourly") or states.get("leaseweb")
+    if state is not None and state.last_attempted_at is not None:
+        print(f"catalog sync status: last attempt {state.last_attempted_at.isoformat()}")
+        print(
+            f"  last successful sync: "
+            f"{state.last_success_at.isoformat() if state.last_success_at else 'never'}"
+        )
+        print(
+            f"  last sync result: discovered={state.discovered} "
+            f"persisted={state.persisted} prices={state.prices_updated} "
+            f"published={state.published} retired={state.retired}"
+        )
+        for warning in state.warnings[:5]:
+            print(f"    warning: {warning}")
+        for error in state.errors[:5]:
+            print(f"    error: {error}")
+    else:
+        print("catalog sync status: never (no coordinator run recorded for leaseweb.hourly)")
+        print("action: ensure [storefront.catalog_sync] enabled = true, then check")
+        print("  python -m cloud_platform.cli catalog auto-sync doctor")
+    if not ok_any and not sellable:
+        print("result: hourly Cloud is NOT buyable (no account serves it or nothing is sellable)")
+        return 1
+    if not sellable:
+        print("result: provider serves Cloud but nothing is sellable yet")
+        return 1
+    print("result: hourly Cloud buyable (Cloud family appears in Telegram)")
     return 0
 
 

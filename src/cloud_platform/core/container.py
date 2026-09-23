@@ -148,6 +148,10 @@ class Container:
     #: when several Leaseweb API keys are configured; ``None`` means the legacy
     #: single-credential deployment, where the logical adapter is the only one.
     leaseweb_account_router: Any | None = None
+    #: Hourly-cloud per-credential-account adapters (Public Cloud is account
+    #: scoped like ordering). ``None`` means no hourly credential is
+    #: configured; callers skip the hourly product instead of failing.
+    leaseweb_cloud_account_router: Any | None = None
     credential_holders: _CredentialHolderRegistry | None = None
     credential_rotation_service: CredentialRotationService | None = None
     # PROD-HARDENING §2: the process-wide Telegram transient-state backend.
@@ -442,10 +446,74 @@ class Container:
             # Display names for the product card's availability list; optional.
             location_repo=SqlAlchemyLocationRepository(self.session_factory),
             cloud_providers=self.hourly_cloud_providers(),
+            cloud_resolver=self.hourly_cloud_resolver(),
         )
 
+    def hourly_cloud_resolver(self) -> Any | None:
+        """Provider-neutral (provider_key, account_id) -> cloud adapter dispatch.
+
+        Built from the Leaseweb cloud account router so hourly image reads
+        and creation resolve the exact credential that owns the offer.
+        ``None`` means no hourly credential is configured (legacy dict
+        fallback still applies in the services). No provider-name
+        branching: the account id selects the adapter.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is None:
+            return None
+
+        class _Resolver:
+            def __init__(self, cloud_router: Any, fallback: dict[str, Any]) -> None:
+                self._router = cloud_router
+                self._fallback = dict(fallback)
+
+            def adapter_for(
+                self, provider_key: str, credential_account_id: str | None = None
+            ) -> Any | None:
+                if provider_key != "leaseweb":
+                    return self._fallback.get(provider_key)
+                try:
+                    return self._router.client_for(credential_account_id)
+                except Exception:
+                    # Fail closed to the logical default only for legacy
+                    # rows without an account; a pinned unknown account
+                    # must not silently fall back to another credential.
+                    if not (credential_account_id or "").strip():
+                        providers = getattr(self._router, "providers", {}) or {}
+                        if isinstance(providers, dict) and providers:
+                            ordered = getattr(self._router, "new_cloud_clients", None)
+                            if callable(ordered):
+                                try:
+                                    clients = ordered()
+                                    if clients:
+                                        return clients[0][1]
+                                except Exception:
+                                    pass
+                            return next(iter(providers.values()))
+                    return None
+
+        return _Resolver(router, self.hourly_cloud_providers())
+
     def hourly_cloud_provider(self) -> Any | None:
-        """Hourly cloud adapter for live image reads (None when unconfigured)."""
+        """Hourly cloud adapter for live image reads (None when unconfigured).
+
+        Account-aware: the default is the first ACTIVE cloud account in
+        deterministic (priority, id) order — never an arbitrary first
+        configured key. Legacy single-credential deployments fall back to
+        the shared settings constructor.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is not None:
+            try:
+                clients = router.new_cloud_clients()
+            except Exception:
+                clients = ()
+            if clients:
+                return clients[0][1]
+            providers = dict(getattr(router, "providers", {}) or {})
+            if providers:
+                return next(iter(providers.values()))
+            return None
         from cloud_platform.providers.leaseweb.cloud import hourly_provider_from_settings
 
         return hourly_provider_from_settings(get_settings())
@@ -481,6 +549,7 @@ class Container:
             operation_repo=SqlAlchemyOperationRepository(self.session_factory),
             audit_repo=_audit_repository(self.session_factory),
             cloud_providers=self.hourly_cloud_providers(),
+            cloud_resolver=self.hourly_cloud_resolver(),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:
@@ -1081,12 +1150,24 @@ class Container:
         candidates = list(self.provider_registry._providers.values())
         for routes in self.provider_registry._routes.values():
             candidates.extend(routes.values())
+        # Hourly cloud adapters are NOT in the provider registry (they serve
+        # a distinct product); close each per-account transport too.
+        cloud_router = self.leaseweb_cloud_account_router
+        if cloud_router is not None:
+            try:
+                providers = dict(getattr(cloud_router, "providers", {}) or {})
+                candidates.extend(providers.values())
+            except Exception:
+                pass
         for provider in candidates:
             if id(provider) in seen:
                 continue
             seen.add(id(provider))
             if hasattr(provider, "close"):
-                await provider.close()
+                try:
+                    await provider.close()
+                except Exception:
+                    logger.warning("provider client close failed")
         # Release the shared Telegram session/confirmation connection too, so a
         # graceful shutdown leaves no half-open Redis client behind.
         store = self.bot_session_store
@@ -1198,6 +1279,20 @@ def create_container() -> Container:
             provider=leaseweb_ordering_provider,
         )
 
+    # Hourly Public Cloud is credential/account scoped like ordering: every
+    # ACTIVE account gets its own adapter and the sync/creation paths
+    # resolve the exact account that owns each region/type. Never the
+    # first configured key by accident — the router owns discovery.
+    leaseweb_cloud_account_router = None
+    try:
+        from cloud_platform.providers.leaseweb.cloud_accounts import (
+            build_cloud_account_router,
+        )
+
+        leaseweb_cloud_account_router = build_cloud_account_router(settings)
+    except Exception:
+        leaseweb_cloud_account_router = None
+
     # M10-008: runtime-rotatable provider credentials - one holder per
     # configured provider, plus the verify-then-swap rotation service.
     holders = _CredentialHolderRegistry()
@@ -1211,6 +1306,7 @@ def create_container() -> Container:
         leaseweb_ordering_syncer=leaseweb_ordering_syncer,
         leaseweb_ordering_provider=leaseweb_ordering_provider,
         leaseweb_account_router=leaseweb_account_router,
+        leaseweb_cloud_account_router=leaseweb_cloud_account_router,
         credential_holders=holders,
         credential_rotation_service=CredentialRotationService(
             holders,
