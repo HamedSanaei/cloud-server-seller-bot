@@ -1663,12 +1663,15 @@ def _cloud_unavailable_reason(capability: Any) -> str:
     regions_seen = int(getattr(capability, "regions_seen", 0) or 0)
     types_raw = int(getattr(capability, "types_raw_items", 0) or 0)
     types_priced = int(getattr(capability, "types_priced_items", 0) or 0)
+    types_currency = getattr(capability, "types_currency", None)
     if regions_raw == 0:
         return "regions endpoint returned zero regions"
     if regions_seen == 0:
         return f"regions response not recognized ({regions_raw} raw item(s), 0 parsed)"
     if types_raw == 0:
         return "regions exist but instanceTypes are all empty"
+    if not types_currency:
+        return "response has no usable _metadata.currency; pricing fail-closed"
     if types_priced == 0:
         return "types present but none carry a usable hourly price/currency"
     parsed_types = sum(count for _region_id, count in (getattr(capability, "regions", ()) or ()))

@@ -313,6 +313,15 @@ class TestLiveCoordinatorRepairsStaleLocations:
         for code, city, country in SIX:
             assert rows[code].city == city, code
             assert (rows[code].country_code or "").upper() == country, code
+        # Sync-state persistence is visible to the doctor through the same
+        # repository it reads: attempted AND success are set.
+        states = {
+            state.provider_key: state
+            for state in await SqlAlchemyCatalogSyncStateRepository(session_factory).list_all()
+        }
+        assert "leaseweb" in states
+        assert states["leaseweb"].last_attempted_at is not None
+        assert states["leaseweb"].last_success_at is not None
 
     async def test_repaired_rows_group_into_two_city_buttons(self, _clean_db: Any) -> None:
         from cloud_platform.modules.checkout.service import OfferCatalogViewService
@@ -369,6 +378,140 @@ class TestLiveCoordinatorRepairsStaleLocations:
         ]
         frankfurt = next(g for g in view.items if g.city == "Frankfurt")
         assert sorted(frankfurt.location_ids) == ["FRA-01", "FRA-10", "FRA-14"]
+
+
+def _official_types_payload() -> dict[str, Any]:
+    """Official ``/publicCloud/v1/instanceTypes`` shape (verbatim layout)."""
+    return {
+        "instanceTypes": [
+            {
+                "name": "lsw.c3.large",
+                "resources": {
+                    "cpu": {"value": 2, "unit": "vCPU"},
+                    "memory": {"value": 3, "unit": "GiB"},
+                    "publicNetworkSpeed": {"value": 1, "unit": "Gbps"},
+                    "privateNetworkSpeed": {"value": 100, "unit": "Mbps"},
+                },
+                "prices": {"hourly": "0.0395", "monthly": "26.0200"},
+                "storageTypes": ["CENTRAL"],
+                "minDiskSize": 5,
+            }
+        ],
+        "_metadata": {"currency": "EUR", "currencySymbol": "€"},
+    }
+
+
+class _StubCloudTransport:
+    """Read-only transport double serving official-shaped payloads."""
+
+    async def request(
+        self, method: str, path: str, params: dict[str, Any] | None = None, **kwargs: Any
+    ) -> Any:
+        assert method == "GET", "live sync acceptance performs reads only"
+        if path == "/publicCloud/v1/regions":
+            return {
+                "regions": [
+                    {
+                        "name": "eu-west-3",
+                        "country": "DE",
+                        "displayName": "Frankfurt",
+                        "city": "Frankfurt",
+                    }
+                ]
+            }
+        if path == "/publicCloud/v1/instanceTypes":
+            return _official_types_payload()
+        raise AssertionError(f"unexpected provider read: {path}")
+
+    async def aclose(self) -> None:
+        return None
+
+
+@requires_postgres
+class TestLiveHourlySyncAcceptance:
+    """Official hourly payload -> sellable Cloud offer on real PostgreSQL."""
+
+    async def test_hourly_offer_becomes_sellable(self, _clean_db: Any) -> None:
+        from cloud_platform.modules.checkout.service import OfferCatalogViewService
+        from cloud_platform.modules.markets.domain import ProviderCatalog
+        from cloud_platform.modules.offers.auto_sync import (
+            CatalogAutoSyncCoordinator,
+            PricingPolicy,
+        )
+        from cloud_platform.providers.leaseweb.cloud import LeasewebHourlyCloudProvider
+        from cloud_platform.providers.leaseweb.cloud_auto_sync import (
+            LeasewebHourlyCloudSyncSource,
+        )
+        from cloud_platform.providers.leaseweb.cloud_sync import LeasewebHourlyCloudSyncer
+
+        session_factory = _clean_db
+        provider = LeasewebHourlyCloudProvider.__new__(LeasewebHourlyCloudProvider)
+        provider._transport = _StubCloudTransport()
+        try:
+            syncer = LeasewebHourlyCloudSyncer(session_factory, accounts={"north": provider})
+            coordinator = CatalogAutoSyncCoordinator(
+                sources=[LeasewebHourlyCloudSyncSource(syncer)],
+                offers=SqlAlchemySellableOfferRepository(session_factory),
+                state=SqlAlchemyCatalogSyncStateRepository(session_factory),
+                lock=PostgresAdvisoryCatalogSyncLock(session_factory),
+                pricing_policies={
+                    "leaseweb.hourly": PricingPolicy(
+                        mode="markup", markup_percent=25, auto_publish=True
+                    )
+                },
+            )
+            report = await coordinator.run()
+            assert report.ran is True
+            offers_repo = SqlAlchemySellableOfferRepository(session_factory)
+            stored = await offers_repo.get_by_ref("leaseweb", "lsw.c3.large", "eu-west-3")
+            assert stored is not None
+            assert stored.provider_account_id == "north"
+            assert stored.provider_cost_minor == 4  # 0.0395 EUR, HALF_UP
+            assert stored.provider_cost_currency == "EUR"
+            assert stored.provider_available is True
+            assert stored.selling_price_minor == 5  # ceil(4 * 1.25)
+            assert stored.selling_currency == "EUR"
+            assert stored.enabled is True
+            assert stored.sellable is True
+            states = {
+                state.provider_key: state
+                for state in await SqlAlchemyCatalogSyncStateRepository(session_factory).list_all()
+            }
+            assert "leaseweb.hourly" in states
+            assert states["leaseweb.hourly"].last_success_at is not None
+            service = OfferCatalogViewService(
+                offers_repo=offers_repo,
+                provider_registry=_FailingRegistry(),
+                wallet_repo=_FailingWallet(),
+                signing_key=SIGNING_KEY,
+                market_catalog=ProviderCatalog(
+                    markets={PROVIDER: "foreign"},
+                    display_names={PROVIDER: "Leaseweb"},
+                    enabled={},
+                    families={
+                        PROVIDER: {
+                            "vps": {
+                                "billing_model": BILLING_MODEL_MONTHLY,
+                                "display_name": "VPS",
+                            },
+                            "cloud": {
+                                "billing_model": "hourly",
+                                "display_name": "Cloud",
+                            },
+                        }
+                    },
+                ),
+                location_repo=SqlAlchemyLocationRepository(session_factory),
+            )
+            families, _, _ = await service.families_screen(PROVIDER)
+            assert [(f.family_key, f.available) for f in families] == [
+                ("vps", False),
+                ("cloud", True),
+            ]
+            cities = await service.cities_screen(PROVIDER, "cloud", 1)
+            assert [(g.country_code, g.city) for g in cities.items] == [("DE", "Frankfurt")]
+        finally:
+            await provider.close()
 
 
 class _FailingRegistry:

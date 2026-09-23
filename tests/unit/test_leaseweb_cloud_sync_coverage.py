@@ -191,9 +191,19 @@ class TestAdapterParsingCorners:
         provider._transport.request = mock.AsyncMock(
             return_value={
                 "instanceTypes": [
-                    {"name": "lsw.a", "cpu": "2", "memory": "4096"},  # no price
-                    {"name": "lsw.b", "pricePerHour": "0.02", "currency": "EUR"},  # ok
-                ]
+                    {"name": "lsw.a", "resources": {}},  # no price
+                    {
+                        "name": "lsw.b",
+                        "resources": {
+                            "cpu": {"value": 2, "unit": "vCPU"},
+                            "memory": {"value": 4, "unit": "GiB"},
+                        },
+                        "prices": {"hourly": "0.02"},
+                        "storageTypes": ["CENTRAL"],
+                        "minDiskSize": 5,
+                    },  # ok
+                ],
+                "_metadata": {"currency": "EUR", "currencySymbol": "€"},
             }
         )
         types = await provider.list_instance_types("eu-west-3")
@@ -204,8 +214,18 @@ class TestAdapterParsingCorners:
         provider._transport.request = mock.AsyncMock(
             return_value={
                 "instanceTypes": [
-                    {"name": "lsw.mystery", "pricePerHour": "0.01", "currency": "EUR"}
-                ]
+                    {
+                        "name": "lsw.mystery",
+                        "resources": {
+                            "cpu": {"value": 1, "unit": "vCPU"},
+                            "memory": {"value": 2, "unit": "GiB"},
+                        },
+                        "prices": {"hourly": "0.01"},
+                        "storageTypes": ["CENTRAL"],
+                        "minDiskSize": 5,
+                    }
+                ],
+                "_metadata": {"currency": "EUR", "currencySymbol": "€"},
             }
         )
         (item,) = await provider.list_instance_types("eu-west-3")

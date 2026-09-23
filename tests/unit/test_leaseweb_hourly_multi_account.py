@@ -151,6 +151,7 @@ class _CloudProviderFake:
         regions_raw: int | None = None,
         types_raw: dict[str, int] | None = None,
         types_priced: dict[str, int] | None = None,
+        types_currency: str | None = None,
     ) -> None:
         self._regions = regions or []
         self._types = types or {}
@@ -161,6 +162,7 @@ class _CloudProviderFake:
         self._regions_raw = len(self._regions) if regions_raw is None else regions_raw
         self._types_raw = dict(types_raw or {})
         self._types_priced = dict(types_priced or {})
+        self._types_currency = types_currency
         self.reads: list[str] = []
         self.posts = 0
 
@@ -188,7 +190,12 @@ class _CloudProviderFake:
         types = await self.list_instance_types(region)
         raw = self._types_raw.get(region, len(types))
         priced = self._types_priced.get(region, len(types))
-        return CloudInstanceTypesRead(types=tuple(types), raw_items=raw, priced_items=priced)
+        return CloudInstanceTypesRead(
+            types=tuple(types),
+            raw_items=raw,
+            priced_items=priced,
+            currency=self._types_currency,
+        )
 
     async def list_images(self, region: str) -> list[Any]:
         self.reads.append(f"images:{region}")
@@ -502,6 +509,18 @@ class TestProbeShapeClassification:
         assert cap.accessible is False
         assert cap.error_class == "RegionError"
 
+    async def test_envelope_currency_threads_through_the_probe(self) -> None:
+        router = _probed_router(
+            _CloudProviderFake(
+                regions=[_region()],
+                types={"eu-west-3": [_ctype()]},
+                types_currency="EUR",
+            )
+        )
+        cap = await router.probe_account("acct")
+        assert cap.accessible is True
+        assert cap.types_currency == "EUR"
+
 
 class TestCloudUnavailableReason:
     """Doctor one-liners for every inaccessible-account shape (no secrets)."""
@@ -544,9 +563,19 @@ class TestCloudUnavailableReason:
         reason = self._reason(regions_raw_items=1, regions_seen=1, types_raw_items=0)
         assert "instanceTypes are all empty" in reason
 
+    def test_missing_envelope_currency(self) -> None:
+        reason = self._reason(
+            regions_raw_items=1, regions_seen=1, types_raw_items=2, types_priced_items=2
+        )
+        assert "no usable _metadata.currency" in reason
+
     def test_unpriced_types(self) -> None:
         reason = self._reason(
-            regions_raw_items=1, regions_seen=1, types_raw_items=2, types_priced_items=0
+            regions_raw_items=1,
+            regions_seen=1,
+            types_raw_items=2,
+            types_priced_items=0,
+            types_currency="EUR",
         )
         assert "usable hourly price" in reason
 
@@ -557,6 +586,7 @@ class TestCloudUnavailableReason:
             regions=(("eu-west-3", 0),),
             types_raw_items=2,
             types_priced_items=2,
+            types_currency="EUR",
         )
         assert "not recognized" in reason
 

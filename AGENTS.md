@@ -52,6 +52,18 @@ When asked to "continue the project" or "do the next tasks":
 - Sibling datacenters in one city must be differentiated with real catalog
   facts (price/count/metadata), not unexplained "Location 1/2/3" labels.
 
+### Provider API contract rules
+
+- Provider adapters must be tested against fixtures shaped like the
+  provider's official documented payload, including envelope-level metadata.
+- Do not flatten provider responses in mocks in ways that differ from
+  official schemas.
+- Financial fields must be sourced from their documented location in the
+  response; no inferred currency/default.
+- When official hourly prices have more precision than the platform's normal
+  currency minor unit, preserve enough precision for correct accrual rather
+  than silently rounding per-hour rates.
+
 ## Quality gates
 
 Static gates run on every change; test scope is layered (see Testing policy).

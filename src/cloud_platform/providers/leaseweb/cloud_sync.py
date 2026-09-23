@@ -61,16 +61,33 @@ class CloudSyncResult:
 
 
 def _technical_spec(item: CloudInstanceType) -> dict[str, object]:
-    return TechnicalSpec(
-        architecture=item.architecture,
-        cpu_type=item.cpu_type,
-        storage_type=item.storage_type,
-        ipv4=item.ipv4,
-        ipv6=item.ipv6,
-    ).to_metadata() | {
+    # Exact provider facts that do not fit the coarse integer spec fields
+    # ride along as namespaced metadata (strings/lists only, never float):
+    # fractional memory, network speeds, the full storage-type list.
+    # Unknown keys are ignored by TechnicalSpec.from_metadata, so the
+    # storefront keeps working if it does not know them yet.
+    extra: dict[str, object] = {
         "plan_family": item.family_key,
         "plan_family_name": item.family_name,
     }
+    if item.memory_gb_exact is not None:
+        extra["memory_gb_exact"] = item.memory_gb_exact
+    if item.network_public is not None:
+        extra["network_public"] = item.network_public
+    if item.network_private is not None:
+        extra["network_private"] = item.network_private
+    if item.storage_types:
+        extra["storage_types"] = list(item.storage_types)
+    return (
+        TechnicalSpec(
+            architecture=item.architecture,
+            cpu_type=item.cpu_type,
+            storage_type=item.storage_type,
+            ipv4=item.ipv4,
+            ipv6=item.ipv6,
+        ).to_metadata()
+        | extra
+    )
 
 
 class LeasewebHourlyCloudSyncer:
@@ -204,6 +221,19 @@ class LeasewebHourlyCloudSyncer:
                     if pair in available:
                         # Already supplied by a higher-priority account.
                         continue
+                    billing_parameters: dict[str, object] = {
+                        "contract_type": "HOURLY",
+                        "monthly_estimate_source": "hourly_rate",
+                        "instance_type_id": item.id,
+                        "region": region.id,
+                        # Exact provider hourly rate (verbatim decimal text):
+                        # sub-cent precision the integer minor field cannot
+                        # hold stays auditable here instead of being rounded
+                        # away silently.
+                        "provider_hourly_rate": item.hourly_rate_exact,
+                    }
+                    if item.monthly_cost_minor is not None:
+                        billing_parameters["provider_monthly_cost_minor"] = item.monthly_cost_minor
                     update = OfferSpecUpdate(
                         name=item.name,
                         vcpu=item.vcpu,
@@ -212,12 +242,7 @@ class LeasewebHourlyCloudSyncer:
                         traffic=item.traffic,
                         provider_cost_minor=item.hourly_cost_minor,
                         provider_cost_currency=item.currency,
-                        billing_parameters={
-                            "contract_type": "HOURLY",
-                            "monthly_estimate_source": "hourly_rate",
-                            "instance_type_id": item.id,
-                            "region": region.id,
-                        },
+                        billing_parameters=billing_parameters,
                         technical_metadata=_technical_spec(item),
                         billing_model="hourly",
                         provider_available=True,

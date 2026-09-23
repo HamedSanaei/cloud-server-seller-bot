@@ -176,8 +176,18 @@ class CatalogAutoSyncCoordinator:
         if report.ok and not report.persistence_failures:
             if self._policy_for(provider_key, report.billing_model) is None:
                 warnings.append("no automatic pricing policy configured; costs refreshed only")
-            prices_updated = await self._auto_price(provider_key, report, warnings)
-            published = await self._auto_publish(provider_key, report, warnings)
+            # The pricing/publication phase must never abort the run: a
+            # failure here used to skip the state write below entirely, so a
+            # sync that repaired catalog data still showed "never" in the
+            # doctor. Record the failure visibly and always persist state.
+            try:
+                prices_updated = await self._auto_price(provider_key, report, warnings)
+                published = await self._auto_publish(provider_key, report, warnings)
+            except Exception as exc:
+                message = f"pricing/publication failed: {type(exc).__name__}: {exc}"
+                logger.warning("catalog auto-sync for %s: %s", provider_key, message)
+                warnings.append(message)
+                errors.append(message)
         elif not report.ok:
             logger.warning(
                 "catalog auto-sync for %s: no pricing/publication (sync not usable)",

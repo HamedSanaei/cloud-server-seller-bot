@@ -45,33 +45,43 @@ def _regions_payload() -> dict[str, Any]:
 
 
 def _types_payload() -> dict[str, Any]:
+    # Official Public Cloud shape: nested resources, prices.hourly, envelope
+    # _metadata.currency (no per-item currency exists in the real API).
     return {
         "instanceTypes": [
             {
-                "name": "lsw.mini",
-                "displayName": "Mini",
-                "cpu": 1,
-                "memoryMb": 1024,
-                "rootDiskSize": 25,
-                "pricePerHour": "0.015",
-                "pricePerMonth": "10.00",
-                "currency": "EUR",
-                "architecture": "x86_64",
-                "cpuType": "shared",
-                "storageType": "ssd",
-                "family": "General Purpose",
+                "name": "lsw.m4.large",
+                "resources": {
+                    "cpu": {"value": 2, "unit": "vCPU"},
+                    "memory": {"value": 8, "unit": "GiB"},
+                    "publicNetworkSpeed": {"value": 5, "unit": "Gbps"},
+                    "privateNetworkSpeed": {"value": 1, "unit": "Gbps"},
+                },
+                "prices": {"hourly": "0.0395", "monthly": "26.0200"},
+                "storageTypes": ["CENTRAL"],
+                "minDiskSize": 5,
             },
             {
-                "name": "lsw.big",
-                "cpu": 4,
-                "memoryMb": 16384,
-                "disk": 200,
-                "pricePerHour": "0.12",
-                "currency": "EUR",
+                "name": "lsw.c3.large",
+                "resources": {
+                    "cpu": {"value": 2, "unit": "vCPU"},
+                    "memory": {"value": 3, "unit": "GiB"},
+                },
+                "prices": {"hourly": "0.0523"},
+                "storageTypes": ["CENTRAL"],
+                "minDiskSize": 5,
             },
-            {"name": "lsw.noprice", "cpu": 2, "memoryMb": 2048},
-            {"name": "lsw.nocurrency", "cpu": 2, "memoryMb": 2048, "pricePerHour": "0.05"},
-        ]
+            {
+                "name": "lsw.noprice",
+                "resources": {
+                    "cpu": {"value": 2, "unit": "vCPU"},
+                    "memory": {"value": 4, "unit": "GiB"},
+                },
+                "storageTypes": ["CENTRAL"],
+                "minDiskSize": 5,
+            },
+        ],
+        "_metadata": {"currency": "EUR", "currencySymbol": "€"},
     }
 
 
@@ -98,21 +108,34 @@ class TestInstanceTypes:
         provider = _provider()
         provider._transport.request = AsyncMock(return_value=_types_payload())
         types = await provider.list_instance_types("eu-west-3")
-        assert [t.id for t in types] == ["lsw.mini", "lsw.big"]
-        mini = types[0]
-        assert (mini.vcpu, mini.ram_gb, mini.disk_gb) == (1, 1, 25)
-        assert mini.hourly_cost_minor == 2  # 0.015 EUR, half-up to minor units
-        assert mini.currency == "EUR"
-        assert mini.architecture == "x86_64"
-        assert mini.cpu_type == "shared"
-        assert mini.storage_type == "ssd"
+        assert [t.id for t in types] == ["lsw.m4.large", "lsw.c3.large"]
+        large = types[0]
+        assert (large.vcpu, large.ram_gb, large.disk_gb) == (2, 8, 5)
+        assert large.hourly_cost_minor == 4  # 0.0395 EUR, half-up to minor units
+        assert large.hourly_rate_exact == "0.0395"
+        assert large.monthly_cost_minor == 2602
+        assert large.currency == "EUR"
+        assert (large.family_key, large.family_name) == ("general", "General Purpose")
+        assert large.storage_type == "CENTRAL"
+        assert large.storage_types == ("CENTRAL",)
+        assert large.memory_gb_exact == "8 GiB"
+        assert large.network_public == "5 Gbps"
+        assert large.network_private == "1 Gbps"
 
-    async def test_missing_price_or_currency_fails_closed(self) -> None:
+    async def test_missing_price_fails_closed(self) -> None:
         provider = _provider()
         provider._transport.request = AsyncMock(return_value=_types_payload())
         types = await provider.list_instance_types("eu-west-3")
         assert "lsw.noprice" not in [t.id for t in types]
-        assert "lsw.nocurrency" not in [t.id for t in types]
+
+    async def test_missing_envelope_currency_fails_closed(self) -> None:
+        # No _metadata.currency anywhere: every item fails closed for
+        # pricing, even with valid prices.hourly values.
+        provider = _provider()
+        payload = _types_payload()
+        del payload["_metadata"]
+        provider._transport.request = AsyncMock(return_value=payload)
+        assert await provider.list_instance_types("eu-west-3") == []
 
 
 class TestFamilyClassification:

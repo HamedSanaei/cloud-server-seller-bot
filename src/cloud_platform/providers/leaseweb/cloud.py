@@ -97,17 +97,39 @@ def _slug(value: str) -> str:
     return cleaned.strip("-") or OTHER_FAMILY_KEY
 
 
+#: Documented Leaseweb Public Cloud naming taxonomy (adapter-local; the
+#: generic storefront must never inspect these prefixes):
+#: https://kb.leaseweb.com/kb/public-cloud-new/new-leaseweb-public-cloud/
+#: ``lsw.m*`` General Purpose, ``lsw.c*`` Compute Optimized,
+#: ``lsw.r*`` Memory Optimized, ``lsw.g*``/``lsw.gr*`` GPU Optimized.
+#: The letter after the family initial is always a platform digit (m4i, c6a,
+#: r5, g6), so a bare ``lsw.mini``-style word never collides.
+_LEASEWEB_FAMILY_BY_PREFIX: tuple[tuple[str, tuple[str, str]], ...] = (
+    ("lsw.gr", ("gpu", "GPU Optimized")),
+    ("lsw.c", ("compute", "Compute Optimized")),
+    ("lsw.m", ("general", "General Purpose")),
+    ("lsw.r", ("memory", "Memory Optimized")),
+    ("lsw.g", ("gpu", "GPU Optimized")),
+)
+
+
 def classify_instance_family(item: dict[str, Any]) -> tuple[str, str]:
     """(family_key, family_name) for one instance-type payload.
 
-    Uses the provider's own category fields when it states one; otherwise
-    the explicit ``other`` family so unclassifiable types stay visible
-    instead of being silently dropped. Never guesses from marketing names.
+    Uses the provider's own category fields when it states one, then the
+    documented ``lsw.*`` naming taxonomy, otherwise the explicit ``other``
+    family so unclassifiable types stay visible instead of being silently
+    dropped. Never guesses from marketing names.
     """
     for category_field in ("family", "category", "planFamily", "series"):
         raw = item.get(category_field)
         if isinstance(raw, str) and raw.strip():
             return _slug(raw), raw.strip()
+    name = str(item.get("name") or "").strip().lower()
+    for prefix, family in _LEASEWEB_FAMILY_BY_PREFIX:
+        rest = name[len(prefix) :] if name.startswith(prefix) else None
+        if rest is not None and (rest == "" or rest[:1] == "." or rest[:1].isdigit()):
+            return family
     return OTHER_FAMILY_KEY, OTHER_FAMILY_NAME
 
 
@@ -123,7 +145,16 @@ class CloudRegion:
 
 @dataclass(frozen=True, slots=True)
 class CloudInstanceType:
-    """One hourly instance type at one region (list payload, normalized)."""
+    """One hourly instance type at one region (list payload, normalized).
+
+    ``hourly_cost_minor`` is the provider rate in integer minor units
+    (HALF_UP, same convention as the monthly syncs); ``hourly_rate_exact``
+    preserves the provider's verbatim decimal rate (e.g. ``"0.0395"``) so
+    sub-cent precision is never silently lost — downstream integer money
+    math stays exact while margin audit keeps the true rate.
+    ``memory_gb_exact``/network/storage facts preserve provider values that
+    do not fit the legacy coarse integer fields.
+    """
 
     id: str
     name: str
@@ -136,12 +167,18 @@ class CloudInstanceType:
     traffic: str | None
     hourly_cost_minor: int
     currency: str
-    architecture: str | None
-    cpu_type: str | None
-    storage_type: str | None
+    architecture: str | None = None
+    cpu_type: str | None = None
+    storage_type: str | None = None
     ipv4: bool | None = None
     ipv6: bool | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    hourly_rate_exact: str = ""
+    monthly_cost_minor: int | None = None
+    memory_gb_exact: str | None = None
+    network_public: str | None = None
+    network_private: str | None = None
+    storage_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,12 +211,16 @@ class CloudInstanceTypesRead:
 
     ``priced_items`` counts raw entries carrying a usable hourly price:
     entries present but unpriced are a pricing fact ("no sellable types"),
-    not a schema failure.
+    not a schema failure. ``currency`` is the envelope ``_metadata.currency``
+    of THIS response (None when missing/invalid — pricing fails closed);
+    it is never inferred from region, account or country.
     """
 
     types: tuple[CloudInstanceType, ...]
     raw_items: int
     priced_items: int
+    currency: str | None = None
+    currency_symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +250,46 @@ def _memory_gb(item: dict[str, Any], resources: dict[str, Any]) -> int:
     return 0
 
 
+def _normalize_currency(value: Any) -> str | None:
+    """ISO 4217 code from a provider value (None when not a 3-letter code)."""
+    code = str(value or "").strip().upper()
+    if len(code) != 3 or not code.isalpha():
+        return None
+    return code
+
+
+def _resource_amount(resources: dict[str, Any], *keys: str) -> tuple[Decimal | None, str | None]:
+    """Nested ``{value, unit}`` resource facts (official ``resources.*`` shape).
+
+    Returns the exact Decimal value plus its unit; no float, no coercion —
+    callers decide how to represent it.
+    """
+    for key in keys:
+        raw = resources.get(key)
+        if not isinstance(raw, dict):
+            continue
+        value = _decimal(raw.get("value"))
+        if value is None:
+            continue
+        unit = raw.get("unit")
+        return value, str(unit).strip() if isinstance(unit, str) and unit.strip() else None
+    return None, None
+
+
+def _display_amount(value: Decimal, unit: str | None) -> str:
+    """Exact provider value with its unit (``1 Gbps``, ``15.25 GiB``)."""
+    text = format(value.normalize(), "f")
+    return f"{text} {unit}" if unit else text
+
+
+def _decimal_string(value: Any) -> str | None:
+    """Verbatim decimal text of a provider value (None when not a number)."""
+    parsed = _decimal(value)
+    if parsed is None:
+        return None
+    return format(parsed, "f")
+
+
 def _int_of(value: Any) -> int:
     try:
         return int(float(str(value)))
@@ -229,19 +310,63 @@ def _parse_region(item: dict[str, Any]) -> CloudRegion | None:
     )
 
 
-def _parse_instance_type(item: dict[str, Any], region: str) -> CloudInstanceType | None:
+def _parse_instance_type(
+    item: dict[str, Any], region: str, currency: str | None
+) -> CloudInstanceType | None:
+    """One official ``instanceTypes`` entry (fail closed without pricing).
+
+    Hourly cost comes ONLY from ``prices.hourly`` (legacy ``pricePerHour``
+    tolerated with documented precedence); currency comes ONLY from the
+    envelope ``_metadata.currency`` passed in — never inferred, never
+    defaulted. A missing/invalid rate or currency drops the item.
+    """
     raw_id = str(item.get("name") or item.get("id") or "").strip()
     if not raw_id:
         return None
-    hourly = _hourly_minor(item.get("pricePerHour", item.get("price_per_hour")))
-    currency = str(item.get("currency") or "").strip().upper()
-    if hourly is None or not currency:
+    code = _normalize_currency(currency)
+    raw_money = item.get("prices")
+    money: dict[str, Any] = raw_money if isinstance(raw_money, dict) else {}
+    hourly_raw = money.get("hourly", item.get("pricePerHour", item.get("price_per_hour")))
+    hourly_text = _decimal_string(hourly_raw)
+    hourly = _hourly_minor(hourly_raw)
+    if hourly is None or hourly_text is None or code is None:
         return None
+    monthly_minor = _hourly_minor(money.get("monthly", item.get("pricePerMonth")))
     raw = item.get("resources")
     resources: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    cpu_value, _cpu_unit = _resource_amount(resources, "cpu")
+    vcpu = (
+        int(cpu_value.to_integral_value(rounding=ROUND_HALF_UP))
+        if cpu_value is not None
+        else _int_of(item.get("cpu") or item.get("vcpus") or resources.get("cpu"))
+    )
+    memory_value, memory_unit = _resource_amount(resources, "memory")
+    if memory_value is not None:
+        ram_gb = int(memory_value.to_integral_value(rounding=ROUND_HALF_UP))
+        memory_exact: str | None = _display_amount(memory_value, memory_unit or "GiB")
+    else:
+        ram_gb = _memory_gb(item, resources)
+        memory_exact = None
+    public_value, public_unit = _resource_amount(resources, "publicNetworkSpeed")
+    private_value, private_unit = _resource_amount(resources, "privateNetworkSpeed")
+    storage_list = item.get("storageTypes")
+    storage_types = (
+        tuple(str(entry).strip() for entry in storage_list if str(entry).strip())
+        if isinstance(storage_list, list)
+        else ()
+    )
+    legacy_storage = item.get("storageType")
+    storage_type = (
+        storage_types[0]
+        if storage_types
+        else (
+            str(legacy_storage).strip()
+            if isinstance(legacy_storage, str) and legacy_storage.strip()
+            else None
+        )
+    )
     architecture = str(item.get("architecture") or "").strip() or None
     cpu_type = item.get("cpuType")
-    storage_type = item.get("storageType")
     family_key, family_name = classify_instance_family(item)
     traffic = item.get("traffic")
     return CloudInstanceType(
@@ -250,19 +375,30 @@ def _parse_instance_type(item: dict[str, Any], region: str) -> CloudInstanceType
         region=region,
         family_key=family_key,
         family_name=family_name,
-        vcpu=_int_of(item.get("cpu") or item.get("vcpus") or resources.get("cpu")),
-        ram_gb=_memory_gb(item, resources),
-        disk_gb=_int_of(item.get("rootDiskSize") or resources.get("disk") or item.get("disk")),
+        vcpu=vcpu,
+        ram_gb=ram_gb,
+        disk_gb=_int_of(
+            item.get("minDiskSize")
+            or item.get("rootDiskSize")
+            or resources.get("disk")
+            or item.get("disk")
+        ),
         traffic=str(traffic).strip() if isinstance(traffic, str) and traffic.strip() else None,
         hourly_cost_minor=hourly,
-        currency=currency,
+        currency=code,
         architecture=architecture,
         cpu_type=str(cpu_type).strip() if isinstance(cpu_type, str) and cpu_type.strip() else None,
-        storage_type=(
-            str(storage_type).strip()
-            if isinstance(storage_type, str) and storage_type.strip()
-            else None
-        ),
+        storage_type=storage_type,
+        hourly_rate_exact=hourly_text,
+        monthly_cost_minor=monthly_minor,
+        memory_gb_exact=memory_exact,
+        network_public=_display_amount(public_value, public_unit or "Gbps")
+        if public_value is not None
+        else None,
+        network_private=_display_amount(private_value, private_unit or "Mbps")
+        if private_value is not None
+        else None,
+        storage_types=storage_types,
     )
 
 
@@ -423,23 +559,46 @@ class LeasewebHourlyCloudProvider:
         return list((await self.read_regions()).regions)
 
     async def read_instance_types(self, region: str) -> CloudInstanceTypesRead:
-        """``GET /publicCloud/v1/instanceTypes?region=`` with raw/priced sizes."""
+        """``GET /publicCloud/v1/instanceTypes?region=`` with raw/priced sizes.
+
+        Currency is read ONCE from this response's ``_metadata`` and handed
+        to every item parse — per-item currency is never consulted, and a
+        missing/invalid envelope currency fails the whole read closed for
+        pricing (items still count as raw, so diagnostics can tell "no
+        currency" apart from "no types").
+        """
         payload = await self._get("/publicCloud/v1/instanceTypes", {"region": region})
+        envelope = payload.get("_metadata") if isinstance(payload, dict) else None
+        envelope = envelope if isinstance(envelope, dict) else {}
+        currency = _normalize_currency(envelope.get("currency"))
+        symbol = envelope.get("currencySymbol")
+        currency_symbol = (
+            str(symbol).strip() if isinstance(symbol, str) and symbol.strip() else None
+        )
         items = [
             item
             for item in self._items(payload, "instanceTypes", "types", "data", "items")
             if isinstance(item, dict)
         ]
-        parsed = [entry for entry in (_parse_instance_type(item, region) for item in items)]
+        parsed = [
+            entry for entry in (_parse_instance_type(item, region, currency) for item in items)
+        ]
         priced = sum(
             1
             for item in items
-            if _hourly_minor(item.get("pricePerHour", item.get("price_per_hour"))) is not None
+            if _hourly_minor(
+                (item.get("prices") or {}).get("hourly")
+                if isinstance(item.get("prices"), dict)
+                else item.get("pricePerHour", item.get("price_per_hour"))
+            )
+            is not None
         )
         return CloudInstanceTypesRead(
             types=tuple(entry for entry in parsed if entry is not None),
             raw_items=len(items),
             priced_items=priced,
+            currency=currency,
+            currency_symbol=currency_symbol,
         )
 
     async def list_instance_types(self, region: str) -> list[CloudInstanceType]:

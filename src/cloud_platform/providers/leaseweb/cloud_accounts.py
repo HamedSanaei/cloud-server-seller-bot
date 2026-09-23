@@ -78,6 +78,7 @@ class CloudAccountCapability:
     regions_raw_items: int = 0
     types_raw_items: int = 0
     types_priced_items: int = 0
+    types_currency: str | None = None
 
 
 def build_cloud_account_router(settings: Any) -> LeasewebCloudAccountRouter | None:
@@ -236,6 +237,7 @@ class LeasewebCloudAccountRouter:
         types_priced = 0
         regions_seen = len(regions)
         regions_raw = regions_read.raw_items
+        types_currency: str | None = None
         for region in regions:
             try:
                 types_read = await provider.read_instance_types(region.id)
@@ -254,6 +256,8 @@ class LeasewebCloudAccountRouter:
                 continue
             types_raw += types_read.raw_items
             types_priced += types_read.priced_items
+            if types_currency is None:
+                types_currency = types_read.currency
             counts.append((region.id, len(types_read.types)))
         if failed:
             return CloudAccountCapability(
@@ -264,6 +268,7 @@ class LeasewebCloudAccountRouter:
                 regions_raw_items=regions_raw,
                 types_raw_items=types_raw,
                 types_priced_items=types_priced,
+                types_currency=types_currency,
             )
         total = sum(count for _region, count in counts)
         if total == 0:
@@ -274,6 +279,7 @@ class LeasewebCloudAccountRouter:
                 regions_raw_items=regions_raw,
                 types_raw_items=types_raw,
                 types_priced_items=types_priced,
+                types_currency=types_currency,
             )
         return CloudAccountCapability(
             account_id,
@@ -283,6 +289,7 @@ class LeasewebCloudAccountRouter:
             regions_raw_items=regions_raw,
             types_raw_items=types_raw,
             types_priced_items=types_priced,
+            types_currency=types_currency,
         )
 
     async def aclose(self) -> None:
