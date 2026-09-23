@@ -102,6 +102,48 @@ class TestRegions:
         provider._transport.request = AsyncMock(return_value={"regions": [{"country": "DE"}]})
         assert await provider.list_regions() == []
 
+    async def test_documented_regions_normalize_country_and_city(self) -> None:
+        provider = _provider()
+        provider._transport.request = AsyncMock(
+            return_value={
+                "regions": [
+                    {"name": "eu-central-1"},
+                    {"name": "eu-west-2"},
+                    {"name": "ap-northeast-1"},
+                ]
+            }
+        )
+        regions = await provider.list_regions()
+        assert [(r.id, r.country_code, r.city) for r in regions] == [
+            ("eu-central-1", "DE", "Frankfurt"),
+            ("eu-west-2", "GB", "London"),
+            ("ap-northeast-1", "JP", "Tokyo"),
+        ]
+
+    async def test_payload_country_and_city_win_over_mapping(self) -> None:
+        provider = _provider()
+        provider._transport.request = AsyncMock(
+            return_value={
+                "regions": [
+                    {
+                        "name": "eu-central-1",
+                        "country": "NL",
+                        "city": "Amsterdam",
+                        "displayName": "Amsterdam",
+                    }
+                ]
+            }
+        )
+        (region,) = await provider.list_regions()
+        assert (region.country_code, region.city) == ("NL", "Amsterdam")
+
+    async def test_unmapped_region_stays_neutral(self) -> None:
+        provider = _provider()
+        provider._transport.request = AsyncMock(return_value={"regions": [{"name": "xx-new-9"}]})
+        (region,) = await provider.list_regions()
+        assert region.country_code is None
+        assert region.city is None
+
 
 class TestInstanceTypes:
     async def test_types_parse_specs_and_hourly_price(self) -> None:

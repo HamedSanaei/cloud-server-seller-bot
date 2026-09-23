@@ -297,16 +297,46 @@ def _int_of(value: Any) -> int:
         return 0
 
 
+#: Leaseweb Public Cloud region geography (adapter-local fallback).
+#:
+#: The ``/regions`` payload carries ids without country/city, so the generic
+#: storefront would render them flagless. Payload fields stay authoritative
+#: when present; this table only fills the gap. Sources: the region ids are
+#: the provider's documented set (terraform ``public_cloud_instance``);
+#: cities follow Leaseweb's datacenter geography (AMS/FRA/LON/MTL/WDC/SFO/
+#: TYO/SIN DC pages) and the Public Cloud KB (eu-west-3 availability zones
+#: on the NL platform). Regions without solid evidence stay unmapped and
+#: render neutrally — a missing flag beats a wrong one.
+CLOUD_REGION_DISPLAY: dict[str, tuple[str, str]] = {
+    "eu-central-1": ("DE", "Frankfurt"),
+    "eu-west-2": ("GB", "London"),
+    "eu-west-3": ("NL", "Amsterdam"),
+    "us-east-1": ("US", "Washington"),
+    "us-west-1": ("US", "San Francisco"),
+    "ca-central-1": ("CA", "Montreal"),
+    "ap-southeast-1": ("SG", "Singapore"),
+    "ap-northeast-1": ("JP", "Tokyo"),
+}
+
+
 def _parse_region(item: dict[str, Any]) -> CloudRegion | None:
     code = str(item.get("name") or item.get("id") or item.get("code") or "").strip()
     if not code:
         return None
     city = item.get("city")
+    country = _normalize_country(item.get("country") or item.get("countryCode"))
+    city_name = str(city).strip() if isinstance(city, str) and city.strip() else None
+    if country is None or city_name is None:
+        fallback = CLOUD_REGION_DISPLAY.get(code)
+        if fallback is not None:
+            fallback_country, fallback_city = fallback
+            country = country or fallback_country
+            city_name = city_name or fallback_city
     return CloudRegion(
         id=code,
         name=str(item.get("displayName") or item.get("name") or code),
-        country_code=_normalize_country(item.get("country") or item.get("countryCode")),
-        city=str(city).strip() if isinstance(city, str) and city.strip() else None,
+        country_code=country,
+        city=city_name,
     )
 
 

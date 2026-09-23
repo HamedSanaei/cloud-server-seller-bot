@@ -789,3 +789,104 @@ class TestHelperPaths:
         monkeypatch.setattr("redis.asyncio.from_url", lambda *a, **k: _FakeRedis())
         ok, _detail = await cli._check_redis()
         assert ok is False
+
+
+class TestLeasewebCloudCatalogMoney:
+    """``leaseweb cloud catalog`` never renders minor units as major currency."""
+
+    async def test_hourly_lines_use_shared_formatter_and_exact_rate(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        from types import SimpleNamespace
+
+        provider = SimpleNamespace(
+            list_regions=AsyncMock(
+                return_value=[
+                    SimpleNamespace(id="eu-central-1", country_code="DE", name="Frankfurt")
+                ]
+            ),
+            list_instance_types=AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        id="lsw.c3.large",
+                        name="lsw.c3.large",
+                        family_name="Compute Optimized",
+                        vcpu=2,
+                        ram_gb=3,
+                        disk_gb=5,
+                        hourly_cost_minor=5,
+                        hourly_rate_exact="0.0453",
+                        currency="EUR",
+                    )
+                ]
+            ),
+            list_images=AsyncMock(return_value=[]),
+            close=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            cli, "_hourly_cloud_provider_or_error", AsyncMock(return_value=provider)
+        )
+        stored = SimpleNamespace(
+            provider_key="leaseweb",
+            product_id="lsw.c3.large",
+            location_id="eu-central-1",
+            selling_price_minor=7,
+            selling_currency="EUR",
+        )
+        repo = AsyncMock()
+        repo.list_all = AsyncMock(return_value=[stored])
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            _fake_repo_class(repo),
+        )
+        assert await cli.leaseweb_cloud_catalog(None) == 0
+        out = capsys.readouterr().out
+        # Exact provider rate preserved for audit, integer fields formatted.
+        assert "0.0453 EUR/hour" in out
+        assert "€0.05/hour" in out
+        assert "€0.07/hour" in out
+        # The old misleading rendering must be gone.
+        assert "5 EUR/h" not in out
+        assert "4 EUR/h" not in out
+
+    async def test_unpriced_offer_marks_selling_clearly(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        from types import SimpleNamespace
+
+        provider = SimpleNamespace(
+            list_regions=AsyncMock(
+                return_value=[
+                    SimpleNamespace(id="eu-central-1", country_code="DE", name="Frankfurt")
+                ]
+            ),
+            list_instance_types=AsyncMock(
+                return_value=[
+                    SimpleNamespace(
+                        id="lsw.c3.large",
+                        name="lsw.c3.large",
+                        family_name="Compute Optimized",
+                        vcpu=2,
+                        ram_gb=3,
+                        disk_gb=5,
+                        hourly_cost_minor=5,
+                        hourly_rate_exact="0.0453",
+                        currency="EUR",
+                    )
+                ]
+            ),
+            list_images=AsyncMock(return_value=[]),
+            close=AsyncMock(),
+        )
+        monkeypatch.setattr(
+            cli, "_hourly_cloud_provider_or_error", AsyncMock(return_value=provider)
+        )
+        repo = AsyncMock()
+        repo.list_all = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            _fake_repo_class(repo),
+        )
+        assert await cli.leaseweb_cloud_catalog(None) == 0
+        out = capsys.readouterr().out
+        assert "unpriced/unpublished" in out

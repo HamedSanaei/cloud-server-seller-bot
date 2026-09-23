@@ -155,7 +155,17 @@ class LeasewebHourlyCloudSyncer:
         raise KeyError(account_id)
 
     async def sync_all(self) -> CloudSyncResult:
-        """Regions per account, then per-region instance types, then reconcile."""
+        """Regions per account, then per-region instance types, then reconcile.
+
+        Ownership is image-aware: checkout mandates image selection through
+        the offer's pinned account, so among the accounts exposing a
+        region/type pair the winner is deterministically the first (in
+        ``(priority, id)`` order) whose region also lists at least one
+        usable image. Image reads never fail an account — an inconclusive
+        read preserves last-known-good routing, while a conclusive empty
+        read routes away (or marks the pair unavailable when no account can
+        serve images for it).
+        """
         from cloud_platform.modules.catalog.repository import SqlAlchemyLocationRepository
 
         offers_repo = SqlAlchemySellableOfferRepository(self._session_factory)
@@ -169,6 +179,10 @@ class LeasewebHourlyCloudSyncer:
         seen_locations: set[str] = set()
         account_failed = False
         written = 0
+        # (type, region) -> [(account, images-state, item)] in account order.
+        # images-state: "ok" (>=1 usable image), "empty" (read ok, none),
+        # "unknown" (read failed; never penalized).
+        candidates: dict[tuple[str, str], list[tuple[str, str, CloudInstanceType]]] = {}
 
         for account_id in self._ordered_accounts():
             if self._state_of(account_id) is CredentialAccountState.DISABLED:
@@ -214,73 +228,118 @@ class LeasewebHourlyCloudSyncer:
                     warnings.append(f"region {region.id}[{account_id}]: {type(exc).__name__}")
                     account_failed = True
                     continue
-                counted = 0
-                region_failed = False
-                for item in types:
-                    pair = (item.id, region.id)
-                    if pair in available:
-                        # Already supplied by a higher-priority account.
-                        continue
-                    billing_parameters: dict[str, object] = {
-                        "contract_type": "HOURLY",
-                        "monthly_estimate_source": "hourly_rate",
-                        "instance_type_id": item.id,
-                        "region": region.id,
-                        # Exact provider hourly rate (verbatim decimal text):
-                        # sub-cent precision the integer minor field cannot
-                        # hold stays auditable here instead of being rounded
-                        # away silently.
-                        "provider_hourly_rate": item.hourly_rate_exact,
-                    }
-                    if item.monthly_cost_minor is not None:
-                        billing_parameters["provider_monthly_cost_minor"] = item.monthly_cost_minor
-                    update = OfferSpecUpdate(
-                        name=item.name,
-                        vcpu=item.vcpu,
-                        ram_gb=item.ram_gb,
-                        disk_gb=item.disk_gb,
-                        traffic=item.traffic,
-                        provider_cost_minor=item.hourly_cost_minor,
-                        provider_cost_currency=item.currency,
-                        billing_parameters=billing_parameters,
-                        technical_metadata=_technical_spec(item),
-                        billing_model="hourly",
-                        provider_available=True,
-                        provider_account_id=account_id,
+                if not types:
+                    continue
+                # Image capability of THIS account for THIS region (read-only).
+                # Checkout mandates image selection through the pinned
+                # account, so ownership below prefers image-capable accounts.
+                # A failed read is "unknown" (never penalized); only a
+                # conclusive empty read routes away.
+                try:
+                    images = await provider.list_images(region.id)
+                    images_state = "ok" if images else "empty"
+                except Exception as exc:
+                    logger.warning(
+                        "leaseweb cloud images of account %s region %s inconclusive: %s",
+                        account_id,
+                        region.id,
+                        type(exc).__name__,
                     )
-                    try:
-                        await offers_repo.upsert_from_provider(
-                            provider_key=PROVIDER_KEY,
-                            product_id=item.id,
-                            location_id=region.id,
-                            update=update,
-                            provider_account_id=account_id,
-                        )
-                    except Exception as exc:
-                        persistence_failures.append(f"upsert {item.id}/{region.id}: {exc}")
-                        warnings.append(
-                            f"{region.id}: keeping last-known offers "
-                            f"({type(exc).__name__}); nothing retired"
-                        )
-                        region_failed = True
-                        continue
-                    available.add(pair)
-                    verified.add(pair)
-                    counted += 1
-                    written += 1
-                previous = per_region.get(region.id)
-                base = previous.products if previous is not None else 0
-                if previous is not None and previous.error is not None and not region_failed:
-                    error: str | None = previous.error
-                else:
-                    error = "persistence failure" if region_failed else None
-                per_region[region.id] = RegionTypeReport(
-                    region_id=region.id,
-                    products=base + counted,
-                    error=error,
+                    images_state = "unknown"
+                for item in types:
+                    candidates.setdefault((item.id, region.id), []).append(
+                        (account_id, images_state, item)
+                    )
+
+        # -- Phase 2: image-aware ownership (deterministic) ----------------
+        for pair in sorted(candidates):
+            type_id, region_id = pair
+            ranked = candidates[pair]
+            winner: tuple[str, str, CloudInstanceType] | None = None
+            for account_id, images_state, item in ranked:
+                if images_state == "ok":
+                    winner = (account_id, images_state, item)
+                    break
+            if winner is None:
+                for account_id, images_state, item in ranked:
+                    if images_state == "unknown":
+                        winner = (account_id, images_state, item)
+                        break
+            if winner is None:
+                # Definitive: every supplying account lists zero usable
+                # images. The pair stays known but unavailable — never
+                # advertised as fully sellable, never retired either.
+                winner = ranked[0]
+            account_id, images_state, item = winner
+            image_ready = images_state != "empty"
+            billing_parameters: dict[str, object] = {
+                "contract_type": "HOURLY",
+                "monthly_estimate_source": "hourly_rate",
+                "instance_type_id": item.id,
+                "region": region_id,
+                # Exact provider hourly rate (verbatim decimal text):
+                # sub-cent precision the integer minor field cannot
+                # hold stays auditable here instead of being rounded
+                # away silently.
+                "provider_hourly_rate": item.hourly_rate_exact,
+            }
+            if item.monthly_cost_minor is not None:
+                billing_parameters["provider_monthly_cost_minor"] = item.monthly_cost_minor
+            update = OfferSpecUpdate(
+                name=item.name,
+                vcpu=item.vcpu,
+                ram_gb=item.ram_gb,
+                disk_gb=item.disk_gb,
+                traffic=item.traffic,
+                provider_cost_minor=item.hourly_cost_minor,
+                provider_cost_currency=item.currency,
+                billing_parameters=billing_parameters,
+                technical_metadata=_technical_spec(item),
+                billing_model="hourly",
+                provider_available=image_ready,
+                provider_account_id=account_id,
+            )
+            counted = 0
+            region_failed = False
+            try:
+                await offers_repo.upsert_from_provider(
+                    provider_key=PROVIDER_KEY,
+                    product_id=item.id,
+                    location_id=region_id,
+                    update=update,
+                    provider_account_id=account_id,
                 )
-                if region_failed:
-                    account_failed = True
+            except Exception as exc:
+                persistence_failures.append(f"upsert {item.id}/{region_id}: {exc}")
+                warnings.append(
+                    f"{region_id}: keeping last-known offers "
+                    f"({type(exc).__name__}); nothing retired"
+                )
+                region_failed = True
+            else:
+                available.add(pair)
+                if image_ready:
+                    verified.add(pair)
+                else:
+                    warnings.append(
+                        f"{region_id}: no account lists usable images for "
+                        f"{type_id}; offer kept unavailable (nothing retired)"
+                    )
+                counted += 1
+                written += 1
+            previous = per_region.get(region_id)
+            base = previous.products if previous is not None else 0
+            if previous is not None and previous.error is not None and not region_failed:
+                error: str | None = previous.error
+            else:
+                error = "persistence failure" if region_failed else None
+            per_region[region_id] = RegionTypeReport(
+                region_id=region_id,
+                products=base + counted,
+                error=error,
+            )
+            if region_failed:
+                account_failed = True
 
         reports = tuple(per_region[region_id] for region_id in sorted(per_region))
         if not reports and not errors:

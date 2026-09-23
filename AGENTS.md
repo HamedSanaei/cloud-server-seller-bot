@@ -51,6 +51,9 @@ When asked to "continue the project" or "do the next tasks":
 - Provider-specific location normalization belongs in the provider adapter.
 - Sibling datacenters in one city must be differentiated with real catalog
   facts (price/count/metadata), not unexplained "Location 1/2/3" labels.
+- Hourly catalog sellability must prove that the pinned credential can supply
+  all mandatory checkout/provisioning inputs, not merely list the instance
+  type.
 
 ### Provider API contract rules
 

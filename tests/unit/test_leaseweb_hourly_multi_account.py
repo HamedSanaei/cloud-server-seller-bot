@@ -152,6 +152,8 @@ class _CloudProviderFake:
         types_raw: dict[str, int] | None = None,
         types_priced: dict[str, int] | None = None,
         types_currency: str | None = None,
+        images: dict[str, list[Any]] | None = None,
+        images_error: Exception | None = None,
     ) -> None:
         self._regions = regions or []
         self._types = types or {}
@@ -163,6 +165,10 @@ class _CloudProviderFake:
         self._types_raw = dict(types_raw or {})
         self._types_priced = dict(types_priced or {})
         self._types_currency = types_currency
+        # Per-region usable images; None means "one image everywhere" (the
+        # legacy default), {} means "conclusively none everywhere".
+        self._images = images
+        self._images_error = images_error
         self.reads: list[str] = []
         self.posts = 0
 
@@ -199,6 +205,10 @@ class _CloudProviderFake:
 
     async def list_images(self, region: str) -> list[Any]:
         self.reads.append(f"images:{region}")
+        if self._images_error is not None:
+            raise self._images_error
+        if self._images is not None:
+            return list(self._images.get(region, []))
         from cloud_platform.providers.leaseweb.cloud import CloudImage
 
         return [CloudImage(id="ubuntu-24.04", label="Ubuntu 24.04", os_family="ubuntu")]
@@ -440,6 +450,136 @@ class TestMultiAccountDiscovery:
         cap = await router.probe_account("flaky")
         assert cap.accessible is False
         assert cap.error_class == "ProviderUnavailable"
+
+
+def _image(image_id: str = "ubuntu-24.04") -> Any:
+    from cloud_platform.providers.leaseweb.cloud import CloudImage
+
+    return CloudImage(id=image_id, label="Ubuntu 24.04", os_family="ubuntu")
+
+
+async def _run_hourly_sync(
+    accounts: dict[str, _CloudProviderFake],
+    priorities: dict[str, int] | None = None,
+) -> tuple[Any, _OffersRepo, _LocationsRepo]:
+    """Real hourly syncer over fake accounts (patched repos)."""
+    from unittest.mock import patch
+
+    import cloud_platform.providers.leaseweb.cloud_sync as mod
+    from cloud_platform.providers.leaseweb.cloud_sync import LeasewebHourlyCloudSyncer
+
+    offers = _OffersRepo([])
+    locations = _LocationsRepo()
+    syncer = LeasewebHourlyCloudSyncer(
+        lambda: None,  # type: ignore[arg-type]
+        accounts=accounts,  # type: ignore[arg-type]
+        account_priorities=priorities or {},
+    )
+    with (
+        patch.object(mod, "SqlAlchemySellableOfferRepository", lambda sf: offers),
+        patch(
+            "cloud_platform.modules.catalog.repository.SqlAlchemyLocationRepository",
+            lambda sf: locations,
+        ),
+    ):
+        result = await syncer.sync_all()
+    return result, offers, locations
+
+
+class TestImageAwareRouting:
+    """Checkout needs images via the pinned account: route to accounts that
+    can actually supply them (production: eu-central-1/north, eu-west-2/uk)."""
+
+    async def test_region_type_routes_to_image_capable_account(self) -> None:
+        shared = {
+            "eu-central-1": [_ctype("lsw.mini", "eu-central-1")],
+            "eu-west-2": [_ctype("lsw.mini", "eu-west-2")],
+        }
+        north = _CloudProviderFake(
+            regions=[_region("eu-central-1"), _region("eu-west-2")],
+            types=dict(shared),
+            images={"eu-central-1": [_image()], "eu-west-2": []},
+        )
+        uk = _CloudProviderFake(
+            regions=[_region("eu-central-1"), _region("eu-west-2")],
+            types=dict(shared),
+            images={"eu-central-1": [], "eu-west-2": [_image()]},
+        )
+        result, offers, _locations = await _run_hourly_sync(
+            {"north": north, "uk": uk}, {"north": 10, "uk": 20}
+        )
+        owners = {
+            (call["product_id"], call["location_id"]): call["provider_account_id"]
+            for call in offers.upserts
+        }
+        assert owners == {
+            ("lsw.mini", "eu-central-1"): "north",
+            ("lsw.mini", "eu-west-2"): "uk",
+        }
+        assert ("lsw.mini", "eu-central-1") in result.verified
+        assert ("lsw.mini", "eu-west-2") in result.verified
+        assert "images:eu-west-2" in north.reads
+        assert "images:eu-west-2" in uk.reads
+
+    async def test_pair_without_images_is_known_but_not_sellable(self) -> None:
+        solo = _CloudProviderFake(
+            regions=[_region("eu-west-2")],
+            types={"eu-west-2": [_ctype("lsw.mini", "eu-west-2")]},
+            images={},
+        )
+        result, offers, _locations = await _run_hourly_sync({"solo": solo})
+        assert len(offers.upserts) == 1
+        update = offers.upserts[0]["update"]
+        assert update.provider_available is False
+        assert update.provider_account_id == "solo"
+        assert ("lsw.mini", "eu-west-2") not in result.verified
+        assert result.offers_written == 1
+        assert any("usable images" in warning for warning in result.warnings)
+
+    async def test_transient_image_failure_preserves_routing(self) -> None:
+        solo = _CloudProviderFake(
+            regions=[_region("eu-west-2")],
+            types={"eu-west-2": [_ctype("lsw.mini", "eu-west-2")]},
+            images_error=ProviderUnavailable("timeout"),
+        )
+        result, offers, _locations = await _run_hourly_sync({"solo": solo})
+        assert len(offers.upserts) == 1
+        update = offers.upserts[0]["update"]
+        assert update.provider_available is True
+        assert ("lsw.mini", "eu-west-2") in result.verified
+        assert not any("usable images" in warning for warning in result.warnings)
+
+    async def test_image_reads_never_suppress_reconciliation(self) -> None:
+        solo = _CloudProviderFake(
+            regions=[_region("eu-west-2")],
+            types={"eu-west-2": [_ctype("lsw.mini", "eu-west-2")]},
+            images_error=ProviderUnavailable("timeout"),
+        )
+        offers = _OffersRepo([])
+
+        async def _mark(provider_key: str, available: Any, billing_model: Any = None) -> int:
+            return 7
+
+        offers.mark_unavailable = _mark  # type: ignore[method-assign]
+        from unittest.mock import patch
+
+        import cloud_platform.providers.leaseweb.cloud_sync as mod
+        from cloud_platform.providers.leaseweb.cloud_sync import LeasewebHourlyCloudSyncer
+
+        syncer = LeasewebHourlyCloudSyncer(
+            lambda: None,  # type: ignore[arg-type]
+            accounts={"solo": solo},  # type: ignore[arg-type]
+        )
+        with (
+            patch.object(mod, "SqlAlchemySellableOfferRepository", lambda sf: offers),
+            patch(
+                "cloud_platform.modules.catalog.repository.SqlAlchemyLocationRepository",
+                lambda sf: _LocationsRepo(),
+            ),
+        ):
+            result = await syncer.sync_all()
+        assert result.marked_unavailable == 7
+        assert not any("skipped mark_unavailable" in warning for warning in result.warnings)
 
 
 def _probed_router(fake: _CloudProviderFake) -> Any:

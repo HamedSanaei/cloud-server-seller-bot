@@ -1879,6 +1879,21 @@ async def leaseweb_cloud_catalog(region: str | None) -> int:
     if region is not None and not wanted:
         print(f"error: unknown region {region!r}")
         return 1
+    from cloud_platform.modules.fx.formatting import format_minor
+
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.offers.repository import (
+            SqlAlchemySellableOfferRepository,
+        )
+
+        stored_offers = {
+            (row.product_id, row.location_id): row
+            for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+            if row.provider_key == "leaseweb"
+        }
+    except Exception:
+        stored_offers = {}
     for item in sorted(wanted, key=lambda r: r.id):
         print(f"== {item.id} ({item.country_code or '??'}) — {item.name}")
         try:
@@ -1887,11 +1902,32 @@ async def leaseweb_cloud_catalog(region: str | None) -> int:
             print(f"   types unreadable ({type(exc).__name__})")
             continue
         for entry in sorted(types, key=lambda e: (e.hourly_cost_minor, e.name)):
+            # Never render minor units as whole currency: the provider rate
+            # keeps its exact decimal text, integer fields go through the
+            # shared money formatter.
+            if entry.hourly_rate_exact:
+                provider_line = f"provider: {entry.hourly_rate_exact} {entry.currency}/hour"
+            else:
+                provider_line = (
+                    f"provider: {format_minor(entry.hourly_cost_minor, entry.currency)}/hour"
+                )
+            normalized = (
+                "normalized provider cost: "
+                f"{format_minor(entry.hourly_cost_minor, entry.currency)}/hour"
+            )
+            stored = stored_offers.get((entry.id, item.id))
+            if stored is not None and stored.selling_price_minor > 0:
+                selling = (
+                    "selling: "
+                    f"{format_minor(stored.selling_price_minor, stored.selling_currency)}/hour"
+                )
+            else:
+                selling = "selling: — (unpriced/unpublished)"
             print(
                 f"   {entry.id} [{entry.family_name}]: "
-                f"{entry.vcpu} vCPU / {entry.ram_gb} GB RAM / {entry.disk_gb} GB disk / "
-                f"{entry.hourly_cost_minor} {entry.currency}/h"
+                f"{entry.vcpu} vCPU / {entry.ram_gb} GB RAM / {entry.disk_gb} GB disk"
             )
+            print(f"      {provider_line} / {normalized} / {selling}")
         try:
             images = await provider.list_images(item.id)
         except Exception as exc:
