@@ -148,11 +148,19 @@ class _CloudProviderFake:
         types: dict[str, list[CloudInstanceType]] | None = None,
         regions_error: Exception | None = None,
         types_error: Exception | None = None,
+        regions_raw: int | None = None,
+        types_raw: dict[str, int] | None = None,
+        types_priced: dict[str, int] | None = None,
     ) -> None:
         self._regions = regions or []
         self._types = types or {}
         self._regions_error = regions_error
         self._types_error = types_error
+        # Raw/priced envelope sizes, for schema-drift probing: None means
+        # "honest" (raw == parsed, priced == parsed).
+        self._regions_raw = len(self._regions) if regions_raw is None else regions_raw
+        self._types_raw = dict(types_raw or {})
+        self._types_priced = dict(types_priced or {})
         self.reads: list[str] = []
         self.posts = 0
 
@@ -167,6 +175,20 @@ class _CloudProviderFake:
         if self._types_error is not None:
             raise self._types_error
         return list(self._types.get(region, []))
+
+    async def read_regions(self) -> Any:
+        from cloud_platform.providers.leaseweb.cloud import CloudRegionsRead
+
+        regions = await self.list_regions()
+        return CloudRegionsRead(regions=tuple(regions), raw_items=self._regions_raw)
+
+    async def read_instance_types(self, region: str) -> Any:
+        from cloud_platform.providers.leaseweb.cloud import CloudInstanceTypesRead
+
+        types = await self.list_instance_types(region)
+        raw = self._types_raw.get(region, len(types))
+        priced = self._types_priced.get(region, len(types))
+        return CloudInstanceTypesRead(types=tuple(types), raw_items=raw, priced_items=priced)
 
     async def list_images(self, region: str) -> list[Any]:
         self.reads.append(f"images:{region}")
@@ -411,6 +433,132 @@ class TestMultiAccountDiscovery:
         cap = await router.probe_account("flaky")
         assert cap.accessible is False
         assert cap.error_class == "ProviderUnavailable"
+
+
+def _probed_router(fake: _CloudProviderFake) -> Any:
+    """Router with one ACTIVE account backed by the fake provider."""
+    from cloud_platform.providers.leaseweb.cloud_accounts import (
+        LeasewebCloudAccountRouter,
+        LeasewebCredentialAccount,
+    )
+
+    router = LeasewebCloudAccountRouter.__new__(LeasewebCloudAccountRouter)
+    router._accounts = {
+        "acct": LeasewebCredentialAccount(
+            account_id="acct", api_key="k", state=CredentialAccountState.ACTIVE
+        ),
+    }
+    router._providers = {"acct": fake}  # type: ignore[attr-defined]
+    return router
+
+
+class TestProbeShapeClassification:
+    """The probe separates empty catalogs from unrecognized responses."""
+
+    async def test_zero_regions_is_empty_not_schema_drift(self) -> None:
+        router = _probed_router(_CloudProviderFake(regions=[]))
+        cap = await router.probe_account("acct")
+        assert cap.accessible is False
+        assert cap.error_class is None
+        assert cap.regions_seen == 0
+        assert cap.regions_raw_items == 0
+
+    async def test_regions_without_types_is_empty_catalog(self) -> None:
+        router = _probed_router(_CloudProviderFake(regions=[_region()], types={}))
+        cap = await router.probe_account("acct")
+        assert cap.accessible is False
+        assert cap.error_class is None
+        assert cap.regions_seen == 1
+        assert cap.types_raw_items == 0
+
+    async def test_raw_regions_without_parsed_is_schema_drift(self) -> None:
+        router = _probed_router(_CloudProviderFake(regions=[], regions_raw=3))
+        cap = await router.probe_account("acct")
+        assert cap.accessible is False
+        assert cap.error_class is None
+        assert cap.regions_seen == 0
+        assert cap.regions_raw_items == 3
+
+    async def test_unpriced_types_are_pricing_fact_not_schema_drift(self) -> None:
+        router = _probed_router(
+            _CloudProviderFake(
+                regions=[_region()],
+                types={"eu-west-3": []},
+                types_raw={"eu-west-3": 2},
+                types_priced={"eu-west-3": 0},
+            )
+        )
+        cap = await router.probe_account("acct")
+        assert cap.accessible is False
+        assert cap.error_class is None
+        assert cap.types_raw_items == 2
+        assert cap.types_priced_items == 0
+
+    async def test_types_request_failure_keeps_region_error(self) -> None:
+        router = _probed_router(
+            _CloudProviderFake(regions=[_region()], types_error=ProviderUnavailable("timeout"))
+        )
+        cap = await router.probe_account("acct")
+        assert cap.accessible is False
+        assert cap.error_class == "RegionError"
+
+
+class TestCloudUnavailableReason:
+    """Doctor one-liners for every inaccessible-account shape (no secrets)."""
+
+    def _reason(self, **overrides: Any) -> str:
+        from types import SimpleNamespace
+
+        from cloud_platform.cli import _cloud_unavailable_reason
+
+        base = {
+            "error_class": None,
+            "regions": (),
+            "regions_seen": 0,
+            "regions_raw_items": 0,
+            "types_raw_items": 0,
+            "types_priced_items": 0,
+        }
+        base.update(overrides)
+        return _cloud_unavailable_reason(SimpleNamespace(**base))
+
+    def test_auth_denied(self) -> None:
+        assert self._reason(error_class="AuthenticationError") == "auth denied for this account"
+
+    def test_regions_request_failed(self) -> None:
+        assert "regions request failed" in self._reason(error_class="ProviderUnavailable")
+        assert "ProviderUnavailable" in self._reason(error_class="ProviderUnavailable")
+
+    def test_types_request_failed(self) -> None:
+        assert "instance-type request failed" in self._reason(error_class="RegionError")
+
+    def test_zero_regions(self) -> None:
+        assert self._reason(regions_raw_items=0) == "regions endpoint returned zero regions"
+
+    def test_unrecognized_regions_response(self) -> None:
+        reason = self._reason(regions_raw_items=3, regions_seen=0)
+        assert "not recognized" in reason
+        assert "3 raw item(s)" in reason
+
+    def test_empty_instance_types(self) -> None:
+        reason = self._reason(regions_raw_items=1, regions_seen=1, types_raw_items=0)
+        assert "instanceTypes are all empty" in reason
+
+    def test_unpriced_types(self) -> None:
+        reason = self._reason(
+            regions_raw_items=1, regions_seen=1, types_raw_items=2, types_priced_items=0
+        )
+        assert "usable hourly price" in reason
+
+    def test_unrecognized_types_response(self) -> None:
+        reason = self._reason(
+            regions_raw_items=1,
+            regions_seen=1,
+            regions=(("eu-west-3", 0),),
+            types_raw_items=2,
+            types_priced_items=2,
+        )
+        assert "not recognized" in reason
 
     async def test_priority_wins_for_shared_region_type(self) -> None:
         from unittest.mock import patch

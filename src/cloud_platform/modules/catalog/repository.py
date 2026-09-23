@@ -31,10 +31,16 @@ from cloud_platform.modules.catalog.domain import (
 #: Namespace for deriving stable provider UUIDs from provider keys.
 _PROVIDER_UUID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:provider")
 
-#: Stable big-int key for the catalog sync advisory lock (Postgres 64-bit).
+#: Stable big-int key for the catalog sync advisory lock.
+#:
+#: PostgreSQL's ``pg_try_advisory_lock(bigint)`` takes a SIGNED int64, and
+#: asyncpg validates the bound client-side (an unsigned derivation raises
+#: ``OverflowError``/``DataError`` before any sync work runs), so the
+#: deterministic UUID bytes MUST be decoded with explicit signedness.
 _CATALOG_SYNC_LOCK_KEY = int.from_bytes(
     uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:catalog-sync-lock").bytes[:8],
     "big",
+    signed=True,
 )
 
 

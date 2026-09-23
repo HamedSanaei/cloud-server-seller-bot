@@ -62,12 +62,22 @@ class CloudAccountCapability:
     serves instance types. An account whose regions read fails carries
     ``error_class`` (``AuthenticationError`` for rejected keys, otherwise the
     exception class = transient/unknown, never "no Cloud").
+
+    The shape counters let diagnostics distinguish "the endpoint returned
+    nothing" (``regions_raw_items == 0``) from "the response was not
+    recognized" (raw items present, nothing parsed) and "types exist but are
+    unpriced" — all of which surface as ``accessible=False`` with
+    ``error_class=None``.
     """
 
     account_id: str
     accessible: bool
     regions: tuple[tuple[str, int], ...] = ()
     error_class: str | None = None
+    regions_seen: int = 0
+    regions_raw_items: int = 0
+    types_raw_items: int = 0
+    types_priced_items: int = 0
 
 
 def build_cloud_account_router(settings: Any) -> LeasewebCloudAccountRouter | None:
@@ -196,13 +206,16 @@ class LeasewebCloudAccountRouter:
         Authentication failures and empty catalogs both mean "this account
         has no usable Cloud" (ineligible); transport failures are UNKNOWN
         (the account might serve Cloud — callers must not retire on it).
+        Shape counters (parsed vs raw) travel on every ``accessible=False``
+        outcome without an ``error_class`` so the doctor can tell an empty
+        catalog from an unrecognized response.
         """
         try:
             provider = self.client_for(account_id)
         except UnknownCredentialAccountError:
             return CloudAccountCapability(account_id, accessible=False, error_class="NotConfigured")
         try:
-            regions = await provider.list_regions()
+            regions_read = await provider.read_regions()
         except ProviderAuthError:
             return CloudAccountCapability(
                 account_id, accessible=False, error_class="AuthenticationError"
@@ -216,11 +229,16 @@ class LeasewebCloudAccountRouter:
             return CloudAccountCapability(
                 account_id, accessible=False, error_class=type(exc).__name__
             )
+        regions = regions_read.regions
         counts: list[tuple[str, int]] = []
         failed = False
+        types_raw = 0
+        types_priced = 0
+        regions_seen = len(regions)
+        regions_raw = regions_read.raw_items
         for region in regions:
             try:
-                types = await provider.list_instance_types(region.id)
+                types_read = await provider.read_instance_types(region.id)
             except ProviderAuthError:
                 return CloudAccountCapability(
                     account_id, accessible=False, error_class="AuthenticationError"
@@ -234,13 +252,38 @@ class LeasewebCloudAccountRouter:
                 )
                 failed = True
                 continue
-            counts.append((region.id, len(types)))
+            types_raw += types_read.raw_items
+            types_priced += types_read.priced_items
+            counts.append((region.id, len(types_read.types)))
         if failed:
-            return CloudAccountCapability(account_id, accessible=False, error_class="RegionError")
+            return CloudAccountCapability(
+                account_id,
+                accessible=False,
+                error_class="RegionError",
+                regions_seen=regions_seen,
+                regions_raw_items=regions_raw,
+                types_raw_items=types_raw,
+                types_priced_items=types_priced,
+            )
         total = sum(count for _region, count in counts)
         if total == 0:
-            return CloudAccountCapability(account_id, accessible=False)
-        return CloudAccountCapability(account_id, accessible=True, regions=tuple(counts))
+            return CloudAccountCapability(
+                account_id,
+                accessible=False,
+                regions_seen=regions_seen,
+                regions_raw_items=regions_raw,
+                types_raw_items=types_raw,
+                types_priced_items=types_priced,
+            )
+        return CloudAccountCapability(
+            account_id,
+            accessible=True,
+            regions=tuple(counts),
+            regions_seen=regions_seen,
+            regions_raw_items=regions_raw,
+            types_raw_items=types_raw,
+            types_priced_items=types_priced,
+        )
 
     async def aclose(self) -> None:
         """Close every per-account transport (best effort)."""

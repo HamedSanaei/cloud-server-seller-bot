@@ -85,6 +85,18 @@ Run only the tests directly related to the modified code:
 
 Run when the change touches shared components: `core/config.py`, `core/container.py`, database models, shared services or dependency injection. Requires the affected module tests plus the related integration tests.
 
+### Database integer contract
+
+- Values passed to PostgreSQL BIGINT APIs, including advisory-lock keys,
+  must be validated against signed int64 bounds.
+- Deterministic byte/hash-derived integers must specify signedness explicitly.
+- Infrastructure primitives whose correctness depends on PostgreSQL semantics
+  require at least one real-PostgreSQL integration test; mock-only tests are
+  insufficient.
+- A push-ready catalog-sync change must exercise the coordinator far enough
+  to acquire its real PostgreSQL advisory lock; provider tests alone do not
+  prove the periodic pipeline can start.
+
 ### Level 3 — Full suite
 
 Run the full pytest suite ONLY when:

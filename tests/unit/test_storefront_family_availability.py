@@ -409,3 +409,58 @@ class TestFamilyAvailabilityGenericCode:
                 assert "LON" not in literal, f"{relative}: {literal!r}"
                 assert "Frankfurt" not in literal, f"{relative}: {literal!r}"
                 assert "London" not in literal, f"{relative}: {literal!r}"
+
+
+class TestConfigLoadedFamilies:
+    """Production-shaped TOML families drive the two-row selector.
+
+    The catalog is built from real ``Settings`` (parsed from a TOML file,
+    exactly like the container builds it), not from a hand-made catalog —
+    so a misconfigured/missing families section would fail here first.
+    """
+
+    _TOML = """\
+[providers.leaseweb]
+enabled = true
+market = "foreign"
+display_name = "Leaseweb"
+
+[providers.leaseweb.families.vps]
+billing_model = "prepaid_monthly_fixed"
+display_name = "وی‌پی‌اس"
+
+[providers.leaseweb.families.cloud]
+billing_model = "hourly"
+display_name = "کلود"
+"""
+
+    def _catalog_from_toml(self, tmp_path: Any) -> ProviderCatalog:
+        from cloud_platform.core.config import load_settings
+
+        path = tmp_path / "configuration.toml"
+        path.write_text(self._TOML, encoding="utf-8")
+        settings = load_settings(path)
+        assert settings.provider_families["leaseweb"]["vps"]["billing_model"] == (
+            "prepaid_monthly_fixed"
+        )
+        assert settings.provider_families["leaseweb"]["cloud"]["billing_model"] == "hourly"
+        # Same construction the container uses for the storefront catalog.
+        return ProviderCatalog(
+            markets=settings.provider_markets,
+            display_names=settings.provider_display_names,
+            enabled=settings.providers_enabled,
+            families=settings.provider_families,
+        )
+
+    async def test_toml_families_render_two_rows_with_zero_hourly(self, tmp_path: Any) -> None:
+        catalog = self._catalog_from_toml(tmp_path)
+        service = _service(
+            [_monthly_offer(location_id="FRA-01")],
+            catalog=catalog,
+        )
+        families, _, _ = await service.families_screen(PROVIDER)
+        assert [(f.family_key, f.available) for f in families] == [
+            ("vps", True),
+            ("cloud", False),
+        ]
+        assert [f.display_name for f in families] == ["وی‌پی‌اس", "کلود"]

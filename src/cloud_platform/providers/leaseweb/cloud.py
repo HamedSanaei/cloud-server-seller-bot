@@ -155,6 +155,34 @@ class CloudImage:
 
 
 @dataclass(frozen=True, slots=True)
+class CloudRegionsRead:
+    """One ``/regions`` read: parsed regions plus the raw envelope size.
+
+    The parsers are lenient by design (unknown envelopes parse to nothing),
+    so ``raw_items > 0`` with zero parsed regions is the observable signal
+    of schema drift — not of an empty catalog. Diagnostics only; the sync
+    path keeps using :meth:`LeasewebHourlyCloudProvider.list_regions`.
+    """
+
+    regions: tuple[CloudRegion, ...]
+    raw_items: int
+
+
+@dataclass(frozen=True, slots=True)
+class CloudInstanceTypesRead:
+    """One ``/instanceTypes`` read: parsed/priced types plus raw size.
+
+    ``priced_items`` counts raw entries carrying a usable hourly price:
+    entries present but unpriced are a pricing fact ("no sellable types"),
+    not a schema failure.
+    """
+
+    types: tuple[CloudInstanceType, ...]
+    raw_items: int
+    priced_items: int
+
+
+@dataclass(frozen=True, slots=True)
 class CloudInstance:
     """One hourly instance as the provider reports it."""
 
@@ -377,24 +405,46 @@ class LeasewebHourlyCloudProvider:
                     return items
         return []
 
+    async def read_regions(self) -> CloudRegionsRead:
+        """``GET /publicCloud/v1/regions`` with the raw envelope size."""
+        payload = await self._get("/publicCloud/v1/regions")
+        items = [
+            item
+            for item in self._items(payload, "regions", "data", "items")
+            if isinstance(item, dict)
+        ]
+        regions = tuple(
+            region for region in (_parse_region(item) for item in items) if region is not None
+        )
+        return CloudRegionsRead(regions=regions, raw_items=len(items))
+
     async def list_regions(self) -> list[CloudRegion]:
         """``GET /publicCloud/v1/regions`` (authoritative region list)."""
-        payload = await self._get("/publicCloud/v1/regions")
-        regions = [
-            region
-            for item in self._items(payload, "regions", "data", "items")
-            if isinstance(item, dict) and (region := _parse_region(item)) is not None
+        return list((await self.read_regions()).regions)
+
+    async def read_instance_types(self, region: str) -> CloudInstanceTypesRead:
+        """``GET /publicCloud/v1/instanceTypes?region=`` with raw/priced sizes."""
+        payload = await self._get("/publicCloud/v1/instanceTypes", {"region": region})
+        items = [
+            item
+            for item in self._items(payload, "instanceTypes", "types", "data", "items")
+            if isinstance(item, dict)
         ]
-        return regions
+        parsed = [entry for entry in (_parse_instance_type(item, region) for item in items)]
+        priced = sum(
+            1
+            for item in items
+            if _hourly_minor(item.get("pricePerHour", item.get("price_per_hour"))) is not None
+        )
+        return CloudInstanceTypesRead(
+            types=tuple(entry for entry in parsed if entry is not None),
+            raw_items=len(items),
+            priced_items=priced,
+        )
 
     async def list_instance_types(self, region: str) -> list[CloudInstanceType]:
         """``GET /publicCloud/v1/instanceTypes?region=`` (catalog membership)."""
-        payload = await self._get("/publicCloud/v1/instanceTypes", {"region": region})
-        return [
-            parsed
-            for item in self._items(payload, "instanceTypes", "types", "data", "items")
-            if isinstance(item, dict) and (parsed := _parse_instance_type(item, region)) is not None
-        ]
+        return list((await self.read_instance_types(region)).types)
 
     async def list_images(self, region: str) -> list[CloudImage]:
         """``GET /publicCloud/v1/images?region=`` (live, for the image screen)."""

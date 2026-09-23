@@ -219,6 +219,54 @@ class TestCatalogAutoSyncDoctor:
         # Presence only — the secret itself must never be printed.
         assert "TEST-CREDENTIAL" not in out
 
+    async def test_doctor_renders_hourly_state_key_only_once(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        # The billing-suffixed "leaseweb.hourly" sync-state/policy key must
+        # not surface as a second generic provider entry alongside the
+        # dedicated monthly/hourly Leaseweb section.
+        import cloud_platform.cli as cli_module
+
+        settings.leaseweb_api_key = "TEST-CREDENTIAL"  # pragma: allowlist secret
+        settings.hetzner_api_token = ""
+        settings.storefront_pricing = {
+            "leaseweb": {"mode": "markup", "markup_percent": 25, "auto_publish": True},
+            "leaseweb.hourly": {
+                "mode": "markup",
+                "markup_percent": 25,
+                "auto_publish": True,
+            },
+        }
+
+        from datetime import UTC, datetime
+
+        state_repo = MagicMock()
+        state_repo.list_all = AsyncMock(
+            return_value=[
+                CatalogSyncState(provider_key="leaseweb"),
+                CatalogSyncState(
+                    provider_key="leaseweb.hourly",
+                    last_attempted_at=datetime.now(UTC),
+                    last_success_at=datetime.now(UTC),
+                ),
+            ]
+        )
+        offers_repo = MagicMock()
+        offers_repo.list_all = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemyCatalogSyncStateRepository",
+            lambda session_factory: state_repo,
+        )
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            lambda session_factory: offers_repo,
+        )
+        assert await cli_module.catalog_auto_sync_doctor() == 0
+        lines = capsys.readouterr().out.splitlines()
+        assert sum(1 for line in lines if line == "leaseweb.hourly: (hourly)") == 1
+        assert not any(line == "leaseweb.hourly:" for line in lines)
+        assert "TEST-CREDENTIAL" not in "\n".join(lines)
+
     async def test_doctor_survives_router_failure(
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:

@@ -1500,7 +1500,15 @@ async def catalog_auto_sync_doctor() -> int:
     print(f"catalog auto-sync: {toggle}")
     print(f"interval: {settings.storefront_catalog_sync_interval_seconds}s")
     print("")
-    for provider_key in sorted(set(stored) | set(states) | set(policies) | set(credentials)):
+    loop_keys = set(stored) | set(states) | set(policies) | set(credentials)
+    # Billing-suffixed sync-state/policy keys ("<provider>.hourly") alias
+    # their provider, which the dedicated section renders: fold them so the
+    # generic loop never invents a fake "leaseweb.hourly" provider entry.
+    folded: set[str] = set()
+    for key in loop_keys:
+        base, dot, _suffix = key.partition(".")
+        folded.add(base if dot and base in loop_keys else key)
+    for provider_key in sorted(folded):
         # Leaseweb is reported as TWO product lines (monthly + hourly),
         # never one opaque status: the offer table shares the key but the
         # sync states ("leaseweb" vs "leaseweb.hourly") and pricing
@@ -1634,6 +1642,41 @@ def _print_leaseweb_line(
     print("")
 
 
+def _cloud_unavailable_reason(capability: Any) -> str:
+    """One-line classification of an inaccessible Public Cloud account.
+
+    Distinguishes, without secrets: auth denied (error_class), a failed
+    regions read (exception class), a failed instance-type read
+    (``RegionError``), an endpoint that returned zero regions, an
+    unrecognized regions response (raw items, nothing parsed), regions with
+    uniformly empty instance-type lists, types present but unpriced, and an
+    unrecognized types response. Read-only diagnostics only.
+    """
+    error_class = getattr(capability, "error_class", None)
+    if error_class == "AuthenticationError":
+        return "auth denied for this account"
+    if error_class == "RegionError":
+        return "instance-type request failed (transient/unknown)"
+    if error_class:
+        return f"regions request failed ({error_class})"
+    regions_raw = int(getattr(capability, "regions_raw_items", 0) or 0)
+    regions_seen = int(getattr(capability, "regions_seen", 0) or 0)
+    types_raw = int(getattr(capability, "types_raw_items", 0) or 0)
+    types_priced = int(getattr(capability, "types_priced_items", 0) or 0)
+    if regions_raw == 0:
+        return "regions endpoint returned zero regions"
+    if regions_seen == 0:
+        return f"regions response not recognized ({regions_raw} raw item(s), 0 parsed)"
+    if types_raw == 0:
+        return "regions exist but instanceTypes are all empty"
+    if types_priced == 0:
+        return "types present but none carry a usable hourly price/currency"
+    parsed_types = sum(count for _region_id, count in (getattr(capability, "regions", ()) or ()))
+    if parsed_types == 0:
+        return f"instance-type responses not recognized ({types_raw} raw item(s), 0 parsed)"
+    return "no usable Cloud catalog"
+
+
 async def _hourly_cloud_provider_or_error() -> Any:
     """Hourly cloud adapter from settings, or an explanatory failure.
 
@@ -1721,7 +1764,7 @@ async def leaseweb_cloud_doctor() -> int:
                         f"images unreadable ({type(exc).__name__})"
                     )
         else:
-            reason = capability.error_class or "no usable Cloud catalog"
+            reason = _cloud_unavailable_reason(capability)
             print(f"  account {account.account_id}: Public Cloud UNAVAILABLE ({reason})")
             if capability.regions:
                 for region_id, type_count in sorted(capability.regions):

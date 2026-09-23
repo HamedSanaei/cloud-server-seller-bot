@@ -150,3 +150,10 @@ jobs:
           echo "alembic head=$head_rev current=$current_rev"
           test -n "$head_rev"
           test "$head_rev" = "$current_rev"
+      # P0 advisory-lock contract: the catalog-sync lock key, the coordinator
+      # run past lock acquisition, and stale-row repair execute against this
+      # REAL PostgreSQL (mock-only tests missed the signed-BIGINT contract).
+      - name: Live PostgreSQL catalog-sync contract
+        env:
+          CLOUD_PLATFORM_TEST_POSTGRES_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
+        run: uv run pytest tests/live/test_postgres_catalog_sync.py -q --no-cov

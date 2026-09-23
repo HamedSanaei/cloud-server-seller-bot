@@ -198,6 +198,36 @@ class TestPostgresAdvisoryLock:
             "SELECT pg_advisory_unlock(:key)",
         ]
 
+    def test_lock_key_is_a_valid_signed_postgres_bigint(self) -> None:
+        # Production pin: the unsigned derivation of these exact UUID bytes
+        # is 14525143593005701961, which PostgreSQL rejected with
+        # "value out of int64 range" and blocked every catalog auto-sync.
+        # The signed decoding must stay inside BIGINT bounds forever.
+        import uuid
+
+        unsigned = int.from_bytes(
+            uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:catalog-sync-lock").bytes[:8],
+            "big",
+        )
+        assert unsigned == 14525143593005701961
+        assert _CATALOG_SYNC_LOCK_KEY == int.from_bytes(
+            uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:catalog-sync-lock").bytes[:8],
+            "big",
+            signed=True,
+        )
+        assert _CATALOG_SYNC_LOCK_KEY != unsigned
+        assert -(2**63) <= _CATALOG_SYNC_LOCK_KEY <= 2**63 - 1
+
+    def test_lock_key_is_deterministic(self) -> None:
+        import uuid
+
+        again = int.from_bytes(
+            uuid.uuid5(uuid.NAMESPACE_URL, "cloud-platform:catalog-sync-lock").bytes[:8],
+            "big",
+            signed=True,
+        )
+        assert again == _CATALOG_SYNC_LOCK_KEY
+
 
 class AdvisoryStyleLock:
     """Models a pg advisory lock: one owner at a time, holder wins, others skip."""
