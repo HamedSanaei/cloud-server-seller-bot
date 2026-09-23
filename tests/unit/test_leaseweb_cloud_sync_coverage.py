@@ -237,7 +237,12 @@ class TestAdapterParsingCorners:
         from types import SimpleNamespace
 
         settings = SimpleNamespace(
-            leaseweb_api_key="primary", leaseweb_accounts=[], leaseweb_timeout_seconds=30
+            # Test-only sentinel: not a credential. The Settings attribute is
+            # what makes it secret-shaped, so detect-secrets needs the repo's
+            # established inline allowlist.
+            leaseweb_api_key="primary",  # pragma: allowlist secret
+            leaseweb_accounts=[],
+            leaseweb_timeout_seconds=30,
         )
         built = hourly_provider_from_settings(settings)
         assert built is not None
