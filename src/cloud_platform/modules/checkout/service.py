@@ -23,6 +23,7 @@ marked ERROR — a failed command never leaves an orphaned reservation.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -639,11 +640,17 @@ PRODUCTS_PAGE_SIZE = 6
 @dataclass(frozen=True, slots=True)
 class FamilyOptionView:
     # One commercial product line of a provider on the family screen.
+    # ``sellable_count``/``available`` describe CURRENT inventory only: a
+    # configured family with zero sellable offers is still shown (as
+    # unavailable), never hidden — family existence and inventory are
+    # different facts.
     provider_key: str
     family_key: str
     billing_model: str
     display_name: str
     select_callback: str
+    sellable_count: int = 0
+    available: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,6 +668,72 @@ class LocationPageView:
     # One page of a provider's locations with pager navigation.
     provider_key: str
     items: tuple[FamilyLocationView, ...]
+    page: int
+    total_pages: int
+    total_count: int
+    back_callback: str
+    cancel_callback: str
+    prev_callback: str | None
+    next_callback: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CityLocationGroup:
+    # One customer-facing city: exact provider locations sharing normalized
+    # (country_code, city). ``min_price_minor``/``currency`` describe the
+    # cheapest sellable offer in the group and are None when the group mixes
+    # selling currencies (prices in different currencies are never compared)
+    # or has no priced offer. ``select_callback`` enters plans directly for a
+    # single-location city and the datacenter screen otherwise.
+    country_code: str | None
+    city: str
+    location_ids: tuple[str, ...]
+    plan_count: int
+    min_price_minor: int | None
+    currency: str | None
+    select_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class CityPageView:
+    # One page of a family's city groups with pager navigation.
+    provider_key: str
+    family_key: str
+    billing_model: str
+    items: tuple[CityLocationGroup, ...]
+    page: int
+    total_pages: int
+    total_count: int
+    back_callback: str
+    cancel_callback: str
+    prev_callback: str | None
+    next_callback: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DatacenterLocationView:
+    # One exact provider datacenter/hall inside a city, differentiated with
+    # real catalog facts only (plan count, minimum native price) — never
+    # invented hardware differences.
+    location_id: str
+    name: str
+    country_code: str | None
+    city: str | None
+    plan_count: int
+    min_price_minor: int | None
+    currency: str | None
+    select_callback: str
+
+
+@dataclass(frozen=True, slots=True)
+class DatacenterPageView:
+    # The exact halls of one city with pager navigation.
+    provider_key: str
+    family_key: str
+    billing_model: str
+    country_code: str | None
+    city: str
+    items: tuple[DatacenterLocationView, ...]
     page: int
     total_pages: int
     total_count: int
@@ -936,31 +1009,60 @@ class OfferCatalogViewService:
         return sorted(out, key=lambda fam: order.get(fam.billing_model, len(order)))
 
     async def families_screen(self, provider_key: str) -> tuple[list[FamilyOptionView], str, str]:
-        # Commercial product lines of one provider that have sellable offers
-        # (monthly VPS vs hourly cloud). Back goes to the market providers.
+        # Commercial product lines of one provider (monthly VPS vs hourly
+        # cloud). Configured families are ALWAYS listed — current inventory
+        # controls each row's count/availability, never whether the family
+        # concept exists. Back goes to the market providers.
         offers = [o for o in await self._offers.list_sellable(provider_key) if o.sellable]
-        if not offers:
-            raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
-        views = [
-            FamilyOptionView(
-                provider_key=provider_key,
-                family_key=family.family_key,
-                billing_model=family.billing_model,
-                display_name=family.display_name,
-                select_callback=self._store_nav_callback("family", provider_key, family.family_key),
-            )
-            for family in self._sellable_families(provider_key, offers)
-        ]
-        if not views:
-            raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
+        configured = self._markets.families_of(provider_key)
+        if configured:
+            counts: dict[str, int] = {}
+            for offer in offers:
+                counts[offer.billing_model] = counts.get(offer.billing_model, 0) + 1
+            views = [
+                FamilyOptionView(
+                    provider_key=provider_key,
+                    family_key=family.family_key,
+                    billing_model=family.billing_model,
+                    display_name=family.display_name,
+                    select_callback=self._store_nav_callback(
+                        "family", provider_key, family.family_key
+                    ),
+                    sellable_count=counts.get(family.billing_model, 0),
+                    available=counts.get(family.billing_model, 0) > 0,
+                )
+                for family in configured
+            ]
+        else:
+            if not offers:
+                raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
+            views = [
+                FamilyOptionView(
+                    provider_key=provider_key,
+                    family_key=family.family_key,
+                    billing_model=family.billing_model,
+                    display_name=family.display_name,
+                    select_callback=self._store_nav_callback(
+                        "family", provider_key, family.family_key
+                    ),
+                )
+                for family in self._sellable_families(provider_key, offers)
+            ]
+            if not views:
+                raise OfferUnavailableError(f"no sellable offers for provider {provider_key!r}")
         market = self._markets.market_of(provider_key)
         back = self._store_nav_callback("providers", market.value if market else "")
         return views, back, self._store_nav_callback("market")
 
     async def resolve_family(self, provider_key: str, family_key: str) -> ProviderProductFamily:
-        # One family by key, validated against sellable offers (an in-flight
-        # button for a sold-out family resolves to nothing instead of an
-        # empty screen).
+        # One family by key. A configured family resolves by EXISTENCE even
+        # when it currently has zero sellable offers, so its button lands on
+        # the explicit unavailable screen instead of reopening the selector;
+        # every downstream screen still enforces sellability itself and raises
+        # OfferUnavailableError for an empty family.
+        for family in self._markets.families_of(provider_key):
+            if family.family_key == family_key:
+                return family
         offers = [o for o in await self._offers.list_sellable(provider_key) if o.sellable]
         for family in self._sellable_families(provider_key, offers):
             if family.family_key == family_key:
@@ -993,8 +1095,8 @@ class OfferCatalogViewService:
         items = tuple(
             FamilyLocationView(
                 location_id=code,
-                name=names.get(code, (code, None))[0],
-                country_code=names.get(code, (code, None))[1],
+                name=names.get(code, (code, None, None))[0],
+                country_code=names.get(code, (code, None, None))[1],
                 city=None,
                 select_callback=self._family_location_callback(family, provider_key, code),
             )
@@ -1046,6 +1148,297 @@ class OfferCatalogViewService:
             )
         return self._store_nav_callback("vps_locations", provider_key, family.family_key, str(page))
 
+    # -- storefront: city grouping / datacenter drill-down ---------------
+
+    _CITY_SLUG_CLEANUP = re.compile(r"[^A-Za-z0-9]+")
+
+    #: Placeholder for an empty country inside signed callbacks (callback
+    #: fields must be non-empty; "-" decodes back to "").
+    _EMPTY_COUNTRY_ARG = "-"
+
+    @classmethod
+    def city_slug(cls, city: str) -> str:
+        """Compact callback-safe handle for a city label (lookup key only).
+
+        Slugs are recomputed from CURRENT groups on every resolve, so a
+        renamed city can at worst show the unavailable screen — never a
+        wrong datacenter.
+        """
+        slug = cls._CITY_SLUG_CLEANUP.sub("-", (city or "").strip()).strip("-").upper()
+        return slug or "-"
+
+    @classmethod
+    def _country_arg(cls, country_code: str | None) -> str:
+        code = (country_code or "").strip().upper()
+        return code or cls._EMPTY_COUNTRY_ARG
+
+    @classmethod
+    def _country_from_arg(cls, arg: str) -> str:
+        if arg == cls._EMPTY_COUNTRY_ARG:
+            return ""
+        return (arg or "").strip().upper()
+
+    @staticmethod
+    def _single_currency_minimum(
+        offers: list[SellableOffer],
+    ) -> tuple[int | None, str | None]:
+        """Cheapest price iff every offer shares one selling currency.
+
+        Prices in different currencies are never compared: a mixed group
+        reports no minimum instead of a misleading one.
+        """
+        best: dict[str, int] = {}
+        for offer in offers:
+            currency = (offer.selling_currency or "").strip().upper()
+            if not currency:
+                continue
+            if currency not in best or offer.selling_price_minor < best[currency]:
+                best[currency] = offer.selling_price_minor
+        if len(best) == 1:
+            currency, minimum = next(iter(best.items()))
+            return minimum, currency
+        return None, None
+
+    async def _family_sellable_offers(
+        self, provider_key: str, family: ProviderProductFamily
+    ) -> list[SellableOffer]:
+        return [
+            offer
+            for offer in await self._offers.list_sellable(provider_key)
+            if offer.sellable and offer.billing_model == family.billing_model
+        ]
+
+    def _group_offers_by_city(
+        self,
+        offers: list[SellableOffer],
+        facts: Mapping[str, tuple[str, str | None, str | None]],
+    ) -> list[tuple[str, str, list[SellableOffer]]]:
+        """Group sellable offers by normalized (country, city).
+
+        Provider-neutral: the grouping key comes only from synced
+        ``ProviderLocation`` facts, never from provider-specific code
+        patterns. A location without city metadata forms its own
+        single-location group so inventory is never hidden.
+        """
+        buckets: dict[tuple[str, str], list[SellableOffer]] = {}
+        for offer in offers:
+            name, country, city = facts.get(offer.location_id, (offer.location_id, None, None))
+            country_norm = (country or "").strip().upper()
+            label = (city or name or offer.location_id).strip()
+            buckets.setdefault((country_norm, label), []).append(offer)
+        return [(country, label, bucket) for (country, label), bucket in sorted(buckets.items())]
+
+    def _family_cities_callback(
+        self, family: ProviderProductFamily, provider_key: str, page: int
+    ) -> str:
+        # City list of one family (monthly and hourly share the screen; the
+        # family key in the args keeps the flows apart).
+        return self._store_nav_callback("loc_cities", provider_key, family.family_key, str(page))
+
+    def _family_halls_callback(
+        self,
+        family: ProviderProductFamily,
+        provider_key: str,
+        country_code: str | None,
+        city: str,
+        page: int,
+    ) -> str:
+        return self._store_nav_callback(
+            "loc_halls",
+            provider_key,
+            family.family_key,
+            self._country_arg(country_code),
+            self.city_slug(city),
+            str(page),
+        )
+
+    async def cities_screen(
+        self, provider_key: str, family_key: str, page: int = 1, page_size: int = 6
+    ) -> CityPageView:
+        """City groups of one family with sellable offers, paginated.
+
+        The first location step is always country/city — never raw
+        datacenter/hall codes. A single-location city enters its plans
+        directly; a multi-hall city opens the datacenter screen.
+        """
+        family = await self.resolve_family(provider_key, family_key)
+        offers = await self._family_sellable_offers(provider_key, family)
+        if not offers:
+            raise OfferUnavailableError(
+                f"no sellable {family_key!r} offers for provider {provider_key!r}"
+            )
+        facts = await self._location_metadata(provider_key)
+        groups = self._group_offers_by_city(offers, facts)
+        total = len(groups)
+        size = max(1, page_size)
+        total_pages = max(1, -(-total // size))
+        current = min(max(1, page), total_pages)
+        items = tuple(
+            self._city_group_view(provider_key, family, country, label, bucket)
+            for country, label, bucket in groups[(current - 1) * size : current * size]
+        )
+        # Back skips the family screen when it would auto-forward straight
+        # back here (a single family loops); multi-family users re-enter
+        # families through the provider.
+        market = self._markets.market_of(provider_key)
+        providers_back = self._store_nav_callback("providers", market.value if market else "")
+        configured = self._markets.families_of(provider_key)
+        if configured:
+            show_selector = len(configured) > 1
+        else:
+            all_sellable = [
+                offer for offer in await self._offers.list_sellable(provider_key) if offer.sellable
+            ]
+            show_selector = len(self._sellable_families(provider_key, all_sellable)) > 1
+        return CityPageView(
+            provider_key=provider_key,
+            family_key=family.family_key,
+            billing_model=family.billing_model,
+            items=items,
+            page=current,
+            total_pages=total_pages,
+            total_count=total,
+            back_callback=(
+                self._store_nav_callback("families", provider_key)
+                if show_selector
+                else providers_back
+            ),
+            cancel_callback=self._store_nav_callback("market"),
+            prev_callback=(
+                self._family_cities_callback(family, provider_key, current - 1)
+                if current > 1
+                else None
+            ),
+            next_callback=(
+                self._family_cities_callback(family, provider_key, current + 1)
+                if current < total_pages
+                else None
+            ),
+        )
+
+    def _city_group_view(
+        self,
+        provider_key: str,
+        family: ProviderProductFamily,
+        country: str,
+        label: str,
+        bucket: list[SellableOffer],
+    ) -> CityLocationGroup:
+        locations = tuple(dict.fromkeys(offer.location_id for offer in bucket))
+        minimum, currency = self._single_currency_minimum(bucket)
+        if len(locations) == 1:
+            select = self._family_location_callback(family, provider_key, locations[0])
+        else:
+            select = self._family_halls_callback(family, provider_key, country or None, label, 1)
+        return CityLocationGroup(
+            country_code=country or None,
+            city=label,
+            location_ids=locations,
+            plan_count=len(bucket),
+            min_price_minor=minimum,
+            currency=currency,
+            select_callback=select,
+        )
+
+    async def city_locations_screen(
+        self,
+        provider_key: str,
+        family_key: str,
+        country_arg: str,
+        city_slug: str,
+        page: int = 1,
+        page_size: int = 6,
+    ) -> DatacenterPageView:
+        """Exact datacenters/halls of one city, with real catalog facts.
+
+        Each row carries its plan count and minimum native price so sibling
+        halls read as distinct provider datacenters, not unexplained
+        duplicates. An unknown or ambiguous slug fails closed.
+        """
+        family = await self.resolve_family(provider_key, family_key)
+        offers = await self._family_sellable_offers(provider_key, family)
+        if not offers:
+            raise OfferUnavailableError(
+                f"no sellable {family_key!r} offers for provider {provider_key!r}"
+            )
+        facts = await self._location_metadata(provider_key)
+        wanted_country = self._country_from_arg(country_arg)
+        matches = [
+            (country, label, bucket)
+            for country, label, bucket in self._group_offers_by_city(offers, facts)
+            if country == wanted_country and self.city_slug(label) == city_slug
+        ]
+        if len(matches) != 1:
+            raise OfferUnavailableError(
+                f"unknown city {country_arg!r}/{city_slug!r} for provider {provider_key!r}"
+            )
+        country, label, _bucket = matches[0]
+        per_location: dict[str, list[SellableOffer]] = {}
+        for offer in offers:
+            name, loc_country, city = facts.get(offer.location_id, (offer.location_id, None, None))
+            if (loc_country or "").strip().upper() != wanted_country:
+                continue
+            if (city or name or offer.location_id).strip() != label:
+                continue
+            per_location.setdefault(offer.location_id, []).append(offer)
+        ordered = sorted(per_location)
+        total = len(ordered)
+        size = max(1, page_size)
+        total_pages = max(1, -(-total // size))
+        current = min(max(1, page), total_pages)
+        items = tuple(
+            self._datacenter_view(provider_key, family, facts, code, per_location[code])
+            for code in ordered[(current - 1) * size : current * size]
+        )
+        return DatacenterPageView(
+            provider_key=provider_key,
+            family_key=family.family_key,
+            billing_model=family.billing_model,
+            country_code=country or None,
+            city=label,
+            items=items,
+            page=current,
+            total_pages=total_pages,
+            total_count=total,
+            back_callback=self._family_cities_callback(family, provider_key, 1),
+            cancel_callback=self._store_nav_callback("market"),
+            prev_callback=(
+                self._family_halls_callback(
+                    family, provider_key, country or None, label, current - 1
+                )
+                if current > 1
+                else None
+            ),
+            next_callback=(
+                self._family_halls_callback(
+                    family, provider_key, country or None, label, current + 1
+                )
+                if current < total_pages
+                else None
+            ),
+        )
+
+    def _datacenter_view(
+        self,
+        provider_key: str,
+        family: ProviderProductFamily,
+        facts: Mapping[str, tuple[str, str | None, str | None]],
+        location_id: str,
+        bucket: list[SellableOffer],
+    ) -> DatacenterLocationView:
+        name, country, city = facts.get(location_id, (location_id, None, None))
+        minimum, currency = self._single_currency_minimum(bucket)
+        return DatacenterLocationView(
+            location_id=location_id,
+            name=name,
+            country_code=(country or "").strip().upper() or None,
+            city=(city or "").strip() or None,
+            plan_count=len(bucket),
+            min_price_minor=minimum,
+            currency=currency,
+            select_callback=self._family_location_callback(family, provider_key, location_id),
+        )
+
     # -- storefront: product-centric catalog -----------------------------
 
     @staticmethod
@@ -1090,7 +1483,8 @@ class OfferCatalogViewService:
             locations = tuple(dict.fromkeys(row.location_id for row in rows))
             countries = tuple(
                 dict.fromkeys(
-                    (names.get(code, (code, None))[1] or "").strip().upper() for code in locations
+                    (names.get(code, (code, None, None))[1] or "").strip().upper()
+                    for code in locations
                 )
             )
             countries = tuple(code for code in countries if code)
@@ -1219,8 +1613,8 @@ class OfferCatalogViewService:
             )
         offer = matches[0]
         names = await self._location_metadata(provider_key)
-        location_name = names.get(location_id, (location_id, None))[0]
-        location_country = names.get(location_id, (location_id, None))[1]
+        location_name = names.get(location_id, (location_id, None, None))[0]
+        location_country = names.get(location_id, (location_id, None, None))[1]
         family_key = self._family_key_for_billing(provider_key, offer.billing_model)
         return PlanDetailView(
             offer=self._view(offer),
@@ -1355,8 +1749,8 @@ class OfferCatalogViewService:
         items = tuple(
             FamilyLocationView(
                 location_id=code,
-                name=names.get(code, (code, None))[0],
-                country_code=names.get(code, (code, None))[1],
+                name=names.get(code, (code, None, None))[0],
+                country_code=names.get(code, (code, None, None))[1],
                 city=None,
                 select_callback=self._store_nav_callback(
                     "cloud_families", provider_key, family_key, code
@@ -1421,8 +1815,10 @@ class OfferCatalogViewService:
                 select_callback=self._store_nav_callback(
                     "cloud_plans", provider_key, location_id, key, "1"
                 ),
+                sellable_count=count,
+                available=True,
             )
-            for key, (name, _count) in sorted(groups.items())
+            for key, (name, count) in sorted(groups.items())
         ]
         return (
             views,
@@ -1538,8 +1934,8 @@ class OfferCatalogViewService:
         return PlanDetailView(
             offer=self._view(offer),
             technical_metadata=dict(offer.technical_metadata or {}),
-            location_name=names.get(location_id, (location_id, None))[0],
-            location_country=names.get(location_id, (location_id, None))[1],
+            location_name=names.get(location_id, (location_id, None, None))[0],
+            location_country=names.get(location_id, (location_id, None, None))[1],
             continue_callback=self._store_nav_callback("cloud_images", self._offer_ref(offer.id)),
             back_callback=self._store_nav_callback(
                 "cloud_plans",
@@ -1623,8 +2019,8 @@ class OfferCatalogViewService:
             monthly_estimate_minor=offer.selling_price_minor * HOURLY_MONTHLY_ESTIMATE_HOURS,
             currency=offer.selling_currency,
             balance_minor=balance,
-            location_name=names.get(offer.location_id, (offer.location_id, None))[0],
-            location_country=names.get(offer.location_id, (offer.location_id, None))[1],
+            location_name=names.get(offer.location_id, (offer.location_id, None, None))[0],
+            location_country=names.get(offer.location_id, (offer.location_id, None, None))[1],
             confirm_callback=self._store_nav_callback(
                 "cloud_buy", self._offer_ref(offer.id), str(image_index)
             ),
@@ -1710,8 +2106,8 @@ class OfferCatalogViewService:
             ProductLocationView(
                 location_id=offer.location_id,
                 offer_id=offer.id,
-                name=names.get(offer.location_id, (offer.location_id, None))[0],
-                country_code=names.get(offer.location_id, (offer.location_id, None))[1],
+                name=names.get(offer.location_id, (offer.location_id, None, None))[0],
+                country_code=names.get(offer.location_id, (offer.location_id, None, None))[1],
                 product_name=offer.name,
                 monthly_price_minor=offer.selling_price_minor,
                 currency=offer.selling_currency,
@@ -1725,11 +2121,16 @@ class OfferCatalogViewService:
             self._store_nav_callback("market"),
         )
 
-    async def _location_metadata(self, provider_key: str) -> dict[str, tuple[str, str | None]]:
-        """Synced display names per location; falls back to the code.
+    async def _location_metadata(
+        self, provider_key: str
+    ) -> dict[str, tuple[str, str | None, str | None]]:
+        """Synced display facts per location: (name, country_code, city).
 
-        Presentation only: a location the provider started selling at before
-        its catalog row synced still shows (as its code) instead of disappearing.
+        Falls back to the code. Presentation only: a location the provider
+        started selling at before its catalog row synced still shows (as its
+        code) instead of disappearing. City is None until the catalog sync
+        reconciles the row — grouping treats such locations as their own
+        single-location group so inventory is never hidden.
         """
         if self._locations is None:
             return {}
@@ -1739,7 +2140,11 @@ class OfferCatalogViewService:
             logger.warning("location display metadata unavailable for %s", provider_key)
             return {}
         return {
-            record.location_id: (record.name or record.location_id, record.country_code)
+            record.location_id: (
+                record.name or record.location_id,
+                record.country_code,
+                getattr(record, "city", None),
+            )
             for record in records
         }
 

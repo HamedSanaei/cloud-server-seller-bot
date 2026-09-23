@@ -264,9 +264,12 @@ def _location(**over: Any) -> SimpleNamespace:
         name="Frankfurt",
         location_id="FRA-01",
         country_code="DE",
+        city="Frankfurt",
         offer_count=6,
+        plan_count=6,
         select_callback="loc-cb",
         monthly_price_minor=100,
+        min_price_minor=624,
         currency="EUR",
         product_name="Leaseweb VPS 1",
     )
@@ -283,6 +286,7 @@ def _paged(items: list[Any], **over: Any) -> SimpleNamespace:
         next_callback=None,
         back_callback="back-cb",
         cancel_callback="cancel-cb",
+        billing_model="prepaid_monthly_fixed",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -498,17 +502,17 @@ class TestStoreScreenGuards:
 
     async def test_vps_locations_unavailable(self) -> None:
         view = SteeringView()
-        view.raises["family_locations_screen"] = OfferUnavailableError("none")
+        view.raises["cities_screen"] = OfferUnavailableError("none")
         assert (await _bot(view).store_vps_locations_screen("leaseweb", "vps")).text
 
     async def test_vps_locations_empty(self) -> None:
         view = SteeringView()
-        view.result["family_locations_screen"] = _paged([])
+        view.result["cities_screen"] = _paged([])
         assert (await _bot(view).store_vps_locations_screen("leaseweb", "vps")).text
 
     async def test_vps_locations_pager_renders_prev_and_next(self) -> None:
         view = SteeringView()
-        view.result["family_locations_screen"] = _paged(
+        view.result["cities_screen"] = _paged(
             [_location()],
             page=2,
             total_pages=3,
@@ -567,21 +571,22 @@ class TestStoreScreenGuards:
 
     async def test_cloud_locations_unavailable(self) -> None:
         view = SteeringView()
-        view.raises["cloud_locations_screen"] = OfferUnavailableError("none")
+        view.raises["cities_screen"] = OfferUnavailableError("none")
         assert (await _bot(view).store_cloud_locations_screen("leaseweb", "cloud")).text
 
     async def test_cloud_locations_empty(self) -> None:
         view = SteeringView()
-        view.result["cloud_locations_screen"] = _paged([])
+        view.result["cities_screen"] = _paged([])
         assert (await _bot(view).store_cloud_locations_screen("leaseweb", "cloud")).text
 
     async def test_cloud_locations_pager(self) -> None:
         view = SteeringView()
-        view.result["cloud_locations_screen"] = _paged(
+        view.result["cities_screen"] = _paged(
             [_location(name="Frankfurt", location_id="FRA-01")],
             page=2,
             total_pages=2,
             prev_callback="prev-cb",
+            billing_model="hourly",
         )
         screen = await _bot(view).store_cloud_locations_screen("leaseweb", "cloud", 2)
         assert screen.text
@@ -806,10 +811,10 @@ class TestStoreDispatchGuards:
             "back-cb",
             "cancel-cb",
         )
-        view.result["cloud_locations_screen"] = _paged([_location()])
+        view.result["cities_screen"] = _paged([_location()], billing_model="hourly")
         bot = _bot(view)
         screen = await _press(bot, bot._callback("store", "family", "leaseweb", "cloud"))
-        assert "cloud_locations_screen" in view.calls
+        assert "cities_screen" in view.calls
         assert screen.text
 
     async def test_a_store_plans_callback_renders_the_legacy_plan_list(self) -> None:
@@ -838,7 +843,7 @@ class TestStoreDispatchGuards:
 
     async def test_a_garbage_vps_locations_page_renders_page_one(self) -> None:
         view = SteeringView()
-        view.result["family_locations_screen"] = _paged([_location()])
+        view.result["cities_screen"] = _paged([_location()])
         bot = _bot(view)
         assert await _press(bot, bot._callback("store", "vps_locations", "leaseweb", "vps", "x"))
 
@@ -851,7 +856,7 @@ class TestStoreDispatchGuards:
 
     async def test_a_garbage_cloud_locations_page_renders_page_one(self) -> None:
         view = SteeringView()
-        view.result["cloud_locations_screen"] = _paged([_location()])
+        view.result["cities_screen"] = _paged([_location()], billing_model="hourly")
         bot = _bot(view)
         cb = bot._callback("store", "cloud_locations", "leaseweb", "cloud", "x")
         assert (await _press(bot, cb)).text
@@ -885,7 +890,7 @@ class TestStoreDispatchGuards:
         # driven through the dispatch entry point directly.
         view = SteeringView()
         view.result["families_screen"] = ([_family()], "back-cb", "cancel-cb")
-        view.result["family_locations_screen"] = _paged([_location()])
+        view.result["cities_screen"] = _paged([_location()])
         bot = _bot(view)
         callback = Callback(
             flow="store",

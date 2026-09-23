@@ -80,6 +80,7 @@ from cloud_platform.modules.navigation.domain import (
     resolve_offer_id_arg,
 )
 from cloud_platform.modules.offers.domain import (
+    BILLING_MODEL_HOURLY,
     HOURLY_MONTHLY_ESTIMATE_HOURS,
     SellableOfferRepository,
     TechnicalSpec,
@@ -494,10 +495,40 @@ class MonthlyBotUi:
         "hourly": "\U0001f558",
     }
 
+    @staticmethod
+    def _family_button_label(
+        t: Translator,
+        family: Any,
+        icons: dict[str, str],
+    ) -> str:
+        # A configured family is always shown: the row carries its CURRENT
+        # sellable count, or an explicit unavailable marker — never faked
+        # inventory, never a hidden product line.
+        base = {
+            "icon": icons.get(family.billing_model, ""),
+            "name": family.display_name,
+            "billing": t.t(f"store.billing.{family.billing_model}"),
+        }
+        if getattr(family, "available", True):
+            return t.t("store.family_row_count", count=getattr(family, "sellable_count", 0), **base)
+        return t.t("store.family_row_unavailable", **base)
+
+    def _family_unavailable_screen(self, provider_key: str) -> BotScreen:
+        # A configured family with zero sellable offers stays clickable and
+        # lands here: honest "temporarily unavailable" plus Back / Main Menu.
+        rows = [
+            [self._back_button("store", "families", provider_key), self._menu_button()],
+        ]
+        return BotScreen(
+            self._t.t("store.family_unavailable_text"),
+            InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
     async def store_families_screen(self, provider_key: str) -> BotScreen:
         # Commercial product lines of one provider (monthly VPS vs hourly
-        # cloud). A single family enters directly so one-family providers
-        # keep their short path; several render the product selector.
+        # cloud). Auto-forward happens ONLY for a single AVAILABLE family —
+        # a provider configured with several families always renders the
+        # selector, even when just one of them currently has inventory.
         try:
             families, back_callback, cancel_callback = await self._view.families_screen(
                 provider_key
@@ -506,21 +537,18 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         if not families:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
-        if len(families) == 1:
+        if len(families) == 1 and getattr(families[0], "available", True):
             return await self._enter_family(
                 provider_key, families[0].family_key, families[0].billing_model
             )
+        if len(families) == 1:
+            return self._family_unavailable_screen(provider_key)
         rows: list[list[InlineKeyboardButton]] = []
         for family in families:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=self._t.t(
-                            "store.family_row",
-                            icon=self._FAMILY_ICONS.get(family.billing_model, ""),
-                            name=family.display_name,
-                            billing=self._t.t(f"store.billing.{family.billing_model}"),
-                        ),
+                        text=self._family_button_label(self._t, family, self._FAMILY_ICONS),
                         callback_data=family.select_callback,
                     )
                 ]
@@ -548,27 +576,109 @@ class MonthlyBotUi:
             return await self.store_cloud_locations_screen(provider_key, family_key)
         return await self.store_vps_locations_screen(provider_key, family_key)
 
-    async def store_vps_locations_screen(
+    def _group_price_text(
+        self, billing_model: str, min_price_minor: int | None, currency: str | None
+    ) -> str | None:
+        # Native minimum for a city/hall button (None when the scope mixes
+        # currencies or has no priced offer). Hourly minima are per-hour
+        # prices, so they always carry the per-hour qualifier.
+        if min_price_minor is None or not currency:
+            return None
+        native = format_minor(min_price_minor, currency)
+        if billing_model == BILLING_MODEL_HOURLY:
+            return self._t.t("store.price_per_hour", price=native)
+        return native
+
+    async def store_cities_screen(
         self, provider_key: str, family_key: str, page: int = 1
     ) -> BotScreen:
-        # Monthly VPS locations with sellable offers: flag + friendly city,
-        # never a raw code as the only label.
+        # City groups of one family (monthly and hourly share the screen;
+        # the title follows the billing model, never the provider).
         try:
-            view = await self._view.family_locations_screen(provider_key, family_key, page)
+            view = await self._view.cities_screen(provider_key, family_key, page)
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         if not view.items:
             return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
         rows: list[list[InlineKeyboardButton]] = []
-        labels = self._location_button_labels(
-            [(item.name, item.location_id, item.country_code) for item in view.items]
-        )
-        for location, label in zip(view.items, labels, strict=True):
+        for group in view.items:
+            price = self._group_price_text(
+                view.billing_model, group.min_price_minor, group.currency
+            )
+            if price is None:
+                text = self._t.t(
+                    "store.city_row",
+                    flag=_country_flag(group.country_code),
+                    city=group.city,
+                )
+            else:
+                text = self._t.t(
+                    "store.city_row_from",
+                    flag=_country_flag(group.country_code),
+                    city=group.city,
+                    price=price,
+                )
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text=label,
-                        callback_data=location.select_callback,
+                        text=text,
+                        callback_data=group.select_callback,
+                    )
+                ]
+            )
+        rows.extend(self._pager_rows(view))
+        rows.append(
+            [
+                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=view.back_callback),
+                InlineKeyboardButton(
+                    text=self._t.t("nav.cancel"), callback_data=view.cancel_callback
+                ),
+            ]
+        )
+        if view.billing_model == BILLING_MODEL_HOURLY:
+            title = self._t.t(
+                "store.cloud_locations_title",
+                provider=self._provider_name(provider_key),
+            )
+        else:
+            title = self._t.t("store.vps_locations_title")
+        return BotScreen(title, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def store_halls_screen(
+        self,
+        provider_key: str,
+        family_key: str,
+        country_arg: str,
+        city_slug: str,
+        page: int = 1,
+    ) -> BotScreen:
+        # Exact datacenters/halls of one city, each differentiated with real
+        # catalog facts (plan count, minimum native price).
+        try:
+            view = await self._view.city_locations_screen(
+                provider_key, family_key, country_arg, city_slug, page
+            )
+        except OfferUnavailableError:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        if not view.items:
+            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
+        rows: list[list[InlineKeyboardButton]] = []
+        for hall in view.items:
+            price = self._group_price_text(view.billing_model, hall.min_price_minor, hall.currency)
+            if price is None:
+                text = self._t.t("store.hall_row", code=hall.location_id, count=hall.plan_count)
+            else:
+                text = self._t.t(
+                    "store.hall_row_from",
+                    code=hall.location_id,
+                    count=hall.plan_count,
+                    price=price,
+                )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=text,
+                        callback_data=hall.select_callback,
                     )
                 ]
             )
@@ -582,9 +692,16 @@ class MonthlyBotUi:
             ]
         )
         return BotScreen(
-            self._t.t("store.vps_locations_title"),
+            self._t.t("store.halls_title", city=view.city),
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
+
+    async def store_vps_locations_screen(
+        self, provider_key: str, family_key: str, page: int = 1
+    ) -> BotScreen:
+        # Monthly VPS locations with sellable offers: flag + friendly city,
+        # never a raw code as the only label.
+        return await self.store_cities_screen(provider_key, family_key, page)
 
     def _pager_rows(self, view: Any) -> list[list[InlineKeyboardButton]]:
         # Prev | page X/Y | next pager (absent on a single page).
@@ -757,41 +874,7 @@ class MonthlyBotUi:
         self, provider_key: str, family_key: str, page: int = 1
     ) -> BotScreen:
         """Hourly cloud regions, API-discovered only, with country flags."""
-        try:
-            view = await self._view.cloud_locations_screen(provider_key, family_key, page)
-        except OfferUnavailableError:
-            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
-        if not view.items:
-            return BotScreen(self._t.t("offers.no_offers"), self._market_back_only())
-        rows: list[list[InlineKeyboardButton]] = []
-        labels = self._location_button_labels(
-            [(item.name, item.location_id, item.country_code) for item in view.items]
-        )
-        for location, label in zip(view.items, labels, strict=True):
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=label,
-                        callback_data=location.select_callback,
-                    )
-                ]
-            )
-        rows.extend(self._pager_rows(view))
-        rows.append(
-            [
-                InlineKeyboardButton(text=self._t.t("nav.back"), callback_data=view.back_callback),
-                InlineKeyboardButton(
-                    text=self._t.t("nav.cancel"), callback_data=view.cancel_callback
-                ),
-            ]
-        )
-        return BotScreen(
-            self._t.t(
-                "store.cloud_locations_title",
-                provider=self._provider_name(provider_key),
-            ),
-            InlineKeyboardMarkup(inline_keyboard=rows),
-        )
+        return await self.store_cities_screen(provider_key, family_key, page)
 
     async def store_cloud_families_screen(
         self, provider_key: str, family_key: str, location_id: str
@@ -1769,6 +1852,8 @@ class MonthlyBotUi:
             family = next((f for f in families if f.family_key == cb.args[1]), None)
             if family is None:
                 return await self.store_families_screen(cb.args[0])
+            if not getattr(family, "available", True):
+                return self._family_unavailable_screen(cb.args[0])
             return await self._enter_family(cb.args[0], family.family_key, family.billing_model)
         if cb.screen == "products":
             # Legacy product-first callbacks re-enter through the family
@@ -1782,6 +1867,20 @@ class MonthlyBotUi:
             except (TypeError, ValueError):
                 numbered = 1
             return await self.store_vps_locations_screen(cb.args[0], cb.args[1], numbered)
+        if cb.screen == "loc_cities" and len(cb.args) == 3:
+            try:
+                numbered = int(cb.args[2])
+            except (TypeError, ValueError):
+                numbered = 1
+            return await self.store_cities_screen(cb.args[0], cb.args[1], numbered)
+        if cb.screen == "loc_halls" and len(cb.args) == 5:
+            try:
+                numbered = int(cb.args[4])
+            except (TypeError, ValueError):
+                numbered = 1
+            return await self.store_halls_screen(
+                cb.args[0], cb.args[1], cb.args[2], cb.args[3], numbered
+            )
         if cb.screen == "vps_plans" and len(cb.args) in (3, 4):
             try:
                 numbered = int(cb.args[3]) if len(cb.args) == 4 else 1

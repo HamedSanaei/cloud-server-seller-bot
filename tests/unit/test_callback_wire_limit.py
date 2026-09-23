@@ -200,6 +200,21 @@ class FakeView:
     ) -> Any:
         return await self._service.family_locations_screen(provider_key, family_key, page)
 
+    async def cities_screen(self, provider_key: str, family_key: str, page: int = 1) -> Any:
+        return await self._service.cities_screen(provider_key, family_key, page)
+
+    async def city_locations_screen(
+        self,
+        provider_key: str,
+        family_key: str,
+        country_arg: str,
+        city_slug: str,
+        page: int = 1,
+    ) -> Any:
+        return await self._service.city_locations_screen(
+            provider_key, family_key, country_arg, city_slug, page
+        )
+
     async def family_plans_screen(
         self, provider_key: str, family_key: str, location_id: str, page: int = 1
     ) -> Any:

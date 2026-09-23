@@ -224,6 +224,21 @@ class FakeView:
     ) -> Any:
         return await self._service.family_locations_screen(provider_key, family_key, page)
 
+    async def cities_screen(self, provider_key: str, family_key: str, page: int = 1) -> Any:
+        return await self._service.cities_screen(provider_key, family_key, page)
+
+    async def city_locations_screen(
+        self,
+        provider_key: str,
+        family_key: str,
+        country_arg: str,
+        city_slug: str,
+        page: int = 1,
+    ) -> Any:
+        return await self._service.city_locations_screen(
+            provider_key, family_key, country_arg, city_slug, page
+        )
+
     async def family_plans_screen(
         self, provider_key: str, family_key: str, location_id: str, page: int = 1
     ) -> Any:
@@ -375,11 +390,33 @@ class TestFamilySelector:
             assert button.callback_data is not None
             assert _size(button.callback_data) <= 64
 
-    async def test_single_family_provider_enters_directly(self) -> None:
+    async def test_configured_multi_family_provider_always_shows_selector(self) -> None:
+        # Two CONFIGURED families, only monthly sellable: the selector must
+        # still show both rows (VPS available, Cloud unavailable) instead of
+        # auto-forwarding into monthly locations.
         bot = _ui(_service([_offer(location_id="FRA-01")]))
         screen = await _press(bot, bot._callback("store", "families", PROVIDER))
-        # No selector: straight into the monthly locations.
-        assert any("FRA-01" in b.text for b in _buttons(screen))
+        labels = [b.text for b in _buttons(screen)]
+        assert any("VPS" in label for label in labels)
+        assert any("Cloud" in label for label in labels)
+        assert not any("FRA-01" in label for label in labels)
+
+    async def test_single_configured_family_enters_directly(self) -> None:
+        # One CONFIGURED family: auto-forward into its locations is allowed.
+        catalog = ProviderCatalog(
+            markets={PROVIDER: "foreign"},
+            display_names={PROVIDER: "Leaseweb"},
+            enabled={},
+            families={
+                PROVIDER: {
+                    "vps": {"billing_model": BILLING_MODEL_MONTHLY, "display_name": "VPS"},
+                }
+            },
+        )
+        bot = _ui(_service([_offer(location_id="FRA-01")], catalog=catalog))
+        screen = await _press(bot, bot._callback("store", "families", PROVIDER))
+        # No selector: straight into the monthly cities.
+        assert any("FRA-01" in b.text or "Frankfurt" in b.text for b in _buttons(screen))
 
     async def test_implicit_family_without_configuration(self) -> None:
         catalog = ProviderCatalog(

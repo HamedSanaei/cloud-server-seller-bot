@@ -237,6 +237,21 @@ class FakeView:
     ) -> Any:
         return await self._service.family_locations_screen(provider_key, family_key, page)
 
+    async def cities_screen(self, provider_key: str, family_key: str, page: int = 1) -> Any:
+        return await self._service.cities_screen(provider_key, family_key, page)
+
+    async def city_locations_screen(
+        self,
+        provider_key: str,
+        family_key: str,
+        country_arg: str,
+        city_slug: str,
+        page: int = 1,
+    ) -> Any:
+        return await self._service.city_locations_screen(
+            provider_key, family_key, country_arg, city_slug, page
+        )
+
     async def family_plans_screen(
         self, provider_key: str, family_key: str, location_id: str, page: int = 1
     ) -> Any:
@@ -372,11 +387,28 @@ async def _press(ui: MonthlyBotUi, callback: str) -> Any:
 
 
 async def _open_detail(bot: MonthlyBotUi, location_id: str) -> Any:
-    locations = await _press(bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1"))
-    location_button = next(
-        b for b in _buttons(locations) if _decode(b.callback_data or "").args[2] == location_id
-    )
-    plans = await _press(bot, location_button.callback_data or "")
+    # cities -> (halls when the city has several datacenters) -> plans.
+    cities = await _press(bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1"))
+    plans = None
+    for button in _buttons(cities):
+        if not button.callback_data:
+            continue
+        target = _decode(button.callback_data)
+        if target.screen == "vps_plans" and target.args[2] == location_id:
+            plans = await _press(bot, button.callback_data)
+            break
+        if target.screen == "loc_halls":
+            halls = await _press(bot, button.callback_data)
+            for hall in _buttons(halls):
+                if not hall.callback_data:
+                    continue
+                hall_target = _decode(hall.callback_data)
+                if hall_target.screen == "vps_plans" and hall_target.args[2] == location_id:
+                    plans = await _press(bot, hall.callback_data)
+                    break
+            if plans is not None:
+                break
+    assert plans is not None, f"no route to plans at {location_id}"
     plan_button = next(
         b for b in _buttons(plans) if _decode(b.callback_data or "").screen == "plan_detail"
     )
@@ -556,10 +588,12 @@ class TestFullStorefrontWalk:
         provider_button = next(b for b in _buttons(market) if "🌍" in b.text)
         providers = await _press(bot, _track(provider_button.callback_data))
         leaseweb_button = next(b for b in _buttons(providers) if "Leaseweb" in b.text)
-        # Single family enters its locations directly (no selector tap).
+        # Implicit single family enters the city list directly (no selector tap).
         locations = await _press(bot, _track(leaseweb_button.callback_data))
-        location_button = next(b for b in _buttons(locations) if "FRA-10" in b.text)
-        plans = await _press(bot, _track(location_button.callback_data))
+        city_button = next(b for b in _buttons(locations) if "Frankfurt" in b.text)
+        halls = await _press(bot, _track(city_button.callback_data))
+        hall_button = next(b for b in _buttons(halls) if "FRA-10" in b.text)
+        plans = await _press(bot, _track(hall_button.callback_data))
         plan_button = next(
             b for b in _buttons(plans) if _decode(b.callback_data or "").screen == "plan_detail"
         )

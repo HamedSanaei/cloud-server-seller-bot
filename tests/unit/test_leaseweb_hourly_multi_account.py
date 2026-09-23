@@ -806,11 +806,21 @@ class TestFamilyVisibility:
         assert all(i.product_id == "lsw.mini" for i in cloud.items)
 
     async def test_hourly_visible_only_when_sellable(self) -> None:
-        # Unpriced hourly offer: only the monthly family is sellable.
+        # Unpriced hourly offer: the configured cloud family is still shown
+        # (family existence != current inventory) but marked unavailable,
+        # while monthly stays available with its count.
         gated = _hourly_offer(price_minor=0)
         service = _view_service([_monthly_offer(), gated])
         families, _, _ = await service.families_screen(PROVIDER)
-        assert [f.billing_model for f in families] == [BILLING_MODEL_MONTHLY]
+        assert [f.billing_model for f in families] == [
+            BILLING_MODEL_MONTHLY,
+            BILLING_MODEL_HOURLY,
+        ]
+        monthly, hourly = families
+        assert monthly.available is True
+        assert monthly.sellable_count == 1
+        assert hourly.available is False
+        assert hourly.sellable_count == 0
 
     async def test_callbacks_within_telegram_limit(self) -> None:
         from cloud_platform.modules.navigation.domain import (

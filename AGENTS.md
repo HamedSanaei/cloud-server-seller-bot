@@ -37,6 +37,21 @@ When asked to "continue the project" or "do the next tasks":
 - Never hard-code live provider prices. Catalog sync and explicit price books own prices.
 - User-facing commands must enforce ownership and authorization in application services, not only at the UI layer.
 
+### Storefront navigation invariants
+
+- A provider configured with multiple commercial product families must show
+  the family selector even when only one family currently has sellable
+  inventory.
+- Current inventory controls availability/count, not whether a configured
+  family concept exists.
+- Customer location navigation groups provider locations by normalized
+  country/city before exposing provider-specific datacenter/hall ids.
+- Country flags derive only from normalized ISO `country_code`; generic UI
+  must never infer geography from provider-specific location codes.
+- Provider-specific location normalization belongs in the provider adapter.
+- Sibling datacenters in one city must be differentiated with real catalog
+  facts (price/count/metadata), not unexplained "Location 1/2/3" labels.
+
 ## Quality gates
 
 Static gates run on every change; test scope is layered (see Testing policy).

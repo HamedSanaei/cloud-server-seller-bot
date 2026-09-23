@@ -62,6 +62,8 @@ _SCREEN_WIRE_ALIASES: dict[str, str] = {
     "cloud_confirm": "cc",
     "cloud_families": "cfam",
     "cloud_plans": "cp",
+    "loc_cities": "lc",
+    "loc_halls": "lh",
 }
 _WIRE_SCREEN_CANONICAL: dict[str, str] = {
     wire: canonical for canonical, wire in _SCREEN_WIRE_ALIASES.items()

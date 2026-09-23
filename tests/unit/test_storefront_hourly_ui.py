@@ -109,6 +109,23 @@ class _ImagesView:
 
         raise OfferUnavailableError("no locations")
 
+    async def cities_screen(self, provider_key: str, family_key: str, page: int = 1) -> Any:
+        from cloud_platform.modules.checkout.service import OfferUnavailableError
+
+        raise OfferUnavailableError("no locations")
+
+    async def city_locations_screen(
+        self,
+        provider_key: str,
+        family_key: str,
+        country_arg: str,
+        city_slug: str,
+        page: int = 1,
+    ) -> Any:
+        from cloud_platform.modules.checkout.service import OfferUnavailableError
+
+        raise OfferUnavailableError("no locations")
+
     async def plan_detail_screen(self, provider_key: str, location_id: str, product_id: str) -> Any:
         from cloud_platform.modules.checkout.service import OfferUnavailableError
 

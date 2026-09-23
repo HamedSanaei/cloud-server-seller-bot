@@ -396,6 +396,8 @@ def _synced_records() -> list[LocationRecord]:
 
 class TestFlagLabels:
     async def test_persisted_rows_render_exact_flag_labels(self) -> None:
+        from cloud_platform.modules.navigation.domain import decode_callback
+
         bot = _ui(
             _view_service(
                 [_offer_row(code) for code, _city, _country in SIX],
@@ -405,15 +407,32 @@ class TestFlagLabels:
         screen = await _press(
             bot, bot._callback("store", "vps_locations", PROVIDER, "monthly", "1")
         )
-        labels = [b.text for b in _buttons(screen) if b.callback_data]
-        # Frankfurt appears twice (two halls) so both carry codes; London
-        # appears three times for the same reason.
-        assert "🇩🇪 Frankfurt — FRA-01" in labels
-        assert "🇩🇪 Frankfurt — FRA-10" in labels
-        assert "🇩🇪 Frankfurt — FRA-14" in labels
-        assert "🇬🇧 London — LON-01" in labels
-        assert "🇬🇧 London — LON-11" in labels
-        assert "🇬🇧 London — LON-12" in labels
+        # First location step is country/city only: exactly two buttons, no
+        # raw hall codes.
+        city_buttons = [
+            b
+            for b in _buttons(screen)
+            if b.callback_data
+            and decode_callback(b.callback_data, SIGNING_KEY).screen == "loc_halls"
+        ]
+        assert {b.text for b in city_buttons} == {
+            "🇩🇪 Frankfurt · از €6.24",
+            "🇬🇧 London · از €6.24",
+        }
+        # Frankfurt drills down to its three exact datacenters, each carrying
+        # its code plus real catalog facts (plan count, minimum price).
+        frankfurt = next(b for b in city_buttons if "Frankfurt" in b.text)
+        halls = await _press(bot, frankfurt.callback_data or "")
+        hall_labels = [b.text for b in _buttons(halls) if b.callback_data]
+        assert "FRA-01 · 1 پلن · شروع از €6.24" in hall_labels
+        assert "FRA-10 · 1 پلن · شروع از €6.24" in hall_labels
+        assert "FRA-14 · 1 پلن · شروع از €6.24" in hall_labels
+        london = next(b for b in city_buttons if "London" in b.text)
+        london_halls = await _press(bot, london.callback_data or "")
+        london_labels = [b.text for b in _buttons(london_halls) if b.callback_data]
+        assert "LON-01 · 1 پلن · شروع از €6.24" in london_labels
+        assert "LON-11 · 1 پلن · شروع از €6.24" in london_labels
+        assert "LON-12 · 1 پلن · شروع از €6.24" in london_labels
 
     async def test_single_hall_button_has_no_code(self) -> None:
         from cloud_platform.modules.navigation.domain import decode_callback
@@ -433,7 +452,9 @@ class TestFlagLabels:
             if b.callback_data
             and decode_callback(b.callback_data, SIGNING_KEY).screen == "vps_plans"
         ]
-        assert labels == ["🇩🇪 Frankfurt"]
+        # A single-hall city enters plans directly; the button carries the
+        # friendly city (plus its minimum), never the raw code.
+        assert labels == ["🇩🇪 Frankfurt · از €6.24"]
 
     async def test_detail_line_carries_code_and_flag(self) -> None:
         bot = _ui(
