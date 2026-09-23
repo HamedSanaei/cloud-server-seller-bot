@@ -89,8 +89,10 @@ Coverage threshold checks are required only for:
 - pull requests targeting `main`
 - release preparation
 - major architectural changes
+- any task being declared ready to push to `main`
 
-Individual feature/fix tasks do not need to satisfy global coverage thresholds.
+Individual feature/fix tasks do not need to satisfy global coverage thresholds
+during iterative development.
 
 For targeted tests:
 
@@ -103,8 +105,132 @@ to Level 1/Level 2 local runs: a partial suite under-reports by construction, so
 coverage number is not comparable to the repository-wide floor. Coverage output from a
 targeted run may be read for debugging, but must never be reported as a pass/fail gate.
 
-If a change genuinely lowers repository-wide coverage, that is CI's finding to make, not
-the agent's to pre-empt by running the full suite early.
+During iterative development, targeted tests are still preferred. Do NOT run the
+expensive complete coverage suite after every tiny edit. BUT once a task is being
+declared ready for push to `main` (see Push-ready / main-bound validation), the exact
+repository-wide CI coverage gate MUST be executed locally. CI must not be the first
+place where a push-ready change discovers the 88% coverage failure.
+
+## Push-ready / main-bound validation
+
+Any task whose result is expected to be pushed directly to `main`, released,
+deployed, or handed to the owner as "ready to push" MUST reproduce the
+repository's real GitHub Actions gates locally before completion.
+
+For such tasks the agent MUST run (or equivalently `uv run python scripts/verify_ci.py --push-ready`):
+
+```bash
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+
+uv run pre-commit run --all-files
+
+mkdir -p .ci-artifacts
+uv run pytest \
+  --junitxml=.ci-artifacts/pytest-results.xml \
+  --cov=src \
+  --cov-report=xml:.ci-artifacts/coverage.xml \
+  --cov-report=term \
+  --cov-fail-under=88
+
+uv run python scripts/check_migrations.py
+uv run python scripts/check_domain_provider_branching.py
+uv run python scripts/gen_leaseweb_coverage.py --check
+uv run python scripts/validate_tasks.py
+uv run python scripts/check_generated_artifacts.py
+```
+
+The agent MUST NOT say "ready to push", "all green", or "full validation
+passed" unless all applicable commands actually exited 0.
+
+## Generated-artifact hygiene
+
+Agents must NEVER commit generated validation artifacts, including:
+
+```text
+pytest-results.xml
+junit.xml
+coverage.xml
+.coverage*
+htmlcov/
+.ci-artifacts/
+test-results/
+temporary logs
+local test reports
+```
+
+Generated reports belong under the git-ignored `.ci-artifacts/` directory
+(and CI upload artifacts), never in source control. Do NOT allowlist a
+generated report's secret-scanner finding, do NOT add it to
+`.secrets.baseline`, and do NOT weaken detect-secrets to accommodate one:
+delete the artifact from tracking instead.
+
+Before completion of any code task, agents MUST run:
+
+```bash
+git status --short
+```
+
+and inspect EVERY listed file. A generated report must not be included
+simply because `git add .` would include it.
+
+For push-ready tasks additionally verify:
+
+```bash
+git ls-files pytest-results.xml coverage.xml
+```
+
+returns no generated report files.
+
+After running full CI-equivalent validation, run:
+
+```bash
+git status --short
+```
+
+AGAIN, because the validation itself may generate files. If validation
+changed tracked files unexpectedly, the task is NOT complete.
+
+## Tracked vs untracked pre-commit rule
+
+`pre-commit run --all-files` primarily validates files known to Git. Newly
+created/untracked files must not be assumed covered by that statement.
+
+Before final validation, inspect:
+
+```bash
+git status --short
+```
+
+Explicitly include new files or validate the tracked+untracked working set
+when necessary. For secret scanning, use the robust check that covers
+untracked files (Unix):
+
+```bash
+git ls-files -co --exclude-standard -z \
+  | xargs -0 uv run pre-commit run detect-secrets --files
+```
+
+On Windows/PowerShell, use an equivalent explicit-file invocation instead of
+copying the Unix pipeline blindly (e.g. pass the listed files explicitly to
+`uv run pre-commit run detect-secrets --files`).
+
+Do NOT require this expensive explicit scan after every small edit. Require it
+for push-ready/security-sensitive changes or when new files were created.
+
+## Pre-commit idempotency
+
+If a pre-commit hook modifies a file, the validation FAILED even if the hook
+repaired it. The agent must:
+
+1. inspect the modification
+2. re-run relevant tests if needed
+3. run pre-commit again
+
+The FINAL pre-commit run must exit 0 AND modify zero files. This specifically
+prevents `end-of-file-fixer modified file` from being reported as a
+successful gate.
 
 ## Test reporting
 
@@ -193,3 +319,15 @@ Suggested commit:
 Next steps:
 - ...
 ```
+
+The final report MUST distinguish intended source changes from
+generated/unexpected files. Run:
+
+```bash
+git status --short
+git diff --check
+```
+
+and inspect the output. The whole worktree is not required to be clean (the
+agent may correctly have uncommitted implementation changes), but there must
+be ZERO accidentally tracked/generated CI reports.

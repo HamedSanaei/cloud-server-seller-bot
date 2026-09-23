@@ -39,6 +39,17 @@ htmlcov/
 coverage.xml
 *.cover
 
+# --- Generated CI/test reports (never commit) ---
+# JUnit XML / coverage XML / generated reports are build artifacts.
+# They are produced by local validation and CI runs and must never be
+# source-controlled (a generated report once broke pre-commit via
+# detect-secrets/end-of-file-fixer). Keep patterns narrow: do NOT use a
+# broad "*.xml" rule because legitimate XML fixtures may exist.
+pytest-results.xml
+junit.xml
+.ci-artifacts/
+test-results/
+
 # --- Databases & local data ---
 *.sqlite3
 *.sqlite3-*

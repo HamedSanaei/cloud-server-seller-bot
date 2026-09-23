@@ -42,6 +42,8 @@ jobs:
           GIT_AUTHOR_EMAIL: "ci@ci.ci"
           GIT_COMMITTER_NAME: "ci"
           GIT_COMMITTER_EMAIL: "ci@ci.ci"
+      - name: Generated-artifact hygiene
+        run: uv run python scripts/check_generated_artifacts.py
 
   test:
     name: Tests & coverage
@@ -57,14 +59,17 @@ jobs:
         run: uv sync --frozen --all-groups
       # Deterministic suite: stable file order, JUnit results, and a coverage
       # regression gate one point below the measured baseline (89%).
+      # Reports land in .ci-artifacts/ (git-ignored): generated test reports
+      # must never be committed.
       - name: Run test suite
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: >-
+          mkdir -p .ci-artifacts &&
           uv run pytest
-          --junitxml=pytest-results.xml
+          --junitxml=.ci-artifacts/pytest-results.xml
           --cov=src
-          --cov-report=xml:coverage.xml
+          --cov-report=xml:.ci-artifacts/coverage.xml
           --cov-report=term
           --cov-fail-under=88
       # M12-003: the migration compatibility gate - rolling-deploy-unsafe
@@ -91,7 +96,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pytest-results
-          path: pytest-results.xml
+          path: .ci-artifacts/pytest-results.xml
           if-no-files-found: ignore
           retention-days: 14
       - name: Upload coverage report
@@ -99,7 +104,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
-          path: coverage.xml
+          path: .ci-artifacts/coverage.xml
           if-no-files-found: ignore
           retention-days: 14
 
