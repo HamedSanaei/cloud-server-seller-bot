@@ -12,6 +12,7 @@ lifecycle branches of :class:`~cloud_platform.modules.hourly.service.HourlyCloud
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
@@ -24,7 +25,11 @@ from cloud_platform.modules.hourly.service import (
     hourly_reference_name,
 )
 from cloud_platform.modules.offers.domain import BILLING_MODEL_PREPAID_MONTHLY
-from cloud_platform.providers.errors import ProviderOutcomeUnknown
+from cloud_platform.providers.errors import (
+    ProviderError,
+    ProviderNotFound,
+    ProviderOutcomeUnknown,
+)
 from tests.unit.test_hourly_cloud_flow import (
     PROVIDER,
     USER,
@@ -35,7 +40,9 @@ from tests.unit.test_hourly_cloud_flow import (
     FakeServerRepo,
     FakeSnapshots,
     FakeWalletRepo2,
+    _cloud_type,
     _offer,
+    _usd_offer,
 )
 
 # ---------------------------------------------------------------------------
@@ -51,10 +58,54 @@ class FakeHourlyAdapter:
         self.create_result: Any = type("C", (), {"id": "lsw-created", "state": "RUNNING"})()
         self.create_error: Exception | None = None
         self.images: list[Any] = [type("I", (), {"id": "UBUNTU", "label": "Ubuntu"})()]
+        self.types: dict[str, list[Any]] = {}
         self.list_images_error: Exception | None = None
         self.find_result: Any = None
         self.find_error: Exception | None = None
         self.listed_regions: list[str] = []
+
+    async def validate_hourly_offer_for_checkout(
+        self,
+        *,
+        location_id: str,
+        product_id: str,
+        image_id: str,
+        expected_cost_minor: int,
+        currency: str,
+        expected_cost_exact: str,
+    ) -> Any:
+        """Fail-closed checkout revalidation over the scripted state."""
+        scripted = self.types.get(location_id)
+        if scripted is None:
+            scripted = [_cloud_type()]
+        match = next((item for item in scripted if item.id == product_id), None)
+        if match is None:
+            raise ProviderNotFound(
+                f"instance type {product_id!r} is not offered in {location_id!r}"
+            )
+        if match.currency.upper() != str(currency or "").strip().upper():
+            raise ProviderError(
+                f"provider cost currency changed for {product_id!r} in {location_id!r}"
+            )
+        if match.hourly_cost_minor != expected_cost_minor:
+            raise ProviderError(f"provider cost changed for {product_id!r} in {location_id!r}")
+        wanted_exact = str(expected_cost_exact or "").strip()
+        if wanted_exact:
+            try:
+                wanted = Decimal(wanted_exact)
+                live_exact = Decimal(match.hourly_rate_exact)
+            except Exception:
+                raise ProviderError(
+                    f"provider rate for {product_id!r} is not valid Decimal text"
+                ) from None
+            if not wanted.is_finite() or wanted <= 0 or live_exact != wanted:
+                raise ProviderError(
+                    f"exact provider rate changed for {product_id!r} in {location_id!r}"
+                )
+        images = await self.list_images(location_id)
+        if not any(image.id == image_id for image in images):
+            raise ProviderNotFound(f"image {image_id!r} is not offered in {location_id!r}")
+        return match
 
     async def list_images(self, region: str) -> list[Any]:
         self.listed_regions.append(region)
@@ -130,18 +181,19 @@ async def _requested_server(
 
 class TestProcessPreSendFailures:
     async def test_missing_snapshot_fails_the_operation(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, snapshots, ops = _service(offers, cloud)
         server = await _requested_server(service, offers)
         snapshots.created.clear()  # the pinned snapshot is missing
-        assert await service.process_server(server.id) == "failed"
+        outcome = await service.process_server(server.id)
+        assert outcome.startswith("invalid:")
         op = ops.ops[f"server-create:{server.id}"]
         assert op.status.value == "failed"
-        assert "no price snapshot" in (op.error or "")
+        assert "invalid immutable hourly intent" in (op.error or "")
 
     async def test_missing_adapter_fails_without_posting(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, _, ops = _service(offers, cloud)
         server = await _requested_server(service, offers)
@@ -153,24 +205,24 @@ class TestProcessPreSendFailures:
         assert "no hourly adapter" in (op.error or "")
 
     async def test_image_vanished_fails_without_posting(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
-        cloud.images = []  # provider stopped offering the pinned label
         service, _, _, ops = _service(offers, cloud)
         server = await _requested_server(service, offers)
+        cloud.images = []  # provider stopped offering the pinned image afterwards
         assert await service.process_server(server.id) == "failed"
         assert cloud.posts == 0
         op = ops.ops[f"server-create:{server.id}"]
         assert op.status.value == "failed"
-        assert "no longer offered" in (op.error or "")
+        assert "revalidation failed" in (op.error or "")
 
-    async def test_images_read_failure_fails_without_posting(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+    async def test_images_read_failure_requeues_without_posting(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
-        cloud.list_images_error = RuntimeError("provider down")
         service, _, _, _ = _service(offers, cloud)
         server = await _requested_server(service, offers)
-        assert await service.process_server(server.id) == "failed"
+        cloud.list_images_error = RuntimeError("provider down")
+        assert await service.process_server(server.id) == "requeued"
         assert cloud.posts == 0
 
 
@@ -187,7 +239,7 @@ class TestProcessDefinitiveFailure:
         class _Rejected(ProviderError):
             pass
 
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         cloud.create_error = _Rejected("quota exhausted")
         service, servers, _, ops = _service(offers, cloud)
@@ -209,7 +261,7 @@ class TestProcessDefinitiveFailure:
         class _Rejected(ProviderError):
             pass
 
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         cloud.create_error = _Rejected("db-reject")
         service, servers, _, ops = _service(offers, cloud)
@@ -233,7 +285,7 @@ class TestReconcileBranches:
     async def test_find_error_propagates_and_stays_unknown(self) -> None:
         """Transient listing errors bubble to the worker loop (which logs
         them); the operation stays OUTCOME_UNKNOWN for the next run."""
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, _, ops = _service(offers, cloud)
         server = await _requested_server(service, offers)
@@ -246,7 +298,7 @@ class TestReconcileBranches:
         assert op.status.value == "outcome_unknown"
 
     async def test_non_unknown_operation_is_not_reconciled(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, servers, _, _ = _service(offers, cloud)
         server = await _requested_server(service, offers)
@@ -256,7 +308,7 @@ class TestReconcileBranches:
         assert server.id not in {s.id for s in servers.servers.values() if s.provider_server_id}
 
     async def test_no_adapter_is_skipped_silently(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, _, _ = _service(offers, cloud)
         server = await _requested_server(service, offers)
@@ -266,7 +318,7 @@ class TestReconcileBranches:
         assert await service.reconcile_server(server.id) == "skipped"
 
     async def test_missing_snapshot_is_skipped(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, snapshots, _ = _service(offers, cloud)
         server = await _requested_server(service, offers)
@@ -283,7 +335,7 @@ class TestReconcileBranches:
 
 class TestSnapshotInvariants:
     async def test_snapshot_carries_exact_hourly_prices(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, _, snapshots, _ = _service(offers, FakeHourlyAdapter())
         offer = (await offers.list_all())[0]
         await service.create_instance(
@@ -299,7 +351,7 @@ class TestSnapshotInvariants:
         assert price.offer.currency == offer.provider_cost_currency
 
     async def test_snapshot_survives_later_catalog_repricing(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, _, snapshots, _ = _service(offers, FakeHourlyAdapter())
         offer = (await offers.list_all())[0]
         result = await service.create_instance(
@@ -314,7 +366,7 @@ class TestSnapshotInvariants:
         import dataclasses
 
         repriced = dataclasses.replace(offer, selling_price_minor=offer.selling_price_minor * 3)
-        offers._offers = [repriced]
+        offers._rows[(repriced.provider_key, repriced.product_id, repriced.location_id)] = repriced
         after = await snapshots.require_snapshot(result.server.id)
         assert after is before
         assert after.selling_minor == before.selling_minor
@@ -333,7 +385,7 @@ class TestQueueSelection:
             ServerLifecycleState,
         )
 
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, servers, _, _ = _service(offers, FakeHourlyAdapter())
         hourly = await _requested_server(service, offers)
         # A monthly row cannot come from this service (it rejects monthly
@@ -391,13 +443,19 @@ class TestQueueSelection:
 
 
 class TestHelpers:
-    async def test_cloud_image_by_index_paths(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+    async def test_cloud_image_by_index_rejects_positional_selection(self) -> None:
+        """Positional image callbacks are never resolved (fail closed).
+
+        The billable contract carries a stable provider image id, so every
+        positional lookup — valid index, out-of-range index, missing adapter
+        or provider read failure — raises ``HourlyNotAvailableError``.
+        """
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, _, _ = _service(offers, cloud)
         offer = (await offers.list_all())[0]
-        image = await service.cloud_image_by_index(offer, 0)
-        assert image.id == "UBUNTU"
+        with pytest.raises(HourlyNotAvailableError):
+            await service.cloud_image_by_index(offer, 0)
         with pytest.raises(HourlyNotAvailableError):
             await service.cloud_image_by_index(offer, 5)
         service._cloud.clear()
@@ -499,7 +557,7 @@ class TestCreateIntentGuards:
         assert servers.servers == {}
 
     async def test_a_replayed_key_of_another_user_is_refused(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, servers, _, _ = _service(offers, FakeHourlyAdapter())
         await _create(service, offers, idempotency_key="shared-key")
         with pytest.raises(HourlyError):
@@ -512,7 +570,7 @@ class TestCreateIntentGuards:
         assert len(servers.servers) == 1
 
     async def test_a_replayed_key_of_the_same_user_is_idempotent(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, servers, _, _ = _service(offers, FakeHourlyAdapter())
         first = await _create(service, offers, idempotency_key="same-key")
         second = await _create(service, offers, idempotency_key="same-key")
@@ -521,7 +579,7 @@ class TestCreateIntentGuards:
         assert len(servers.servers) == 1
 
     async def test_a_user_without_a_wallet_is_refused(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         snapshots = FakeSnapshots()
         servers = FakeServerRepo()
@@ -541,19 +599,31 @@ class TestCreateIntentGuards:
         assert snapshots.created == []
 
     async def test_the_unique_key_race_replays_the_original_intent(self) -> None:
-        offers = FakeOffersRepo([_offer()])
-        original = type("S", (), {"id": uuid4(), "user_id": USER.id})()
+        offers = FakeOffersRepo([await _usd_offer()])
+        snapshots = FakeSnapshots()
+        ops = FakeOpsRepo()
+        seed_service, _, _, _ = _service(
+            offers,
+            FakeHourlyAdapter(),
+            servers=FakeServerRepo(),
+            snapshots=snapshots,
+            ops=ops,
+        )
+        original = await _requested_server(seed_service, offers, idempotency_key="seed-raced")
+        priced_before = len(snapshots.created)
         servers = _CreateRaceRepo(original)
-        service, _, snapshots, _ = _service(offers, FakeHourlyAdapter(), servers=servers)
+        service, _, _, _ = _service(
+            offers, FakeHourlyAdapter(), servers=servers, snapshots=snapshots, ops=ops
+        )
         result = await _create(service, offers, idempotency_key="raced")
         assert result.replayed is True
         assert result.server is original
-        assert snapshots.created == []  # nothing new was priced or charged
+        assert len(snapshots.created) == priced_before  # nothing new was priced or charged
 
     async def test_the_race_of_another_users_key_is_not_replayed(self) -> None:
         from cloud_platform.modules.compute.domain import ServerCreateError
 
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         foreign = type("S", (), {"id": uuid4(), "user_id": uuid4()})()
         servers = _CreateRaceRepo(foreign)
         service, _, _, _ = _service(offers, FakeHourlyAdapter(), servers=servers)
@@ -563,7 +633,7 @@ class TestCreateIntentGuards:
     async def test_a_failed_price_snapshot_marks_the_server_error_and_reraises(self) -> None:
         from cloud_platform.modules.compute.domain import ServerLifecycleState
 
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         snapshots = _FailingSnapshots()
         service, servers, _, _ = _service(offers, FakeHourlyAdapter(), snapshots=snapshots)
         with pytest.raises(RuntimeError):
@@ -573,7 +643,7 @@ class TestCreateIntentGuards:
         assert created.state is ServerLifecycleState.ERROR
 
     async def test_a_failed_rollback_never_hides_the_snapshot_error(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         server_repo = _UnsaveableRepo()
         service, _, _, _ = _service(
             offers,
@@ -632,7 +702,7 @@ class TestQueueAndClaimBranches:
         assert await service.process_server(uuid4()) == "skipped"
 
     async def test_a_monthly_server_is_never_submitted_hourly(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, servers, _, _ = _service(offers, FakeHourlyAdapter())
         server = await _requested_server(service, offers)
         server.billing_model = BILLING_MODEL_PREPAID_MONTHLY
@@ -643,7 +713,7 @@ class TestQueueAndClaimBranches:
     async def test_a_server_that_is_not_requested_is_skipped(self) -> None:
         from cloud_platform.modules.compute.domain import ServerLifecycleState
 
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, servers, _, _ = _service(offers, FakeHourlyAdapter())
         server = await _requested_server(service, offers)
         server.transition_to(ServerLifecycleState.PROVISIONING)
@@ -651,7 +721,7 @@ class TestQueueAndClaimBranches:
         assert await service.process_server(server.id) == "skipped"
 
     async def test_a_terminal_operation_is_not_submitted_twice(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, _, ops = _service(offers, cloud)
         server = await _requested_server(service, offers)
@@ -662,17 +732,19 @@ class TestQueueAndClaimBranches:
         assert cloud.posts == 0
 
     async def test_an_operation_claimed_elsewhere_is_not_posted(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyAdapter()
         service, _, _, ops = _service(offers, cloud)
         server = await _requested_server(service, offers)
         operation = await ops.get_by_key(f"server-create:{server.id}")
         operation.mark_in_flight()
-        assert await service.process_server(server.id) == "claimed-elsewhere"
+        # The stuck in-flight operation has no provider evidence, so the
+        # worker quarantines it as outcome-unknown instead of re-POSTing.
+        assert await service.process_server(server.id) == "outcome-unknown"
         assert cloud.posts == 0
 
     async def test_a_server_with_an_attached_instance_is_not_reconciled(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, servers, _, _ = _service(offers, FakeHourlyAdapter())
         server = await _requested_server(service, offers)
         server.provider_server_id = "lsw-attached"
@@ -680,9 +752,84 @@ class TestQueueAndClaimBranches:
         assert await service.reconcile_server(server.id) == "skipped"
 
     async def test_a_server_without_an_operation_is_not_reconciled(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         service, servers, _, _ = _service(offers, FakeHourlyAdapter())
         server = await _requested_server(service, offers)
         server.provider_server_id = None
         await servers.save(server)
         assert await service.reconcile_server(server.id) == "skipped"
+
+
+class TestResponseIdentityMatching:
+    """Optional identity evidence is checked when present, never required."""
+
+    def _response(self, **overrides: Any) -> Any:
+        from types import SimpleNamespace
+
+        values: dict[str, Any] = {
+            "region": "eu-west-3",
+            "reference": "srv-abc",
+            "instance_type": "lsw.m4.large",
+            "image_id": "UBUNTU_24_04",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    def _match(self, response: Any) -> bool:
+        from cloud_platform.modules.hourly.service import _response_identity_matches
+
+        return _response_identity_matches(
+            response,
+            location_id="eu-west-3",
+            plan_id="lsw.m4.large",
+            image_id="UBUNTU_24_04",
+            account_id="uk",
+            reference="srv-abc",
+        )
+
+    def test_full_identity_matches(self) -> None:
+        assert self._match(self._response()) is True
+
+    def test_absent_optional_fields_still_match(self) -> None:
+        response = self._response()
+        del response.instance_type
+        del response.image_id
+        assert self._match(response) is True
+
+    def test_present_but_different_identity_fails(self) -> None:
+        assert self._match(self._response(instance_type="lsw.r5.xlarge")) is False
+        assert self._match(self._response(image_id="DEBIAN_12")) is False
+
+    def test_wrong_region_or_reference_fails(self) -> None:
+        assert self._match(self._response(region="eu-central-1")) is False
+        assert self._match(self._response(reference="srv-other")) is False
+
+
+class TestCatalogRepriceImmutability:
+    """A later catalog reprice never changes an accepted hourly contract."""
+
+    async def test_process_uses_snapshot_price_after_catalog_reprice(self) -> None:
+        from types import SimpleNamespace
+
+        from cloud_platform.modules.hourly.service import hourly_reference_name
+
+        offers = FakeOffersRepo([await _usd_offer()])
+        cloud = FakeHourlyAdapter()
+        service, _servers, snapshots, _ops = _service(offers, cloud)
+        server = await _requested_server(service, offers)
+        offer = (await offers.list_all())[0]
+        before = (await snapshots.require_snapshot(server.id)).selling_minor
+        # Tomorrow's catalog moves; the accepted snapshot must not follow it.
+        await offers.set_selling_price(offer.id, before + 500, "USD")
+        cloud.create_result = SimpleNamespace(
+            id="lsw-created",
+            state="RUNNING",
+            region="eu-west-3",
+            reference=hourly_reference_name(server.id),
+            instance_type="lsw.mini",
+            image_id="UBUNTU",
+        )
+        outcome = await service.process_server(server.id)
+        assert outcome == "provisioned"
+        snapshot = await snapshots.require_snapshot(server.id)
+        assert snapshot.selling_minor == before

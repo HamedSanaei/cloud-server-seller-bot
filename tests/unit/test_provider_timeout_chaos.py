@@ -508,7 +508,7 @@ class TestFinalChargeTimeoutChaos:
 
         harness = _ChargeHarness(server_id)
         # chaos: the first commit's ack is lost -> the flow sees a timeout
-        harness.fail_next_post_with = True
+        harness.fail_next_adjust_with = True
         with pytest.raises(TimeoutError):
             await harness.charge_final(server, deleted)
         # the entry DID commit before the timeout (the ack was lost, not the row)
@@ -526,16 +526,23 @@ class TestFinalChargeTimeoutChaos:
 
 
 class _ChargeHarness:
-    """FinalChargeService over in-memory repos that can simulate a lost ack."""
+    """FinalChargeService over in-memory repos that can simulate a lost ack.
+
+    Each deterministic idempotency key binds immutable facts (fail-closed):
+    the flat remainder uses the single ``final:{server_id}`` key with the
+    identical amount/description on replay, so the second post is a no-op
+    and never a double debit.
+    """
 
     def __init__(self, server_id: Any) -> None:
         self.debits = 0
-        self.entries: list[dict[str, Any]] = []
-        self.fail_next_post_with = False
+        self.entries: dict[str, Any] = {}
+        self.accrual_rows: dict[str, Any] = {}
+        self.fail_next_adjust_with = False
         self.wallet = Wallet(user_id=USER_ID, id=WALLET_ID, balance=1_000_000, currency="EUR")
         self.wallets = AsyncMock()
         self.wallets.get = AsyncMock(return_value=self.wallet)
-        self.wallets.debit = AsyncMock(side_effect=_make_debit_side_effect(self))
+        self.wallets.adjust = AsyncMock(side_effect=self._adjust)
         self.holds = AsyncMock()
         self.holds.get_by_idempotency = AsyncMock(return_value=None)
         self.holds.capture_hold = AsyncMock(return_value=None)
@@ -545,7 +552,8 @@ class _ChargeHarness:
         self.ledger.post_entry = AsyncMock(side_effect=self._post_entry)
         self.accruals = AsyncMock()
         self.accruals.month_total = AsyncMock(return_value=0)
-        self.accruals.add = AsyncMock(return_value=None)
+        self.accruals.get_by_key = AsyncMock(side_effect=self._accrual_get)
+        self.accruals.add = AsyncMock(side_effect=self._accrual_add)
         self.servers = AsyncMock()
         self.servers.save = AsyncMock(return_value=None)
         self.snapshots = AsyncMock()
@@ -594,19 +602,71 @@ class _ChargeHarness:
             audit_repo=self.audit,  # type: ignore[arg-type]
         )
 
+    async def _adjust(
+        self,
+        user_id: Any,
+        delta: int,
+        key: str,
+        *,
+        entry_type: Any,
+        reference_type: str = "",
+        reference_id: str = "",
+        description: str = "",
+    ) -> Any:
+        from decimal import Decimal
+        from uuid import uuid4 as _uuid4
+
+        from cloud_platform.core.money import Money
+        from cloud_platform.modules.wallet.domain import LedgerEntry
+
+        new_key = str(key).strip()
+        if new_key in self.entries:
+            return self.wallet, False
+        new_balance = self.wallet.balance + delta
+        if new_balance < 0:
+            from cloud_platform.modules.wallet.domain import InsufficientBalanceError
+
+            raise InsufficientBalanceError("insufficient balance")
+        self.wallet.balance = new_balance
+        if delta < 0:
+            self.debits += 1
+        self.entries[new_key] = LedgerEntry(
+            id=_uuid4(),
+            wallet_id=WALLET_ID,
+            entry_type=entry_type,
+            amount=Money(Decimal(abs(delta)), "EUR"),
+            reference_type=reference_type,
+            reference_id=reference_id,
+            idempotency_key=new_key,
+            description=description,
+        )
+        # chaos: the commit landed, but the ack was lost
+        if self.fail_next_adjust_with:
+            self.fail_next_adjust_with = False
+            raise TimeoutError("injected chaos: ledger ack lost after commit")
+        return self.wallet, True
+
+    async def _accrual_get(self, key: str) -> Any:
+        return self.accrual_rows.get(key)
+
+    async def _accrual_add(self, period: Any) -> Any:
+        if period.idempotency_key in self.accrual_rows:
+            from cloud_platform.modules.billing.service import AccrualPeriodExistsError
+
+            raise AccrualPeriodExistsError(period.idempotency_key)
+        self.accrual_rows[period.idempotency_key] = period
+        return period
+
     async def _debit(self, uid: Any, amount: int, key: str) -> None:
-        # the wallet ledger rejects a duplicate (wallet_id, key)
-        for entry in self.entries:
-            if entry["key"] == key:
-                raise ValueError(f"duplicate ledger key {key}")
+        # Legacy helper kept for the module-level side-effect factory; the
+        # current atomic path goes through _adjust (same key, same facts).
+        if key in self.entries:
+            raise ValueError(f"duplicate ledger key {key}")
         self.debits += 1
         self.wallet.balance -= amount
 
     async def _get_entry(self, wallet_id: Any, key: str) -> Any:
-        for entry in self.entries:
-            if entry["key"] == key:
-                return entry
-        return None
+        return self.entries.get(key)
 
     async def _post_entry(
         self,
@@ -618,14 +678,14 @@ class _ChargeHarness:
         **kwargs: Any,
     ) -> None:
         # enforce the same uniqueness the DB does
-        for entry in self.entries:
-            if entry["key"] == key:
-                raise ValueError(f"duplicate ledger key {key}")
-        self.entries.append({"key": key, "amount": amount, "type": entry_type, **kwargs})
-        # chaos: the commit landed, but the ack was lost
-        if self.fail_next_post_with:
-            self.fail_next_post_with = False
-            raise TimeoutError("injected chaos: ledger ack lost after commit")
+        if key in self.entries:
+            raise ValueError(f"duplicate ledger key {key}")
+        self.entries[key] = {
+            "key": key,
+            "amount": amount,
+            "type": entry_type,
+            **kwargs,
+        }
 
     async def charge_final(self, server: CloudServer, deleted_at: datetime) -> Any:
         return await self._service.charge_final(server, deleted_at)

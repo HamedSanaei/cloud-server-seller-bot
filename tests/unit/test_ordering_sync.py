@@ -256,6 +256,7 @@ class TestDynamicEligibilityDiscovery:
             product_id="VPS02_1",
             location_id="AMS-01",
             provider_available=True,
+            provider_account_id=None,
         )
         repos["offers"].list_all = AsyncMock(return_value=[current])
 
@@ -269,9 +270,9 @@ class TestDynamicEligibilityDiscovery:
         syncer = LeaseWebOrderingCatalogSyncer(lambda: MagicMock(), _Provider({}))  # type: ignore[arg-type]
         result = await syncer.sync_all()
         # The transient location keeps its last-known availability: the only
-        # pair handed to mark_unavailable is the preserved one.
+        # triple handed to mark_unavailable is the preserved legacy one.
         marked = repos["offers"].mark_unavailable.await_args.args
-        assert ("VPS02_1", "AMS-01") in marked[1]
+        assert ("", "VPS02_1", "AMS-01") in marked[1]
         assert result["products"].total_upserted == 0
 
     async def test_empty_eligible_location_creates_no_offers(self, monkeypatch: Any) -> None:

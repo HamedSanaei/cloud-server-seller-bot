@@ -22,7 +22,7 @@
 [app]
 environment = "development"        # development | staging | production
 log_level = "INFO"
-default_currency = "EUR"
+default_currency = "USD"
 
 [database]
 # Local example has no password; production inserts it after "cloud"
@@ -162,7 +162,7 @@ display_name = "کلود"
 # After this section, provider plan changes need NO manual
 # sync-offers / price-book / enable commands: the worker refreshes costs
 # from the official APIs every interval, reprices auto-priced rows with the
-# configured markup (same currency, integer minor units) and publishes
+# configured markup (foreign costs use the configured catalog currency) and publishes
 # eligible rows — unless the operator blocked them (offers disable), which
 # the sync never undoes. Verify with:
 #   python -m cloud_platform.cli catalog auto-sync doctor
@@ -190,26 +190,35 @@ markup_percent = 25
 auto_publish = true
 
 [payments.zarinpal]
-enabled = true
+# Disabled by default: enabling requires a real merchant credential, and
+# placeholder credentials are deliberately rejected by validation.
+enabled = false
 merchant_id = "CHANGE_ME"
-base_url = "https://api.zarinpal.com/pg/v4/payment"
-sandbox = false
+base_url = "https://sandbox.zarinpal.com/pg/v4/payment"
+sandbox = true
 callback_url = "https://example.com/api/v1/payments/zarinpal/callback"
 
 # ---------------------------------------------------------------------------
 # Currency / FX resolution (platform-level, provider-neutral)
 #
-# The first live source is AbanTether's PUBLIC ticker (read-only, no secret).
-# The resolver converts already-defined money for display/charging/settlement
-# bridging — it never reprices the operator-owned selling price and never
-# auto-converts wallet balances. USD display uses the USDT market EXPLICITLY
-# as a proxy (metadata proxy=true); settlement via the proxy stays off unless
-# the operator opts in. See docs/fx/CURRENCY_FX.md.
+# Domestic/payment FX uses AbanTether. Global provider-cost normalization uses
+# Frankfurter's official reference-rate endpoint; it has no bid/ask spread and
+# never settles payments. Foreign catalog offers are exact native Decimal -> FX
+# -> operator markup -> final target-currency ceiling. USD display proxy rules
+# below belong only to the domestic/payment path.
 # ---------------------------------------------------------------------------
 
 [fx]
 enabled = true
-provider = "abantether"
+# Family switches; the legacy `enabled` key remains a master default.
+domestic_enabled = true
+global_enabled = true
+# Explicitly separate the two FX families.
+domestic_provider = "abantether"
+global_fiat_provider = "frankfurter"
+# Foreign storefront rows must sell in this canonical catalog currency.
+catalog_pricing_currency = "USD"
+# Legacy domestic UI/payment display only; it does not change catalog pricing.
 default_display_currency = "IRT"
 quote_ttl_seconds = 60
 max_stale_seconds = 300
@@ -223,12 +232,21 @@ base_url = "https://api.abantether.com"
 eur_symbol = "EUR"
 usd_proxy_symbol = "USDT"
 
+[fx.frankfurter]
+base_url = "https://api.frankfurter.dev"
+request_timeout_seconds = 5
+quote_ttl_seconds = 3600
+# Last-known-good reference rates may be reused for catalog repricing only
+# within this bounded window; this is not a payment/settlement rate.
+max_stale_seconds = 345600
+catalog_max_stale_seconds = 86400
+
 [security]
 provider_credential_encryption_key = "CHANGE_ME"
 backup_encryption_key = "CHANGE_ME"
 
 [billing]
-price_book_name = "retail-eur"
+price_book_name = "retail-usd"
 customer_billing_quantum_seconds = 3600
 low_balance_threshold_minor = 5000
 low_balance_grace_hours = 24
@@ -296,3 +314,6 @@ auto_renew_default = true
 # flag only decides whether the application stops the VPS after grace expires;
 # it stays off unless the operator deliberately opts in.
 stop_server_after_grace = false
+
+# Automatic catalog pricing policies live under [storefront.pricing.*] above.
+# Foreign offers use the configured [fx] catalog_pricing_currency (USD).

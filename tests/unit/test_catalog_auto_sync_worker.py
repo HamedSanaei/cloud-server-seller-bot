@@ -159,6 +159,77 @@ class TestCatalogAutoSyncSchedule:
         assert getattr(by_name["catalog_auto_sync"], "run_at_startup", False) is True
 
 
+class _DeterministicEurUsdRates:
+    """Fake EUR/USD reference rates (no network): 1.17, frankfurter family."""
+
+    async def get_rate(self, base: str, quote: str, *, allow_catalog_stale: bool = False) -> Any:
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        from cloud_platform.modules.fx.domain import FxReferenceQuote
+        from cloud_platform.modules.fx.service import ReferenceRateResolution
+
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=Decimal("1.17"),
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+
+async def _usd_priced_offer(cost_minor: int = 499) -> Any:
+    """Production-shaped monthly EUR offer, priced to USD in-test.
+
+    Uses the real CatalogOfferPricer with a deterministic fake EUR/USD
+    quote (no network), so the row carries exactly the provenance the
+    doctor validates — never a hand-duplicated metadata dict.
+    """
+    import dataclasses
+    from decimal import Decimal
+    from uuid import uuid4 as _uuid4
+
+    from cloud_platform.modules.offers.domain import PricingPolicy, SellableOffer
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+
+    base = SellableOffer(
+        id=_uuid4(),
+        provider_key="leaseweb",
+        product_id="VPS02_1",
+        location_id="FRA-01",
+        name="Leaseweb VPS 1",
+        vcpu=4,
+        ram_gb=6,
+        disk_gb=100,
+        traffic="5 TB",
+        provider_cost_minor=cost_minor,
+        provider_cost_currency="EUR",
+        selling_price_minor=0,
+        selling_currency="EUR",
+        billing_parameters={"provider_monthly_rate": str(Decimal(cost_minor) / 100)},
+        billing_model="prepaid_monthly_fixed",
+        provider_available=True,
+        enabled=True,
+        auto_priced=True,
+    )
+    priced = await CatalogOfferPricer(_DeterministicEurUsdRates(), "USD").price_auto(
+        base, PricingPolicy(mode="markup", markup_percent=25, auto_publish=True)
+    )
+    return dataclasses.replace(
+        base,
+        selling_price_minor=priced.selling_price_minor,
+        selling_currency=priced.selling_currency,
+        pricing_metadata=dict(priced.pricing_metadata),
+    )
+
+
 class TestCatalogAutoSyncDoctor:
     async def test_doctor_reports_configuration_and_status(
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -172,7 +243,6 @@ class TestCatalogAutoSyncDoctor:
         }
 
         from datetime import UTC, datetime
-        from types import SimpleNamespace
 
         state_repo = MagicMock()
         state_repo.list_all = AsyncMock(
@@ -191,13 +261,12 @@ class TestCatalogAutoSyncDoctor:
                 )
             ]
         )
+        import dataclasses
+
+        sellable = await _usd_priced_offer()
+        unpriced = dataclasses.replace(await _usd_priced_offer(), selling_price_minor=0)
         offers_repo = MagicMock()
-        offers_repo.list_all = AsyncMock(
-            return_value=[
-                SimpleNamespace(provider_key="leaseweb", sellable=True),
-                SimpleNamespace(provider_key="leaseweb", sellable=False),
-            ]
-        )
+        offers_repo.list_all = AsyncMock(return_value=[sellable, unpriced])
         monkeypatch.setattr(
             "cloud_platform.modules.offers.repository.SqlAlchemyCatalogSyncStateRepository",
             lambda session_factory: state_repo,

@@ -66,4 +66,6 @@ class LeasewebCatalogSyncSource:
             warnings=tuple(products.warnings),
             errors=tuple(products.errors),
             verified=products.verified,
+            verified_accounts=products.verified_accounts,
+            account_aware=True,
         )

@@ -7,13 +7,19 @@ worker, and bot entry points.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from cloud_platform.core.config import get_settings
 from cloud_platform.core.session_store import BotSessionStore, build_session_store
@@ -159,6 +165,14 @@ class Container:
     # (Redis in production, in-memory for tests/development). Containers
     # built directly (tests) leave it ``None`` and get a lazily built one.
     bot_session_store: BotSessionStore | None = None
+    engine: AsyncEngine | None = None
+    #: Transports/adapters created solely for the catalog syncers. They are
+    #: not provider-registry routes, but they are still process-owned and must
+    #: be closed by :meth:`close` (the manual catalog scripts expose the
+    #: syncers through these fields).
+    owned_resources: tuple[Any, ...] = field(default=(), repr=False)
+    _global_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
+    _domestic_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
     # Lifecycle guard: :meth:`initialize` registers provider adapters, and
     # the registry rejects duplicates. The flag makes a second initialize a
     # no-op instead of a double registration; it is set only after a fully
@@ -167,6 +181,18 @@ class Container:
     # container (what :func:`get_container`/:func:`close_container` do)
     # rather than re-initializing a closed one.
     _initialized: bool = field(default=False, init=False, repr=False, compare=False)
+    _closed: bool = field(default=False, init=False, repr=False, compare=False)
+    _closing: bool = field(default=False, init=False, repr=False, compare=False)
+    # Successful resource closures are remembered across a retry.  A failed
+    # resource must remain eligible for a second attempt without re-closing
+    # transports that already completed successfully.
+    _closed_resource_ids: set[int] = field(
+        default_factory=set, init=False, repr=False, compare=False
+    )
+
+    @property
+    def catalog_currency(self) -> str:
+        return get_settings().fx_catalog_pricing_currency
 
     def ssh_key_service(self) -> SshKeyService:
         """Ownership-scoped SSH-key service (M13-001), request-scoped."""
@@ -351,7 +377,12 @@ class Container:
         """Sellable-offer price book repository (LEASEWEB-MVP)."""
         from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 
-        return SqlAlchemySellableOfferRepository(self.session_factory)
+        settings = get_settings()
+        return SqlAlchemySellableOfferRepository(
+            self.session_factory,
+            catalog_currency=settings.fx_catalog_pricing_currency,
+            catalog_stale_limit_seconds=settings.fx_frankfurter_catalog_max_stale_seconds,
+        )
 
     def provider_order_repository(self) -> Any:
         """Provider-order repository (LEASEWEB-MVP)."""
@@ -550,6 +581,8 @@ class Container:
             audit_repo=_audit_repository(self.session_factory),
             cloud_providers=self.hourly_cloud_providers(),
             cloud_resolver=self.hourly_cloud_resolver(),
+            catalog_currency=get_settings().fx_catalog_pricing_currency,
+            catalog_stale_limit_seconds=(get_settings().fx_frankfurter_catalog_max_stale_seconds),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:
@@ -686,6 +719,16 @@ class Container:
             # business event, so the operator channel and the money never
             # depend on each other's availability.
             event_sink=self.business_event_sink(),
+        )
+
+    def offer_admin_service(self) -> Any:
+        """Application service for operator-owned offer prices/visibility."""
+        from cloud_platform.modules.offers.service import OfferAdminService
+
+        return OfferAdminService(
+            self.sellable_offer_repository(),
+            _audit_repository(self.session_factory),
+            catalog_currency=get_settings().fx_catalog_pricing_currency,
         )
 
     def wallet_admin_service(self) -> Any:
@@ -861,13 +904,16 @@ class Container:
         )
 
     def fx_config(self) -> Any:
-        """Operator FX policy from server-owned configuration."""
+        """Domestic/payment FX policy from server-owned configuration."""
         from cloud_platform.modules.fx.service import FxConfig
 
         settings = get_settings()
         return FxConfig(
-            enabled=settings.fx_enabled,
-            provider=settings.fx_provider,
+            enabled=(
+                getattr(settings, "fx_domestic_enabled", settings.fx_enabled)
+                and settings.fx_enabled
+            ),
+            provider=settings.fx_domestic_provider or settings.fx_provider,
             default_display_currency=settings.fx_default_display_currency,
             quote_ttl_seconds=settings.fx_quote_ttl_seconds,
             max_stale_seconds=settings.fx_max_stale_seconds,
@@ -877,52 +923,116 @@ class Container:
             allow_usdt_proxy_for_settlement=settings.fx_allow_usdt_proxy_for_settlement,
         )
 
-    def fx_resolver(self) -> Any:
-        """Build the platform FX resolver (process owner closes it).
+    def global_fx_config(self) -> Any:
+        """Global provider-cost normalization policy."""
+        from cloud_platform.modules.fx.service import GlobalFiatFxConfig
 
-        One AbanTether HTTP client + one cache client per resolver; the
-        caller that built it owns closing it (see :meth:`aclose_fx` and the
-        bot/API/worker shutdown paths). Construction lives here — in
-        infrastructure — so domain/application code never branches on FX
-        sources.
-        """
+        settings = get_settings()
+        return GlobalFiatFxConfig(
+            enabled=(
+                getattr(settings, "fx_global_enabled", settings.fx_enabled) and settings.fx_enabled
+            ),
+            catalog_currency=settings.fx_catalog_pricing_currency,
+            quote_ttl_seconds=settings.fx_frankfurter_quote_ttl_seconds,
+            max_stale_seconds=settings.fx_frankfurter_max_stale_seconds,
+            catalog_max_stale_seconds=settings.fx_frankfurter_catalog_max_stale_seconds,
+        )
+
+    @staticmethod
+    def _fx_cache_backend() -> tuple[str, str]:
+        settings = get_settings()
+        backend = "redis" if (settings.app_env or "").strip().lower() == "production" else "memory"
+        return backend, settings.redis_url
+
+    def global_fx_resolver(self) -> Any:
+        """Return the process-owned global resolver, preserving outage memo."""
+        from cloud_platform.modules.fx.cache import build_fx_cache
+        from cloud_platform.modules.fx.service import GlobalFiatFxResolver
+        from cloud_platform.providers.frankfurter_fx.client import FrankfurterFxClient
+
+        if self._global_fx_resolver is not None:
+            return self._global_fx_resolver
+        settings = get_settings()
+        source = FrankfurterFxClient(
+            base_url=settings.fx_frankfurter_base_url,
+            timeout_seconds=settings.fx_frankfurter_request_timeout_seconds,
+            ttl_seconds=settings.fx_frankfurter_quote_ttl_seconds,
+        )
+        backend, redis_url = self._fx_cache_backend()
+        config = self.global_fx_config()
+        cache = build_fx_cache(
+            backend=backend,
+            redis_url=redis_url,
+            retention_seconds=config.max_stale_seconds,
+        )
+        resolver = GlobalFiatFxResolver(source=source, cache=cache, config=config)
+        object.__setattr__(resolver, "_container_owned", True)
+        object.__setattr__(self, "_global_fx_resolver", resolver)
+        return resolver
+
+    def fx_resolver(self) -> Any:
+        """Return the process-owned domestic/payment resolver."""
         from cloud_platform.modules.fx.cache import build_fx_cache
         from cloud_platform.modules.fx.service import FxResolver
         from cloud_platform.providers.abantether_fx.client import AbanTetherFxClient
 
+        if self._domestic_fx_resolver is not None:
+            return self._domestic_fx_resolver
         settings = get_settings()
-        source = AbanTetherFxClient(
+        domestic_source = AbanTetherFxClient(
             base_url=settings.fx_abantether_base_url,
-            timeout_seconds=float(settings.fx_request_timeout_seconds),
+            timeout_seconds=int(settings.fx_request_timeout_seconds),
             ttl_seconds=settings.fx_quote_ttl_seconds,
             eur_symbol=settings.fx_abantether_eur_symbol,
             usd_proxy_symbol=settings.fx_abantether_usd_proxy_symbol,
         )
-        backend = "redis" if (settings.app_env or "").strip().lower() == "production" else "memory"
-        # Production shares Redis; dev/test use the deterministic memory cache.
-        # The FX cache backend follows the deployment topology the same way
-        # the Telegram session store does (Redis in production only).
-        cache = build_fx_cache(backend=backend, redis_url=settings.redis_url)
-        return FxResolver(source=source, cache=cache, config=self.fx_config())
+        backend, redis_url = self._fx_cache_backend()
+        domestic_config = self.fx_config()
+        domestic_cache = build_fx_cache(
+            backend=backend,
+            redis_url=redis_url,
+            retention_seconds=domestic_config.max_stale_seconds,
+        )
+        domestic = FxResolver(
+            source=domestic_source,
+            cache=domestic_cache,
+            config=domestic_config,
+        )
+        object.__setattr__(domestic, "_container_owned", True)
+        object.__setattr__(self, "_domestic_fx_resolver", domestic)
+        return domestic
 
-    def fx_resolver_or_none(self) -> Any | None:
-        """FX resolver for recharge/catalog, or None when FX is disabled."""
+    def global_fx_resolver_or_none(self) -> Any | None:
+        """Global FX resolver for catalog sync, or None when disabled."""
         try:
             settings = get_settings()
+            if not (
+                settings.fx_enabled and getattr(settings, "fx_global_enabled", settings.fx_enabled)
+            ):
+                return None
+            return self.global_fx_resolver()
         except Exception:
+            logger.warning("global FX resolver unavailable; continuing without FX", exc_info=True)
             return None
-        if not settings.fx_enabled:
-            return None
+
+    def fx_resolver_or_none(self) -> Any | None:
+        """Routed FX resolver for payment/recharge callers, or None when disabled."""
         try:
+            settings = get_settings()
+            if not (
+                settings.fx_enabled
+                and getattr(settings, "fx_domestic_enabled", settings.fx_enabled)
+            ):
+                return None
             return self.fx_resolver()
         except Exception:
-            logger.warning("fx resolver unavailable; continuing without FX", exc_info=True)
+            logger.warning("FX resolver unavailable; continuing without FX", exc_info=True)
             return None
 
     @staticmethod
     async def aclose_fx(resolver: Any | None) -> None:
         """Best-effort close of the FX resolver (never raises)."""
-        if resolver is None:
+        if resolver is None or getattr(resolver, "_container_owned", False):
             return
         try:
             await resolver.close()
@@ -1142,43 +1252,136 @@ class Container:
                 self.provider_registry.register(leaseweb)
 
     async def close(self) -> None:
-        """Close all resources."""
+        """Close all process-owned transports, providers, and database state.
+
+        Catalog syncers create a few adapters that are not provider-registry
+        routes (legacy catalog syncers and account routers).  They are owned
+        by this container too; keeping that ownership explicit prevents a
+        scheduled sync or a container that was never initialized from leaking
+        HTTP clients.  The operation is idempotent for callers that already
+        closed a manually-used syncer before calling ``container.close()``.
+        """
+        if self._closed:
+            return
+        object.__setattr__(self, "_closing", True)
+        seen: set[int] = set(self._closed_resource_ids)
+        close_failed = False
+        closed_resource_ids = self._closed_resource_ids
+
+        async def close_resource(resource: Any) -> None:
+            nonlocal close_failed
+            if resource is None or id(resource) in seen:
+                return
+            seen.add(id(resource))
+            closer = getattr(resource, "aclose", None) or getattr(resource, "close", None)
+            closed = False
+            if callable(closer):
+                try:
+                    await closer()
+                    closed = True
+                except Exception:
+                    close_failed = True
+                    logger.warning("owned resource close failed", exc_info=True)
+            else:
+                # A resource without a closer is nevertheless fully processed;
+                # remembering it keeps repeated shutdown calls cheap.
+                closed = True
+            if closed:
+                closed_resource_ids.add(id(resource))
+                # Routers close their account adapters internally.  Only mark
+                # children after a successful router close; otherwise the registry
+                # pass remains available to retry those routes.  A mapping-only
+                # shim without its own closer must leave children for the
+                # registry pass.
+                if callable(closer):
+                    for attribute in ("providers", "ordered_providers"):
+                        mapping = getattr(resource, attribute, None)
+                        if isinstance(mapping, Mapping):
+                            for child in mapping.values():
+                                child_id = id(child)
+                                seen.add(child_id)
+                                closed_resource_ids.add(child_id)
+
+        # Close syncer-only transports first.  A manually closed Hetzner
+        # syncer may be encountered here as well; httpx close is idempotent,
+        # and the object-identity guard prevents duplicate closure for the
+        # normal container path.
+        for resource in self.owned_resources:
+            await close_resource(resource)
+        await close_resource(self._global_fx_resolver)
+        await close_resource(self._domestic_fx_resolver)
+        # Account routers may be present on directly constructed test
+        # containers without being listed in ``owned_resources``.
+        await close_resource(self.leaseweb_account_router)
+        await close_resource(self.leaseweb_cloud_account_router)
+
+        if self.engine is not None and id(self.engine) not in seen:
+            engine_id = id(self.engine)
+            seen.add(engine_id)
+            try:
+                await self.engine.dispose()
+                closed_resource_ids.add(engine_id)
+            except Exception:
+                close_failed = True
+                logger.warning("database engine dispose failed", exc_info=True)
+
         # Close provider connections. A multi-account provider has one adapter
         # per credential account, each with its own HTTP client, so the routes
         # must be closed too — the logical map only holds the default one.
-        seen: set[int] = set()
         candidates = list(self.provider_registry._providers.values())
         for routes in self.provider_registry._routes.values():
             candidates.extend(routes.values())
-        # Hourly cloud adapters are NOT in the provider registry (they serve
-        # a distinct product); close each per-account transport too.
+        # Hourly cloud adapters are not in the provider registry (they serve a
+        # distinct product); their router is normally in ``owned_resources``,
+        # but retain this fallback for manually constructed containers.
         cloud_router = self.leaseweb_cloud_account_router
         if cloud_router is not None:
-            try:
-                providers = dict(getattr(cloud_router, "providers", {}) or {})
+            providers = getattr(cloud_router, "providers", None)
+            if isinstance(providers, Mapping):
                 candidates.extend(providers.values())
-            except Exception:
-                pass
         for provider in candidates:
-            if id(provider) in seen:
+            provider_id = id(provider)
+            if provider_id in seen:
                 continue
-            seen.add(id(provider))
-            if hasattr(provider, "close"):
+            seen.add(provider_id)
+            closer = getattr(provider, "close", None)
+            if callable(closer):
                 try:
-                    await provider.close()
+                    await closer()
+                    closed_resource_ids.add(provider_id)
                 except Exception:
-                    logger.warning("provider client close failed")
+                    close_failed = True
+                    logger.warning("provider client close failed", exc_info=True)
+            else:
+                closed_resource_ids.add(provider_id)
+
         # Release the shared Telegram session/confirmation connection too, so a
         # graceful shutdown leaves no half-open Redis client behind.
         store = self.bot_session_store
         client = getattr(store, "client", None)
-        if client is not None:
+        if client is not None and id(client) not in seen:
+            client_id = id(client)
+            seen.add(client_id)
             from cloud_platform.core.redis import close_redis_client
 
-            await close_redis_client(client)
+            try:
+                await close_redis_client(client)
+                closed_resource_ids.add(client_id)
+            except Exception:
+                close_failed = True
+                logger.warning("bot session store close failed", exc_info=True)
+
+        if not close_failed:
+            object.__setattr__(self, "_closed", True)
+            object.__setattr__(self, "_closing", False)
+        else:
+            # Keep the reference globally reachable for an explicit retry, but
+            # make it unusable for new callers until cleanup succeeds.
+            object.__setattr__(self, "_closing", True)
 
 
 _container: Container | None = None
+_container_lock = asyncio.Lock()
 
 
 def create_container() -> Container:
@@ -1200,6 +1403,10 @@ def create_container() -> Container:
     # Create provider registry and allocator
     registry = ProviderRegistry()
     allocator = CompositeAllocator([])  # Providers registered later
+    # Syncer-only transports are not registry routes, but they are still owned
+    # by this process.  Keep explicit ownership so normal shutdown and the
+    # manual catalog scripts release them as well.
+    owned_resources: list[Any] = []
 
     # Create Hetzner syncer if token available
     hetzner_syncer = None
@@ -1209,6 +1416,7 @@ def create_container() -> Container:
             token=settings.hetzner_api_token,
             base_url=settings.hetzner_api_base_url,
         )
+        owned_resources.append(hetzner_syncer)
 
     # Create ArvanCloud syncer(s) if key available - one per configured region
     arvancloud_syncers: list[ArvanCloudCatalogSyncer] = []
@@ -1218,6 +1426,8 @@ def create_container() -> Container:
             base_url=settings.arvancloud_api_base_url,
             region=settings.arvancloud_region,
         )
+        # All regional syncers share this one transport; register it once.
+        owned_resources.append(arvancloud_provider)
         for region in _configured_regions(settings.arvancloud_region):
             arvancloud_syncers.append(
                 ArvanCloudCatalogSyncer(
@@ -1230,12 +1440,14 @@ def create_container() -> Container:
     # LeaseWeb syncer (EU second provider next to Hetzner)
     leaseweb_syncer = None
     if settings.leaseweb_api_key:
+        leaseweb_legacy_provider = LeaseWebProvider(
+            api_key=settings.leaseweb_api_key,
+            base_url=settings.leaseweb_api_base_url,
+        )
+        owned_resources.append(leaseweb_legacy_provider)
         leaseweb_syncer = LeaseWebCatalogSyncer(
             session_factory=session_factory,
-            provider=LeaseWebProvider(
-                api_key=settings.leaseweb_api_key,
-                base_url=settings.leaseweb_api_base_url,
-            ),
+            provider=leaseweb_legacy_provider,
         )
 
     # LEASEWEB-MVP: ordering-VPS provider + catalog syncer (monthly products).
@@ -1253,6 +1465,9 @@ def create_container() -> Container:
 
         leaseweb_account_router = build_leaseweb_account_router(settings)
         assert leaseweb_account_router is not None  # accounts are configured
+        # The router owns every per-account ordering transport, including when
+        # the container is never initialized and no registry routes exist.
+        owned_resources.append(leaseweb_account_router)
         new_order_clients = leaseweb_account_router.new_order_clients()
         ordered = leaseweb_account_router.ordered_providers
         if new_order_clients:
@@ -1274,6 +1489,9 @@ def create_container() -> Container:
         from cloud_platform.providers.leaseweb.ordering_sync import ordering_provider_from_settings
 
         leaseweb_ordering_provider = ordering_provider_from_settings(settings)
+        # In the single-credential form there is no router to own this
+        # adapter, so the container owns it explicitly.
+        owned_resources.append(leaseweb_ordering_provider)
         leaseweb_ordering_syncer = LeaseWebOrderingCatalogSyncer(
             session_factory=session_factory,
             provider=leaseweb_ordering_provider,
@@ -1290,6 +1508,11 @@ def create_container() -> Container:
         )
 
         leaseweb_cloud_account_router = build_cloud_account_router(settings)
+        if leaseweb_cloud_account_router is not None:
+            # The hourly router is not registered as a normal cloud route;
+            # retain explicit ownership for both initialized and uninitialized
+            # containers.
+            owned_resources.append(leaseweb_cloud_account_router)
     except Exception:
         leaseweb_cloud_account_router = None
 
@@ -1297,6 +1520,7 @@ def create_container() -> Container:
     # configured provider, plus the verify-then-swap rotation service.
     holders = _CredentialHolderRegistry()
     container = Container(
+        engine=engine,
         session_factory=session_factory,
         provider_registry=registry,
         provider_allocator=allocator,
@@ -1307,6 +1531,7 @@ def create_container() -> Container:
         leaseweb_ordering_provider=leaseweb_ordering_provider,
         leaseweb_account_router=leaseweb_account_router,
         leaseweb_cloud_account_router=leaseweb_cloud_account_router,
+        owned_resources=tuple(owned_resources),
         credential_holders=holders,
         credential_rotation_service=CredentialRotationService(
             holders,
@@ -1339,23 +1564,40 @@ async def get_container() -> Container:
     """Get the global container instance, creating it if needed.
 
     The returned container is fully initialized (providers registered).
-
-    Returns:
-        The global Container instance.
+    Initialization and shutdown share a single-flight lock so concurrent
+    first callers cannot create competing engines.
     """
     global _container
-    if _container is None:
-        _container = create_container()
-        await _container.initialize()
-    return _container
+    async with _container_lock:
+        if _container is not None:
+            if _container._closing:
+                raise RuntimeError("application container is currently closing")
+            if _container._closed:
+                _container = None
+            else:
+                return _container
+        candidate = create_container()
+        try:
+            await candidate.initialize()
+        except BaseException:
+            # ``create_container`` may already have opened syncer/router
+            # transports before registration fails.  Do not strand them when
+            # process startup is retried.
+            await candidate.close()
+            raise
+        _container = candidate
+        return _container
 
 
 async def close_container() -> None:
     """Close the global container and release resources."""
     global _container
-    if _container is not None:
-        await _container.close()
-        _container = None
+    async with _container_lock:
+        if _container is not None:
+            container = _container
+            await container.close()
+            if container._closed:
+                _container = None
 
 
 # FastAPI dependency injection helpers
@@ -1401,4 +1643,6 @@ async def get_payment_webhook_service() -> PaymentWebhookService:
         payments_repo=SqlAlchemyPaymentSessionRepository(container.session_factory),
         wallet_repo=SqlAlchemyWalletRepository(container.session_factory),
         ledger_repo=SqlAlchemyLedgerRepository(container.session_factory),
+        event_sink=container.business_event_sink(),
+        user_repo=container.user_repository(),
     )

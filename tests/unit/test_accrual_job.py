@@ -54,7 +54,7 @@ P2_KEY = accrual_charge_key(SERVER_ID, T0 + timedelta(hours=2))
 
 
 def _money(amount: int) -> Money:
-    return Money(Decimal(amount), "EUR")
+    return Money(Decimal(amount), "USD")
 
 
 def _server(**kw: object) -> CloudServer:
@@ -80,10 +80,10 @@ def _snapshot() -> ServerPriceSnapshot:
             plan_id="cx22",
             location_id="fsn1",
             cost_minor=COST,
-            currency="EUR",
+            currency="USD",
         ),
         selling_minor=SELLING,
-        book_name="retail-eur",
+        book_name="retail-usd",
         book_version=1,
         rule=MarginRule(
             provider="hetzner",
@@ -99,7 +99,7 @@ def _hold(key: str, status: HoldStatus = HoldStatus.CREATED, amount: int = SELLI
     return Hold(
         wallet_id=WALLET_ID,
         amount=amount,
-        currency="EUR",
+        currency="USD",
         idempotency_key=key,
         id=uuid4(),
         status=status,
@@ -131,7 +131,16 @@ class Harness:
         self.audit = AsyncMock()
 
     # -- shared money posting (mirrors the DB's unique key: duplicates explode) --
-    def post(self, amount: int, key: str, etype: LedgerEntryType, reference: str = "") -> None:
+    def post(
+        self,
+        amount: int,
+        key: str,
+        etype: LedgerEntryType,
+        reference: str = "",
+        *,
+        reference_type: str = "",
+        description: str = "",
+    ) -> None:
         if key in self.entries:
             raise AssertionError(f"duplicate ledger key {key}")
         self.entries[key] = LedgerEntry(
@@ -139,9 +148,10 @@ class Harness:
             wallet_id=WALLET_ID,
             entry_type=etype,
             amount=_money(amount),
-            reference_type="hold" if etype is LedgerEntryType.CHARGE else "server",
+            reference_type=reference_type,
             reference_id=reference,
             idempotency_key=key,
+            description=description,
         )
 
     # -- ServerRepository -------------------------------------------------------
@@ -170,12 +180,23 @@ class Harness:
     # -- HoldService ----------------------------------------------------------------
     async def capture_hold(self, wallet_id, hold_id, key: str) -> Hold:
         hold = self.holds[key]
-        if hold.status is not HoldStatus.CREATED:
+        if hold.status is HoldStatus.RELEASED:
             raise ValueError("cannot capture")
-        hold.capture()
-        self.captured.append(key)
-        self.wallet.balance -= hold.amount
-        self.post(hold.amount, f"capture-{key}", LedgerEntryType.CHARGE, reference=key)
+        if hold.status is HoldStatus.CREATED:
+            hold.capture()
+            self.captured.append(key)
+            self.wallet.balance -= hold.amount
+        capture_key = f"capture-{key}"
+        if capture_key not in self.entries:
+            assert hold.id is not None
+            self.post(
+                hold.amount,
+                capture_key,
+                LedgerEntryType.CHARGE,
+                reference=str(hold.id),
+                reference_type="hold",
+                description=f"hold captured for {key}",
+            )
         return hold
 
     # -- LedgerRepository -------------------------------------------------------------
@@ -185,7 +206,14 @@ class Harness:
     async def ledger_post(
         self, wallet_id, amount: int, currency: str, etype: LedgerEntryType, key: str, **kw: object
     ) -> LedgerEntry:
-        self.post(amount, key, etype, reference=str(kw.get("reference_id", "")))
+        self.post(
+            amount,
+            key,
+            etype,
+            reference=str(kw.get("reference_id", "")),
+            reference_type=str(kw.get("reference_type", "")),
+            description=str(kw.get("description", "")),
+        )
         return self.entries[key]
 
     # -- AccrualPeriodRepository -------------------------------------------------------
@@ -221,6 +249,33 @@ class Harness:
 
         async def debit(self, user_id, amount, key):
             return await self.h.debit(user_id, amount, key)
+
+        async def adjust(
+            self,
+            user_id,
+            delta,
+            key,
+            *,
+            entry_type,
+            reference_type="",
+            reference_id="",
+            description="",
+        ):
+            if key in self.h.entries:
+                return self.h.wallet, False
+            if delta < 0:
+                await self.h.debit(user_id, -delta, key)
+            else:
+                self.h.wallet.balance += delta
+            self.h.post(
+                abs(delta),
+                key,
+                entry_type,
+                reference=str(reference_id),
+                reference_type=str(reference_type),
+                description=str(description),
+            )
+            return self.h.wallet, True
 
     @dataclass
     class _HoldRepo:
@@ -413,11 +468,20 @@ class TestHoldEdgeCases:
         assert h.debit_calls == [(SELLING, P0_KEY)]
 
     async def test_capture_replay_when_hold_already_captured(self) -> None:
+        hold = _hold(HOLD_KEY, status=HoldStatus.CAPTURED)
         h = Harness(
             servers=[_server()],
-            holds={HOLD_KEY: _hold(HOLD_KEY, status=HoldStatus.CAPTURED)},
+            holds={HOLD_KEY: hold},
         )
-        h.post(SELLING, CAPTURE_KEY, LedgerEntryType.CHARGE, reference=HOLD_KEY)
+        assert hold.id is not None
+        h.post(
+            SELLING,
+            CAPTURE_KEY,
+            LedgerEntryType.CHARGE,
+            reference=str(hold.id),
+            reference_type="hold",
+            description=f"hold captured for {HOLD_KEY}",
+        )
         report = await h.make_job().run(now=T0 + timedelta(hours=1))
 
         assert report.periods_posted == 0
@@ -474,6 +538,43 @@ class TestFailureModes:
         report = await job.run(now=T0 + timedelta(hours=1))
         assert report.errors == 1
         assert report.periods_posted == 0
+
+    async def test_wallet_currency_mismatch_fails_closed(self) -> None:
+        """A USD wallet must never settle a EUR-selling snapshot (fail closed)."""
+        eur_snapshot = ServerPriceSnapshot(
+            server_id=SERVER_ID,
+            offer=OfferCost(
+                provider_key="hetzner",
+                plan_id="cx22",
+                location_id="fsn1",
+                cost_minor=COST,
+                currency="EUR",
+            ),
+            selling_minor=SELLING,
+            book_name="retail-eur",
+            book_version=1,
+            rule=MarginRule(
+                provider="hetzner",
+                plan="cx22",
+                location="fsn1",
+                margin_factor=Decimal("1.43"),
+            ),
+            priced_at=T0,
+        )
+        h = Harness(
+            servers=[_server()],
+            wallet=Wallet(USER_ID, id=WALLET_ID, balance=10_000, currency="USD"),
+            holds={HOLD_KEY: _hold(HOLD_KEY)},
+            snapshots={SERVER_ID: eur_snapshot},
+        )
+        with pytest.raises(ValueError, match="wallet currency"):
+            await h.make_job()._accrue_server(
+                h.servers[0], T0 + timedelta(hours=1), AccrualRunReport()
+            )
+        assert h.entries == {}
+        assert h.debit_calls == []
+        assert h.captured == []
+        assert h.wallet.balance == 10_000
 
 
 class TestLock:

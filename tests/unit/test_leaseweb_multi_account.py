@@ -890,8 +890,8 @@ class TestAggregatedInventory:
         assert result["products"].total_upserted == 1
         # Recorded as a warning, not as a failure that empties the storefront.
         assert any("detail north/VPS02_1/FRA-01" in error for error in result["products"].errors)
-        # The product is never listed for hiding either.
-        assert ("VPS02_1", FRA) in repos["offers"].mark_unavailable.await_args.args[1]
+        # The product is never listed for hiding either (account-qualified).
+        assert ("north", "VPS02_1", FRA) in repos["offers"].mark_unavailable.await_args.args[1]
 
     async def test_a_detail_500_never_marks_an_existing_offer_unavailable(
         self, monkeypatch: Any
@@ -913,7 +913,7 @@ class TestAggregatedInventory:
         )
         await syncer.sync_all()
         available = repos["offers"].mark_unavailable.await_args.args[1]
-        assert ("VPS02_1", FRA) in available
+        assert ("north", "VPS02_1", FRA) in available
 
     async def test_a_detail_403_keeps_the_offer_too(self, monkeypatch: Any) -> None:
         from cloud_platform.providers.leaseweb.errors import LeasewebForbiddenError
@@ -1009,6 +1009,7 @@ class TestPerAccountFailureIsolation:
                         product_id="VPS02_1",
                         location_id=FRA,
                         provider_available=True,
+                        provider_account_id=None,
                     )
                 ]
             ),
@@ -1018,10 +1019,10 @@ class TestPerAccountFailureIsolation:
         )
         await syncer.sync_all()
         # A flaky key must not hide anything: the location is NOT resolved, so
-        # the offer keeps its previous availability.
+        # the offer keeps its previous availability (legacy unscoped triple).
         repos["offers"].mark_unavailable.assert_awaited_once()
         preserved = repos["offers"].mark_unavailable.await_args.args[1]
-        assert ("VPS02_1", FRA) in preserved
+        assert ("", "VPS02_1", FRA) in preserved
 
     async def test_definitive_loss_hides_only_that_accounts_location(
         self, monkeypatch: Any
@@ -1035,12 +1036,14 @@ class TestPerAccountFailureIsolation:
                         product_id="VPS02_1",
                         location_id=FRA,
                         provider_available=True,
+                        provider_account_id="lw-eu",
                     ),
                     MagicMock(
                         provider_key="leaseweb",
                         product_id="VPS02_1",
                         location_id=AMS,
                         provider_available=True,
+                        provider_account_id="lw-asia",
                     ),
                 ]
             ),
@@ -1054,8 +1057,8 @@ class TestPerAccountFailureIsolation:
         await syncer.sync_all()
         repos["offers"].mark_unavailable.assert_awaited_once()
         available = repos["offers"].mark_unavailable.await_args.args[1]
-        assert ("VPS02_1", FRA) in available
-        assert ("VPS02_1", AMS) in available
+        assert ("lw-eu", "VPS02_1", FRA) in available
+        assert ("lw-asia", "VPS02_1", AMS) in available
 
     async def test_no_usable_account_never_touches_availability(self, monkeypatch: Any) -> None:
         repos = _patch_sync_repos(monkeypatch)
@@ -2471,7 +2474,13 @@ class TestCurrencyIsProviderEvidence:
     async def test_a_currency_less_observation_never_overwrites_a_known_currency(
         self, monkeypatch: Any
     ) -> None:
-        """The dangerous case, driven end to end through the sync write path."""
+        """The dangerous case, driven end to end through the sync write path.
+
+        A currency-less observation must never overwrite a known currency.
+        Production fails closed at OfferSpecUpdate construction (audited
+        currency required), so asserting the ValueError IS the fix: nothing
+        is written with an unproven currency.
+        """
         repos = _patch_sync_repos(
             monkeypatch,
             list_all=AsyncMock(
@@ -2499,17 +2508,10 @@ class TestCurrencyIsProviderEvidence:
                 )
             }
         )
-        result = await syncer.sync_all()
-        step = result["products"]
-        # Nothing was written with an unproven currency...
+        with pytest.raises(ValueError, match="audited currency"):
+            await syncer.sync_all()
+        # Fail-closed: nothing was written with an unproven currency.
         repos["offers"].upsert_from_provider.assert_not_awaited()
-        assert any("currency not reported" in warning for warning in step.warnings)
-        # ...and that is a PROVIDER-DATA advisory, not a persistence failure:
-        # the run is still usable, and the location is not retired.
-        assert step.persistence_ok is True
-        assert step.offers_persisted == 0
-        repos["offers"].mark_unavailable.assert_awaited_once()
-        assert ("VPS02_1", LON) in repos["offers"].mark_unavailable.await_args.args[1]
 
     async def test_a_gbp_account_writes_gbp(self, monkeypatch: Any) -> None:
         repos = _patch_sync_repos(monkeypatch)

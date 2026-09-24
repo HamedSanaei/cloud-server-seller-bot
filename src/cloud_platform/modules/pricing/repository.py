@@ -126,6 +126,11 @@ def _snapshot_to_domain(row: _ServerPriceSnapshotModel) -> ServerPriceSnapshot:
         location_id=str(_attr(row, "location_id")),
         cost_minor=int(_attr(row, "cost_minor")),
         currency=str(_attr(row, "currency")),
+        provider_rate_exact=(
+            str(row.provider_rate_exact)
+            if getattr(row, "provider_rate_exact", None) is not None
+            else None
+        ),
     )
     return ServerPriceSnapshot(
         server_id=_attr(row, "server_id"),
@@ -139,6 +144,13 @@ def _snapshot_to_domain(row: _ServerPriceSnapshotModel) -> ServerPriceSnapshot:
         created_at=_aware(_attr(row, "created_at"))
         if _attr(row, "created_at") is not None
         else None,
+        selling_currency=str(getattr(row, "selling_currency", None) or _attr(row, "currency")),
+        pricing_metadata=dict(getattr(row, "pricing_metadata", None) or {}),
+        offer_fingerprint=(
+            dict(getattr(row, "offer_fingerprint", None) or {})
+            if getattr(row, "offer_fingerprint", None) is not None
+            else None
+        ),
     )
 
 
@@ -165,6 +177,12 @@ class SqlAlchemyServerPriceSnapshotRepository:
             currency=snapshot.offer.currency,
             cost_minor=snapshot.offer.cost_minor,
             selling_minor=snapshot.selling_minor,
+            selling_currency=snapshot.selling_currency,
+            provider_rate_exact=snapshot.offer.provider_rate_exact,
+            pricing_metadata=dict(snapshot.pricing_metadata),
+            offer_fingerprint=(
+                dict(snapshot.offer_fingerprint) if snapshot.offer_fingerprint else None
+            ),
             book_name=snapshot.book_name,
             book_version=snapshot.book_version,
             margin_rule=rule_to_dict(snapshot.rule),

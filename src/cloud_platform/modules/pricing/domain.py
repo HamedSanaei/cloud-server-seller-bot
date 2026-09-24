@@ -18,7 +18,7 @@ prices are reproducible.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Protocol
@@ -116,6 +116,7 @@ class OfferCost:
     location_id: str
     cost_minor: int
     currency: str
+    provider_rate_exact: str | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -144,6 +145,15 @@ class SellingPrice:
     book_name: str
     version: int
     priced_at: datetime
+    selling_currency: str | None = None
+    pricing_metadata: dict[str, object] = field(default_factory=dict)
+    offer_fingerprint: dict[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        currency = self.offer.currency if self.selling_currency is None else self.selling_currency
+        if not currency or not currency.strip():
+            raise ValueError("selling_currency must not be empty")
+        object.__setattr__(self, "selling_currency", currency.strip().upper())
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +201,9 @@ class ServerPriceSnapshot:
     priced_at: datetime
     id: UUID | None = None
     created_at: datetime | None = None
+    selling_currency: str | None = None
+    pricing_metadata: dict[str, object] = field(default_factory=dict)
+    offer_fingerprint: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.selling_minor < 0:
@@ -201,6 +214,10 @@ class ServerPriceSnapshot:
             raise ValueError("book_name must not be empty")
         if self.priced_at.tzinfo is None:
             raise ValueError("priced_at must be timezone-aware")
+        currency = self.offer.currency if self.selling_currency is None else self.selling_currency
+        if not currency or not currency.strip():
+            raise ValueError("selling_currency must not be empty")
+        object.__setattr__(self, "selling_currency", currency.strip().upper())
 
 
 def snapshot_from_selling_price(server_id: UUID, price: SellingPrice) -> ServerPriceSnapshot:
@@ -213,6 +230,9 @@ def snapshot_from_selling_price(server_id: UUID, price: SellingPrice) -> ServerP
         book_version=price.version,
         rule=price.rule,
         priced_at=price.priced_at,
+        selling_currency=price.selling_currency,
+        pricing_metadata=dict(price.pricing_metadata),
+        offer_fingerprint=(dict(price.offer_fingerprint) if price.offer_fingerprint else None),
     )
 
 

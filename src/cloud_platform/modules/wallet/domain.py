@@ -40,6 +40,18 @@ class LedgerEntry:
 # Wallet aggregate & repository port
 # ---------------------------------------------------------------------------
 
+#: Canonical customer billing currency for the storefront.
+#:
+#: A foreign provider cost is converted to the configured catalog currency
+#: (``fx.catalog_pricing_currency``, USD) *before* the operator markup, so the
+#: amount a customer accepts is a USD amount and the hourly/monthly charge
+#: snapshot is USD. A wallet denominated in another unit could only settle that
+#: contract by relabelling money, so new wallets are created in this canonical
+#: unit and a domestic (IRT/IRR) recharge converts through the audited FX
+#: boundary at credit time. Existing non-USD balances are never silently
+#: rewritten: an operator migrates them explicitly (docs/fx/CURRENCY_FX.md).
+DEFAULT_WALLET_CURRENCY: str = "USD"
+
 
 class WalletError(Exception):
     """Base error for wallet operations."""
@@ -65,7 +77,7 @@ class Wallet:
     user_id: UUID
     id: UUID | None = None
     balance: int = 0  # minor units
-    currency: str = "EUR"
+    currency: str = DEFAULT_WALLET_CURRENCY
     status: WalletStatus = WalletStatus.ACTIVE
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -130,8 +142,8 @@ class WalletRepository(Protocol):
         """Every wallet (reconciliation/reporting)."""
         ...
 
-    async def get_or_create(self, user_id: UUID, currency: str = "EUR") -> Wallet:
-        """Return the wallet; create it if absent."""
+    async def get_or_create(self, user_id: UUID, currency: str = DEFAULT_WALLET_CURRENCY) -> Wallet:
+        """Return the wallet; create it if absent (canonical USD by default)."""
         ...
 
     async def debit(self, user_id: UUID, amount: int, idempotency_key: str) -> Wallet:
@@ -140,6 +152,24 @@ class WalletRepository(Protocol):
 
     async def add_funds(self, user_id: UUID, amount: int, idempotency_key: str) -> Wallet:
         """Credit the wallet idempotently. Returns updated aggregate."""
+        ...
+
+    async def adjust(
+        self,
+        user_id: UUID,
+        delta: int,
+        idempotency_key: str,
+        *,
+        entry_type: LedgerEntryType,
+        reference_type: str = "",
+        reference_id: str = "",
+        description: str = "",
+    ) -> tuple[Wallet, bool]:
+        """Atomically apply a signed balance delta and append its ledger fact.
+
+        ``applied`` is False for an idempotent replay. The wallet mutation and
+        ledger insert must commit in one transaction.
+        """
         ...
 
     async def credit_deposit(

@@ -36,6 +36,7 @@ def _result(*rows: Any) -> MagicMock:
     result = MagicMock()
     result.scalars.return_value.first.return_value = rows[0] if rows else None
     result.scalars.return_value.all.return_value = list(rows)
+    result.scalar_one_or_none.return_value = rows[0] if rows else None
     return result
 
 
@@ -55,7 +56,9 @@ def _offer_row(**overrides: Any) -> MagicMock:
     row.selling_price_minor = 0
     row.selling_currency = "EUR"
     row.billing_parameters = {}
+    row.billing_model = "prepaid_monthly_fixed"
     row.technical_metadata = {"architecture": "x86_64"}
+    row.pricing_metadata = {}
     row.provider_available = True
     row.enabled = False
     row.operator_disabled = False
@@ -79,10 +82,17 @@ def _state(db: AsyncMock) -> SqlAlchemyCatalogSyncStateRepository:
 class TestPublicationMapping:
     async def test_get_maps_new_fields(self) -> None:
         db = _db()
-        db.get.return_value = _offer_row(operator_disabled=True, auto_priced=False)
+        db.get.return_value = _offer_row(
+            operator_disabled=True,
+            auto_priced=False,
+            pricing_metadata={"pricing_mode": "manual"},
+        )
         offer = await _offers(db).get(OFFER_ID)
         assert offer is not None
         assert offer.technical_metadata == {"architecture": "x86_64"}
+        assert offer.pricing_metadata == {"pricing_mode": "manual"}
+        assert offer.billing_model == "prepaid_monthly_fixed"
+        assert offer.provider_account_id == "default"
         assert offer.operator_disabled is True
         assert offer.auto_priced is False
 
@@ -117,6 +127,7 @@ class TestPublicationMapping:
             provider_key="leaseweb",
             product_id="VPS02_1",
             location_id="FRA-01",
+            provider_account_id="default",
             update=OfferSpecUpdate(
                 name="VPS 1",
                 vcpu=4,
@@ -141,6 +152,7 @@ class TestPublicationMapping:
             provider_key="leaseweb",
             product_id="VPS02_1",
             location_id="FRA-01",
+            provider_account_id="default",
             update=OfferSpecUpdate(
                 name="VPS 1",
                 vcpu=2,
@@ -161,7 +173,19 @@ class TestPublicationMapping:
         db.get.return_value = _offer_row()
         disabled = await _offers(db).set_operator_disabled(OFFER_ID, True)
         assert disabled.operator_disabled is True
-        cleared = await _offers(db).set_operator_disabled(OFFER_ID, False)
+        # Clearing the block is a visibility transition: the row must already
+        # be enabled and publishable (priced + valid manual provenance).
+        clear_db = _db()
+        publishable = _offer_row(
+            enabled=True,
+            operator_disabled=True,
+            selling_price_minor=799,
+            auto_priced=False,
+            billing_parameters={"provider_monthly_rate": "4.99"},
+        )
+        clear_db.get.return_value = publishable
+        clear_db.execute.return_value = _result(publishable)
+        cleared = await _offers(clear_db).set_operator_disabled(OFFER_ID, False)
         assert cleared.operator_disabled is False
 
     async def test_set_auto_priced(self) -> None:
@@ -169,7 +193,17 @@ class TestPublicationMapping:
         db.get.return_value = _offer_row()
         manual = await _offers(db).set_auto_priced(OFFER_ID, False)
         assert manual.auto_priced is False
-        auto = await _offers(db).set_auto_priced(OFFER_ID, True)
+        assert manual.pricing_metadata.get("pricing_mode") == "manual"
+        # Re-enabling automatic pricing requires valid pricing provenance:
+        # a priced manual row bound to its exact provider rate qualifies.
+        auto_db = _db()
+        provenanced = _offer_row(
+            selling_price_minor=799,
+            auto_priced=False,
+            billing_parameters={"provider_monthly_rate": "4.99"},
+        )
+        auto_db.get.return_value = provenanced
+        auto = await _offers(auto_db).set_auto_priced(OFFER_ID, True)
         assert auto.auto_priced is True
 
     async def test_unknown_offer_raises(self) -> None:

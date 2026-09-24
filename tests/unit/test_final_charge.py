@@ -47,7 +47,7 @@ FINAL_KEY = f"final:{SERVER_ID}"
 
 
 def _money(amount: int) -> Money:
-    return Money(Decimal(amount), "EUR")
+    return Money(Decimal(amount), "USD")
 
 
 def _deleted_server(**kw: object) -> CloudServer:
@@ -74,8 +74,12 @@ def _snapshot() -> ServerPriceSnapshot:
             location_id="fsn1",
             cost_minor=COST,
             currency="EUR",
+            # Exact native provider rate: a cross-currency accrual
+            # (EUR cost -> USD selling) is never reconstructed from cents.
+            provider_rate_exact="7.00",
         ),
         selling_minor=SELLING,
+        selling_currency="USD",
         book_name="retail-eur",
         book_version=1,
         rule=MarginRule(
@@ -92,7 +96,7 @@ def _hold(key: str, status: HoldStatus = HoldStatus.CREATED, amount: int = SELLI
     return Hold(
         wallet_id=WALLET_ID,
         amount=amount,
-        currency="EUR",
+        currency="USD",
         idempotency_key=key,
         id=uuid4(),
         status=status,
@@ -118,7 +122,16 @@ class Fakes:
         self.accrual_rows: dict[str, object] = {}
         self.audit = AsyncMock()
 
-    def post(self, amount: int, key: str, etype: LedgerEntryType, reference: str = "") -> None:
+    def post(
+        self,
+        amount: int,
+        key: str,
+        etype: LedgerEntryType,
+        reference: str = "",
+        *,
+        reference_type: str = "",
+        description: str = "",
+    ) -> None:
         if key in self.entries:
             raise AssertionError(f"duplicate ledger key {key}")
         self.entries[key] = LedgerEntry(
@@ -126,9 +139,10 @@ class Fakes:
             wallet_id=WALLET_ID,
             entry_type=etype,
             amount=_money(amount),
-            reference_type="hold" if etype is LedgerEntryType.CHARGE else "server",
+            reference_type=reference_type,
             reference_id=reference,
             idempotency_key=key,
+            description=description,
         )
 
     async def save(self, server: CloudServer) -> CloudServer:
@@ -145,17 +159,60 @@ class Fakes:
         self.wallet.balance -= amount
         return self.wallet
 
+    async def adjust(
+        self,
+        user_id,
+        delta: int,
+        key: str,
+        *,
+        entry_type: LedgerEntryType,
+        reference_type: str = "",
+        reference_id: str = "",
+        description: str = "",
+    ) -> tuple[Wallet, bool]:
+        if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
+            raise ValueError("wallet adjustment delta must be a non-zero integer")
+        new_key = str(key).strip()
+        if not new_key:
+            raise ValueError("idempotency_key must not be empty")
+        if new_key in self.entries:
+            return self.wallet, False
+        new_balance = self.wallet.balance + delta
+        if new_balance < 0:
+            raise InsufficientBalanceError(f"balance {self.wallet.balance} < required {-delta}")
+        self.wallet.balance = new_balance
+        if delta < 0:
+            self.debit_calls.append((-delta, new_key))
+        self.post(
+            abs(delta),
+            new_key,
+            entry_type,
+            reference=str(reference_id),
+            reference_type=str(reference_type),
+            description=str(description),
+        )
+        return self.wallet, True
+
     async def hold_get(self, wallet_id, key: str) -> Hold | None:
         return self.holds.get(key)
 
     async def capture_hold(self, wallet_id, hold_id, key: str) -> Hold:
         hold = self.holds[key]
+        if hold.status is HoldStatus.CAPTURED:
+            return hold
         if hold.status is not HoldStatus.CREATED:
             raise ValueError("cannot capture")
         hold.capture()
         self.captured.append(key)
         self.wallet.balance -= hold.amount
-        self.post(hold.amount, f"capture-{key}", LedgerEntryType.CHARGE, reference=key)
+        self.post(
+            hold.amount,
+            f"capture-{key}",
+            LedgerEntryType.CHARGE,
+            reference=str(hold.id),
+            reference_type="hold",
+            description=f"hold captured for {key}",
+        )
         return hold
 
     async def ledger_get(self, wallet_id, key: str) -> LedgerEntry | None:
@@ -164,7 +221,14 @@ class Fakes:
     async def ledger_post(
         self, wallet_id, amount: int, currency: str, etype: LedgerEntryType, key: str, **kw: object
     ) -> LedgerEntry:
-        self.post(amount, key, etype, reference=str(kw.get("reference_id", "")))
+        self.post(
+            amount,
+            key,
+            etype,
+            reference=str(kw.get("reference_id", "")),
+            reference_type=str(kw.get("reference_type", "")),
+            description=str(kw.get("description", "")),
+        )
         return self.entries[key]
 
     async def accrual_get(self, key: str):
@@ -191,6 +255,27 @@ class Fakes:
 
             async def debit(self, user_id, amount, key):
                 return await h.debit(user_id, amount, key)
+
+            async def adjust(
+                self,
+                user_id,
+                delta,
+                key,
+                *,
+                entry_type,
+                reference_type="",
+                reference_id="",
+                description="",
+            ):
+                return await h.adjust(
+                    user_id,
+                    delta,
+                    key,
+                    entry_type=entry_type,
+                    reference_type=reference_type,
+                    reference_id=reference_id,
+                    description=description,
+                )
 
         @dataclass
         class _HoldRepo:
@@ -313,10 +398,14 @@ class TestFinalSegmentOnce:
         assert f.captured == [HOLD_KEY]
         assert f.debit_calls == [(SELLING, FINAL_KEY)]
         assert f.wallet.balance == 100_000 - 2 * SELLING
-        # the business record covers the FULL window, under the final key
+        # business records are split per leg: capture leg + flat remainder
+        assert len(f.accrual_rows) == 2
+        capture_record = f.accrual_rows[CAPTURE_KEY]
+        assert capture_record.selling_minor == SELLING
+        assert capture_record.cost_minor == COST
         record = f.accrual_rows[FINAL_KEY]
-        assert record.selling_minor == 2 * SELLING
-        assert record.cost_minor == 2 * COST
+        assert record.selling_minor == SELLING
+        assert record.cost_minor == COST
 
         # full replay AFTER the watermark was persisted: a pure no-op
         second = await f.make_service().charge_final(server, T0 + timedelta(minutes=90))
@@ -343,7 +432,14 @@ class TestFinalSegmentOnce:
         hold.capture()
         f.captured.append(HOLD_KEY)
         f.wallet.balance -= hold.amount
-        f.post(hold.amount, CAPTURE_KEY, LedgerEntryType.CHARGE, reference=HOLD_KEY)
+        f.post(
+            hold.amount,
+            CAPTURE_KEY,
+            LedgerEntryType.CHARGE,
+            reference=str(hold.id),
+            reference_type="hold",
+            description=f"hold captured for {HOLD_KEY}",
+        )
 
         result = await service.charge_final(server, T0 + timedelta(minutes=90))
 
@@ -351,15 +447,26 @@ class TestFinalSegmentOnce:
         assert result.captured_hold is False
         assert f.debit_calls == [(SELLING, FINAL_KEY)]
         assert f.wallet.balance == 100_000 - 2 * SELLING  # total still exactly 2 quanta
-        assert len(f.accrual_rows) == 1
+        assert len(f.accrual_rows) == 2
+        capture_record = f.accrual_rows[CAPTURE_KEY]
+        assert capture_record.selling_minor == SELLING
+        assert capture_record.cost_minor == COST
         record = f.accrual_rows[FINAL_KEY]
-        assert record.selling_minor == 2 * SELLING  # full window recorded
+        assert record.selling_minor == SELLING  # flat remainder leg only
+        assert record.cost_minor == COST
 
 
 class TestWindowRules:
     async def test_grid_aligned_deletion_charges_nothing(self) -> None:
         f = Fakes(holds={HOLD_KEY: _hold(HOLD_KEY, status=HoldStatus.CAPTURED)})
-        f.post(SELLING, CAPTURE_KEY, LedgerEntryType.CHARGE, reference=HOLD_KEY)
+        f.post(
+            SELLING,
+            CAPTURE_KEY,
+            LedgerEntryType.CHARGE,
+            reference=str(f.holds[HOLD_KEY].id),
+            reference_type="hold",
+            description=f"hold captured for {HOLD_KEY}",
+        )
         server = _deleted_server(last_accrued_at=T0 + timedelta(hours=1))
 
         result = await f.make_service().charge_final(server, T0 + timedelta(hours=1))

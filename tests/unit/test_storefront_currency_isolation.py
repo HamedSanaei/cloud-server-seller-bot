@@ -483,22 +483,22 @@ class TestCurrencyCardIdentity:
                 product_id="SHARED-9",
                 location_id="LOC-B",
                 price_minor=999,
-                currency="CHF",
+                currency="GBP",
             ),
         ]
         service = _service(offers, provider_key=provider)
         products, _, _ = await service.products_screen(provider)
         assert len(products) == 2
         usd = next(p for p in products if p.currency == "USD")
-        chf = next(p for p in products if p.currency == "CHF")
+        gbp = next(p for p in products if p.currency == "GBP")
         usd_locations, _, _ = await service.product_locations_screen(
             provider, usd.product_id, usd.monthly_price_minor, usd.currency
         )
-        chf_locations, _, _ = await service.product_locations_screen(
-            provider, chf.product_id, chf.monthly_price_minor, chf.currency
+        gbp_locations, _, _ = await service.product_locations_screen(
+            provider, gbp.product_id, gbp.monthly_price_minor, gbp.currency
         )
         assert [view.location_id for view in usd_locations] == ["LOC-A"]
-        assert [view.location_id for view in chf_locations] == ["LOC-B"]
+        assert [view.location_id for view in gbp_locations] == ["LOC-B"]
 
 
 class TestSameCurrencyAggregation:

@@ -13,10 +13,13 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+from cloud_platform.modules.fx.domain import FxReferenceQuote
+from cloud_platform.modules.fx.service import ReferenceRateResolution
 from cloud_platform.modules.offers.auto_sync import (
     CatalogAutoSyncCoordinator,
     pricing_policies_from_settings,
@@ -34,6 +37,47 @@ from cloud_platform.modules.offers.domain import (
 
 PROVIDER = "leaseweb"
 SECOND = "second-provider"
+FIXED_NOW = datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC)
+
+
+class _Rates:
+    """Deterministic EUR/USD reference rates (no network, no float).
+
+    Mirrors the test_global_usd_pricing pattern: 1.17, frankfurter family.
+    Fresh timestamps keep auto-pricing provenance currently valid (never
+    expired), so publishing succeeds end to end.
+    """
+
+    def __init__(self, rate: Decimal = Decimal("1.17")) -> None:
+        self.rate = rate
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_rate(
+        self, base: str, quote: str, *, allow_catalog_stale: bool = False
+    ) -> ReferenceRateResolution:
+        self.calls.append((base, quote))
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=self.rate,
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+    async def get_catalog_rate(self, base: str, quote: str) -> ReferenceRateResolution:
+        # auto_sync prefers get_rate when callable; both exist for honesty.
+        return await self.get_rate(base, quote, allow_catalog_stale=True)
+
+
+def _exact_monthly(cost_minor: int) -> str:
+    return str(Decimal(cost_minor) / 100)
 
 
 def _offer(
@@ -50,8 +94,12 @@ def _offer(
     auto_priced: bool = True,
     available: bool = True,
     technical_metadata: dict[str, object] | None = None,
+    billing_parameters: dict[str, object] | None = None,
+    pricing_metadata: dict[str, object] | None = None,
     name: str = "VPS 1",
 ) -> SellableOffer:
+    if billing_parameters is None:
+        billing_parameters = {"provider_monthly_rate": _exact_monthly(cost_minor)}
     return SellableOffer(
         id=uuid4(),
         provider_key=provider_key,
@@ -66,13 +114,52 @@ def _offer(
         provider_cost_currency=cost_currency,
         selling_price_minor=price_minor,
         selling_currency=price_currency,
-        billing_parameters={},
+        billing_parameters=dict(billing_parameters),
         technical_metadata=dict(technical_metadata or {}),
+        pricing_metadata=dict(pricing_metadata or {}),
         provider_available=available,
         enabled=enabled,
         operator_disabled=operator_disabled,
         auto_priced=auto_priced,
         created_at=None,
+    )
+
+
+async def _usd_priced_row(
+    *,
+    cost_minor: int = 499,
+    markup_percent: int = 25,
+    enabled: bool = True,
+    product_id: str = "VPS02_1",
+    location_id: str = "FRA-01",
+) -> SellableOffer:
+    """Production-shaped foreign EUR row priced to USD with valid provenance."""
+    from dataclasses import replace
+
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+
+    base = _offer(
+        product_id=product_id,
+        location_id=location_id,
+        cost_minor=cost_minor,
+        cost_currency="EUR",
+        price_minor=0,
+        price_currency="EUR",
+        enabled=False,
+        auto_priced=True,
+    )
+    priced = await CatalogOfferPricer(_Rates(), "USD").price_auto(
+        base, PricingPolicy(markup_percent=markup_percent, auto_publish=True)
+    )
+    metadata = dict(priced.pricing_metadata)
+    metadata["provider_cost_minor"] = cost_minor
+    metadata["provider_cost_currency"] = "EUR"
+    return replace(
+        base,
+        selling_price_minor=priced.selling_price_minor,
+        selling_currency=priced.selling_currency,
+        pricing_metadata=metadata,
+        enabled=enabled,
     )
 
 
@@ -91,7 +178,7 @@ def _spec(
         traffic=None,
         provider_cost_minor=cost_minor,
         provider_cost_currency=currency,
-        billing_parameters={},
+        billing_parameters={"provider_monthly_rate": _exact_monthly(cost_minor)},
         technical_metadata=technical_metadata,
         provider_available=True,
     )
@@ -120,8 +207,15 @@ class FakeOffersRepo:
         return next((o for o in self._rows.values() if o.id == offer_id), None)
 
     async def get_by_ref(
-        self, provider_key: str, product_id: str, location_id: str
+        self,
+        provider_key: str,
+        product_id: str,
+        location_id: str,
+        provider_account_id: str | None = None,
     ) -> SellableOffer | None:
+        # Single-account tests: the triple is the identity; the account
+        # qualifier is accepted (port signature) and ignored when no
+        # account-scoped rows exist.
         return self._rows.get((provider_key, product_id, location_id))
 
     async def list_all(self) -> list[SellableOffer]:
@@ -198,6 +292,92 @@ class FakeOffersRepo:
                     changed += 1
         return changed
 
+    async def set_auto_price_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        selling_price_minor: int,
+        selling_currency: str,
+        pricing_metadata: dict[str, object],
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        offer = await self.get(offer_id)
+        assert offer is not None
+        if (
+            not offer.auto_priced
+            or offer.operator_disabled
+            or offer.provider_cost_minor != expected_cost_minor
+            or offer.provider_cost_currency.strip().upper()
+            != expected_cost_currency.strip().upper()
+        ):
+            return None
+        # Idempotent no-op: the exact USD price is already current for the
+        # same native cost, so no price write is needed (pins "unchanged
+        # causes no write"; provenance timestamps refresh separately).
+        if (
+            offer.selling_price_minor == selling_price_minor
+            and offer.selling_currency.strip().upper() == selling_currency.strip().upper()
+        ):
+            return None
+        self.calls.append(f"auto_price={selling_price_minor} {selling_currency}")
+        return self._replace(
+            offer,
+            selling_price_minor=selling_price_minor,
+            selling_currency=selling_currency,
+            pricing_metadata=dict(pricing_metadata),
+        )
+
+    async def publish_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_price_minor: int,
+        expected_currency: str,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        offer = await self.get(offer_id)
+        assert offer is not None
+        if (
+            offer.operator_disabled
+            or not offer.provider_available
+            or not offer.auto_priced
+            or offer.provider_cost_minor != expected_cost_minor
+            or offer.selling_price_minor != expected_price_minor
+        ):
+            return None
+        if offer.enabled:
+            return None  # already published: no write, not counted
+        self.calls.append("publish")
+        return self._replace(offer, enabled=True)
+
+    async def record_auto_pricing_failure_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_price_minor: int,
+        expected_selling_currency: str,
+        expected_pricing_metadata: dict[str, object],
+        pricing_metadata: dict[str, object],
+        preserve_valid_price: bool,
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        offer = await self.get(offer_id)
+        assert offer is not None
+        if (
+            offer.provider_cost_minor != expected_cost_minor
+            or offer.selling_price_minor != expected_price_minor
+        ):
+            return None
+        self.calls.append("record_fx_failure")
+        return self._replace(offer, pricing_metadata=dict(pricing_metadata))
+
+    # Legacy operator writes kept for the admin-service tests in this file.
     async def set_enabled(self, offer_id: UUID, enabled: bool) -> SellableOffer:
         offer = await self.get(offer_id)
         assert offer is not None
@@ -223,6 +403,46 @@ class FakeOffersRepo:
         return self._replace(
             offer, selling_price_minor=selling_price_minor, selling_currency=currency
         )
+
+    async def set_manual_price(
+        self,
+        offer_id: UUID,
+        selling_price_minor: int,
+        currency: str,
+        pricing_metadata: dict[str, object],
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_updated_at: object | None = None,
+    ) -> SellableOffer | None:
+        from dataclasses import replace
+
+        offer = await self.get(offer_id)
+        assert offer is not None
+        if (
+            offer.provider_cost_minor != expected_cost_minor
+            or offer.provider_cost_currency.strip().upper()
+            != expected_cost_currency.strip().upper()
+        ):
+            return None
+        self.calls.append(f"manual_price={selling_price_minor} {currency}")
+        updated = replace(
+            offer,
+            selling_price_minor=selling_price_minor,
+            selling_currency=currency,
+            auto_priced=False,
+            pricing_metadata=dict(pricing_metadata),
+        )
+        self._rows[self._key(offer)] = updated
+        return updated
+
+    async def set_visibility_state(
+        self, offer_id: UUID, *, enabled: bool, operator_disabled: bool
+    ) -> SellableOffer:
+        offer = await self.get(offer_id)
+        assert offer is not None
+        self.calls.append(f"visibility={enabled}/{operator_disabled}")
+        return self._replace(offer, enabled=enabled, operator_disabled=operator_disabled)
 
 
 class FakeStateRepo:
@@ -334,6 +554,7 @@ def _coordinator(
     state: FakeStateRepo | None = None,
     lock: FakeLock | None = None,
     policies: dict[str, PricingPolicy] | None = None,
+    reference_rates: Any | None = None,
 ) -> CatalogAutoSyncCoordinator:
     return CatalogAutoSyncCoordinator(
         sources=sources,
@@ -343,11 +564,14 @@ def _coordinator(
         pricing_policies=policies
         if policies is not None
         else {"leaseweb": PricingPolicy(markup_percent=25, auto_publish=True)},
+        reference_rates=reference_rates if reference_rates is not None else _Rates(),
     )
 
 
 class TestNewProductAutoPublication:
     async def test_new_eligible_product_appears_priced_and_published(self) -> None:
+        # Foreign EUR 4.99 * 1.17 (FX) * 1.25 (markup) = 7.297875 USD,
+        # ceiling to USD minor -> 730 USD (never EUR, never float).
         repo = FakeOffersRepo()
         source = FakeSource(
             PROVIDER, repo, [("VPS02_1", "FRA-01", _spec(cost_minor=499, currency="EUR"))]
@@ -360,23 +584,16 @@ class TestNewProductAutoPublication:
         assert provider.published == 1
         row = await repo.get_by_ref(PROVIDER, "VPS02_1", "FRA-01")
         assert row is not None
-        assert row.selling_price_minor == 624  # 499 + 25%
-        assert row.selling_currency == "EUR"
+        assert row.selling_price_minor == 730
+        assert row.selling_currency == "USD"
         assert row.enabled is True
         assert row.operator_disabled is False
         assert row.provider_cost_minor == 499  # cost untouched by markup
 
     async def test_cost_refresh_updates_auto_price(self) -> None:
-        repo = FakeOffersRepo(
-            [
-                _offer(
-                    price_minor=624,
-                    price_currency="EUR",
-                    enabled=True,
-                    auto_priced=True,
-                )
-            ]
-        )
+        # 5.99 EUR * 1.17 * 1.25 = 8.760375 USD -> 877 USD.
+        prebuilt = await _usd_priced_row(cost_minor=499)
+        repo = FakeOffersRepo([prebuilt])
         source = FakeSource(
             PROVIDER, repo, [("VPS02_1", "FRA-01", _spec(cost_minor=599, currency="EUR"))]
         )
@@ -385,26 +602,32 @@ class TestNewProductAutoPublication:
         row = await repo.get_by_ref(PROVIDER, "VPS02_1", "FRA-01")
         assert row is not None
         assert row.provider_cost_minor == 599
-        assert row.selling_price_minor == 749  # 599 * 1.25 = 748.75, rounded up
-        assert row.selling_currency == "EUR"
+        assert row.selling_price_minor == 877
+        assert row.selling_currency == "USD"
 
     async def test_unchanged_price_causes_no_write(self) -> None:
-        repo = FakeOffersRepo(
-            [_offer(price_minor=624, price_currency="EUR", enabled=True, auto_priced=True)]
-        )
+        # Idempotent no-op: the row already carries the exact USD price and
+        # provenance the pricer would write (same fixed FX timestamps), so
+        # the CAS write is skipped and no price call is recorded.
+        prebuilt = await _usd_priced_row(cost_minor=499)
+        repo = FakeOffersRepo([prebuilt])
         source = FakeSource(
             PROVIDER, repo, [("VPS02_1", "FRA-01", _spec(cost_minor=499, currency="EUR"))]
         )
         report = await _coordinator([source], repo).run()
         assert report.providers[0].prices_updated == 0
-        assert "price=" not in " ".join(repo.calls)
+        assert "auto_price=" not in " ".join(repo.calls)
 
     async def test_manual_price_is_never_overwritten(self) -> None:
+        # Manual EUR price on foreign cost: normalization warning, never
+        # auto-overwritten; provider cost still refreshed.
         repo = FakeOffersRepo(
             [
                 _offer(
                     price_minor=700,
                     price_currency="EUR",
+                    cost_minor=499,
+                    cost_currency="EUR",
                     enabled=True,
                     auto_priced=False,
                 )
@@ -421,9 +644,19 @@ class TestNewProductAutoPublication:
         assert row.provider_cost_minor == 599  # cost still refreshed
 
     async def test_currency_is_preserved_never_converted(self) -> None:
+        # Native USD identity: 4.00 USD * 1.25 = 5.00 USD -> 500, no FX call
+        # needed beyond identity (resolver present but unused for USD).
         repo = FakeOffersRepo()
         source = FakeSource(
-            SECOND, repo, [("CX-22", "FSN-1", _spec(cost_minor=400, currency="USD"))]
+            SECOND,
+            repo,
+            [
+                (
+                    "CX-22",
+                    "FSN-1",
+                    _spec(cost_minor=400, currency="USD"),
+                )
+            ],
         )
         policies = {SECOND: PricingPolicy(markup_percent=25, auto_publish=True)}
         report = await _coordinator([source], repo, policies=policies).run()
@@ -440,6 +673,8 @@ class TestOperatorBlock:
                 _offer(
                     price_minor=624,
                     price_currency="EUR",
+                    cost_minor=499,
+                    cost_currency="EUR",
                     enabled=False,
                     operator_disabled=True,
                     auto_priced=True,
@@ -461,8 +696,10 @@ class TestOperatorBlock:
         repo = FakeOffersRepo(
             [
                 _offer(
-                    price_minor=624,
+                    price_minor=0,
                     price_currency="EUR",
+                    cost_minor=499,
+                    cost_currency="EUR",
                     enabled=False,
                     operator_disabled=False,
                     auto_priced=True,
@@ -503,8 +740,12 @@ class TestOperatorBlock:
                     product_id="lsw.mini",
                     location_id="eu-west-3",
                     price_minor=0,
+                    price_currency="EUR",
+                    cost_minor=100,
+                    cost_currency="EUR",
                     enabled=False,
                     auto_priced=True,
+                    billing_parameters={"provider_hourly_rate": "1.00"},
                 )
             ]
         )
@@ -538,7 +779,8 @@ class TestOperatorBlock:
         assert report.providers[0].prices_updated == 1
         priced = await repo.get_by_ref("leaseweb", "lsw.mini", "eu-west-3")
         assert priced is not None
-        assert priced.selling_price_minor == 110  # 100 + 10%, not +25%
+        # 1.00 EUR * 1.17 * 1.10 = 1.287 USD -> 129 (not 147 from +25%).
+        assert priced.selling_price_minor == 129
 
     async def test_auto_publish_off_prices_without_publishing(self) -> None:
         repo = FakeOffersRepo()
@@ -551,7 +793,8 @@ class TestOperatorBlock:
         assert report.providers[0].published == 0
         row = await repo.get_by_ref(PROVIDER, "VPS02_1", "FRA-01")
         assert row is not None
-        assert row.selling_price_minor == 624
+        assert row.selling_price_minor == 730
+        assert row.selling_currency == "USD"
         assert row.enabled is False
 
     async def test_deprecated_plan_is_neither_priced_nor_published(self) -> None:
@@ -644,19 +887,34 @@ class TestPartialFailureSafety:
         assert row.enabled is False
 
     async def test_missing_cost_or_currency_is_skipped_with_warning(self) -> None:
-        repo = FakeOffersRepo(
-            [
-                _offer(cost_minor=0, price_minor=0, enabled=False, auto_priced=True),
-                _offer(
-                    product_id="BAD-CUR",
-                    cost_minor=499,
-                    cost_currency="EURO",
-                    price_minor=0,
-                    enabled=False,
-                    auto_priced=True,
-                ),
-            ]
+        # Zero cost is a valid construction (non-negative) but unpriceable;
+        # an unaudited currency cannot even be constructed, so the corrupt
+        # legacy shape is built with legacy_invalid (never inferred, never
+        # converted) and both rows are skipped fail-closed with warnings.
+        zero_cost = _offer(cost_minor=0, price_minor=0, enabled=False, auto_priced=True)
+        bad_currency = _offer(cost_minor=499, price_minor=0, enabled=False, auto_priced=True)
+        import dataclasses
+
+        bad_currency = dataclasses.replace(
+            bad_currency,
+            provider_cost_currency="EURO",
+            selling_currency="EURO",
+            legacy_invalid=True,
+            provider_available=False,
+            enabled=False,
         )
+        # A quarantined legacy row is unsellable but constructible; make it
+        # eligible for the pricing pass so the currency gate is exercised.
+        bad_currency = dataclasses.replace(bad_currency, provider_available=True)
+        repo = FakeOffersRepo([zero_cost, bad_currency])
+        # The legacy row uses a distinct product id for its verified pair.
+        legacy_row = await repo.get_by_ref(PROVIDER, "VPS02_1", "FRA-01")
+        assert legacy_row is not None
+        repo._rows[(PROVIDER, "BAD-CUR", "FRA-01")] = dataclasses.replace(
+            bad_currency, product_id="BAD-CUR"
+        )
+        del repo._rows[(PROVIDER, "VPS02_1", "FRA-01")]
+        repo._rows[(PROVIDER, "VPS02_1", "FRA-01")] = zero_cost
         source = FakeSource(
             PROVIDER,
             repo,
@@ -669,7 +927,11 @@ class TestPartialFailureSafety:
         )
         outcome = await _coordinator([source], repo).run()
         assert outcome.providers[0].prices_updated == 0
-        assert len(outcome.providers[0].warnings) == 2
+        # Both rows are skipped fail-closed (zero cost unpriceable, unaudited
+        # currency missing); publishing adds currency-mismatch advisories on
+        # top, so at least the two pricing warnings must be present.
+        assert len(outcome.providers[0].warnings) >= 2
+        assert any("currency missing" in w for w in outcome.providers[0].warnings)
 
 
 class TestConcurrencyAndState:
@@ -794,13 +1056,20 @@ class TestPricingPolicyConfig:
         assert report.providers[0].published == 0
 
     async def test_invalid_markup_policy_warns_and_skips(self) -> None:
+        # PricingPolicy refuses negative markups at construction (fail-closed),
+        # so the invalid policy is built bypassing validation to prove the
+        # coordinator warns and skips instead of mispricing.
         repo = FakeOffersRepo(
             [_offer(price_minor=0, enabled=False, auto_priced=True)],
         )
         source = FakeSource(
             PROVIDER, repo, [("VPS02_1", "FRA-01", _spec(cost_minor=499, currency="EUR"))]
         )
-        policies = {PROVIDER: PricingPolicy(markup_percent=-5, auto_publish=True)}
+        invalid = object.__new__(PricingPolicy)
+        object.__setattr__(invalid, "mode", "markup")
+        object.__setattr__(invalid, "markup_percent", -5)
+        object.__setattr__(invalid, "auto_publish", True)
+        policies = {PROVIDER: invalid}
         report = await _coordinator([source], repo, policies=policies).run()
         assert report.providers[0].prices_updated == 0
         assert report.providers[0].warnings
@@ -829,11 +1098,15 @@ class TestPricingPolicyConfig:
         assert report.providers[0].warnings
 
     async def test_deprecated_publish_warns(self) -> None:
+        # Manual USD with exact-rate provenance: auto-pricing skips (manual),
+        # publishing then warns about the deprecated plan (never published).
         repo = FakeOffersRepo(
             [
                 _offer(
                     price_minor=624,
-                    price_currency="EUR",
+                    price_currency="USD",
+                    cost_minor=499,
+                    cost_currency="USD",
                     enabled=False,
                     operator_disabled=False,
                     auto_priced=False,
@@ -886,7 +1159,20 @@ class TestOperatorBlockAdministration:
         return OfferAdminService(repo, _Audit())  # type: ignore[arg-type]
 
     async def test_disable_records_block_and_enable_clears_it(self) -> None:
-        repo = FakeOffersRepo([_offer(price_minor=624, enabled=True, operator_disabled=False)])
+        # USD-native with exact-rate provenance so showing is allowed.
+        repo = FakeOffersRepo(
+            [
+                _offer(
+                    cost_currency="USD",
+                    price_currency="USD",
+                    cost_minor=499,
+                    price_minor=624,
+                    enabled=True,
+                    operator_disabled=False,
+                    auto_priced=False,
+                )
+            ]
+        )
         service = self._service(repo)
         actor = self._admin()
         row = (await repo.list_all())[0]
@@ -902,14 +1188,27 @@ class TestOperatorBlockAdministration:
         assert enabled.operator_disabled is False
 
     async def test_manual_price_opts_out_of_auto_pricing(self) -> None:
-        repo = FakeOffersRepo([_offer(price_minor=0, enabled=False, auto_priced=True)])
+        # USD-native manual price (same-currency, exact rate): stored and
+        # auto-pricing cleared via the single manual CAS write.
+        repo = FakeOffersRepo(
+            [
+                _offer(
+                    cost_currency="USD",
+                    price_currency="USD",
+                    cost_minor=499,
+                    price_minor=0,
+                    enabled=False,
+                    auto_priced=True,
+                )
+            ]
+        )
         service = self._service(repo)
         row = (await repo.list_all())[0]
         updated = await service.set_selling_price(
             actor=self._admin(),
             offer_id=row.id,
             selling_price_minor=700,
-            currency="EUR",
+            currency="USD",
             reason="launch offer",
         )
         assert updated.selling_price_minor == 700

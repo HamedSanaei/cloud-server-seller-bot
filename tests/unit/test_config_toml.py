@@ -231,7 +231,11 @@ class TestPrecedence:
 class TestCommittedExample:
     """The committed example must parse and stay secret-free."""
 
-    def test_example_file_parses(self) -> None:
+    def test_example_file_parses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Explicit file, but environment still outranks TOML: drop the one
+        # variable that switches validation into production-strict mode so
+        # the test is deterministic on any machine.
+        monkeypatch.delenv("APP_ENV", raising=False)
         example = REPO_ROOT / "configuration.example.toml"
         assert example.is_file(), "configuration.example.toml must ship in the repo"
         settings = load_settings(example)

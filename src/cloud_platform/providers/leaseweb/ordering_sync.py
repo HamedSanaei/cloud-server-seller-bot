@@ -306,6 +306,10 @@ class SyncResult:
     #: (product_id, location_id) pairs successfully persisted as AVAILABLE
     #: this run — the only rows automatic pricing/publication may touch.
     verified: frozenset[tuple[str, str]] = frozenset()
+    #: Winning credential per verified pair: (account_id, product_id,
+    #: location_id). The coordinator prices the exact account-scoped row the
+    #: sync wrote, never an unscoped product/location guess.
+    verified_accounts: frozenset[tuple[str, str, str]] = frozenset()
 
     @property
     def location_count(self) -> int:
@@ -537,6 +541,12 @@ class LeaseWebOrderingCatalogSyncer:
                 candidates.setdefault(location, []).append(account_id)
 
         verified_pairs: set[tuple[str, str]] = set()
+        verified_owner: set[tuple[str, str, str]] = set()
+        # Account-qualified reconciliation set: scoped rows retire unless
+        # their exact (account, product, location) triple was observed (or
+        # preserved) this run. Pair-only sets would retire every scoped row
+        # the sync itself just wrote.
+        reconciled: set[tuple[str, str, str]] = set()
         for location, probing_accounts in candidates.items():
             verdicts: dict[str, LocationEligibility] = {}
             for account_id in self._accounts:
@@ -573,6 +583,8 @@ class LeaseWebOrderingCatalogSyncer:
                     warnings,
                     persistence_failures,
                     verified_pairs,
+                    verified_owner,
+                    reconciled,
                 )
             elif (
                 verdicts
@@ -640,10 +652,26 @@ class LeaseWebOrderingCatalogSyncer:
             for pair in current_available:
                 if pair[1] not in resolved:
                     available.add(pair)
+            # Preserve last-known rows of unresolved locations with their
+            # exact account qualification (legacy NULL-account rows keep
+            # the "" account triple, which is what the reconciler matches).
+            for row in current_rows or []:
+                if (
+                    row.provider_key == PROVIDER_KEY
+                    and row.provider_available
+                    and str(row.location_id) not in resolved
+                ):
+                    reconciled.add(
+                        (
+                            str(row.provider_account_id or ""),
+                            str(row.product_id),
+                            str(row.location_id),
+                        )
+                    )
             availability_reconciled = True
             try:
                 marked_count = await offers_repo.mark_unavailable(
-                    PROVIDER_KEY, available, billing_model=BILLING_MODEL_MONTHLY
+                    PROVIDER_KEY, reconciled, billing_model=BILLING_MODEL_MONTHLY
                 )
             except Exception as exc:
                 persistence_failures.append(f"mark_unavailable: {exc}")
@@ -683,6 +711,7 @@ class LeaseWebOrderingCatalogSyncer:
             availability_reconciled=availability_reconciled,
             marked_unavailable=marked_count,
             verified=frozenset(verified_pairs),
+            verified_accounts=frozenset(verified_owner),
         )
 
     # ------------------------------------------------------------------
@@ -772,6 +801,8 @@ class LeaseWebOrderingCatalogSyncer:
         warnings: list[str],
         persistence_failures: list[str],
         verified: set[tuple[str, str]],
+        verified_accounts: set[tuple[str, str, str]],
+        reconciled: set[tuple[str, str, str]],
     ) -> int:
         """Upsert every product a serving account reports at one location.
 
@@ -837,6 +868,11 @@ class LeaseWebOrderingCatalogSyncer:
                                 "contract_term": self._contract_term_of(account_id),
                                 "billing_cycle": self._billing_cycle_of(account_id),
                                 "monthly_price_source": "contractTerms",
+                                # Exact provider text for catalog pricing,
+                                # which refuses rounded minor costs.
+                                "provider_monthly_rate": getattr(
+                                    product, "monthly_price_exact", ""
+                                ),
                             },
                             technical_metadata=normalize_technical_spec(product).to_metadata(),
                             provider_available=False,
@@ -870,6 +906,11 @@ class LeaseWebOrderingCatalogSyncer:
                             "available_locations": sorted(
                                 detail.available_locations if detail is not None else ()
                             ),
+                            # Exact provider text for catalog pricing,
+                            # which refuses rounded minor costs.
+                            "provider_monthly_rate": getattr(
+                                offer_product, "monthly_price_exact", ""
+                            ),
                         },
                         technical_metadata=normalize_technical_spec(offer_product).to_metadata(),
                         provider_available=True,
@@ -880,6 +921,8 @@ class LeaseWebOrderingCatalogSyncer:
                 ):
                     written += 1
                     verified.add(pair)
+                    verified_accounts.add((account_id, product.id, location))
+                    reconciled.add((account_id, product.id, location))
         return written
 
     def _contract_term_of(self, account_id: str) -> str:

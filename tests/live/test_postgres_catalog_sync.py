@@ -75,6 +75,9 @@ class _Product:
         self.traffic = "5 TB"
         self.currency = "EUR"
         self.monthly_price_minor = 624
+        # Exact provider text the catalog pricer requires (never rebuilt
+        # from rounded minor units).
+        self.monthly_price_exact = "6.24"
 
 
 class _Detail:
@@ -287,6 +290,7 @@ class TestLiveCoordinatorRepairsStaleLocations:
             pricing_policies={
                 "leaseweb": PricingPolicy(mode="markup", markup_percent=25, auto_publish=True)
             },
+            reference_rates=_DeterministicEurUsdRates(),
         )
         return await coordinator.run()
 
@@ -380,6 +384,47 @@ class TestLiveCoordinatorRepairsStaleLocations:
         assert sorted(frankfurt.location_ids) == ["FRA-01", "FRA-10", "FRA-14"]
 
 
+class _DeterministicEurUsdRates:
+    """Fake EUR/USD reference rates for live pipeline tests (no network).
+
+    The live tests prove sync/repair/pricing mechanics on real PostgreSQL;
+    FX correctness itself is covered by the Frankfurter client and pricer
+    unit tests. Queued resolutions serve in call order.
+    """
+
+    def __init__(self, rate: str = "1.17") -> None:
+        from decimal import Decimal
+
+        self._rate = Decimal(rate)
+
+    async def get_rate(self, base: str, quote: str, *, allow_catalog_stale: bool = False) -> Any:
+        from datetime import UTC, datetime, timedelta
+
+        from cloud_platform.modules.fx.domain import FxReferenceQuote
+        from cloud_platform.modules.fx.service import ReferenceRateResolution
+
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=self._rate,
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+    async def get_catalog_rate(self, base: str, quote: str) -> Any:
+        return await self.get_rate(base, quote, allow_catalog_stale=True)
+
+    async def close(self) -> None:
+        return None
+
+
 def _official_types_payload() -> dict[str, Any]:
     """Official ``/publicCloud/v1/instanceTypes`` shape (verbatim layout)."""
     return {
@@ -459,18 +504,23 @@ class TestLiveHourlySyncAcceptance:
                         mode="markup", markup_percent=25, auto_publish=True
                     )
                 },
+                reference_rates=_DeterministicEurUsdRates(),
             )
             report = await coordinator.run()
             assert report.ran is True
             offers_repo = SqlAlchemySellableOfferRepository(session_factory)
-            stored = await offers_repo.get_by_ref("leaseweb", "lsw.c3.large", "eu-west-3")
+            stored = await offers_repo.get_by_ref(
+                "leaseweb", "lsw.c3.large", "eu-west-3", provider_account_id="north"
+            )
             assert stored is not None
             assert stored.provider_account_id == "north"
             assert stored.provider_cost_minor == 4  # 0.0395 EUR, HALF_UP
             assert stored.provider_cost_currency == "EUR"
             assert stored.provider_available is True
-            assert stored.selling_price_minor == 5  # ceil(4 * 1.25)
-            assert stored.selling_currency == "EUR"
+            # Exact native rate through FX first: 0.0395 * 1.17 * 1.25
+            # = 0.05776875 USD -> 6 ceiling USD cents (never via rounded 4c).
+            assert stored.selling_price_minor == 6
+            assert stored.selling_currency == "USD"
             assert stored.enabled is True
             assert stored.sellable is True
             states = {

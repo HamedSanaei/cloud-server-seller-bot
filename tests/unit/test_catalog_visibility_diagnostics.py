@@ -25,7 +25,12 @@ from cloud_platform.modules.checkout.service import (
 )
 from cloud_platform.modules.markets.domain import MARKET_ORDER, Market, ProviderCatalog
 from cloud_platform.modules.offers.domain import (
+    GATE_CURRENCY,
+    GATE_DEPRECATED,
     GATE_DISABLED,
+    GATE_OPERATOR_DISABLED,
+    GATE_PRICING_PENDING,
+    GATE_PRICING_PROVENANCE,
     GATE_PROVIDER_UNAVAILABLE,
     GATE_UNPRICED,
     SellableOffer,
@@ -61,6 +66,69 @@ def _offer(**overrides: Any) -> SellableOffer:
     )
     values.update(overrides)
     return SellableOffer(**values)
+
+
+class _DeterministicEurUsdRates:
+    """Fake EUR/USD reference rates (no network): 1.17, frankfurter family."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_rate(self, base: str, quote: str, *, allow_catalog_stale: bool = False) -> Any:
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        from cloud_platform.modules.fx.domain import FxReferenceQuote
+        from cloud_platform.modules.fx.service import ReferenceRateResolution
+
+        self.calls.append((base, quote))
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=Decimal("1.17"),
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+    async def get_catalog_rate(self, base: str, quote: str) -> Any:
+        return await self.get_rate(base, quote, allow_catalog_stale=True)
+
+    async def close(self) -> None:
+        return None
+
+
+async def _usd_offer(cost_minor: int = 449, markup_percent: int = 30) -> SellableOffer:
+    """Production-shaped monthly EUR offer priced to USD with the real pricer.
+
+    The row carries exactly the provenance production validation requires —
+    never a hand-duplicated metadata dict.
+    """
+    import dataclasses
+    from decimal import Decimal
+
+    from cloud_platform.modules.offers.domain import PricingPolicy
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+
+    base = _offer(
+        provider_cost_minor=cost_minor,
+        billing_parameters={"provider_monthly_rate": str(Decimal(cost_minor) / 100)},
+    )
+    priced = await CatalogOfferPricer(_DeterministicEurUsdRates(), "USD").price_auto(
+        base, PricingPolicy(mode="markup", markup_percent=markup_percent, auto_publish=True)
+    )
+    return dataclasses.replace(
+        base,
+        selling_price_minor=priced.selling_price_minor,
+        selling_currency=priced.selling_currency,
+        pricing_metadata=dict(priced.pricing_metadata),
+    )
 
 
 def _fake_repo_class(repo: Any) -> Any:
@@ -176,18 +244,47 @@ class TestBlockingGate:
         )
         assert summary == {
             "sellable": 1,
-            GATE_UNPRICED: 1,
-            GATE_DISABLED: 1,
             GATE_PROVIDER_UNAVAILABLE: 1,
+            GATE_DISABLED: 1,
+            GATE_OPERATOR_DISABLED: 0,
+            GATE_PRICING_PENDING: 0,
+            GATE_PRICING_PROVENANCE: 0,
+            GATE_DEPRECATED: 0,
+            GATE_UNPRICED: 1,
         }
 
     def test_summary_of_nothing_is_all_zero(self) -> None:
         assert visibility_summary([]) == {
             "sellable": 0,
-            GATE_UNPRICED: 0,
-            GATE_DISABLED: 0,
             GATE_PROVIDER_UNAVAILABLE: 0,
+            GATE_DISABLED: 0,
+            GATE_OPERATOR_DISABLED: 0,
+            GATE_PRICING_PENDING: 0,
+            GATE_PRICING_PROVENANCE: 0,
+            GATE_DEPRECATED: 0,
+            GATE_UNPRICED: 0,
         }
+
+    def test_foreign_non_usd_selling_currency_is_blocked(self) -> None:
+        # A priced foreign row still selling EUR is not customer-visible.
+        summary = visibility_summary([_offer(selling_price_minor=899)], "USD")
+        assert summary["sellable"] == 0
+        assert summary[GATE_CURRENCY] == 1
+
+    def test_missing_pricing_provenance_is_blocked(self) -> None:
+        # USD selling price without an FX audit is legacy/corrupt, not safe.
+        summary = visibility_summary(
+            [_offer(selling_price_minor=899, selling_currency="USD")], "USD"
+        )
+        assert summary["sellable"] == 0
+        assert summary[GATE_PRICING_PROVENANCE] == 1
+
+    def test_repricing_pending_is_blocked(self) -> None:
+        summary = visibility_summary(
+            [_offer(pricing_metadata={"fx_repricing_pending": True})], "USD"
+        )
+        assert summary["sellable"] == 0
+        assert summary[GATE_PRICING_PENDING] == 1
 
 
 class TestMarkupUnitPrice:
@@ -220,53 +317,102 @@ class TestMarkupUnitPrice:
             markup_unit_price(100, -1)
 
 
+class _FakeFxContainer:
+    """Container stand-in with a deterministic global FX resolver (no network)."""
+
+    def __init__(self, rates: Any) -> None:
+        self._rates = rates
+        self.closed = False
+
+    def global_fx_resolver_or_none(self) -> Any:
+        return self._rates
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _patch_fx_container(monkeypatch: pytest.MonkeyPatch) -> _DeterministicEurUsdRates:
+    rates = _DeterministicEurUsdRates()
+    container = _FakeFxContainer(rates)
+    monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
+    return rates
+
+
 class TestPriceBook:
-    async def test_prices_only_unpriced_in_the_cost_currency(
+    async def test_prices_unpriced_to_usd_with_deterministic_fx(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
+        # 4.49 EUR * 1.17 * 1.30 = 6.82929 USD -> 683 ceiling USD cents.
         priced = _offer(id=uuid4(), selling_price_minor=1299)
-        unpriced = _offer(id=uuid4(), provider_cost_minor=449)
+        unpriced = _offer(
+            id=uuid4(),
+            provider_cost_minor=449,
+            billing_parameters={"provider_monthly_rate": "4.49"},
+        )
         repo = _patch_offers_repo(monkeypatch, [priced, unpriced])
+        rates = _patch_fx_container(monkeypatch)
 
         assert await cli.offers_price_book("leaseweb", 30, False, False) == 0
 
         out = capsys.readouterr().out
         assert "priced 1 offer(s)" in out
-        repo.set_selling_price.assert_awaited_once()
-        args = repo.set_selling_price.await_args
-        assert args.args[0] == unpriced.id
-        assert args.args[1] == 584  # integer minor units, rounded up
-        assert args.args[2] == "EUR"  # the provider cost currency, never relabelled
-        assert isinstance(args.args[1], int)
+        assert rates.calls == [("EUR", "USD")]
+        repo.set_auto_price_if_current.assert_awaited_once()
+        call = repo.set_auto_price_if_current.await_args
+        assert call.args[0] == unpriced.id
+        kwargs = call.kwargs
+        assert kwargs["selling_price_minor"] == 683  # integer minor units, ceiling
+        assert kwargs["selling_currency"] == "USD"  # canonical catalog currency
+        assert isinstance(kwargs["selling_price_minor"], int)
 
     async def test_dry_run_writes_nothing(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
-        repo = _patch_offers_repo(monkeypatch, [_offer()])
+        repo = _patch_offers_repo(
+            monkeypatch,
+            [
+                _offer(
+                    provider_cost_minor=449,
+                    billing_parameters={"provider_monthly_rate": "4.49"},
+                )
+            ],
+        )
+        _patch_fx_container(monkeypatch)
         assert await cli.offers_price_book("leaseweb", 30, True, False) == 0
-        repo.set_selling_price.assert_not_awaited()
+        repo.set_auto_price_if_current.assert_not_awaited()
         assert "would price 1 offer(s)" in capsys.readouterr().out
 
     async def test_disabled_offers_are_left_alone_unless_asked(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
-        repo = _patch_offers_repo(monkeypatch, [_offer(enabled=False)])
+        repo = _patch_offers_repo(
+            monkeypatch,
+            [
+                _offer(
+                    enabled=False,
+                    provider_cost_minor=449,
+                    billing_parameters={"provider_monthly_rate": "4.49"},
+                )
+            ],
+        )
+        _patch_fx_container(monkeypatch)
         assert await cli.offers_price_book("leaseweb", 30, False, False) == 0
-        repo.set_selling_price.assert_not_awaited()
+        repo.set_auto_price_if_current.assert_not_awaited()
         assert "disabled (use --include-disabled): 1" in capsys.readouterr().out
 
         assert await cli.offers_price_book("leaseweb", 30, False, True) == 0
-        repo.set_selling_price.assert_awaited_once()
+        repo.set_auto_price_if_current.assert_awaited_once()
 
     async def test_missing_or_unknown_cost_is_reported_not_guessed(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
         repo = _patch_offers_repo(monkeypatch, [_offer(provider_cost_minor=0)])
+        _patch_fx_container(monkeypatch)
         assert await cli.offers_price_book("leaseweb", 30, False, False) == 0
-        repo.set_selling_price.assert_not_awaited()
+        repo.set_auto_price_if_current.assert_not_awaited()
         out = capsys.readouterr().out
-        assert "no usable provider cost" in out
-        assert "no cost: 1" in out
+        assert "pricing failed (OfferPricingError" in out
+        assert "skipped: 1" in out
 
     async def test_negative_markup_refused(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
@@ -298,13 +444,13 @@ class TestOffersDoctor:
         assert not result.ok
         assert "unpriced=2" in text
         assert "missing a CUSTOMER PRICE" in text
-        assert "offers price-book --provider leaseweb --markup-percent 30" in text
+        assert "offers normalize-selling-currency --target USD --dry-run" in text
         assert "would show NO provider" in text
 
     async def test_priced_catalog_is_ok_and_market_is_listed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _patch_offers_repo(monkeypatch, [_offer(selling_price_minor=899)])
+        _patch_offers_repo(monkeypatch, [await _usd_offer()])
         _patch_container(
             monkeypatch,
             markets={"leaseweb": "foreign"},
@@ -315,6 +461,22 @@ class TestOffersDoctor:
         assert result.ok
         assert "sellable=1" in text
         assert f"market {Market.FOREIGN.value}: leaseweb" in text
+
+    async def test_legacy_non_usd_row_fails_the_doctor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A still-priced EUR row is not a valid foreign sellable offer: the
+        # doctor must fail it and point at normalization, never relabel it.
+        _patch_offers_repo(monkeypatch, [_offer(selling_price_minor=899)])
+        _patch_container(
+            monkeypatch,
+            markets={"leaseweb": "foreign"},
+            providers={"leaseweb": _ordering_capable()},
+        )
+        result = await cli.offers_doctor()
+        text = "\n".join(result.lines)
+        assert not result.ok
+        assert "normalize-selling-currency" in text
 
     async def test_empty_price_book_points_at_the_sync(
         self, monkeypatch: pytest.MonkeyPatch
@@ -380,9 +542,15 @@ class TestOffersDoctor:
         assert "ValueError" in text
 
     async def test_never_prints_a_credential(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        settings = SimpleNamespace(
-            leaseweb_api_key=FAKE_LEASEWEB_KEY,
-            tetraminator_api_key=FAKE_KEY,
+        # A realistic Settings object carrying fake credentials: the doctor
+        # reads real configuration (no defensive getattr defaults in
+        # diagnostic paths that need financial invariants) yet prints nothing
+        # secret-shaped.
+        from cloud_platform.core.config import Settings
+
+        settings = Settings(
+            leaseweb_api_key=FAKE_LEASEWEB_KEY,  # pragma: allowlist secret
+            tetraminator_api_key=FAKE_KEY,  # pragma: allowlist secret
         )
         monkeypatch.setattr(cli, "get_settings", lambda: settings)
         _patch_offers_repo(monkeypatch, [_offer()])
@@ -454,8 +622,12 @@ class TestCredentialProvenanceDiagnostic:
         assert "[WARN] leaseweb: 2 available offer(s) still carry the legacy" in text
         assert "a supplying account is already known for 1 of them" in text
         assert "cloud_platform.cli leaseweb sync-offers" in text
-        # Provenance is reported, never silently repaired, and never fatal.
-        assert result.ok is True
+        # Provenance is reported, never silently repaired. These legacy EUR
+        # rows are additionally not valid foreign sellables, so the overall
+        # verdict is a failure pointing at normalization — the provenance
+        # note itself stays a warning, never the cause.
+        assert not result.ok
+        assert "normalize-selling-currency" in text
 
     async def test_a_single_legacy_credential_is_not_stale_provenance(
         self, monkeypatch: pytest.MonkeyPatch
@@ -502,7 +674,9 @@ class TestCredentialProvenanceDiagnostic:
         text = "\n".join(result.lines)
         assert "credential routes unreadable (RuntimeError)" in text
         assert "does not exist" not in text
-        assert result.ok is True
+        # The legacy EUR rows additionally fail currency validation; the
+        # routes diagnostic itself is non-fatal and non-crashing.
+        assert not result.ok
 
 
 class TestSyncReadiness:
@@ -514,12 +688,12 @@ class TestSyncReadiness:
         out = capsys.readouterr().out
         assert "stored offers: 3" in out
         assert "NOTHING is on sale" in out
-        assert "offers price-book --provider leaseweb --markup-percent 30" in out
+        assert "offers normalize-selling-currency --target USD --dry-run" in out
 
     async def test_priced_sync_confirms_offers_are_on_sale(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
-        _patch_offers_repo(monkeypatch, [_offer(selling_price_minor=899)])
+        _patch_offers_repo(monkeypatch, [await _usd_offer()])
         await cli._print_storefront_readiness("leaseweb")
         out = capsys.readouterr().out
         assert "sellable=1" in out

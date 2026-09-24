@@ -173,7 +173,32 @@ class TestJobInstrumentation:
             == 1.0
         )
 
-    async def test_arq_reconcile_job_is_timed(self) -> None:
+    async def test_arq_reconcile_job_is_timed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The job now runs real reconcilers: hermetic fakes keep it off the
+        # network/database while still proving the timing wrapper.
+        from unittest.mock import MagicMock
+
+        server_repo = AsyncMock()
+        server_repo.list_requested = AsyncMock(return_value=[])
+        server_repo.list_provisioning = AsyncMock(return_value=[])
+        ops_repo = AsyncMock()
+        ops_repo.list_in_flight = AsyncMock(return_value=[])
+        container = MagicMock()
+        container.initialize = AsyncMock()
+        container.close = AsyncMock()
+        container.server_repository = MagicMock(return_value=server_repo)
+        container.provider_registry = MagicMock()
+        container.audit_repository = MagicMock(return_value=AsyncMock())
+        container.wallet_repository = MagicMock(return_value=AsyncMock())
+        monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
+        monkeypatch.setattr(
+            "cloud_platform.modules.operations.repository.SqlAlchemyOperationRepository",
+            lambda *a, **k: ops_repo,
+        )
+        monkeypatch.setattr(
+            "cloud_platform.modules.wallet.repository.SqlAlchemyHoldRepository",
+            lambda *a, **k: AsyncMock(),
+        )
         before = _value(
             "cloud_platform_job_runs_total",
             {"job": "reconcile_provider_resources", "status": "ok"},

@@ -69,6 +69,7 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         contained_from=_state_or_none(_attr(row, "contained_from")),
         idempotency_key=_attr(row, "idempotency_key"),
         created_at=_aware_or_none(_attr(row, "created_at")),
+        updated_at=_aware_or_none(_attr(row, "updated_at")),
         last_accrued_at=_aware_or_none(_attr(row, "last_accrued_at")),
         deleted_at=_aware_or_none(_attr(row, "deleted_at")),
         low_balance_since=_aware_or_none(_attr(row, "low_balance_since")),
@@ -76,6 +77,12 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         billing_model=str(_attr(row, "billing_model") or "hourly"),
         os=_attr(row, "os"),
         credential_account_id=_attr(row, "credential_account_id"),
+        image_id=getattr(row, "image_id", None),
+        offer_fingerprint=(
+            dict(getattr(row, "offer_fingerprint", None) or {})
+            if getattr(row, "offer_fingerprint", None) is not None
+            else None
+        ),
     )
 
 
@@ -314,6 +321,12 @@ class SqlAlchemyServerRepository:
             cast_any.deleted_at = server.deleted_at
             cast_any.low_balance_since = server.low_balance_since
             cast_any.os = server.os
+            if hasattr(cast_any, "image_id"):
+                cast_any.image_id = server.image_id
+            if hasattr(cast_any, "offer_fingerprint"):
+                cast_any.offer_fingerprint = (
+                    dict(server.offer_fingerprint) if server.offer_fingerprint else None
+                )
             await session.commit()
             await session.refresh(server_row)
             return _to_domain(server_row, str(provider_name))
@@ -351,6 +364,12 @@ class SqlAlchemyServerRepository:
                 billing_model=server.billing_model,
                 os=server.os,
                 credential_account_id=server.credential_account_id,
+                image_id=intent.image_id or server.image_id,
+                offer_fingerprint=(
+                    dict(intent.offer_fingerprint)
+                    if intent.offer_fingerprint
+                    else (dict(server.offer_fingerprint) if server.offer_fingerprint else None)
+                ),
                 idempotency_key=intent.idempotency_key,
             )
             session.add(row)

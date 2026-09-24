@@ -2,7 +2,7 @@
 
 Acceptance: different billing quantum/policy settles correctly.
 
-Two providers with different billing shapes (Hetzner: EUR, hourly quantum,
+Two providers with different billing shapes (Hetzner: USD, hourly quantum,
 integer-minor prices; ArvanCloud: IRR, hourly or daily quantum, IRR prices
 mapped from the provider's own payload in M15-003) must settle through the
 SAME provider-neutral billing pipeline:
@@ -21,6 +21,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
+
+import pytest
 
 from cloud_platform.core.money import Money
 from cloud_platform.modules.billing.service import (
@@ -209,7 +211,7 @@ IRR_USER = uuid4()
 HZ_SERVER = uuid4()
 AC_SERVER = uuid4()
 
-HZ_COST = 700  # EUR minor per quantum
+HZ_COST = 700  # USD minor per quantum
 HZ_SELLING = 1_000
 AC_COST = 2_000_000  # IRR minor per quantum
 AC_SELLING = 2_500_000
@@ -290,6 +292,9 @@ class ParityHarness:
         etype: LedgerEntryType,
         currency: str,
         reference: str = "",
+        *,
+        reference_type: str = "",
+        description: str = "",
     ) -> None:
         if (wallet_id, key) in self.entries:
             raise AssertionError(f"duplicate ledger key {key}")
@@ -298,9 +303,10 @@ class ParityHarness:
             wallet_id=wallet_id,
             entry_type=etype,
             amount=Money(Decimal(amount), currency),
-            reference_type="hold" if etype is LedgerEntryType.CHARGE else "server",
+            reference_type=reference_type,
             reference_id=reference,
             idempotency_key=key,
+            description=description,
         )
 
     # -- ServerRepository ------------------------------------------------------
@@ -329,21 +335,61 @@ class ParityHarness:
 
     async def capture_hold(self, wallet_id: UUID, hold_id: UUID, key: str) -> Hold:
         hold = self.holds[key]
-        if hold.status is not HoldStatus.CREATED:
+        if hold.status is HoldStatus.RELEASED:
             raise ValueError("cannot capture")
-        hold.capture()
-        self.captured.append(key)
-        wallet = self.wallets_by_wallet_id[wallet_id]
-        wallet.balance -= hold.amount
-        self.post(
-            wallet_id,
-            hold.amount,
-            f"capture-{key}",
-            LedgerEntryType.CHARGE,
-            wallet.currency,
-            reference=key,
-        )
+        if hold.status is HoldStatus.CREATED:
+            hold.capture()
+            self.captured.append(key)
+            wallet = self.wallets_by_wallet_id[wallet_id]
+            wallet.balance -= hold.amount
+        capture_key = f"capture-{key}"
+        if (wallet_id, capture_key) not in self.entries:
+            assert hold.id is not None
+            self.post(
+                wallet_id,
+                hold.amount,
+                capture_key,
+                LedgerEntryType.CHARGE,
+                hold.currency,
+                reference=str(hold.id),
+                reference_type="hold",
+                description=f"hold captured for {key}",
+            )
         return hold
+
+    async def adjust(
+        self,
+        user_id: UUID,
+        delta: int,
+        key: str,
+        *,
+        entry_type: LedgerEntryType,
+        reference_type: str = "",
+        reference_id: str = "",
+        description: str = "",
+    ) -> tuple[Wallet, bool]:
+        wallet = self.wallets[user_id]
+        assert wallet.id is not None
+        if (wallet.id, key) in self.entries:
+            return wallet, False
+        if delta < 0:
+            if wallet.balance < -delta:
+                raise InsufficientBalanceError(f"balance {wallet.balance} < {-delta}")
+            self.debits.append((user_id, -delta, key))
+            wallet.balance += delta
+        else:
+            wallet.balance += delta
+        self.post(
+            wallet.id,
+            abs(delta),
+            key,
+            entry_type,
+            wallet.currency,
+            reference=str(reference_id),
+            reference_type=str(reference_type),
+            description=str(description),
+        )
+        return wallet, True
 
     async def release_hold(self, wallet_id: UUID, hold_id: UUID, key: str) -> Hold | None:
         hold = self.holds.get(key)
@@ -373,7 +419,14 @@ class ParityHarness:
         **kw: object,
     ) -> LedgerEntry:
         self.post(
-            wallet_id, amount, key, etype, currency, reference=str(kw.get("reference_id", ""))
+            wallet_id,
+            amount,
+            key,
+            etype,
+            currency,
+            reference=str(kw.get("reference_id", "")),
+            reference_type=str(kw.get("reference_type", "")),
+            description=str(kw.get("description", "")),
         )
         return self.entries[(wallet_id, key)]
 
@@ -390,14 +443,14 @@ class ParityHarness:
     async def accrual_between(self, start, end):
         return [p for p in self.accrual_rows.values() if start <= p.period_start < end]
 
-    async def month_total(self, wallet_id, month_start):
+    async def month_total(self, wallet_id, month_start, currency=None, rule_key=None, **kw):
         return sum(
             p.selling_minor
             for p in self.accrual_rows.values()
             if p.wallet_id == wallet_id and p.period_start >= month_start
         )
 
-    async def daily_cost_total(self, day_start, day_end, server_ids):
+    async def daily_cost_total(self, day_start, day_end, server_ids, currency=None, **kw):
         return sum(
             p.cost_minor
             for p in self.accrual_rows.values()
@@ -418,6 +471,27 @@ class ParityHarness:
 
             async def debit(self, user_id, amount, key):
                 return await h.debit(user_id, amount, key)
+
+            async def adjust(
+                self,
+                user_id,
+                delta,
+                key,
+                *,
+                entry_type,
+                reference_type="",
+                reference_id="",
+                description="",
+            ):
+                return await h.adjust(
+                    user_id,
+                    delta,
+                    key,
+                    entry_type=entry_type,
+                    reference_type=reference_type,
+                    reference_id=reference_id,
+                    description=description,
+                )
 
         @dataclass
         class _HoldRepo:
@@ -451,11 +525,13 @@ class ParityHarness:
             async def list_between(self, start, end):
                 return await h.accrual_between(start, end)
 
-            async def month_total(self, wallet_id, month_start):
-                return await h.month_total(wallet_id, month_start)
+            async def month_total(self, wallet_id, month_start, currency=None, rule_key=None):
+                return await h.month_total(
+                    wallet_id, month_start, currency=currency, rule_key=rule_key
+                )
 
-            async def daily_cost_total(self, day_start, day_end, server_ids):
-                return await h.daily_cost_total(day_start, day_end, server_ids)
+            async def daily_cost_total(self, day_start, day_end, server_ids, currency=None):
+                return await h.daily_cost_total(day_start, day_end, server_ids, currency=currency)
 
         @dataclass
         class _SnapshotRepo:
@@ -484,6 +560,27 @@ class ParityHarness:
             async def debit(self, user_id, amount, key):
                 return await h.debit(user_id, amount, key)
 
+            async def adjust(
+                self,
+                user_id,
+                delta,
+                key,
+                *,
+                entry_type,
+                reference_type="",
+                reference_id="",
+                description="",
+            ):
+                return await h.adjust(
+                    user_id,
+                    delta,
+                    key,
+                    entry_type=entry_type,
+                    reference_type=reference_type,
+                    reference_id=reference_id,
+                    description=description,
+                )
+
         @dataclass
         class _HoldRepo:
             async def get_by_idempotency(self, wallet_id, key):
@@ -516,8 +613,10 @@ class ParityHarness:
             async def list_between(self, start, end):
                 return await h.accrual_between(start, end)
 
-            async def month_total(self, wallet_id, month_start):
-                return await h.month_total(wallet_id, month_start)
+            async def month_total(self, wallet_id, month_start, currency=None, rule_key=None):
+                return await h.month_total(
+                    wallet_id, month_start, currency=currency, rule_key=rule_key
+                )
 
         @dataclass
         class _SnapshotRepo:
@@ -554,17 +653,17 @@ def _parity_setup(
     hz_balance: int = 100_000,
     ac_balance: int = 100_000_000,
 ) -> ParityHarness:
-    hz_wallet = Wallet(EUR_USER, id=uuid4(), balance=hz_balance, currency="EUR")
+    hz_wallet = Wallet(EUR_USER, id=uuid4(), balance=hz_balance, currency="USD")
     ac_wallet = Wallet(IRR_USER, id=uuid4(), balance=ac_balance, currency="IRR")
     servers = [
         _server(HZ_SERVER, EUR_USER, "hetzner", HZ_IK, quantum=3600),
         _server(AC_SERVER, IRR_USER, ARVANCLOUD, AC_IK, quantum=ac_quantum),
     ]
     snapshots = {
-        HZ_SERVER: _snapshot(HZ_SERVER, "hetzner", "cx22", "fsn1", HZ_COST, "EUR", HZ_SELLING),
+        HZ_SERVER: _snapshot(HZ_SERVER, "hetzner", "cx22", "fsn1", HZ_COST, "USD", HZ_SELLING),
         AC_SERVER: _snapshot(AC_SERVER, ARVANCLOUD, "123", "ir-thr-1", AC_COST, "IRR", AC_SELLING),
     }
-    hz_key, hz_hold = _hold(hz_wallet.id, HZ_SELLING, "EUR", HZ_IK)
+    hz_key, hz_hold = _hold(hz_wallet.id, HZ_SELLING, "USD", HZ_IK)
     ac_key, ac_hold = _hold(ac_wallet.id, AC_SELLING, "IRR", AC_IK)
     return ParityHarness(
         servers=servers,
@@ -585,7 +684,7 @@ class TestAccrualParity:
         assert report.errors == 0
         # 2 complete 1h periods for EACH provider (2h30m window)
         assert report.periods_posted == 4
-        # Hetzner: 1000 EUR (hold capture) + 1000 EUR (debit);
+        # Hetzner: 1000 USD (hold capture) + 1000 USD (debit);
         # ArvanCloud: 2_500_000 IRR (hold capture) + 2_500_000 IRR (debit)
         hz_debits = [(a, k) for (u, a, k) in h.debits if u == EUR_USER]
         ac_debits = [(a, k) for (u, a, k) in h.debits if u == IRR_USER]
@@ -599,7 +698,7 @@ class TestAccrualParity:
         # ledger entries carry the wallet's own currency
         for wallet_id, entry in ((w, e) for (w, _key), e in h.entries.items()):
             if wallet_id == hz_wallet.id:
-                assert entry.amount.currency == "EUR"
+                assert entry.amount.currency == "USD"
             else:
                 assert entry.amount.currency == "IRR"
         # accrual business records: margin consistent per provider
@@ -610,7 +709,7 @@ class TestAccrualParity:
         for p in hz_rows:
             assert p.selling_minor == HZ_SELLING
             assert p.cost_minor == HZ_COST
-            assert p.currency == "EUR"
+            assert p.currency == "USD"
         for p in ac_rows:
             assert p.selling_minor == AC_SELLING
             assert p.cost_minor == AC_COST
@@ -748,6 +847,37 @@ class TestFinalChargeParity:
         assert second.charged_minor == 0
         assert len(h.entries) == entry_count
         assert h.wallets[IRR_USER].balance == balance
+
+    async def test_wallet_currency_mismatch_fails_closed(self) -> None:
+        """A USD wallet must never settle a EUR-selling snapshot (fail closed)."""
+        h = _parity_setup()
+        h.snapshots[HZ_SERVER] = ServerPriceSnapshot(
+            server_id=HZ_SERVER,
+            offer=OfferCost(
+                provider_key="hetzner",
+                plan_id="cx22",
+                location_id="fsn1",
+                cost_minor=HZ_COST,
+                currency="EUR",
+            ),
+            selling_minor=HZ_SELLING,
+            book_name="retail-eur",
+            book_version=1,
+            rule=MarginRule(
+                provider="hetzner",
+                plan="cx22",
+                location="fsn1",
+                margin_factor=Decimal("1.43"),
+            ),
+            priced_at=T0,
+        )
+        h.servers[0].state = ServerLifecycleState.DELETED
+        balance_before = h.wallets[EUR_USER].balance
+        entries_before = len(h.entries)
+        with pytest.raises(ValueError, match="wallet currency"):
+            await h.make_final_charge_service().charge_final(h.servers[0], T0 + timedelta(hours=1))
+        assert h.wallets[EUR_USER].balance == balance_before
+        assert len(h.entries) == entries_before
 
 
 def hz_wallet_id(h: ParityHarness) -> UUID:

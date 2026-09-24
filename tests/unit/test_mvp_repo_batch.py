@@ -353,6 +353,10 @@ class TestAccrualPeriodRepository:
         row.cost_minor = 100
         row.selling_minor = 150
         row.currency = "EUR"
+        row.cost_currency = "EUR"
+        row.selling_currency = "EUR"
+        row.cost_amount = None
+        row.rule_key = None
         row.idempotency_key = "p-1"
         for k, v in overrides.items():
             setattr(row, k, v)
@@ -391,7 +395,9 @@ class TestAccrualPeriodRepository:
 
     async def test_add_duplicate_raises(self, db: AsyncMock) -> None:
         db.execute = AsyncMock(return_value=_scalar_result(None))
-        db.commit = AsyncMock(side_effect=Exception("duplicate key"))
+        db.commit = AsyncMock(
+            side_effect=IntegrityError("stmt", {}, Exception("uq_accrual_periods_idempotency_key"))
+        )
         repo = SqlAlchemyAccrualPeriodRepository(lambda: db)  # type: ignore[arg-type]
         with pytest.raises(AccrualPeriodExistsError):
             await repo.add(self._period())

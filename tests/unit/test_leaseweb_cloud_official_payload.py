@@ -249,9 +249,17 @@ class _BookOffersRepo:
         return None
 
     async def get_by_ref(
-        self, provider_key: str, product_id: str, location_id: str
+        self,
+        provider_key: str,
+        product_id: str,
+        location_id: str,
+        provider_account_id: str | None = None,
     ) -> SellableOffer | None:
-        return self.rows.get((provider_key, product_id, location_id))
+        row = self.rows.get((provider_key, product_id, location_id))
+        if row is not None and provider_account_id is not None:
+            if (row.provider_account_id or "") != provider_account_id:
+                return None
+        return row
 
     async def set_selling_price(self, offer_id: UUID, minor: int, currency: str) -> Any:
         for key, row in self.rows.items():
@@ -263,6 +271,69 @@ class _BookOffersRepo:
                 )
                 return self.rows[key]
         raise KeyError(offer_id)
+
+    def _by_id(self, offer_id: UUID) -> tuple[Any, SellableOffer]:
+        for key, row in self.rows.items():
+            if row.id == offer_id:
+                return key, row
+        raise KeyError(offer_id)
+
+    async def set_auto_price_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        selling_price_minor: int,
+        selling_currency: str,
+        pricing_metadata: dict[str, object],
+        expected_provider_rate: str | None = None,
+    ) -> Any:
+        import dataclasses
+
+        key, row = self._by_id(offer_id)
+        if (
+            not row.auto_priced
+            or row.operator_disabled
+            or row.provider_cost_minor != expected_cost_minor
+            or row.provider_cost_currency != expected_cost_currency
+        ):
+            return None
+        self.rows[key] = dataclasses.replace(
+            row,
+            selling_price_minor=selling_price_minor,
+            selling_currency=selling_currency,
+            pricing_metadata=dict(pricing_metadata),
+        )
+        return self.rows[key]
+
+    async def record_auto_pricing_failure_if_current(self, offer_id: UUID, **kwargs: Any) -> Any:
+        return self._by_id(offer_id)[1]
+
+    async def publish_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_price_minor: int,
+        expected_currency: str,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_provider_rate: str | None = None,
+    ) -> Any:
+        import dataclasses
+
+        key, row = self._by_id(offer_id)
+        if (
+            row.operator_disabled
+            or not row.provider_available
+            or row.selling_price_minor != expected_price_minor
+            or row.selling_currency != expected_currency
+            or row.provider_cost_minor != expected_cost_minor
+            or row.provider_cost_currency != expected_cost_currency
+        ):
+            return None
+        self.rows[key] = dataclasses.replace(row, enabled=True)
+        return self.rows[key]
 
     async def set_enabled(self, offer_id: UUID, enabled: bool) -> Any:
         for key, row in self.rows.items():
@@ -321,6 +392,42 @@ class _AllowLock:
         yield True
 
 
+class _DeterministicEurUsdRates:
+    """Fake EUR/USD reference rates (no network)."""
+
+    def __init__(self, rate: str = "1.17") -> None:
+        from decimal import Decimal
+
+        self._rate = Decimal(rate)
+
+    async def get_rate(self, base: str, quote: str, *, allow_catalog_stale: bool = False) -> Any:
+        from datetime import UTC, datetime, timedelta
+
+        from cloud_platform.modules.fx.domain import FxReferenceQuote
+        from cloud_platform.modules.fx.service import ReferenceRateResolution
+
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=self._rate,
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+    async def get_catalog_rate(self, base: str, quote: str) -> Any:
+        return await self.get_rate(base, quote, allow_catalog_stale=True)
+
+    async def close(self) -> None:
+        return None
+
+
 class TestOfficialHourlySyncAcceptance:
     """Official payload -> offer -> 25% pricing -> publish -> sellable."""
 
@@ -368,6 +475,7 @@ class TestOfficialHourlySyncAcceptance:
                         mode="markup", markup_percent=25, auto_publish=True
                     )
                 },
+                reference_rates=_DeterministicEurUsdRates(),
             )
             report = await coordinator.run()
         assert report.ran is True
@@ -380,11 +488,12 @@ class TestOfficialHourlySyncAcceptance:
         assert update.provider_cost_currency == "EUR"
         assert update.provider_available is True
         assert update.billing_parameters["provider_hourly_rate"] == "0.0395"
-        # 25% pricing + auto-publish -> enabled, sellable, exact integer money.
+        # 25% pricing + auto-publish -> enabled, sellable, exact integer money:
+        # 0.0395 EUR * 1.17 * 1.25 = 0.05776875 USD -> 6 ceiling USD cents.
         stored = await offers.get_by_ref("leaseweb", "lsw.c3.large", "eu-west-3")
         assert stored is not None
-        assert stored.selling_price_minor == 5  # ceil(4 * 1.25), integer cents
-        assert stored.selling_currency == "EUR"
+        assert stored.selling_price_minor == 6
+        assert stored.selling_currency == "USD"
         assert stored.enabled is True
         assert stored.sellable is True
         # Sync state recorded for the hourly product line.

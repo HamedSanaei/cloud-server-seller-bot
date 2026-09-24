@@ -101,6 +101,63 @@ def _fake_repo_class(repo: Any) -> Any:
     return lambda *a, **k: repo  # type: ignore[assignment]
 
 
+class _DeterministicEurUsdRates:
+    """Fake EUR/USD reference rates (no network): 1.17, frankfurter family."""
+
+    async def get_rate(self, base: str, quote: str, *, allow_catalog_stale: bool = False) -> Any:
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        from cloud_platform.modules.fx.domain import FxReferenceQuote
+        from cloud_platform.modules.fx.service import ReferenceRateResolution
+
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=Decimal("1.17"),
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+    async def get_catalog_rate(self, base: str, quote: str) -> Any:
+        return await self.get_rate(base, quote, allow_catalog_stale=True)
+
+    async def close(self) -> None:
+        return None
+
+
+async def _usd_offer(**overrides: Any) -> SellableOffer:
+    """Production-shaped monthly EUR offer priced to USD with the real pricer."""
+    import dataclasses
+    from decimal import Decimal
+
+    from cloud_platform.modules.offers.domain import PricingPolicy
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+
+    cost_minor = int(overrides.pop("provider_cost_minor", 449))
+    base = _offer(
+        provider_cost_minor=cost_minor,
+        billing_parameters={"provider_monthly_rate": str(Decimal(cost_minor) / 100)},
+    )
+    priced = await CatalogOfferPricer(_DeterministicEurUsdRates(), "USD").price_auto(
+        base, PricingPolicy(mode="markup", markup_percent=30, auto_publish=True)
+    )
+    return dataclasses.replace(
+        base,
+        selling_price_minor=priced.selling_price_minor,
+        selling_currency=priced.selling_currency,
+        pricing_metadata=dict(priced.pricing_metadata),
+        **overrides,
+    )
+
+
 class TestLeasewebDoctor:
     async def test_missing_key_fails_with_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
         settings = MagicMock()
@@ -561,7 +618,7 @@ class TestOffersCommands:
         repo = AsyncMock()
         repo.list_sellable = AsyncMock(
             return_value=[
-                _offer(),
+                await _usd_offer(),
                 _offer(id=uuid4(), enabled=False),
                 _offer(id=uuid4(), selling_price_minor=0),
             ]
@@ -576,12 +633,42 @@ class TestOffersCommands:
         assert "off" in out
         assert "no-price" in out
 
+    async def test_offers_list_flags_legacy_eur_row(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        # A priced-but-EUR foreign row is blocked on currency, never on sale.
+        repo = AsyncMock()
+        repo.list_sellable = AsyncMock(return_value=[_offer(selling_price_minor=899)])
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            _fake_repo_class(repo),
+        )
+        assert await cli.offers_list(False) == 0
+        out = capsys.readouterr().out
+        assert "currency" in out
+        assert "SALE" not in out
+
+    async def test_offers_manual_eur_price_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        # A manual EUR price on a foreign offer is refused: the catalog
+        # currency is USD and relabelling is never allowed.
+        repo = AsyncMock()
+        repo.get = AsyncMock(return_value=_offer())
+        monkeypatch.setattr(
+            "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+            _fake_repo_class(repo),
+        )
+        assert await cli.offers_set(str(OFFER_ID), "price", "1899", "EUR") == 1
+        assert "USD" in capsys.readouterr().out
+
     async def test_offers_price_and_enable(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
         repo = AsyncMock()
+        repo.get = AsyncMock(return_value=await _usd_offer(enabled=False))
         repo.set_selling_price = AsyncMock(return_value=_offer(selling_price_minor=1899))
-        repo.set_enabled = AsyncMock(return_value=_offer(enabled=True))
+        repo.set_enabled = AsyncMock(return_value=await _usd_offer())
         repo.set_auto_priced = AsyncMock(
             return_value=_offer(selling_price_minor=1899, auto_priced=False)
         )
@@ -590,17 +677,24 @@ class TestOffersCommands:
             "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
             _fake_repo_class(repo),
         )
-        assert await cli.offers_set(str(OFFER_ID), "price", "1899", "EUR") == 0
-        assert "1899 EUR" in capsys.readouterr().out
+        monkeypatch.setattr(
+            "cloud_platform.core.container._audit_repository",
+            _fake_repo_class(AsyncMock()),
+        )
         assert await cli.offers_set(str(OFFER_ID), "enable", None, None) == 0
         assert "enabled" in capsys.readouterr().out
 
     async def test_offers_error_path(self, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
         repo = AsyncMock()
-        repo.set_enabled = AsyncMock(side_effect=RuntimeError("boom"))
+        repo.get = AsyncMock(return_value=await _usd_offer(enabled=False))
+        repo.set_visibility_state = AsyncMock(side_effect=RuntimeError("boom"))
         monkeypatch.setattr(
             "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
             _fake_repo_class(repo),
+        )
+        monkeypatch.setattr(
+            "cloud_platform.core.container._audit_repository",
+            _fake_repo_class(AsyncMock()),
         )
         assert await cli.offers_set(str(OFFER_ID), "enable", None, None) == 1
         assert "boom" in capsys.readouterr().out

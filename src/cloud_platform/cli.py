@@ -9,7 +9,8 @@ Commands::
     leaseweb doctor              Pre-flight diagnostics (read-only; never
     leaseweb accounts list       Safe credential-account inventory (no keys)
     leaseweb accounts doctor     Per-account authentication pre-flight
-    fx doctor                    Currency/FX pre-flight (AbanTether, cache)
+    fx doctor                    Currency/FX pre-flight (AbanTether + Frankfurter, cache)
+    fx rates [--target USD]       Read-only global reference rates (target must match config)
     leaseweb auth-check          Read-only API key check
     leaseweb coverage            Print the VPS API endpoint coverage matrix
     leaseweb products list       Read-only ordering catalogue
@@ -74,6 +75,14 @@ logger = logging.getLogger("cli")
 def _csv(value: str) -> tuple[str, ...]:
     """Parse a comma-separated setting into a tuple of trimmed parts."""
     return tuple(part.strip() for part in (value or "").split(",") if part.strip())
+
+
+def _valid_currency(value: object) -> str | None:
+    """3-letter uppercase ISO code or None (never inferred, never converted)."""
+    code = str(value or "").strip().upper()
+    if len(code) != 3 or not code.isalpha():
+        return None
+    return code
 
 
 def _redact(value: str) -> str:
@@ -403,6 +412,54 @@ async def leaseweb_doctor() -> DoctorResult:
     return DoctorResult(ok, lines)
 
 
+async def fx_rates(target: str | None = None) -> int:
+    """Read one exact global reference rate for each supported base currency."""
+    from cloud_platform.core.container import Container, create_container
+    from cloud_platform.modules.fx.domain import GLOBAL_FIAT_CURRENCIES, FxError
+
+    settings = get_settings()
+    if not (settings.fx_enabled and settings.fx_global_enabled):
+        print("Global FX is disabled ([fx] global_enabled = false or enabled = false)")
+        return 1
+    configured_target = (settings.fx_catalog_pricing_currency or "USD").strip().upper()
+    target = (target or configured_target).strip().upper()
+    if target != configured_target:
+        print(
+            f"refused: --target {target} differs from configured catalog currency "
+            f"{configured_target}"
+        )
+        return 2
+    if target not in GLOBAL_FIAT_CURRENCIES:
+        print(f"unsupported target currency: {target}")
+        return 1
+    container = create_container()
+    resolver = container.global_fx_resolver_or_none()
+    if resolver is None:
+        await container.close()
+        print("global FX resolver unavailable")
+        return 1
+    failures = 0
+    try:
+        for base in sorted(GLOBAL_FIAT_CURRENCIES - {target}):
+            try:
+                resolution = await resolver.get_rate(base, target)
+                print(
+                    f"{base}/{target}: rate={resolution.rate} "
+                    f"provider_date={resolution.quote.provider_date.isoformat()} "
+                    f"source={resolution.source} stale={resolution.stale}"
+                )
+            except Exception as exc:
+                failures += 1
+                print(f"{base}/{target}: error ({type(exc).__name__})")
+        return 1 if failures else 0
+    except FxError as exc:
+        print(f"FX rates unavailable ({type(exc).__name__})")
+        return 1
+    finally:
+        await Container.aclose_fx(resolver)
+        await container.close()
+
+
 async def fx_doctor() -> DoctorResult:
     """Read-only FX pre-flight: config, AbanTether markets, proxy, cache.
 
@@ -425,51 +482,117 @@ async def fx_doctor() -> DoctorResult:
         lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
 
     if not settings.fx_enabled:
-        note("SKIP", "FX provider", "disabled ([fx] enabled = false)")
-        return DoctorResult(True, lines)
-    provider = (settings.fx_provider or "").strip().lower()
-    if provider != "abantether":
-        report("FX provider", False, f"unknown provider {provider!r}")
-        return DoctorResult(ok, lines)
-    report("FX provider", True, "AbanTether configured (read-only ticker, no key)")
-
-    from cloud_platform.providers.abantether_fx.client import AbanTetherFxClient
-
-    client = AbanTetherFxClient(
-        base_url=settings.fx_abantether_base_url,
-        timeout_seconds=float(settings.fx_request_timeout_seconds),
-        ttl_seconds=settings.fx_quote_ttl_seconds,
-        eur_symbol=settings.fx_abantether_eur_symbol,
-        usd_proxy_symbol=settings.fx_abantether_usd_proxy_symbol,
-    )
-    try:
-        try:
-            eur = await client.get_quote("EUR", "IRT")
-        except Exception as exc:
-            report("EUR/IRT", False, f"{type(exc).__name__}")
+        note("SKIP", "All FX families", "disabled ([fx] enabled = false)")
+    if not (settings.fx_enabled and settings.fx_domestic_enabled):
+        # The master switch wins, exactly as it does for the container's
+        # FxConfig and for the global family below. A read-only pre-flight must
+        # never call the public ticker for an operator-disabled family.
+        note(
+            "SKIP",
+            "Domestic FX provider",
+            "disabled ([fx] domestic_enabled/enabled = false)",
+        )
+    else:
+        legacy_provider = (settings.fx_provider or "").strip().lower()
+        domestic_provider = (settings.fx_domestic_provider or "").strip().lower()
+        if domestic_provider and legacy_provider and domestic_provider != legacy_provider:
+            report(
+                "FX provider",
+                False,
+                "legacy fx.provider and fx.domestic_provider disagree",
+            )
         else:
-            report("EUR/IRT", True, f"active (market {eur.source_market})")
-        if settings.fx_allow_usdt_proxy_for_display or settings.fx_allow_usdt_proxy_for_settlement:
-            try:
-                usdt = await client.get_quote(settings.fx_abantether_usd_proxy_symbol, "IRT")
-            except Exception as exc:
-                report("USD display proxy", False, f"{type(exc).__name__}")
+            provider = domestic_provider or legacy_provider
+            if provider != "abantether":
+                report("FX provider", False, f"unknown provider {provider!r}")
             else:
-                scope = (
-                    "display+settlement"
-                    if settings.fx_allow_usdt_proxy_for_settlement
-                    else "display only"
-                )
-                report(
-                    "USD display proxy",
-                    True,
-                    f"USDT/IRT active ({scope}; proxy=true)",
-                )
-                _ = usdt
-        else:
-            note("SKIP", "USD display proxy", "disabled by configuration")
-    finally:
-        await client.close()
+                report("FX provider", True, "AbanTether configured (read-only ticker, no key)")
+
+            from cloud_platform.providers.abantether_fx.client import AbanTetherFxClient
+
+            client = AbanTetherFxClient(
+                base_url=settings.fx_abantether_base_url,
+                timeout_seconds=float(settings.fx_request_timeout_seconds),
+                ttl_seconds=settings.fx_quote_ttl_seconds,
+                eur_symbol=settings.fx_abantether_eur_symbol,
+                usd_proxy_symbol=settings.fx_abantether_usd_proxy_symbol,
+            )
+            try:
+                try:
+                    eur = await client.get_quote("EUR", "IRT")
+                except Exception as exc:
+                    report("EUR/IRT", False, f"{type(exc).__name__}")
+                else:
+                    report("EUR/IRT", True, f"active (market {eur.source_market})")
+                if (
+                    settings.fx_allow_usdt_proxy_for_display
+                    or settings.fx_allow_usdt_proxy_for_settlement
+                ):
+                    try:
+                        usdt = await client.get_quote(
+                            settings.fx_abantether_usd_proxy_symbol, "IRT"
+                        )
+                    except Exception as exc:
+                        report("USD display proxy", False, f"{type(exc).__name__}")
+                    else:
+                        scope = (
+                            "display+settlement"
+                            if settings.fx_allow_usdt_proxy_for_settlement
+                            else "display only"
+                        )
+                        report(
+                            "USD display proxy",
+                            True,
+                            f"USDT/IRT active ({scope}; proxy=true)",
+                        )
+                        _ = usdt
+                else:
+                    note("SKIP", "USD display proxy", "disabled by configuration")
+            finally:
+                await client.close()
+
+    # Global reference-rate family is independent of the domestic/payment path.
+    target = (settings.fx_catalog_pricing_currency or "USD").strip().upper()
+    report(
+        "Global FX target",
+        target in {"EUR", "GBP", "JPY", "SGD", "AUD", "CAD", "USD", "KRW"},
+        target,
+    )
+    global_provider = (settings.fx_global_fiat_provider or "").strip().lower()
+    if not (settings.fx_enabled and settings.fx_global_enabled):
+        note("SKIP", "Global FX provider", "disabled ([fx] global_enabled/enabled = false)")
+    elif global_provider != "frankfurter":
+        report("Global FX provider", False, f"unknown provider {global_provider!r}")
+    else:
+        report("Global FX provider", True, "Frankfurter reference rates configured")
+        try:
+            from cloud_platform.core.container import Container, create_container
+            from cloud_platform.modules.fx.domain import GLOBAL_FIAT_CURRENCIES
+
+            global_container = None
+            global_resolver = None
+            try:
+                global_container = create_container()
+                global_resolver = global_container.global_fx_resolver_or_none()
+                if global_resolver is None:
+                    report("Global FX probe", False, "resolver unavailable")
+                else:
+                    for base in sorted(GLOBAL_FIAT_CURRENCIES - {target}):
+                        resolution = await global_resolver.get_rate(base, target)
+                        if resolution.rate <= 0:
+                            report(f"Global FX {base}/{target}", False, "non-positive rate")
+                        else:
+                            report(
+                                f"Global FX {base}/{target}",
+                                True,
+                                f"rate={resolution.rate} stale={resolution.stale}",
+                            )
+            finally:
+                await Container.aclose_fx(global_resolver)
+                if global_container is not None:
+                    await global_container.close()
+        except Exception as exc:
+            report("Global FX probe", False, type(exc).__name__)
 
     # Cache reachability (production shares Redis; dev/test use memory).
     try:
@@ -482,7 +605,9 @@ async def fx_doctor() -> DoctorResult:
                 report("FX cache", True, "memory (dev/test)")
             else:
                 # Read-only probe: a miss still proves the backend answers.
-                await cache.get("EUR->IRT")
+                from cloud_platform.modules.fx.ports import fx_cache_key
+
+                await cache.get(fx_cache_key("EUR", "IRT", source="abantether"))
                 report("FX cache", True, f"{backend} reachable")
         finally:
             closer = getattr(cache, "close", None)
@@ -736,11 +861,12 @@ async def _print_storefront_readiness(provider_key: str) -> None:
         return
     print("  [WARN] NOTHING is on sale — the customer-facing catalog is empty")
     if counts["unpriced"]:
-        print("  a provider cost is not a selling price by design; set yours:")
+        print("  a provider cost is not a selling price by design; inspect canonical FX pricing:")
         print(
-            f"    python -m cloud_platform.cli offers price-book "
-            f"--provider {provider_key} --markup-percent 30"
+            "    python -m cloud_platform.cli offers normalize-selling-currency "
+            "--target USD --dry-run"
         )
+        print("    use 'offers price-book' only for a deliberate manual price override")
     print("    python -m cloud_platform.cli offers doctor")
 
 
@@ -1093,7 +1219,12 @@ async def offers_list(include_all: bool) -> int:
     # One definition of visibility for every diagnostic: the SAME first
     # blocking gate the storefront enforces, not a second opinion.
     from cloud_platform.modules.offers.domain import (
+        GATE_CURRENCY,
+        GATE_DEPRECATED,
         GATE_DISABLED,
+        GATE_OPERATOR_DISABLED,
+        GATE_PRICING_PENDING,
+        GATE_PRICING_PROVENANCE,
         GATE_PROVIDER_UNAVAILABLE,
         GATE_UNPRICED,
         blocking_gate,
@@ -1104,9 +1235,15 @@ async def offers_list(include_all: bool) -> int:
         GATE_DISABLED: "off",
         GATE_UNPRICED: "no-price",
         GATE_PROVIDER_UNAVAILABLE: "unavail",
+        GATE_CURRENCY: "currency",
+        GATE_OPERATOR_DISABLED: "operator",
+        GATE_PRICING_PENDING: "pending",
+        GATE_PRICING_PROVENANCE: "provenance",
+        GATE_DEPRECATED: "deprecated",
     }
+    catalog_currency = get_settings().fx_catalog_pricing_currency
     for offer in sorted(offers, key=lambda o: (o.location_id, o.product_id)):
-        flag = flags[blocking_gate(offer)]
+        flag = flags[blocking_gate(offer, catalog_currency)]
         print(
             f"{offer.id}  {flag:8s}  {offer.location_id:8s} {offer.product_id:12s} "
             f"{offer.name:24s} cost={offer.provider_cost_minor} {offer.provider_cost_currency} "
@@ -1115,11 +1252,11 @@ async def offers_list(include_all: bool) -> int:
     return 0
 
 
-def _offer_gate_counts(offers: list[Any]) -> dict[str, int]:
+def _offer_gate_counts(offers: list[Any], catalog_currency: str | None = None) -> dict[str, int]:
     """Count offers per blocking gate for one provider (pure domain helper)."""
     from cloud_platform.modules.offers.domain import visibility_summary
 
-    return visibility_summary(offers)
+    return visibility_summary(offers, catalog_currency)
 
 
 async def offers_doctor() -> DoctorResult:
@@ -1134,6 +1271,7 @@ async def offers_doctor() -> DoctorResult:
     """
     lines: list[str] = []
     ok = True
+    catalog_currency = get_settings().fx_catalog_pricing_currency
 
     def fail(message: str) -> None:
         nonlocal ok
@@ -1209,7 +1347,9 @@ async def offers_doctor() -> DoctorResult:
             )
         else:
             markets_shown.setdefault(market.value, []).append(provider_key)
-        counts = _offer_gate_counts(by_provider.get(provider_key, []))
+        counts = _offer_gate_counts(
+            by_provider.get(provider_key, []), catalog_currency=catalog_currency
+        )
         lines.append(
             f"[{'OK ' if counts['sellable'] else 'WARN'}] provider {provider_key} "
             f"(stored={len(by_provider.get(provider_key, []))}): "
@@ -1221,8 +1361,22 @@ async def offers_doctor() -> DoctorResult:
                 "cost is not a selling price by design"
             )
             lines.append(
-                f"       Action: python -m cloud_platform.cli offers price-book "
-                f"--provider {provider_key} --markup-percent 30"
+                f"       Action: run the configured automatic pricing policy or "
+                f"'offers normalize-selling-currency --target {catalog_currency} --dry-run' "
+                f"then re-run catalog sync; never relabel native prices"
+            )
+        if (
+            not counts["sellable"]
+            and (counts.get("selling_currency") or counts.get("pricing_provenance"))
+            and not counts["unpriced"]
+        ):
+            lines.append(
+                "       priced rows are blocked on currency/provenance — a manual "
+                "non-USD price is never relabelled into the catalog currency"
+            )
+            lines.append(
+                f"       Action: 'offers normalize-selling-currency "
+                f"--target {catalog_currency} --dry-run' to convert deliberately"
             )
 
     # 2) what the bot would actually render for each market
@@ -1231,7 +1385,9 @@ async def offers_doctor() -> DoctorResult:
         has_sellable = [
             key
             for key in market_providers
-            if _offer_gate_counts(by_provider.get(key, []))["sellable"]
+            if _offer_gate_counts(by_provider.get(key, []), catalog_currency=catalog_currency)[
+                "sellable"
+            ]
         ]
         if has_sellable:
             lines.append(f"[OK ] market {market.value}: {', '.join(sorted(has_sellable))}")
@@ -1340,7 +1496,12 @@ def _visibility_line(label: str, counts: dict[str, int]) -> str:
     return (
         f"{label}: sellable={counts['sellable']} "
         f"unpriced={counts['unpriced']} disabled={counts['disabled']} "
-        f"provider-unavailable={counts['provider_unavailable']}"
+        f"provider-unavailable={counts['provider_unavailable']} "
+        f"operator-disabled={counts.get('operator_disabled', 0)} "
+        f"pricing-pending={counts.get('pricing_pending', 0)} "
+        f"pricing-provenance={counts.get('pricing_provenance', 0)} "
+        f"deprecated={counts.get('deprecated', 0)} "
+        f"selling-currency={counts.get('selling_currency', 0)}"
     )
 
 
@@ -1428,6 +1589,10 @@ async def catalog_auto_sync_doctor() -> int:
     from cloud_platform.core.config import get_settings
     from cloud_platform.db.session import SessionFactory
     from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+    from cloud_platform.modules.offers.domain import (
+        has_valid_pricing_provenance,
+        is_sellable_in_currency,
+    )
     from cloud_platform.modules.offers.repository import (
         SqlAlchemyCatalogSyncStateRepository,
         SqlAlchemySellableOfferRepository,
@@ -1445,11 +1610,12 @@ async def catalog_auto_sync_doctor() -> int:
         print(f"error: catalog state unreadable ({type(exc).__name__})")
         return 1
 
+    catalog_currency = settings.fx_catalog_pricing_currency.strip().upper()
     sellable: dict[str, int] = {}
     stored: dict[str, int] = {}
     for row in rows:
         stored[row.provider_key] = stored.get(row.provider_key, 0) + 1
-        if row.sellable:
+        if is_sellable_in_currency(row, catalog_currency):
             sellable[row.provider_key] = sellable.get(row.provider_key, 0) + 1
 
     # Leaseweb billing split (monthly VPS vs hourly Cloud share one
@@ -1471,7 +1637,7 @@ async def catalog_auto_sync_doctor() -> int:
         for row in rows
         if row.provider_key == "leaseweb"
         and _billing_of(row) == "prepaid_monthly_fixed"
-        and row.sellable
+        and is_sellable_in_currency(row, catalog_currency)
     )
     leaseweb_hourly_stored = sum(
         1 for row in rows if row.provider_key == "leaseweb" and _billing_of(row) == "hourly"
@@ -1479,7 +1645,9 @@ async def catalog_auto_sync_doctor() -> int:
     leaseweb_hourly_sellable = sum(
         1
         for row in rows
-        if row.provider_key == "leaseweb" and _billing_of(row) == "hourly" and row.sellable
+        if row.provider_key == "leaseweb"
+        and _billing_of(row) == "hourly"
+        and is_sellable_in_currency(row, catalog_currency)
     )
 
     leaseweb_credential = bool(settings.leaseweb_api_key)
@@ -1499,6 +1667,23 @@ async def catalog_auto_sync_doctor() -> int:
     toggle = "enabled" if settings.storefront_catalog_sync_enabled else "disabled"
     print(f"catalog auto-sync: {toggle}")
     print(f"interval: {settings.storefront_catalog_sync_interval_seconds}s")
+    catalog_currency = settings.fx_catalog_pricing_currency.strip().upper()
+    print(
+        f"catalog currency: {catalog_currency}; global FX: "
+        f"{'enabled' if settings.fx_enabled and settings.fx_global_enabled else 'disabled'}"
+    )
+    foreign = [
+        row
+        for row in rows
+        if row.provider_cost_currency.strip().upper() not in {"IRT", "IRR"}
+        and row.provider_cost_currency.strip().upper() != catalog_currency
+    ]
+    pending = sum(bool(row.pricing_metadata.get("fx_repricing_pending")) for row in rows)
+    provenance = sum(has_valid_pricing_provenance(row, catalog_currency) for row in rows)
+    print(
+        f"pricing audit: foreign={len(foreign)} pending={pending} "
+        f"valid-provenance={provenance}/{len(rows)}"
+    )
     print("")
     loop_keys = set(stored) | set(states) | set(policies) | set(credentials)
     # Billing-suffixed sync-state/policy keys ("<provider>.hourly") alias
@@ -1721,6 +1906,7 @@ async def leaseweb_cloud_doctor() -> int:
     """
     from cloud_platform.core.config import get_settings
     from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+    from cloud_platform.modules.offers.domain import is_sellable_in_currency
 
     settings = get_settings()
     try:
@@ -1804,7 +1990,11 @@ async def leaseweb_cloud_doctor() -> int:
     manual = sum(1 for r in rows if not r.auto_priced)
     enabled = sum(1 for r in rows if r.enabled)
     operator_disabled = sum(1 for r in rows if r.operator_disabled)
-    sellable = sum(1 for r in rows if r.sellable)
+    sellable = sum(
+        1
+        for r in rows
+        if is_sellable_in_currency(r, settings.fx_catalog_pricing_currency.strip().upper())
+    )
     print(f"hourly offers stored: {total}")
     print(f"  provider_available: {available}")
     print(f"  priced: {priced}")
@@ -1964,7 +2154,7 @@ async def leaseweb_cloud_create_preview(
 
 
 async def leaseweb_cloud_create(
-    user_id: str, offer_id: str, image_index: int, execute_live: bool
+    user_id: str, offer_id: str, image_id: str, execute_live: bool
 ) -> int:
     """Create an hourly instance intent (worker POSTs under the ledger).
 
@@ -1998,7 +2188,7 @@ async def leaseweb_cloud_create(
             print(f"error: unknown offer {offer_id}")
             return 1
         service = container.hourly_cloud_service()
-        image = await service.cloud_image_by_index(offer, image_index)
+        image = await service.cloud_image_by_id(offer, image_id)
         result = await service.create_instance(
             user=user,
             offer_id=offer.id,
@@ -2019,112 +2209,405 @@ async def offers_price_book(
     dry_run: bool,
     include_disabled: bool,
 ) -> int:
-    """Bulk-price every UNPRICED offer of one provider from its synced cost.
-
-    The operator supplies the markup explicitly — this never invents a price,
-    never reprices an offer that already has one, and never crosses
-    currencies: the selling price is denominated in the SAME currency the
-    provider cost was captured in, because relabelling without an explicit FX
-    policy would be an implicit conversion. Integer minor units throughout.
-    """
-    from cloud_platform.db.session import SessionFactory
-    from cloud_platform.modules.offers.domain import markup_unit_price
-    from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
-
+    """Deliberately price unpriced offers from native cost + explicit markup."""
     if markup_percent < 0:
         print("markup-percent must not be negative")
         return 2
+    from cloud_platform.core.container import Container, create_container
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.offers.domain import PricingPolicy
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+    from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 
-    repo = SqlAlchemySellableOfferRepository(SessionFactory)
-    rows = [row for row in await repo.list_all() if row.provider_key == provider]
-    if not rows:
-        print(f"no stored offers for provider {provider!r} — sync the catalog first")
-        return 1
-
-    priced = 0
-    skipped_priced = 0
-    skipped_disabled = 0
-    skipped_cost = 0
-    for row in sorted(rows, key=lambda o: (o.location_id, o.product_id)):
-        if row.selling_price_minor > 0:
-            skipped_priced += 1
-            continue
-        if not row.enabled and not include_disabled:
-            # A disabled offer is hidden by the operator; pricing it would
-            # imply an intent they did not express.
-            skipped_disabled += 1
-            continue
-        if row.provider_cost_minor <= 0:
-            skipped_cost += 1
-            print(f"  warning: {row.ref} has no usable provider cost; left unpriced")
-            continue
-        try:
-            price = markup_unit_price(row.provider_cost_minor, markup_percent)
-        except ValueError as exc:  # pragma: no cover - guarded above
-            print(f"  warning: {row.ref}: {exc}")
-            skipped_cost += 1
-            continue
-        currency = row.provider_cost_currency
-        if dry_run:
-            print(
-                f"  would price {row.ref}: cost {row.provider_cost_minor} "
-                f"{currency} -> {price} {currency} (+{markup_percent}%)"
-            )
-            priced += 1
-            continue
-        await repo.set_selling_price(row.id, price, currency)
-        # Operator-invoked bulk pricing is manual: the automatic policy must
-        # never overwrite a price the operator chose explicitly.
-        await repo.set_auto_priced(row.id, False)
-        print(
-            f"priced {row.ref}: {price} {currency} "
-            f"(cost {row.provider_cost_minor}, +{markup_percent}%)"
-        )
-        priced += 1
-
-    verb = "would price" if dry_run else "priced"
-    print(
-        f"{verb} {priced} offer(s); already priced: {skipped_priced}, "
-        f"disabled (use --include-disabled): {skipped_disabled}, "
-        f"no cost: {skipped_cost}"
+    settings = get_settings()
+    target = str(settings.fx_catalog_pricing_currency).strip().upper()
+    if target != str(settings.fx_catalog_pricing_currency).strip().upper():
+        print("configured catalog currency is invalid")
+        return 2
+    catalog_stale_limit = int(getattr(settings, "fx_frankfurter_catalog_max_stale_seconds", 86400))
+    catalog_quote_ttl = int(getattr(settings, "fx_frankfurter_quote_ttl_seconds", 3600))
+    container = create_container()
+    resolver = container.global_fx_resolver_or_none()
+    repo = SqlAlchemySellableOfferRepository(
+        SessionFactory,
+        catalog_currency=target,
+        catalog_stale_limit_seconds=catalog_stale_limit,
     )
-    if not dry_run and priced:
-        print("next: python -m cloud_platform.cli offers doctor")
-    return 0
+    priced = skipped = disabled_skipped = 0
+    try:
+        rows = [row for row in await repo.list_all() if row.provider_key == provider]
+        if not rows:
+            print(f"no stored offers for provider {provider!r} — sync the catalog first")
+            return 1
+        policy = PricingPolicy(mode="markup", markup_percent=markup_percent, auto_publish=False)
+        prefetched_rates: dict[tuple[str, str], Any] = {}
+        if resolver is not None:
+            for row in rows:
+                if row.selling_price_minor > 0 or (not row.enabled and not include_disabled):
+                    continue
+                source = (row.provider_cost_currency or "").strip().upper()
+                destination = source if source in {"IRT", "IRR"} else target
+                if source in {"", "IRT", "IRR"} or source == destination:
+                    continue
+                pair = (source, destination)
+                if pair in prefetched_rates:
+                    continue
+                try:
+                    get_catalog_rate = getattr(resolver, "get_catalog_rate", None)
+                    if callable(get_catalog_rate):
+                        prefetched_rates[pair] = await get_catalog_rate(source, destination)
+                    else:
+                        prefetched_rates[pair] = await resolver.get_rate(
+                            source, destination, allow_catalog_stale=True
+                        )
+                except Exception:
+                    continue
+        for row in sorted(rows, key=lambda o: (o.location_id, o.product_id)):
+            native_currency = (row.provider_cost_currency or "").strip().upper()
+            row_target = native_currency if native_currency in {"IRT", "IRR"} else target
+            pricer = CatalogOfferPricer(
+                resolver if row_target != native_currency else None,
+                row_target,
+                identity_ttl_seconds=catalog_quote_ttl,
+                prefetched_rates=prefetched_rates,
+            )
+            if row.selling_price_minor > 0:
+                continue
+            if not row.enabled and not include_disabled:
+                disabled_skipped += 1
+                skipped += 1
+                continue
+            try:
+                priced_result = await pricer.price_auto(row, policy)
+                amount = priced_result.selling_price_minor
+                result_currency = priced_result.selling_currency
+                metadata = dict(priced_result.pricing_metadata)
+                metadata.update(
+                    {
+                        "provider_cost_minor": row.provider_cost_minor,
+                        "provider_cost_currency": row.provider_cost_currency,
+                    }
+                )
+            except Exception as exc:
+                print(f"  warning: {row.ref}: pricing failed ({type(exc).__name__}: {exc})")
+                skipped += 1
+                continue
+            if dry_run:
+                print(f"  would price {row.ref}: {amount} {result_currency} (+{markup_percent}%)")
+            else:
+                rate_key = (
+                    "provider_hourly_rate"
+                    if row.billing_model == "hourly"
+                    else "provider_monthly_rate"
+                )
+                expected_rate = (row.billing_parameters or {}).get(rate_key)
+                result = await repo.set_auto_price_if_current(
+                    row.id,
+                    expected_cost_minor=row.provider_cost_minor,
+                    expected_cost_currency=row.provider_cost_currency,
+                    selling_price_minor=amount,
+                    selling_currency=result_currency,
+                    pricing_metadata=metadata,
+                    expected_provider_rate=(
+                        str(expected_rate) if expected_rate is not None else None
+                    ),
+                )
+                if result is None:
+                    print(f"  warning: {row.ref}: provider observation changed; retry")
+                    skipped += 1
+                    continue
+                print(f"priced {result.ref}: {amount} {result_currency}")
+            priced += 1
+        if disabled_skipped and not include_disabled:
+            print(f"disabled (use --include-disabled): {disabled_skipped}")
+        print(f"{'would price' if dry_run else 'priced'} {priced} offer(s); skipped: {skipped}")
+        return 0
+    finally:
+        await Container.aclose_fx(resolver)
+        await container.close()
 
 
 async def offers_set(offer_id: str, action: str, price: str | None, currency: str | None) -> int:
-    from cloud_platform.db.session import SessionFactory
-    from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
+    """Operator offer commands through the audited application service."""
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.offers.domain import required_selling_currency
+    from cloud_platform.modules.users.domain import Role, User, UserStatus
 
-    repo = SqlAlchemySellableOfferRepository(SessionFactory)
+    container = create_container()
     try:
+        admin = User(
+            username="cli-operator",
+            email="operator@local",
+            status=UserStatus.ACTIVE,
+            role=Role.ADMIN,
+        )
+        service = container.offer_admin_service()
+        repo = container.sellable_offer_repository()
+        current = await repo.get(UUID(offer_id))
+        if current is None:
+            print(f"error: unknown offer {offer_id}")
+            return 1
         if action == "enable":
-            # Explicit enable clears the operator block so the offer may sell.
-            offer = await repo.set_enabled(UUID(offer_id), True)
-            offer = await repo.set_operator_disabled(UUID(offer_id), False)
+            offer = await service.set_enabled(
+                actor=admin,
+                offer_id=current.id,
+                enabled=True,
+                reason="operator CLI enable",
+            )
             print(f"enabled {offer.ref}")
         elif action == "disable":
-            # Explicit disable persists an operator block that automatic
-            # publishing never undoes (only another enable clears it).
-            offer = await repo.set_enabled(UUID(offer_id), False)
-            offer = await repo.set_operator_disabled(UUID(offer_id), True)
+            offer = await service.set_enabled(
+                actor=admin,
+                offer_id=current.id,
+                enabled=False,
+                reason="operator CLI disable",
+            )
             print(f"disabled {offer.ref} (operator block recorded)")
         elif action == "price":
             if price is None:
                 print("price requires a minor-unit amount")
                 return 2
-            offer = await repo.set_selling_price(UUID(offer_id), int(price), currency or "EUR")
-            # A manually set price opts out of the automatic pricing policy.
-            offer = await repo.set_auto_priced(UUID(offer_id), False)
+            selected_currency = (
+                currency.strip().upper()
+                if currency
+                else required_selling_currency(current, get_settings().fx_catalog_pricing_currency)
+            )
+            offer = await service.set_selling_price(
+                actor=admin,
+                offer_id=current.id,
+                selling_price_minor=int(price),
+                currency=selected_currency,
+                reason="operator CLI price",
+            )
             print(f"priced {offer.ref}: {offer.selling_price_minor} {offer.selling_currency}")
         else:  # pragma: no cover
             print(f"unknown action {action}")
             return 2
     except Exception as exc:
-        print(f"error: {exc}")
+        print(f"error: {type(exc).__name__}: {exc}")
         return 1
+    finally:
+        await container.close()
     return 0
+
+
+async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") -> int:
+    """Normalize catalog selling prices to the configured target currency.
+
+    Auto-priced rows are recomputed from immutable provider cost + policy
+    markup. Manual rows convert their existing selling amount with no second
+    markup. FX is shared across the whole command and closed in one place.
+    """
+    from cloud_platform.core.container import create_container
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+    from cloud_platform.modules.offers.domain import (
+        has_valid_pricing_provenance,
+        requires_currency_normalization,
+    )
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+    from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
+
+    settings = get_settings()
+    target = str(target or settings.fx_catalog_pricing_currency).strip().upper()
+    configured_target = str(settings.fx_catalog_pricing_currency).strip().upper()
+    catalog_stale_limit = int(getattr(settings, "fx_frankfurter_catalog_max_stale_seconds", 86400))
+    catalog_quote_ttl = int(getattr(settings, "fx_frankfurter_quote_ttl_seconds", 3600))
+    if target != configured_target:
+        print(
+            f"refused: --target {target} differs from configured catalog currency "
+            f"{configured_target}; change configuration deliberately"
+        )
+        return 2
+    policies = pricing_policies_from_settings(settings)
+    repo = SqlAlchemySellableOfferRepository(
+        SessionFactory,
+        catalog_currency=settings.fx_catalog_pricing_currency,
+        catalog_stale_limit_seconds=catalog_stale_limit,
+    )
+    container = create_container()
+    resolver = container.global_fx_resolver_or_none()
+    try:
+        rows = [
+            row
+            for row in await repo.list_all()
+            if requires_currency_normalization(row, target)
+            or not has_valid_pricing_provenance(
+                row,
+                target,
+                catalog_stale_limit_seconds=catalog_stale_limit,
+            )
+        ]
+        if not rows:
+            print(f"all storefront selling prices already use {target}")
+            return 0
+        prefetched_rates: dict[tuple[str, str], Any] = {}
+        if resolver is not None:
+            for row in rows:
+                if row.auto_priced:
+                    source_currency = (row.provider_cost_currency or "").strip().upper()
+                else:
+                    source_currency = (row.selling_currency or "").strip().upper()
+                destination = target
+                if source_currency in {"", "IRT", "IRR", destination}:
+                    continue
+                pair = (source_currency, destination)
+                if pair in prefetched_rates:
+                    continue
+                try:
+                    get_rate = getattr(resolver, "get_rate", None)
+                    if callable(get_rate):
+                        prefetched_rates[pair] = await get_rate(
+                            source_currency, destination, allow_catalog_stale=True
+                        )
+                    else:
+                        get_catalog_rate = getattr(resolver, "get_catalog_rate", None)
+                        if not callable(get_catalog_rate):
+                            continue
+                        prefetched_rates[pair] = await get_catalog_rate(
+                            source_currency, destination
+                        )
+                except Exception:
+                    continue
+        applied = 0
+        skipped = 0
+        for row in sorted(rows, key=lambda o: (o.provider_key, o.location_id, o.product_id)):
+            priced_minor = 0
+            priced_currency = target
+            if row.operator_disabled:
+                print(f"  SKIP {row.ref}: operator-disabled; left untouched")
+                skipped += 1
+                continue
+            native = (row.provider_cost_currency or "").strip().upper()
+            if row.auto_priced:
+                policy = policies.get(f"{row.provider_key}.{row.billing_model}") or policies.get(
+                    row.provider_key
+                )
+                if policy is None:
+                    print(f"  SKIP {row.ref}: no automatic pricing policy")
+                    skipped += 1
+                    continue
+                try:
+                    native_currency = (row.provider_cost_currency or "").strip().upper()
+                    row_target = native_currency if native_currency in {"IRT", "IRR"} else target
+                    pricer = CatalogOfferPricer(
+                        resolver if row_target != native_currency else None,
+                        row_target,
+                        identity_ttl_seconds=catalog_quote_ttl,
+                        prefetched_rates=prefetched_rates,
+                    )
+                    priced = await pricer.price_auto(row, policy)
+                    priced_minor = priced.selling_price_minor
+                    priced_currency = priced.selling_currency
+                    priced.pricing_metadata.update(
+                        {
+                            "provider_cost_minor": row.provider_cost_minor,
+                            "provider_cost_currency": row.provider_cost_currency,
+                        }
+                    )
+                    rate_key = (
+                        "provider_hourly_rate"
+                        if row.billing_model == "hourly"
+                        else "provider_monthly_rate"
+                    )
+                    expected_rate = (row.billing_parameters or {}).get(rate_key)
+                    execute = (
+                        repo.set_auto_price_if_current(
+                            row.id,
+                            expected_cost_minor=row.provider_cost_minor,
+                            expected_cost_currency=row.provider_cost_currency,
+                            selling_price_minor=priced.selling_price_minor,
+                            selling_currency=priced.selling_currency,
+                            pricing_metadata=priced.pricing_metadata,
+                            expected_provider_rate=(
+                                str(expected_rate) if expected_rate is not None else None
+                            ),
+                        )
+                        if not dry_run
+                        else None
+                    )
+                except Exception as exc:
+                    print(f"  SKIP {row.ref}: pricing failed ({type(exc).__name__})")
+                    skipped += 1
+                    continue
+            elif native in {"IRT", "IRR"}:
+                print(
+                    f"  SKIP {row.ref}: manual domestic price must remain in {native}; "
+                    "operator repair required"
+                )
+                skipped += 1
+                continue
+            else:
+                try:
+                    native_currency = (row.provider_cost_currency or "").strip().upper()
+                    manual_currency = (row.selling_currency or "").strip().upper()
+                    if native_currency in {"IRT", "IRR"} or manual_currency in {"IRT", "IRR"}:
+                        raise ValueError("manual domestic pricing requires operator repair")
+                    pricer = CatalogOfferPricer(
+                        resolver if manual_currency != target else None,
+                        target,
+                        identity_ttl_seconds=catalog_quote_ttl,
+                        prefetched_rates=prefetched_rates,
+                    )
+                    priced = await pricer.price_manual(row)
+                    priced_minor = priced.selling_price_minor
+                    priced_currency = priced.selling_currency
+                    execute = (
+                        repo.set_manual_price(
+                            row.id,
+                            priced.selling_price_minor,
+                            priced.selling_currency,
+                            priced.pricing_metadata,
+                            expected_cost_minor=row.provider_cost_minor,
+                            expected_cost_currency=row.provider_cost_currency,
+                            expected_updated_at=row.updated_at,
+                        )
+                        if not dry_run
+                        else None
+                    )
+                except Exception as exc:
+                    print(
+                        f"  SKIP {row.ref}: selling-price conversion failed ({type(exc).__name__})"
+                    )
+                    skipped += 1
+                    continue
+            if dry_run:
+                metadata = dict(priced.pricing_metadata)
+                fx_source = metadata.get("fx_source", metadata.get("fx_provider", ""))
+                fx_path = metadata.get("fx_source_market", metadata.get("fx_path", ""))
+                fx_rate = metadata.get("fx_rate", metadata.get("rate", ""))
+                fx_observed = metadata.get("fx_observed_at", metadata.get("observed_at", ""))
+                fx_expires = metadata.get("fx_expires_at", metadata.get("expires_at", ""))
+                fx_date = metadata.get("fx_provider_date", "n/a")
+                fx_stale = metadata.get("fx_stale", False)
+                valid_until = metadata.get("catalog_valid_until", "n/a")
+                print(
+                    f"  WOULD {row.ref}: {row.selling_price_minor} {row.selling_currency}"
+                    f" -> {priced_minor} {priced_currency}"
+                )
+                print(
+                    "    FX provenance: "
+                    f"source={fx_source or 'n/a'} path={fx_path or 'n/a'} "
+                    f"rate={fx_rate or 'n/a'} provider_date={fx_date} "
+                    f"observed_at={fx_observed or 'n/a'} expires_at={fx_expires or 'n/a'} "
+                    f"stale={fx_stale} valid_until={valid_until}"
+                )
+            else:
+                result = await execute  # type: ignore[misc]
+                if result is None:
+                    print(f"  SKIP {row.ref}: concurrent pricing/manual change won")
+                    skipped += 1
+                    continue
+                print(f"  OK   {row.ref}: {priced_minor} {priced_currency}")
+            applied += 1
+        verb = "would normalize" if dry_run else "normalized"
+        print(f"{verb} {applied} offer(s) to {target}; skipped/failed: {skipped}")
+        return 0 if skipped == 0 else 1
+    finally:
+        await container.close()
+        from cloud_platform.core.container import Container
+
+        await Container.aclose_fx(resolver)
 
 
 async def users_find(telegram_id: int) -> int:
@@ -2537,7 +3020,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     lsw_cloud_create.add_argument("--user-id", required=True)
     lsw_cloud_create.add_argument("--offer-id", required=True)
-    lsw_cloud_create.add_argument("--image-index", type=int, required=True)
+    lsw_cloud_create.add_argument("--image-id", dest="image_id", required=True)
     lsw_cloud_create.add_argument(
         "--execute-live",
         action="store_true",
@@ -2589,7 +3072,19 @@ def _parser() -> argparse.ArgumentParser:
     price = offers_sub.add_parser("price")
     price.add_argument("offer_id")
     price.add_argument("minor", type=int, help="selling price in minor units (e.g. 1299 = 12.99)")
-    price.add_argument("currency", nargs="?", default="EUR")
+    price.add_argument("currency", nargs="?", default=None)
+    normalize = offers_sub.add_parser(
+        "normalize-selling-currency",
+        help="convert foreign-currency offers to a single selling currency (USD)",
+    )
+    normalize.add_argument(
+        "--target",
+        default=None,
+        help="target selling currency (defaults to [fx] catalog_pricing_currency)",
+    )
+    mode = normalize.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true", help="print changes without applying")
+    mode.add_argument("--execute", action="store_true", help="apply the currency normalization")
 
     catalog = sub.add_parser("catalog", help="automatic catalog sync operations")
     catalog_sub = catalog.add_subparsers(dest="subcommand", required=True)
@@ -2652,6 +3147,12 @@ def _parser() -> argparse.ArgumentParser:
     fx = sub.add_parser("fx", help="currency / FX resolution (read-only)")
     fx_sub = fx.add_subparsers(dest="subcommand", required=True)
     fx_sub.add_parser("doctor", help="read-only FX pre-flight diagnostics")
+    fx_rates = fx_sub.add_parser("rates", help="show Frankfurter reference rates")
+    fx_rates.add_argument(
+        "--target",
+        default=None,
+        help="quote currency (must match configured catalog currency)",
+    )
 
     return parser
 
@@ -2662,6 +3163,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
             result = await fx_doctor()
             print("\n".join(result.lines))
             return 0 if result.ok else 1
+        if args.subcommand == "rates":
+            return await fx_rates(args.target)
         return 2
     if args.command == "leaseweb":
         if args.subcommand == "doctor":
@@ -2699,7 +3202,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
                 )
             if args.leaseweb_cloud == "create":
                 return await leaseweb_cloud_create(
-                    args.user_id, args.offer_id, args.image_index, args.execute_live
+                    args.user_id, args.offer_id, args.image_id, args.execute_live
                 )
             print(f"unknown leaseweb cloud subcommand {args.leaseweb_cloud}")  # pragma: no cover
             return 2
@@ -2744,6 +3247,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
             )
         if args.subcommand == "price":
             return await offers_set(args.offer_id, "price", str(args.minor), args.currency)
+        if args.subcommand == "normalize-selling-currency":
+            return await offers_normalize_selling_currency(args.dry_run, args.target)
         return await offers_set(args.offer_id, args.subcommand, None, None)
     if args.command == "catalog":
         if args.subcommand == "auto-sync" and args.subsubcommand == "doctor":

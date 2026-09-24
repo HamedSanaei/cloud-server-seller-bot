@@ -30,10 +30,12 @@ with safe fake values; the real ``configuration.toml`` is git-ignored.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import tomllib
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -169,8 +171,13 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     # --- Currency / FX resolution (platform-level, provider-neutral) --------
     # The FIRST live source is AbanTether's public ticker (read-only, no key).
     ("fx", "enabled"): "fx_enabled",
-    ("fx", "provider"): "fx_provider",
+    ("fx", "domestic_enabled"): "fx_domestic_enabled",
+    ("fx", "global_enabled"): "fx_global_enabled",
+    ("fx", "provider"): "fx_provider",  # backward-compatible legacy name
+    ("fx", "domestic_provider"): "fx_domestic_provider",
     ("fx", "default_display_currency"): "fx_default_display_currency",
+    ("fx", "catalog_pricing_currency"): "fx_catalog_pricing_currency",
+    ("fx", "global_fiat_provider"): "fx_global_fiat_provider",
     ("fx", "quote_ttl_seconds"): "fx_quote_ttl_seconds",
     ("fx", "max_stale_seconds"): "fx_max_stale_seconds",
     ("fx", "charge_max_stale_seconds"): "fx_charge_max_stale_seconds",
@@ -180,6 +187,13 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("fx", "abantether", "base_url"): "fx_abantether_base_url",
     ("fx", "abantether", "eur_symbol"): "fx_abantether_eur_symbol",
     ("fx", "abantether", "usd_proxy_symbol"): "fx_abantether_usd_proxy_symbol",
+    ("fx", "frankfurter", "base_url"): "fx_frankfurter_base_url",
+    ("fx", "frankfurter", "request_timeout_seconds"): ("fx_frankfurter_request_timeout_seconds"),
+    ("fx", "frankfurter", "quote_ttl_seconds"): "fx_frankfurter_quote_ttl_seconds",
+    ("fx", "frankfurter", "max_stale_seconds"): "fx_frankfurter_max_stale_seconds",
+    ("fx", "frankfurter", "catalog_max_stale_seconds"): (
+        "fx_frankfurter_catalog_max_stale_seconds"
+    ),
     # --- Automatic catalog sync (the periodic offer-sync coordinator) -------
     ("storefront", "catalog_sync", "enabled"): "storefront_catalog_sync_enabled",
     ("storefront", "catalog_sync", "interval_seconds"): (
@@ -662,7 +676,7 @@ class Settings(BaseSettings):
     arvancloud_api_base_url: str = "https://napi.arvancloud.ir/ecc/v1"
     arvancloud_region: str = ""
     provider_credential_encryption_key: str = ""
-    zarinpal_enabled: bool = True
+    zarinpal_enabled: bool = False
     zarinpal_merchant_id: str = ""
     zarinpal_base_url: str = "https://api.zarinpal.com/pg/v4/payment"
     zarinpal_sandbox: bool = False
@@ -679,8 +693,17 @@ class Settings(BaseSettings):
     # stay integer minor units everywhere; the resolver owns every rate
     # formula and the only Toman/Euro/cent conversions.
     fx_enabled: bool = True
+    #: Explicit family switches; ``fx_enabled`` remains a backwards-compatible
+    #: master default for old configuration files.
+    fx_domestic_enabled: bool = True
+    fx_global_enabled: bool = True
+    #: Legacy alias retained for existing TOML/environment deployments.
     fx_provider: str = "abantether"
+    #: Preferred explicit name for the domestic/payment FX path.
+    fx_domestic_provider: str | None = None
     fx_default_display_currency: str = "IRT"
+    #: Server-owned canonical selling currency for foreign catalog offers.
+    fx_catalog_pricing_currency: str = "USD"
     fx_quote_ttl_seconds: int = Field(default=60, gt=0)
     fx_max_stale_seconds: int = Field(default=300, gt=0)
     fx_charge_max_stale_seconds: int = Field(default=30, ge=0)
@@ -693,11 +716,18 @@ class Settings(BaseSettings):
     fx_abantether_base_url: str = "https://api.abantether.com"
     fx_abantether_eur_symbol: str = "EUR"
     fx_abantether_usd_proxy_symbol: str = "USDT"
-    default_currency: str = "EUR"
+    # Global fiat FX via Frankfurter (reference rates, no API key).
+    fx_frankfurter_base_url: str = "https://api.frankfurter.dev"
+    fx_frankfurter_request_timeout_seconds: int = Field(default=5, gt=0)
+    fx_frankfurter_quote_ttl_seconds: int = Field(default=3600, gt=0)
+    fx_frankfurter_max_stale_seconds: int = Field(default=345600, ge=0)
+    fx_frankfurter_catalog_max_stale_seconds: int = Field(default=86400, ge=0)
+    fx_global_fiat_provider: str = "frankfurter"
+    default_currency: str = "USD"
     # The OPERATOR-declared price book the selling price is derived from
     # (M08-005): confirmation, holds and immutable server price snapshots
     # all read the SAME book. There is no versioned book by default.
-    price_book_name: str = "retail-eur"
+    price_book_name: str = "retail-usd"
     customer_billing_quantum_seconds: int = Field(default=3600, ge=60)
     low_balance_threshold_minor: int = Field(default=5000, ge=0)
     low_balance_grace_hours: int = Field(default=24, ge=0)
@@ -909,7 +939,7 @@ class Settings(BaseSettings):
         may use http. Secrets are never echoed in the error text.
         """
         if not self.tetraminator_enabled:
-            return self
+            return self._validate_zarinpal_configuration()
         from urllib.parse import urlsplit
 
         if not (self.tetraminator_api_key or "").strip():
@@ -936,6 +966,32 @@ class Settings(BaseSettings):
                 "'production' (the callback is unauthenticated and must be publicly "
                 "reachable; use the API's reverse-proxied domain)"
             )
+        return self._validate_zarinpal_configuration()
+
+    def _validate_zarinpal_configuration(self) -> Settings:
+        """Validate the enabled ZarinPal gateway without exposing secrets."""
+        if not self.zarinpal_enabled:
+            return self
+        from urllib.parse import urlsplit
+
+        if (
+            not (self.zarinpal_merchant_id or "").strip()
+            or (self.zarinpal_merchant_id or "").strip() == "CHANGE_ME"
+        ):
+            raise ValueError(
+                "payments.zarinpal.merchant_id is required when payments.zarinpal.enabled is true"
+            )
+        base_url = urlsplit((self.zarinpal_base_url or "").strip())
+        if base_url.scheme not in ("http", "https") or not base_url.netloc:
+            raise ValueError("payments.zarinpal.base_url must be an absolute http(s) URL")
+        callback_url = urlsplit((self.zarinpal_callback_url or "").strip())
+        if callback_url.scheme not in ("http", "https") or not callback_url.netloc:
+            raise ValueError(
+                "payments.zarinpal.callback_url must be an absolute http(s) URL: "
+                "it is the address ZarinPal calls after a payment"
+            )
+        if (self.app_env or "").strip().lower() == "production" and callback_url.scheme != "https":
+            raise ValueError("payments.zarinpal.callback_url must use https:// in production")
         return self
 
     @model_validator(mode="after")
@@ -943,24 +999,60 @@ class Settings(BaseSettings):
         """Validate the platform FX section (read-only source, no secret)."""
         from urllib.parse import urlsplit
 
-        provider = (self.fx_provider or "").strip().lower()
-        if provider not in ("abantether",):
+        legacy_provider = (self.fx_provider or "").strip().lower()
+        domestic_alias = (self.fx_domestic_provider or "").strip().lower()
+        if domestic_alias and legacy_provider != "abantether" and domestic_alias != legacy_provider:
             raise ValueError(
-                "fx.provider must be a known rate source ('abantether'); "
-                "adding a source is a code change, not a config edit"
+                "fx.domestic_provider conflicts with legacy fx.provider; configure one source"
+            )
+        provider = domestic_alias or legacy_provider
+        if provider != "abantether":
+            raise ValueError(
+                "fx.domestic_provider must be 'abantether'; global fiat uses "
+                "fx.global_fiat_provider and remains a separate route"
             )
         self.fx_provider = provider
+        self.fx_domestic_provider = provider
         if self.fx_quote_ttl_seconds <= 0:
             raise ValueError("fx.quote_ttl_seconds must be greater than 0")
         if self.fx_max_stale_seconds < self.fx_quote_ttl_seconds:
             raise ValueError("fx.max_stale_seconds must be >= fx.quote_ttl_seconds")
-        if self.fx_charge_max_stale_seconds < 0:
-            raise ValueError("fx.charge_max_stale_seconds must be >= 0")
-        if self.fx_request_timeout_seconds <= 0:
-            raise ValueError("fx.request_timeout_seconds must be greater than 0")
+        if self.fx_enabled and self.fx_charge_max_stale_seconds <= 0:
+            raise ValueError("fx.charge_max_stale_seconds must be greater than 0")
+        if self.fx_charge_max_stale_seconds > self.fx_max_stale_seconds:
+            raise ValueError("fx.charge_max_stale_seconds must be <= fx.max_stale_seconds")
+        if (
+            not math.isfinite(float(self.fx_request_timeout_seconds))
+            or self.fx_request_timeout_seconds <= 0
+        ):
+            raise ValueError("fx.request_timeout_seconds must be a positive finite number")
+        self.fx_request_timeout_seconds = float(math.ceil(self.fx_request_timeout_seconds))
+
+        global_provider = (self.fx_global_fiat_provider or "").strip().lower()
+        if global_provider not in ("frankfurter",):
+            raise ValueError(
+                "fx.global_fiat_provider must be a known global fiat source "
+                "('frankfurter'); adding a source is a code change, not a config edit"
+            )
+        self.fx_global_fiat_provider = global_provider
+
         base = urlsplit((self.fx_abantether_base_url or "").strip())
         if base.scheme not in ("http", "https") or not base.netloc:
             raise ValueError("fx.abantether.base_url must be an absolute http(s) URL")
+        if (
+            base.username
+            or base.password
+            or base.query
+            or base.fragment
+            or any(character.isspace() for character in (self.fx_abantether_base_url or ""))
+        ):
+            raise ValueError("fx.abantether.base_url must not contain credentials/query/fragment")
+        try:
+            port = base.port
+        except ValueError as exc:
+            raise ValueError("fx.abantether.base_url has an invalid port") from exc
+        if port is not None and not 1 <= port <= 65_535:
+            raise ValueError("fx.abantether.base_url has an invalid port")
         if (self.app_env or "").strip().lower() == "production" and base.scheme != "https":
             raise ValueError(
                 "fx.abantether.base_url must use https:// when app_env is 'production'"
@@ -974,10 +1066,56 @@ class Settings(BaseSettings):
             raise ValueError(
                 "fx.abantether.usd_proxy_symbol must not be empty when the USD proxy is enabled"
             )
+        frankfurter_base = urlsplit((self.fx_frankfurter_base_url or "").strip())
+        if frankfurter_base.scheme not in ("http", "https") or not frankfurter_base.netloc:
+            raise ValueError("fx.frankfurter.base_url must be an absolute http(s) URL")
+        if any(character.isspace() for character in (self.fx_frankfurter_base_url or "")):
+            raise ValueError("fx.frankfurter.base_url must not contain whitespace")
+        try:
+            frankfurter_port = frankfurter_base.port
+        except ValueError as exc:
+            raise ValueError("fx.frankfurter.base_url has an invalid port") from exc
+        if frankfurter_port is not None and not 1 <= frankfurter_port <= 65_535:
+            raise ValueError("fx.frankfurter.base_url has an invalid port")
+        prod_env = (self.app_env or "").strip().lower() == "production"
+        if prod_env and frankfurter_base.scheme != "https":
+            raise ValueError(
+                "fx.frankfurter.base_url must use https:// when app_env is 'production'"
+            )
+        if self.fx_frankfurter_quote_ttl_seconds <= 0:
+            raise ValueError("fx.frankfurter.quote_ttl_seconds must be > 0")
+        try:
+            timeout_decimal = Decimal(str(self.fx_frankfurter_request_timeout_seconds))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError(
+                "fx.frankfurter.request_timeout_seconds must be a positive finite number"
+            ) from exc
+        if not timeout_decimal.is_finite() or timeout_decimal <= 0:
+            raise ValueError(
+                "fx.frankfurter.request_timeout_seconds must be a positive finite number"
+            )
+        if self.fx_frankfurter_max_stale_seconds < self.fx_frankfurter_quote_ttl_seconds:
+            raise ValueError("fx.frankfurter.max_stale_seconds must be >= quote_ttl_seconds")
+        if self.fx_frankfurter_catalog_max_stale_seconds < self.fx_frankfurter_quote_ttl_seconds:
+            raise ValueError(
+                "fx.frankfurter.catalog_max_stale_seconds must be >= quote_ttl_seconds"
+            )
+        if self.fx_frankfurter_catalog_max_stale_seconds > self.fx_frankfurter_max_stale_seconds:
+            raise ValueError(
+                "fx.frankfurter.catalog_max_stale_seconds must be <= max_stale_seconds"
+            )
+        if frankfurter_base.username or frankfurter_base.password:
+            raise ValueError("fx.frankfurter.base_url must not contain userinfo")
+        if frankfurter_base.query or frankfurter_base.fragment:
+            raise ValueError("fx.frankfurter.base_url must not contain a query or fragment")
         display = (self.fx_default_display_currency or "").strip().upper()
-        if display not in ("IRT", "EUR", "USD", "IRR"):
-            raise ValueError("fx.default_display_currency must be one of IRT, EUR, USD, IRR")
+        if display not in ("IRT", "IRR", "EUR", "GBP", "JPY", "SGD", "AUD", "CAD", "USD", "KRW"):
+            raise ValueError("fx.default_display_currency is not a supported display currency")
         self.fx_default_display_currency = display
+        target = (self.fx_catalog_pricing_currency or "").strip().upper()
+        if target not in ("EUR", "GBP", "JPY", "SGD", "AUD", "CAD", "USD", "KRW"):
+            raise ValueError("fx.catalog_pricing_currency must be an audited global fiat code")
+        self.fx_catalog_pricing_currency = target
         return self
 
     @classmethod

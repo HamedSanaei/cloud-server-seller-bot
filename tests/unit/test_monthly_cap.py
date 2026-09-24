@@ -69,8 +69,13 @@ def _snapshot(cap: int | None = None) -> ServerPriceSnapshot:
             location_id="fsn1",
             cost_minor=COST,
             currency="EUR",
+            # The exact native provider rate: a cross-currency accrual
+            # (EUR cost -> USD selling) may never be reconstructed from
+            # rounded native minor units.
+            provider_rate_exact="7.00",
         ),
         selling_minor=SELLING,
+        selling_currency="USD",
         book_name="retail-eur",
         book_version=1,
         rule=_rule(cap),
@@ -134,17 +139,27 @@ class Fakes:
         self.saved: list[CloudServer] = []
         self.audit = AsyncMock()
 
-    def post(self, amount: int, key: str, etype: LedgerEntryType, reference: str = "") -> None:
+    def post(
+        self,
+        amount: int,
+        key: str,
+        etype: LedgerEntryType,
+        reference: str = "",
+        *,
+        reference_type: str = "",
+        description: str = "",
+    ) -> None:
         if key in self.entries:
             raise AssertionError(f"duplicate ledger key {key}")
         self.entries[key] = LedgerEntry(
             id=uuid4(),
             wallet_id=WALLET_ID,
             entry_type=etype,
-            amount=Money(Decimal(amount), "EUR"),
-            reference_type="hold" if etype is LedgerEntryType.CHARGE else "server",
+            amount=Money(Decimal(amount), "USD"),
+            reference_type=reference_type,
             reference_id=reference,
             idempotency_key=key,
+            description=description,
         )
 
     async def save(self, server: CloudServer) -> CloudServer:
@@ -166,12 +181,23 @@ class Fakes:
 
     async def capture_hold(self, wallet_id, hold_id, key: str) -> Hold:
         hold = self.holds[key]
-        if hold.status is not HoldStatus.CREATED:
+        if hold.status is HoldStatus.RELEASED:
             raise ValueError("cannot capture")
-        hold.capture()
-        self.captured.append(key)
-        self.wallet.balance -= hold.amount
-        self.post(hold.amount, f"capture-{key}", LedgerEntryType.CHARGE, reference=key)
+        if hold.status is HoldStatus.CREATED:
+            hold.capture()
+            self.captured.append(key)
+            self.wallet.balance -= hold.amount
+        capture_key = f"capture-{key}"
+        if capture_key not in self.entries:
+            assert hold.id is not None
+            self.post(
+                hold.amount,
+                capture_key,
+                LedgerEntryType.CHARGE,
+                reference=str(hold.id),
+                reference_type="hold",
+                description=f"hold captured for {key}",
+            )
         return hold
 
     async def release_hold(self, wallet_id, hold_id, key: str) -> Hold:
@@ -187,7 +213,14 @@ class Fakes:
     async def ledger_post(
         self, wallet_id, amount: int, currency: str, etype: LedgerEntryType, key: str, **kw: object
     ) -> LedgerEntry:
-        self.post(amount, key, etype, reference=str(kw.get("reference_id", "")))
+        self.post(
+            amount,
+            key,
+            etype,
+            reference=str(kw.get("reference_id", "")),
+            reference_type=str(kw.get("reference_type", "")),
+            description=str(kw.get("description", "")),
+        )
         return self.entries[key]
 
     async def accrual_get(self, key: str) -> AccrualPeriod | None:
@@ -202,8 +235,20 @@ class Fakes:
         self.rows_by_key[period.idempotency_key] = period
         return period
 
-    async def month_total(self, wallet_id, month_start) -> int:
-        return sum(r.selling_minor for r in self.rows if r.period_start >= month_start)
+    async def month_total(
+        self,
+        wallet_id,
+        month_start,
+        currency: str | None = None,
+        rule_key: str | None = None,
+    ) -> int:
+        return sum(
+            r.selling_minor
+            for r in self.rows
+            if r.period_start >= month_start
+            and (currency is None or r.currency == currency)
+            and (rule_key is None or r.rule_key == rule_key)
+        )
 
     async def snapshot_get(self, server_id) -> ServerPriceSnapshot | None:
         return self.snapshot
@@ -226,6 +271,34 @@ class Fakes:
 
             async def debit(self, user_id, amount, key):
                 return await h.debit(user_id, amount, key)
+
+            async def adjust(
+                self,
+                user_id,
+                delta,
+                key,
+                *,
+                entry_type,
+                reference_type="",
+                reference_id="",
+                description="",
+            ):
+                """Atomic balance + ledger mutation (the real repository's contract)."""
+                if key in h.entries:
+                    return h.wallet, False
+                if delta < 0:
+                    await h.debit(user_id, -delta, key)
+                else:
+                    h.wallet.balance += delta
+                h.post(
+                    abs(delta),
+                    key,
+                    entry_type,
+                    reference=str(reference_id),
+                    reference_type=str(reference_type),
+                    description=str(description),
+                )
+                return h.wallet, True
 
         @dataclass
         class _HoldRepo:
@@ -259,8 +332,10 @@ class Fakes:
             async def list_between(self, start, end):
                 return [r for r in h.rows if start <= r.period_start < end]
 
-            async def month_total(self, wallet_id, month_start):
-                return await h.month_total(wallet_id, month_start)
+            async def month_total(self, wallet_id, month_start, currency=None, rule_key=None):
+                return await h.month_total(
+                    wallet_id, month_start, currency=currency, rule_key=rule_key
+                )
 
         @dataclass
         class _SnapshotRepo:
@@ -294,6 +369,34 @@ class Fakes:
             async def debit(self, user_id, amount, key):
                 return await h.debit(user_id, amount, key)
 
+            async def adjust(
+                self,
+                user_id,
+                delta,
+                key,
+                *,
+                entry_type,
+                reference_type="",
+                reference_id="",
+                description="",
+            ):
+                """Atomic balance + ledger mutation (the real repository's contract)."""
+                if key in h.entries:
+                    return h.wallet, False
+                if delta < 0:
+                    await h.debit(user_id, -delta, key)
+                else:
+                    h.wallet.balance += delta
+                h.post(
+                    abs(delta),
+                    key,
+                    entry_type,
+                    reference=str(reference_id),
+                    reference_type=str(reference_type),
+                    description=str(description),
+                )
+                return h.wallet, True
+
         @dataclass
         class _HoldRepo:
             async def get_by_idempotency(self, wallet_id, key):
@@ -326,8 +429,10 @@ class Fakes:
             async def list_between(self, start, end):
                 return [r for r in h.rows if start <= r.period_start < end]
 
-            async def month_total(self, wallet_id, month_start):
-                return await h.month_total(wallet_id, month_start)
+            async def month_total(self, wallet_id, month_start, currency=None, rule_key=None):
+                return await h.month_total(
+                    wallet_id, month_start, currency=currency, rule_key=rule_key
+                )
 
         @dataclass
         class _SnapshotRepo:
@@ -365,7 +470,7 @@ def _hold(key: str, status: HoldStatus = HoldStatus.CREATED) -> Hold:
     return Hold(
         wallet_id=WALLET_ID,
         amount=SELLING,
-        currency="EUR",
+        currency="USD",
         idempotency_key=key,
         id=uuid4(),
         status=status,
@@ -436,7 +541,13 @@ class TestAccrualCap:
 
 class TestFinalChargeCap:
     def _seeded_month(self, fakes: Fakes, deleted: datetime) -> None:
-        """A period already billed this month (so the month has used cap room)."""
+        """A period already billed this month (so the month has used cap room).
+
+        The month cap counts SETTLED money in the canonical selling currency
+        for the same pricing rule, so the seeded row carries the selling
+        currency and the rule key production writes
+        (``provider|plan|location`` of the snapshot's margin rule).
+        """
         row = AccrualPeriod(
             server_id=uuid4(),
             wallet_id=WALLET_ID,
@@ -444,7 +555,11 @@ class TestFinalChargeCap:
             period_end=deleted - timedelta(hours=1),
             selling_minor=SELLING,
             cost_minor=COST,
-            currency="EUR",
+            currency="USD",
+            cost_currency="EUR",
+            selling_currency="USD",
+            cost_amount=Decimal("7.00"),
+            rule_key="hetzner|cx22|fsn1",
             idempotency_key="seed-1",
         )
         fakes.rows.append(row)
@@ -472,9 +587,16 @@ class TestFinalChargeCap:
         assert fakes.released == [HOLD_KEY]
         assert fakes.holds[HOLD_KEY].status is HoldStatus.RELEASED
         assert f"release-{HOLD_KEY}" in fakes.entries
-        # the audit trail explains both skipped legs and the final charge
-        actions = [c.args[0].action for c in fakes.audit.append.call_args_list]
-        assert actions.count("billing.cap_reached") == 2
+        # the audit trail explains the (single) skipped leg and the final charge:
+        # a 30-minute window covers only the reserved first quantum, so the cap
+        # blocks the capture leg and no flat remainder leg exists at all.
+        cap_audits = [
+            c.args[0]
+            for c in fakes.audit.append.call_args_list
+            if c.args[0].action == "billing.cap_reached"
+        ]
+        assert len(cap_audits) == 1
+        assert "capture leg" in cap_audits[0].reason
         final = next(
             c.args[0]
             for c in fakes.audit.append.call_args_list

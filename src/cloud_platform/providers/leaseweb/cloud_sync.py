@@ -56,6 +56,9 @@ class CloudSyncResult:
     marked_unavailable: int = 0
     warnings: tuple[str, ...] = ()
     verified: frozenset[tuple[str, str]] = frozenset()
+    #: Winning credential per verified pair: (account_id, product_id,
+    #: location_id). The coordinator prices the exact account-scoped row.
+    verified_accounts: frozenset[tuple[str, str, str]] = frozenset()
     persistence_failures: tuple[str, ...] = ()
     errors: list[str] = field(default_factory=list)
 
@@ -175,7 +178,8 @@ class LeasewebHourlyCloudSyncer:
         persistence_failures: list[str] = []
         per_region: dict[str, RegionTypeReport] = {}
         verified: set[tuple[str, str]] = set()
-        available: set[tuple[str, str]] = set()
+        verified_owner: set[tuple[str, str, str]] = set()
+        available: set[tuple[str, str, str]] = set()
         seen_locations: set[str] = set()
         account_failed = False
         written = 0
@@ -317,9 +321,13 @@ class LeasewebHourlyCloudSyncer:
                 )
                 region_failed = True
             else:
-                available.add(pair)
+                # Account-qualified: scoped rows retire unless their exact
+                # (account, product, location) triple was observed. Pair-only
+                # sets would retire every scoped row the sync just wrote.
+                available.add((account_id, item.id, region_id))
                 if image_ready:
                     verified.add(pair)
+                    verified_owner.add((account_id, item.id, region_id))
                 else:
                     warnings.append(
                         f"{region_id}: no account lists usable images for "
@@ -363,6 +371,7 @@ class LeasewebHourlyCloudSyncer:
             marked_unavailable=marked,
             warnings=tuple(warnings),
             verified=frozenset(verified),
+            verified_accounts=frozenset(verified_owner),
             persistence_failures=tuple(persistence_failures),
             errors=errors,
         )

@@ -82,7 +82,7 @@ class Wallet(Base):
         PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True
     )
     balance = Column(BigInteger, default=0, nullable=False)
-    currency = Column(String(3), nullable=False, server_default="EUR")
+    currency = Column(String(3), nullable=False, server_default="USD")
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(
         DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
@@ -374,7 +374,9 @@ class Server(Base):
     ipv4 = Column(String, nullable=True)
     ipv6 = Column(String, nullable=True)
     price_per_quantum = Column(BigInteger, nullable=False)
-    currency = Column(String(3), nullable=False, server_default="EUR")
+    # No silent currency default: writers must state the balance unit
+    # explicitly (migration 0043 drops the historical EUR server default).
+    currency = Column(String(3), nullable=False)
     quantum_seconds = Column(Integer, nullable=False, server_default="3600")
     #: hourly (usage-based accrual) or prepaid_monthly_fixed (fixed prepaid
     #: monthly products, e.g. Leaseweb ordering VPS — LEASEWEB-MVP). The
@@ -387,6 +389,10 @@ class Server(Base):
     #: be addressed with that account's own credential. NULL on legacy rows
     #: (routed as the ``default`` account).
     credential_account_id = Column(String(64), nullable=True)
+    #: Stable provider image id pinned for hourly checkout/replay safety.
+    image_id = Column(String, nullable=True)
+    #: Immutable checkout contract fingerprint for hourly create replay validation.
+    offer_fingerprint = Column(JSONB, nullable=True)
     #: The operating system the server was ordered with (prepaid monthly
     #: path), e.g. "Ubuntu 24.04".
     os = Column(String, nullable=True)
@@ -462,9 +468,13 @@ class SellableOffer(Base):
     disk_gb = Column(Integer, nullable=False, server_default="0")
     traffic = Column(String, nullable=True)
     provider_cost_minor = Column(BigInteger, nullable=False, server_default="0")
-    provider_cost_currency = Column(String(3), nullable=False, server_default="EUR")
+    # No silent currency defaults: writers must state native cost and selling
+    # currencies explicitly (migration 0043 drops the historical EUR defaults
+    # so a corrupt/direct write can never be relabelled as native EUR).
+    provider_cost_currency = Column(String(3), nullable=False)
     selling_price_minor = Column(BigInteger, nullable=False, server_default="0")
-    selling_currency = Column(String(3), nullable=False, server_default="EUR")
+    selling_currency = Column(String(3), nullable=False)
+    pricing_metadata = Column(JSONB, nullable=False, server_default="{}")
     billing_parameters = Column(JSONB, nullable=False, server_default="{}")
     #: Provider-neutral customer-visible technical facts normalized by the
     #: adapters (architecture, storage type, ...). Never secrets, credential
@@ -580,6 +590,8 @@ class ProviderOrder(Base):
     provider_cost_currency = Column(String(3), nullable=True)
     selling_price_minor = Column(BigInteger, nullable=True)
     selling_currency = Column(String(3), nullable=True)
+    provider_monthly_rate_exact = Column(Text, nullable=True)
+    pricing_metadata = Column(JSONB, nullable=False, server_default="{}")
     post_attempted_at = Column(DateTime(timezone=True), nullable=True)
     #: Local payment settlement sub-state (release hardening): provider
     #: acceptance and local charge settlement are different facts; delivery
@@ -1006,6 +1018,10 @@ class ServerPriceSnapshot(Base):
     currency = Column(String, nullable=False)
     cost_minor = Column(BigInteger, nullable=False)
     selling_minor = Column(BigInteger, nullable=False)
+    selling_currency = Column(String(3), nullable=True)
+    provider_rate_exact = Column(Text, nullable=True)
+    pricing_metadata = Column(JSONB, nullable=False, server_default="{}")
+    offer_fingerprint = Column(JSONB, nullable=True)
     book_name = Column(String, nullable=False)
     book_version = Column(Integer, nullable=False)
     margin_rule = Column(JSONB, nullable=False)
@@ -1147,6 +1163,10 @@ class AccrualPeriod(Base):
     cost_minor = Column(BigInteger, nullable=False, server_default="0")
     selling_minor = Column(BigInteger, nullable=False)
     currency = Column(String(3), nullable=False)
+    cost_currency = Column(String(3), nullable=True)
+    selling_currency = Column(String(3), nullable=True)
+    cost_amount = Column(Text, nullable=True)
+    rule_key = Column(String, nullable=True)
     idempotency_key = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
 

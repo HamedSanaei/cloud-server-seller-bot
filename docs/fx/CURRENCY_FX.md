@@ -1,122 +1,212 @@
 # Currency / FX Resolution
 
-Provider-neutral, platform-level financial subsystem. The single reusable
-path for displaying money, converting catalog prices for display, and
-bridging wallet recharge amounts between the wallet currency and the payment
-gateway settlement currency.
+The platform has two deliberately separate FX families:
 
-## Supported currencies
+* **Domestic/payment:** AbanTether, used for IRT/IRR/USDT payment and wallet
+  display/settlement paths. It is not a global catalog-price source.
+* **Global catalog normalization:** Frankfurter V2, used only to turn a
+  foreign provider's native cost into the configured canonical catalog
+  currency. It is a reference-rate source, not an executable market and not a
+  payment settlement source.
 
-| Code | Meaning | Minor units |
-|------|---------|-------------|
-| IRT  | Toman   | zero-decimal: minor == Toman |
-| IRR  | Rial    | zero-decimal: minor == Rial (`1 IRT = 10 IRR` exact) |
-| EUR  | Euro    | 2 decimals: minor == cents |
-| USD  | US dollar (display) | 2 decimals: minor == cents |
+All financial arithmetic is `Decimal`; final customer rounding happens once,
+with `ROUND_CEILING` in the target currency's audited minor unit.
 
-`IRT` is shown as `تومان` in Persian UI (never divided by 100, never shown
-as `IRT`). `EUR 499 minor` renders `€4.99`; `USD 499 minor` renders `$4.99`.
+## Audited currencies
 
-## AbanTether source (first live FX source)
+| Code | Meaning | Exponent |
+|------|---------|----------|
+| IRT | Toman | 0 |
+| IRR | Rial | 0 |
+| EUR, GBP, SGD, AUD, CAD, USD | global fiat | 2 |
+| JPY, KRW | global fiat | 0 |
+
+`IRT 1_250_000` is 1,250,000 Toman. `JPY 691` is ¥691, never ¥6.91. An
+unknown currency fails closed in conversion/pricing. Display formatting uses
+the same exponent registry.
+
+## AbanTether (domestic/payment)
 
 Read-only public ticker (no API key):
 
-- `GET https://api.abantether.com/api/v1/manager/otc/ticker?coin=EUR`
-- `GET https://api.abantether.com/api/v1/manager/otc/ticker?coin=USDT`
+* `GET https://api.abantether.com/api/v1/manager/otc/ticker?coin=EUR`
+* `GET https://api.abantether.com/api/v1/manager/otc/ticker?coin=USDT`
 
-Only the EXACT market keys `EURIRT` and `USDTIRT` are read (never substring
-matches; `EURI` is a different asset and is never used as EUR). Entries
-require `active == true` and positive Decimal prices parsed from strings
-(never float). `buy_price` is IRT to BUY one unit (acquisition side);
-`sell_price` is IRT received when SELLING one unit.
+Only the exact `EURIRT` and `USDTIRT` markets are accepted. `DISPLAY` and
+`CHARGE` use the acquisition (`buy`) side; `LIQUIDATION` uses `sell`. The
+`USD`/`USDT` relationship is an explicit configured proxy, never an implicit
+identity. Settlement through the proxy is disabled by default and requires the
+operator flag.
 
-## Buy vs sell semantics
+## Frankfurter V2 (global catalog)
 
-- `DISPLAY` and `CHARGE` use the acquisition (`buy_price`) side so the shown
-  or charged price never undercharges.
-- `LIQUIDATION` uses the `sell_price` side (reporting/payout contexts).
+The adapter calls only:
 
-Callers pass an explicit `FxPurpose`; there is no ambiguous `convert()`.
+```text
+GET https://api.frankfurter.dev/v2/rate/{base}/{quote}
+```
 
-## USD / USDT proxy warning
+The official response is a flat object, for example:
 
-Live data provides `EURIRT` and `USDTIRT` — there is NO verified fiat
-`USDIRT` market. USD display uses the USDT market EXPLICITLY as a
-configured proxy (`proxy=true, proxy_asset="USDT"` in every result).
+```json
+{"date":"2026-01-05","base":"EUR","quote":"USD","rate":1.145}
+```
 
-- Default: `allow_usdt_proxy_for_display = true`,
-  `allow_usdt_proxy_for_settlement = false`.
-- A USD wallet top-up through the proxy is REJECTED by default; enabling it
-  requires the operator flag plus audit metadata. A future real USD source
-  replaces the proxy without changing catalog/payment/domain code.
+The adapter parses numeric JSON tokens directly as `Decimal`, validates the
+base/quote/date/rate, and records provider date separately from retrieval
+time. There is one reference rate and therefore no bid/ask spread. It supports
+the audited global currencies above, including JPY/KRW, and never handles IRT,
+IRR, or USDT. `USD -> USD` is an explicit identity operation and makes no HTTP
+request.
 
-## Routes (owned by the resolver; never duplicated at call sites)
+## Catalog pricing contract
 
-- Identity (`IRT->IRT`, `EUR->EUR`, `USD->USD`, `IRR->IRR`): no provider call.
-- Exact `1 IRT = 10 IRR` both directions: no provider call.
-- `EUR <-> IRT` through `EURIRT`.
-- `USD(display) <-> IRT` through `USDTIRT` proxy when allowed.
-- `EUR <-> USD` through IRT: `EUR * EURIRT.buy / USDTIRT.buy` (DISPLAY/CHARGE).
-- `EUR/USD <-> IRR` via IRT anchor + exact x10.
-- `CHARGE` rounds UP (ceiling) to the target smallest unit; `DISPLAY` uses
-  half-up; `LIQUIDATION` uses floor.
+For a foreign offer, auto-sync and the deliberate normalization command use:
 
-## Cache / staleness
+```text
+immutable provider-native exact Decimal
+  -> exact global reference rate
+  -> configured operator markup
+  -> one final ceiling to target minor units
+```
 
-- `quote_ttl_seconds = 60`: fresh cache is used without a live fetch.
-- Expired cache triggers a live fetch (singleflight per market), validates,
-  saves last-known-good, returns fresh.
-- Live failure falls back to last-known-good ONLY if age <= the purpose
-  limit (`max_stale_seconds = 300` for display;
-  `charge_max_stale_seconds = 30` for financially binding CHARGE/LIQUIDATION),
-  marked `stale=true`. Older quotes FAIL CLOSED (never 0, never rate=1,
-  never silent fallbacks).
-- Production uses a Redis last-known-good store; dev/test use in-memory.
+The native `provider_cost_minor` and `provider_cost_currency` remain unchanged
+for audit. Hourly pricing prefers
+`billing_parameters.provider_hourly_rate` (or the provider adapter's exact
+hourly-rate key) as Decimal text; it fails closed if an hourly observation has
+no exact rate rather than pricing from already-rounded cents. A sample:
 
-## Recharge snapshot (why callback never re-fetches FX)
+```text
+0.0453 EUR * 1.17 = 0.053001 USD
+0.053001 * 1.25 = 0.06625125 USD
+final customer price = $0.07/hour
+```
 
-1. Customer picks a CREDIT amount in the wallet currency.
-2. The service resolves a fresh CHARGE quote and converts to the gateway
-   settlement amount (Tetraminator: IRT; ZarinPal: IRR via exact x10, or
-   EUR->IRT->IRR through FX).
-3. The durable session persists BOTH sides plus the conversion snapshot
-   (source/rate/path/observed/proxy).
-4. The gateway invoice uses the settlement side.
-5. The GET callback performs server-side inquiry and verifies the PROVIDER
-   amount against the persisted settlement amount (exact pay_id + exact
-   amount); only then is the wallet credited with the FROZEN credit side.
-6. Replays and reconciliation reuse the same snapshot — a market move before
-   the callback never changes the wallet credit.
+The durable `pricing_metadata` JSONB records a versioned provenance snapshot:
+source/target currencies and amounts, exact rate/provider date/retrieval and
+expiry, stale marker, markup, rounding rule, and final minor amount. The
+provider-native cost fields are included separately.
 
-## Gateway settlement
+A bounded last-known-good global reference rate may be used for catalog
+repricing only within `[fx.frankfurter].catalog_max_stale_seconds` (the
+separate cache retention bound is `max_stale_seconds`). The resolver keeps a
+short failure memo so a provider outage cannot turn into a request stampede.
+An expired cache entry is refreshed live first; a stale value is considered
+only after that live attempt fails (or while a failure memo is active), and the
+failure memo is rechecked while holding the pair lock. The flag is persisted
+as `fx_stale=true`. A missing/expired/too-old rate never becomes 1:1 or zero:
 
-- Tetraminator: IRT only, minimum 50,000 Toman enforced after conversion.
-- ZarinPal: IRR only (`IRT->IRR` exact x10; `EUR->IRT->IRR` through FX).
-- No implicit `EUR<->IRT` exchange rate outside the resolver; no silent
-  `USD=USDT` settlement.
+* a previously canonical price is preserved only when its native cost snapshot
+  is unchanged and it remains safe;
+* a new, noncanonical, or stale-cost offer is left unpriced and not sellable;
+* manual prices and operator-disabled rows are never overwritten.
 
-## Checkout note
+The entire sync shares one resolver and one cache; external calls scale with
+distinct currency pairs, not offer count. In-process singleflight and a
+versioned provider-family cache key prevent local stampedes. Redis is used in
+production.
 
-`MonthlyCheckoutService` still requires the hold currency to match the
-offer's selling currency (holds are currency-checked by reconciliation).
-Cross-currency checkout (selling != wallet) is NOT part of this task: the
-resolver API is designed so checkout can later use the same CHARGE
-conversion without a second FX implementation, but the billable provider
-POST flow is intentionally untouched here.
+## Identity and domestic routes
 
-## Adding another FX source later
+* Identity conversions make no source call.
+* `1 IRT = 10 IRR` is exact in both directions and makes no source call.
+* AbanTether routes EUR/USDT to IRT according to the explicit domestic policy.
+* Global catalog pricing never routes an IRT/IRR/USDT pair through Frankfurter.
+* Existing accepted orders and hourly snapshots retain their creation-time
+  selling amount and currency; later FX movement only reprices catalog rows.
 
-Implement the `FxRateSource` port (`get_quote` + `close`), register it in
-the container (infrastructure only), and point `fx.provider` at it. Domain,
-catalog, recharge, Telegram and checkout code do not change.
+## Configuration
 
-## Operations
+```toml
+[fx]
+enabled = true
+domestic_enabled = true
+global_enabled = true
+domestic_provider = "abantether"
+global_fiat_provider = "frankfurter"
+catalog_pricing_currency = "USD"
+# Domestic UI/payment compatibility only; not a catalog selling currency.
+default_display_currency = "IRT"
 
-- Config lives in server-owned `configuration.toml` (`[fx]`,
-  `[fx.abantether]`); examples carry safe placeholders only.
-- Pre-flight: `uv run python -m cloud_platform.cli fx doctor` (read-only:
-  config, EUR/IRT, USD proxy, cache; never trades, never prints prices).
-- Metrics: `fx_quote_requests_total`, `fx_quote_failures_total`,
-  `fx_cache_hits_total`, `fx_stale_quote_uses_total` (closed label sets).
-- Wallet currency report (no balance mutation):
-  `fx doctor` prints wallet counts grouped by currency.
+[fx.frankfurter]
+base_url = "https://api.frankfurter.dev"
+request_timeout_seconds = 5
+quote_ttl_seconds = 3600
+max_stale_seconds = 345600
+catalog_max_stale_seconds = 86400
+```
+
+`fx.provider` remains accepted as a backward-compatible alias for the
+domestic provider. Production requires HTTPS, a safe absolute Frankfurter URL
+with no credentials/query/fragment, and a positive timeout. The configuration
+validator rejects an unsupported target or an invalid stale window.
+
+Automatic policies are under `[storefront.pricing.<provider>]` (and an
+optional `[storefront.pricing."<provider>.<billing-model>"]` override). The
+legacy root `[storefront_pricing.*]` block is not read.
+
+## CLI and operations
+
+```bash
+uv run python -m cloud_platform.cli fx doctor
+uv run python -m cloud_platform.cli fx rates --target USD
+uv run python -m cloud_platform.cli offers doctor
+uv run python -m cloud_platform.cli offers normalize-selling-currency --target USD --dry-run
+uv run python -m cloud_platform.cli offers normalize-selling-currency --target USD --execute
+uv run python -m cloud_platform.cli catalog auto-sync doctor
+```
+
+`normalize-selling-currency` is deliberately gated by exactly one of
+`--dry-run` or `--execute`. It shares one global resolver, preserves manual
+intent, recomputes auto rows from native cost plus policy markup, converts
+manual rows from their existing selling amount without a second markup, and is
+idempotent. It never changes provider-native cost or an operator-disabled row.
+
+All customer browse/checkout/create paths reject a foreign offer unless its
+selling currency is the configured target, and a wallet must match the offer's
+selling currency. Monthly OS/panel callbacks carry signed, stable selectors
+(digests of exact live option names), never list indexes; the terminal selector
+also binds the confirmation-time integer price and currency, so a catalog
+change cannot be charged through an old button. The bot's foreign catalog
+presentation shows the canonical amount only; mixed native/USD display amounts
+are not shown to customers.
+
+## Post-deploy verification (read-only)
+
+```bash
+uv run python -m cloud_platform.cli fx doctor
+uv run python -m cloud_platform.cli offers doctor
+uv run python -m cloud_platform.cli catalog auto-sync doctor
+uv run python -m cloud_platform.cli fx rates --target USD
+uv run alembic current
+```
+
+Confirm migration `0043` (current head) applied cleanly, the configured `[fx]`
+family switches and blocks, provider-cost columns still show their original
+currencies, and every sellable foreign row has
+`pricing_metadata.fx_provider = "frankfurter"`, `selling_currency = "USD"`, and
+an auditable exact conversion. No deployment command in this document performs
+a provider mutation or changes a wallet balance.
+
+## Legacy non-USD wallets (explicit operator plan)
+
+New wallets are created in USD (`DEFAULT_WALLET_CURRENCY`). Existing non-USD
+balances are NEVER silently rewritten: checkout and accrual fail closed when
+the wallet currency does not match the selling currency, and the mismatch is
+surfaced as a `ValueError` naming both currencies.
+
+To migrate a legacy wallet, the operator must do all of the following
+deliberately, per wallet:
+
+1. Confirm the wallet has no RUNNING hourly server and no CAPTURED hold
+   (an active contract keeps its frozen snapshot regardless).
+2. Record the exact pre-migration balance and currency off-system.
+3. Zero the old balance with an audited `wallet_adjust` (negative amount,
+   explicit reason) — this creates the immutable ledger fact.
+4. Credit the identical major-unit value into a new USD wallet only after an
+   explicit, separately recorded conversion decision (rate, source, date);
+   the platform never invents that rate.
+5. Keep the old wallet row for audit; never delete ledger history.
+
+There is no automatic conversion, no background rewrite, and no code path
+that relabels a balance.

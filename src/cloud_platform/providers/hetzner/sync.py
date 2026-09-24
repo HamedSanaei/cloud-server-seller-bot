@@ -111,8 +111,13 @@ class HetznerCatalogSyncer:
         token: str | None = None,
         base_url: str = "https://api.hetzner.cloud/v1",
         per_page: int = 50,
+        *,
+        catalog_currency: str = "USD",
+        catalog_stale_limit_seconds: int | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self._catalog_currency = catalog_currency
+        self._catalog_stale_limit_seconds = catalog_stale_limit_seconds
         self._token = token or get_settings().hetzner_api_token
         self._base_url = base_url.rstrip("/")
         self._per_page = per_page
@@ -151,7 +156,7 @@ class HetznerCatalogSyncer:
             raise ProviderError(_error_message(response))
         if response.status_code == 204 or not response.content:
             return {}
-        data = response.json()
+        data = response.json(parse_float=Decimal, parse_int=int)
         if not isinstance(data, dict):
             raise ProviderError("provider returned unexpected JSON shape")
         return data
@@ -463,7 +468,11 @@ class HetznerCatalogSyncer:
         off and unpriced. Nothing is ever deleted — a server type or location
         that stops being offered is marked provider-unavailable.
         """
-        repo = SqlAlchemySellableOfferRepository(self._session_factory)
+        repo = SqlAlchemySellableOfferRepository(
+            self._session_factory,
+            catalog_currency=self._catalog_currency,
+            catalog_stale_limit_seconds=self._catalog_stale_limit_seconds,
+        )
         locations, location_errors = await self._offer_locations()
         available: set[tuple[str, str]] = set()
         verified: set[tuple[str, str]] = set()
@@ -597,7 +606,7 @@ class HetznerCatalogSyncer:
 
 
 def _int_or_none(value: str | None) -> int | None:
-    if value is None:
+    if value is None or isinstance(value, (bool, float)):
         return None
     try:
         return int(value)
@@ -607,7 +616,7 @@ def _int_or_none(value: str | None) -> int | None:
 
 def _decimal_or_none(value: Any) -> Decimal | None:
     """Parse a provider price string into a Decimal, or None if absent."""
-    if value is None:
+    if value is None or isinstance(value, (bool, float)):
         return None
     text = str(value).strip()
     if not text:
@@ -630,8 +639,9 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
     without a provider price there is nothing safe to sell, so the caller
     records a warning instead of inventing one.
     """
+    monthly_exact = _monthly_exact_for_location(item, location_id)
     monthly = _monthly_minor_for_location(item, location_id)
-    if monthly is None:
+    if monthly is None or monthly_exact is None:
         return None
     # The server type NAME is the stable, human-meaningful provider reference
     # an operator can match against the Hetzner console (and the provider
@@ -661,6 +671,7 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
                 "contract_term": "1_MONTH",
                 "billing_cycle": "1_MONTH",
                 "monthly_price_minor": monthly,
+                "provider_monthly_rate": str(monthly_exact),
                 "monthly_price_source": "server_types.location",
                 "server_type_id": str(item.get("id") or ""),
                 "location": location_id,
@@ -668,6 +679,18 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
             provider_available=True,
         ),
     )
+
+
+def _monthly_exact_for_location(item: dict[str, Any], location_id: str) -> Decimal | None:
+    """Return the provider's exact monthly gross value for a location."""
+    raw_prices = [raw for raw in item.get("prices", []) if isinstance(raw, dict)]
+    for raw in raw_prices:
+        declared = str(raw.get("location") or raw.get("location_name") or "")
+        if declared == location_id:
+            return _monthly_value(raw)
+    if len(raw_prices) == 1:
+        return _monthly_value(raw_prices[0])
+    return None
 
 
 def _monthly_minor_for_location(item: dict[str, Any], location_id: str) -> int | None:
@@ -688,15 +711,22 @@ def _monthly_minor_for_location(item: dict[str, Any], location_id: str) -> int |
     return None
 
 
-def _monthly_minor(raw: dict[str, Any]) -> int | None:
+def _monthly_value(raw: dict[str, Any]) -> Decimal | None:
     gross = (raw.get("monthly") or {}).get("gross")
-    if gross is None:
+    if gross is None or isinstance(gross, (bool, float)):
         return None
     try:
         value = Decimal(str(gross))
     except (InvalidOperation, ValueError):
         return None
-    if value <= 0:
+    if value <= 0 or not value.is_finite():
+        return None
+    return value
+
+
+def _monthly_minor(raw: dict[str, Any]) -> int | None:
+    value = _monthly_value(raw)
+    if value is None or isinstance(value, (bool, float)):
         return None
     return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
@@ -730,7 +760,7 @@ def _traffic_label(value: Any) -> str | None:
     Rendered in binary terabytes, the unit the provider itself uses for
     included traffic, from Decimal arithmetic only.
     """
-    if value is None:
+    if value is None or isinstance(value, (bool, float)):
         return None
     try:
         total = Decimal(str(value))
@@ -781,7 +811,7 @@ def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:
 
 def _error_message(response: httpx.Response) -> str:
     try:
-        payload = response.json()
+        payload = response.json(parse_float=Decimal, parse_int=int)
         error = payload.get("error", {})
         return str(error.get("message") or error.get("code") or response.text)
     except Exception:

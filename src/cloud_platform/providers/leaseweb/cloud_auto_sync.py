@@ -56,4 +56,6 @@ class LeasewebHourlyCloudSyncSource:
             warnings=result.warnings,
             errors=tuple(errors),
             verified=result.verified,
+            verified_accounts=result.verified_accounts,
+            account_aware=True,
         )

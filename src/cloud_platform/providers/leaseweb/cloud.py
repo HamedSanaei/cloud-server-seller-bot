@@ -225,7 +225,12 @@ class CloudInstanceTypesRead:
 
 @dataclass(frozen=True, slots=True)
 class CloudInstance:
-    """One hourly instance as the provider reports it."""
+    """One hourly instance as the provider reports it.
+
+    Identity fields (type/image/account) are populated only when the API
+    response carries them; the hourly service correlates creates through
+    them, and an absent field simply cannot prove a match (fail closed).
+    """
 
     id: str
     reference: str
@@ -233,6 +238,9 @@ class CloudInstance:
     region: str
     ipv4: str | None = None
     ipv6: str | None = None
+    instance_type: str | None = None
+    image_id: str | None = None
+    account_id: str | None = None
 
 
 def _memory_gb(item: dict[str, Any], resources: dict[str, Any]) -> int:
@@ -464,6 +472,14 @@ def _parse_instance(item: dict[str, Any]) -> CloudInstance | None:
                 ipv4 = address
             elif address and ipv4 is None and ":" not in address:
                 ipv4 = address
+
+    def _optional(*keys: str) -> str | None:
+        for key in keys:
+            raw = item.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return None
+
     return CloudInstance(
         id=raw_id,
         reference=str(item.get("reference") or item.get("name") or raw_id),
@@ -471,6 +487,9 @@ def _parse_instance(item: dict[str, Any]) -> CloudInstance | None:
         region=str(item.get("region") or ""),
         ipv4=ipv4,
         ipv6=ipv6,
+        instance_type=_optional("instanceType", "instance_type", "type"),
+        image_id=_optional("imageId", "image_id", "image"),
+        account_id=_optional("accountId", "account_id", "salesOrg", "sales_org"),
     )
 
 
@@ -643,6 +662,53 @@ class LeasewebHourlyCloudProvider:
             for item in self._items(payload, "images", "data", "items")
             if isinstance(item, dict) and (parsed := _parse_image(item)) is not None
         ]
+
+    async def validate_hourly_offer_for_checkout(
+        self,
+        *,
+        location_id: str,
+        product_id: str,
+        image_id: str,
+        expected_cost_minor: int,
+        currency: str,
+        expected_cost_exact: str,
+    ) -> CloudInstanceType:
+        """Revalidate an offer+image against live provider facts (read-only).
+
+        Checkout-time guard required by the hourly service: the pinned type
+        must still exist at the region with the same provider cost (minor
+        units AND verbatim exact rate) and currency, and the image must be
+        listed for the region. Anything else fails closed without mutating.
+        """
+        types = await self.list_instance_types(location_id)
+        match = next((item for item in types if item.id == product_id), None)
+        if match is None:
+            raise ProviderNotFound(
+                f"instance type {product_id!r} is not offered in {location_id!r}"
+            )
+        if match.currency.upper() != str(currency or "").strip().upper():
+            raise ProviderError(
+                f"provider cost currency changed for {product_id!r} in {location_id!r}"
+            )
+        if match.hourly_cost_minor != expected_cost_minor:
+            raise ProviderError(f"provider cost changed for {product_id!r} in {location_id!r}")
+        wanted_exact = str(expected_cost_exact or "").strip()
+        if wanted_exact:
+            try:
+                wanted = Decimal(wanted_exact)
+                live_exact = Decimal(match.hourly_rate_exact)
+            except (InvalidOperation, ValueError, AttributeError):
+                raise ProviderError(
+                    f"provider rate for {product_id!r} is not valid Decimal text"
+                ) from None
+            if not wanted.is_finite() or wanted <= 0 or live_exact != wanted:
+                raise ProviderError(
+                    f"exact provider rate changed for {product_id!r} in {location_id!r}"
+                )
+        images = await self.list_images(location_id)
+        if not any(image.id == image_id for image in images):
+            raise ProviderNotFound(f"image {image_id!r} is not offered in {location_id!r}")
+        return match
 
     async def list_instances(self, region: str) -> list[CloudInstance]:
         """``GET /publicCloud/v1/instances?region=`` (reconciliation reads)."""

@@ -19,7 +19,7 @@
 [app]
 environment = "production"
 log_level = "INFO"
-default_currency = "EUR"
+default_currency = "USD"
 
 [database]
 # Same credentials as POSTGRES_PASSWORD in the deployment .env file.
@@ -189,10 +189,12 @@ markup_percent = 25
 auto_publish = true
 
 [payments.zarinpal]
-enabled = true
+# Disabled by default: enabling requires a real merchant credential, and
+# placeholder credentials are deliberately rejected by validation.
+enabled = false
 merchant_id = "CHANGE_ME"  # pragma: allowlist secret
-base_url = "https://api.zarinpal.com/pg/v4/payment"
-sandbox = false
+base_url = "https://sandbox.zarinpal.com/pg/v4/payment"
+sandbox = true
 callback_url = "https://your-domain.example/api/v1/payments/zarinpal/callback"
 
 [payments.tetraminator]
@@ -205,15 +207,17 @@ base_url = "https://api.tetraminator.com/v1"
 callback_url = "https://your-domain.example/webhooks/payments/tetraminator"
 timeout_seconds = 30
 
-# Currency / FX resolution (platform-level, provider-neutral). The first live
-# source is AbanTether's PUBLIC ticker (read-only, no secret). Production
-# requires HTTPS for the ticker base URL. Reverse-proxy note: the API needs
-# no inbound FX connectivity (outbound HTTPS to api.abantether.com only);
-# the Tetraminator callback URL above is the one that must be publicly
-# reachable (see docs/payments/TETRAMINATOR.md).
+# Currency / FX resolution. AbanTether is domestic/payment only; Frankfurter
+# V2 is the separate global reference-rate source for foreign catalog prices.
 [fx]
 enabled = true
-provider = "abantether"
+domestic_enabled = true
+global_enabled = true
+domestic_provider = "abantether"
+global_fiat_provider = "frankfurter"
+# Canonical selling currency for every foreign storefront catalog row.
+catalog_pricing_currency = "USD"
+# Domestic UI/payment compatibility only; foreign catalog prices remain USD.
 default_display_currency = "IRT"
 quote_ttl_seconds = 60
 max_stale_seconds = 300
@@ -227,6 +231,13 @@ base_url = "https://api.abantether.com"
 eur_symbol = "EUR"
 usd_proxy_symbol = "USDT"
 
+[fx.frankfurter]
+base_url = "https://api.frankfurter.dev"
+request_timeout_seconds = 5
+quote_ttl_seconds = 3600
+max_stale_seconds = 345600
+catalog_max_stale_seconds = 86400
+
 [security]
 # 32-byte url-safe base64 keys. Generate with:
 #   python -c "import base64; from cloud_platform.core.secrets import MasterKey; print(base64.urlsafe_b64encode(MasterKey.generate().material).decode())"
@@ -234,7 +245,7 @@ provider_credential_encryption_key = "CHANGE_ME"
 backup_encryption_key = "CHANGE_ME"
 
 [billing]
-price_book_name = "retail-eur"
+price_book_name = "retail-usd"
 customer_billing_quantum_seconds = 3600
 low_balance_threshold_minor = 5000
 low_balance_grace_hours = 24

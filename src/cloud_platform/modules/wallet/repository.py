@@ -25,6 +25,7 @@ from cloud_platform.db.base import Hold as _HoldModel
 from cloud_platform.db.base import LedgerEntry as _LEModel
 from cloud_platform.db.base import Wallet as SQLAlchemyWallet
 from cloud_platform.modules.wallet.domain import (
+    DEFAULT_WALLET_CURRENCY,
     DuplicateIdempotencyError,
     Hold,
     HoldNotFoundError,
@@ -95,7 +96,7 @@ class SqlAlchemyWalletRepository:
             result = await session.execute(select(SQLAlchemyWallet))
             return [_wallet_to_domain(row) for row in result.scalars().all()]
 
-    async def get_or_create(self, user_id: UUID, currency: str = "EUR") -> Wallet:
+    async def get_or_create(self, user_id: UUID, currency: str = DEFAULT_WALLET_CURRENCY) -> Wallet:
         wallet = await self.get(user_id)
         if wallet is not None:
             return wallet
@@ -116,12 +117,13 @@ class SqlAlchemyWalletRepository:
             bal = int(_attr(row, "balance"))
             if bal < amount:
                 raise InsufficientBalanceError(f"balance {bal} < required {amount}")
-            wallet_id: UUID = _attr(row, "id")
             cast(Any, row).balance = bal - amount
             await session.commit()
-            updated_row = await session.get(SQLAlchemyWallet, wallet_id)
-            assert updated_row is not None
-            return _wallet_to_domain(updated_row)
+            # Server-generated columns (updated_at onupdate) expire on flush;
+            # refresh inside the greenlet before mapping to domain, otherwise
+            # attribute access raises MissingGreenlet on real PostgreSQL.
+            await session.refresh(row)
+            return _wallet_to_domain(row)
 
     async def add_funds(self, user_id: UUID, amount: int, idempotency_key: str) -> Wallet:
         del idempotency_key
@@ -139,11 +141,154 @@ class SqlAlchemyWalletRepository:
                 raise ValueError(f"no wallet for user {user_id}")
             bal = int(_attr(row, "balance"))
             cast(Any, row).balance = bal + amount
-            wallet_id: UUID = _attr(row, "id")
             await session.commit()
-            updated_row = await session.get(SQLAlchemyWallet, wallet_id)
-            assert updated_row is not None
-            return _wallet_to_domain(updated_row)
+            await session.refresh(row)
+            return _wallet_to_domain(row)
+
+    async def adjust(
+        self,
+        user_id: UUID,
+        delta: int,
+        idempotency_key: str,
+        *,
+        entry_type: LedgerEntryType,
+        reference_type: str = "",
+        reference_id: str = "",
+        description: str = "",
+    ) -> tuple[Wallet, bool]:
+        """Atomically mutate a wallet and append the matching ledger entry."""
+        if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
+            raise ValueError("wallet adjustment delta must be a non-zero integer")
+        new_key = str(idempotency_key).strip()
+        if not new_key:
+            raise ValueError("idempotency_key must not be empty")
+
+        async with self._session_factory() as session:
+            stmt = (
+                select(SQLAlchemyWallet)
+                .where(SQLAlchemyWallet.user_id == user_id)
+                .with_for_update()
+            )
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+            if row is None:
+                raise ValueError(f"no wallet for user {user_id}")
+            wallet_id: UUID = _attr(row, "id")
+
+            existing = await session.execute(
+                select(_LEModel).where(
+                    _LEModel.wallet_id == wallet_id,
+                    _LEModel.idempotency_key == new_key,
+                )
+            )
+            prior = existing.scalar_one_or_none()
+            if prior is not None:
+                # Same key, same immutable facts: idempotent replay, move no
+                # money. Same key, DIFFERENT facts: fail closed — a reused
+                # key must never silently stand in for another movement.
+                # Compare BEFORE rollback: rollback expires the row and its
+                # attributes can no longer be read outside a refresh.
+                self._check_adjust_replay(
+                    prior,
+                    wallet_id=wallet_id,
+                    key=new_key,
+                    delta=delta,
+                    entry_type=entry_type,
+                    reference_type=reference_type,
+                    reference_id=reference_id,
+                    description=description,
+                )
+                await session.rollback()
+                refreshed = await session.get(SQLAlchemyWallet, wallet_id)
+                assert refreshed is not None
+                await session.refresh(refreshed)
+                return _wallet_to_domain(refreshed), False
+
+            balance = int(_attr(row, "balance"))
+            new_balance = balance + delta
+            if new_balance < 0:
+                raise InsufficientBalanceError(f"balance {balance} < required {-delta}")
+            cast(Any, row).balance = new_balance
+            session.add(
+                _LEModel(
+                    wallet_id=wallet_id,
+                    amount=abs(delta),
+                    currency=str(_attr(row, "currency")),
+                    entry_type=entry_type,
+                    idempotency_key=new_key,
+                    reference_type=reference_type or None,
+                    reference_id=UUID(reference_id) if reference_id else None,
+                    description=description,
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                if "uq_ledger_wallet_idempotency" in str(exc.orig):
+                    # Lost a concurrent same-key race: the winner's facts
+                    # decide — identical facts replay quietly, differing
+                    # facts fail closed. The rollback above already undid
+                    # this attempt's balance mutation.
+                    raced = await session.execute(
+                        select(_LEModel).where(
+                            _LEModel.wallet_id == wallet_id,
+                            _LEModel.idempotency_key == new_key,
+                        )
+                    )
+                    winner = raced.scalar_one_or_none()
+                    if winner is not None:
+                        self._check_adjust_replay(
+                            winner,
+                            wallet_id=wallet_id,
+                            key=new_key,
+                            delta=delta,
+                            entry_type=entry_type,
+                            reference_type=reference_type,
+                            reference_id=reference_id,
+                            description=description,
+                        )
+                        refreshed = await session.get(SQLAlchemyWallet, wallet_id)
+                        assert refreshed is not None
+                        await session.refresh(refreshed)
+                        return _wallet_to_domain(refreshed), False
+                raise
+
+            await session.refresh(row)
+            return _wallet_to_domain(row), True
+
+    @staticmethod
+    def _check_adjust_replay(
+        row: Any,
+        *,
+        wallet_id: UUID,
+        key: str,
+        delta: int,
+        entry_type: LedgerEntryType,
+        reference_type: str,
+        reference_id: str,
+        description: str,
+    ) -> None:
+        """Fail closed when a consumed idempotency key carries other facts."""
+        facts = (
+            str(_attr(row, "entry_type")),
+            int(_attr(row, "amount")),
+            str(_attr(row, "reference_type") or ""),
+            str(_attr(row, "reference_id") or ""),
+            str(_attr(row, "description") or ""),
+        )
+        wanted = (
+            str(entry_type.value if isinstance(entry_type, LedgerEntryType) else entry_type),
+            abs(delta),
+            str(reference_type or ""),
+            str(reference_id or ""),
+            str(description or ""),
+        )
+        if facts != wanted:
+            raise DuplicateIdempotencyError(
+                f"ledger entry with idempotency_key {key!r} already exists "
+                f"for wallet {wallet_id} with different facts"
+            )
 
     async def credit_deposit(
         self,
@@ -188,6 +333,7 @@ class SqlAlchemyWalletRepository:
             )
             if existing.scalar_one_or_none() is not None:
                 await session.rollback()
+                await session.refresh(row)
                 return _wallet_to_domain(row), False
             bal = int(_attr(row, "balance"))
             cast(Any, row).balance = bal + amount
@@ -215,11 +361,11 @@ class SqlAlchemyWalletRepository:
                 if "uq_ledger_wallet_idempotency" in str(exc.orig):
                     refreshed = await session.get(SQLAlchemyWallet, wallet_id)
                     assert refreshed is not None
+                    await session.refresh(refreshed)
                     return _wallet_to_domain(refreshed), False
                 raise
-            updated_row = await session.get(SQLAlchemyWallet, wallet_id)
-            assert updated_row is not None
-            return _wallet_to_domain(updated_row), True
+            await session.refresh(row)
+            return _wallet_to_domain(row), True
 
     async def _create(self, user_id: UUID, currency: str) -> Wallet:
         async with self._session_factory() as session:

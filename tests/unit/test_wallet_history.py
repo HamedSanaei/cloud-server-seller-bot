@@ -112,7 +112,9 @@ class TestBalance:
         view = await _service(no_wallet=True).balance(USER_ID)
         assert view.has_wallet is False
         assert view.balance_minor == 0
-        assert view.formatted == "€0.00"
+        # No wallet yet: the canonical display unit, not a legacy currency.
+        assert view.currency == "USD"
+        assert view.formatted == "$0.00"
 
 
 # --------------------------------------------------------------------------

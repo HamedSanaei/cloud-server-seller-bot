@@ -2,8 +2,9 @@
 
 Every money-affecting or visibility mutation is admin-authorized
 (``admin:manage_settings``), requires a non-empty reason, is audited, and is
-idempotent. Selling prices are stored as explicit integer minor units —
-never derived from provider cost, never float.
+idempotent. Selling prices are stored as explicit integer minor units.
+Automatic pricing may derive them only through the audited FX/markup pipeline;
+manual prices remain operator-owned and are never silently overwritten.
 """
 
 from __future__ import annotations
@@ -15,11 +16,16 @@ from uuid import UUID
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.catalog.domain import LocationRecord, LocationRepository
+from cloud_platform.modules.fx.domain import minor_to_major
 from cloud_platform.modules.offers.domain import (
     OfferError,
     OfferNotFoundError,
     SellableOffer,
     SellableOfferRepository,
+    has_valid_pricing_provenance,
+    is_sellable_in_currency,
+    required_selling_currency,
+    requires_currency_normalization,
 )
 from cloud_platform.modules.users.domain import Permission, PermissionChecker, User
 
@@ -33,9 +39,15 @@ class OfferAdminError(OfferError):
 class OfferAdminService:
     """Admin commands over the sellable-offer price book."""
 
-    def __init__(self, offers_repo: SellableOfferRepository, audit_repo: AuditRepository) -> None:
+    def __init__(
+        self,
+        offers_repo: SellableOfferRepository,
+        audit_repo: AuditRepository,
+        catalog_currency: str = "USD",
+    ) -> None:
         self._offers = offers_repo
         self._audit = AuditTrail(audit_repo)
+        self._catalog_currency = catalog_currency.strip().upper()
 
     @staticmethod
     def _require_reason(reason: str) -> None:
@@ -60,13 +72,50 @@ class OfferAdminService:
         self._require_reason(reason)
         if selling_price_minor <= 0:
             raise OfferAdminError("selling price must be positive minor units")
+        currency = currency.strip().upper()
+        if len(currency) != 3 or not currency.isalpha():
+            raise OfferAdminError("selling currency must be a 3-letter ISO code")
 
         offer = await self._offers.get(offer_id)
         if offer is None:
             raise OfferNotFoundError(f"offer {offer_id} not found")
-        updated = await self._offers.set_selling_price(offer_id, selling_price_minor, currency)
-        # A manually set price opts out of the automatic pricing policy.
-        updated = await self._offers.set_auto_priced(offer_id, False)
+        required_currency = required_selling_currency(offer, self._catalog_currency)
+        if currency != required_currency:
+            raise OfferAdminError(
+                f"offer selling currency must be {required_currency}; "
+                "normalize deliberately instead of relabelling"
+            )
+        if (
+            offer.provider_cost_currency.strip().upper() != self._catalog_currency
+            and offer.provider_cost_currency.strip().upper() not in ("IRT", "IRR")
+        ):
+            raise OfferAdminError(
+                "foreign offers must be normalized with the catalog FX command; "
+                "manual target-currency prices require audited FX provenance"
+            )
+        updated = await self._offers.set_manual_price(
+            offer_id,
+            selling_price_minor,
+            currency,
+            {
+                "pricing_schema_version": 1,
+                "price_source": "manual",
+                "pricing_mode": "manual",
+                "source_currency": currency,
+                "source_amount": str(minor_to_major(selling_price_minor, currency)),
+                "target_currency": currency,
+                "provider_cost_minor": offer.provider_cost_minor,
+                "provider_cost_currency": offer.provider_cost_currency,
+                "markup_percent": "0",
+                "rounding": "operator_minor_units",
+                "final_selling_price_minor": selling_price_minor,
+            },
+            expected_cost_minor=offer.provider_cost_minor,
+            expected_cost_currency=offer.provider_cost_currency,
+            expected_updated_at=offer.updated_at,
+        )
+        if updated is None:
+            raise OfferAdminError("provider cost changed while setting the manual price; retry")
         await self._audit.record_mutation(
             actor_type=ActorType.ADMIN,
             actor_id=actor.id,
@@ -99,10 +148,29 @@ class OfferAdminService:
         offer = await self._offers.get(offer_id)
         if offer is None:
             raise OfferNotFoundError(f"offer {offer_id} not found")
+        if enabled and requires_currency_normalization(offer, self._catalog_currency):
+            raise OfferAdminError(
+                f"offer must be normalized to {self._catalog_currency} before it can be enabled"
+            )
+        if enabled:
+            metadata = offer.pricing_metadata or {}
+            if (
+                not offer.provider_available
+                or offer.selling_price_minor <= 0
+                or bool(metadata.get("fx_repricing_pending"))
+                or offer.technical_metadata.get("deprecated")
+                or not has_valid_pricing_provenance(offer, self._catalog_currency)
+            ):
+                raise OfferAdminError(
+                    "offer needs valid current pricing provenance before it can be shown"
+                )
         if offer.enabled is enabled and offer.operator_disabled is not enabled:
             return offer  # idempotent no-op
-        updated = await self._offers.set_enabled(offer_id, enabled)
-        updated = await self._offers.set_operator_disabled(offer_id, not enabled)
+        updated = await self._offers.set_visibility_state(
+            offer_id,
+            enabled=enabled,
+            operator_disabled=not enabled,
+        )
         await self._audit.record_mutation(
             actor_type=ActorType.ADMIN,
             actor_id=actor.id,
@@ -124,8 +192,12 @@ class OfferAdminService:
         return await self._offers.list_all()
 
     async def list_sellable(self) -> list[SellableOffer]:
-        """Only what customers can currently buy."""
-        return await self._offers.list_sellable()
+        """Only what customers can currently buy in the canonical currency."""
+        return [
+            offer
+            for offer in await self._offers.list_sellable()
+            if is_sellable_in_currency(offer, self._catalog_currency)
+        ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,12 +223,18 @@ class OfferBrowseService:
         self,
         offers_repo: SellableOfferRepository,
         location_repo: LocationRepository,
+        catalog_currency: str = "USD",
     ) -> None:
         self._offers = offers_repo
         self._locations = location_repo
+        self._catalog_currency = catalog_currency.strip().upper()
 
     async def list_locations(self) -> list[OfferBrowseLocation]:
-        offers = await self._offers.list_sellable()
+        offers = [
+            offer
+            for offer in await self._offers.list_sellable()
+            if is_sellable_in_currency(offer, self._catalog_currency)
+        ]
         if not offers:
             return []
         index: dict[tuple[str, str], LocationRecord] = {}

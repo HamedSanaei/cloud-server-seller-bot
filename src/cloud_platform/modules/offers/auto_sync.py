@@ -4,15 +4,15 @@ The coordinator drives one provider-neutral pass over every configured
 provider sync source (:class:`OfferCatalogSyncSource`, adapter-implemented):
 
 1. **sync** — each source refreshes its offers (and location metadata) from
-   the official provider APIs. A provider failure is isolated: it is
-   recorded and never prevents another provider's run.
+    the official provider APIs. A provider failure is isolated: it is
+    recorded and never prevents another provider's run.
 2. **price** — every observation that was successfully AND durably persisted
-   this run (the report's ``verified`` set) is repriced with the
-   server-owned markup policy while the row is auto-priced. Manual prices,
-   missing costs/currencies/identity and deprecated plans are never touched.
+    this run (the report's ``verified`` set) is repriced with the
+    server-owned markup policy while the row is auto-priced. Manual prices,
+    missing costs/currencies/identity and deprecated plans are never touched.
 3. **publish** — verified, provider-available, priced rows go on sale unless
-   the operator explicitly blocked them (``operator_disabled``) or the
-   policy disables auto-publication.
+    the operator explicitly blocked them (``operator_disabled``) or the
+    policy disables auto-publication.
 
 Safety properties:
 
@@ -21,8 +21,9 @@ Safety properties:
 - persistence failures suppress pricing/publication for that provider;
 - the whole run holds the catalog sync lock, so two replicas (or an
   overlapping manual run) serialize instead of interleaving writes;
-- provider cost is never modified by the markup; the selling price keeps the
-  exact provider cost currency (no inference, no conversion).
+- provider cost is never modified by the markup; domestic offers keep their
+  native selling currency and foreign offers use the configured catalog
+  currency after exact reference-rate conversion.
 """
 
 from __future__ import annotations
@@ -30,21 +31,44 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from cloud_platform.modules.catalog.domain import CatalogSyncLock
+from cloud_platform.modules.fx.domain import FxUnavailableError
+from cloud_platform.modules.fx.service import ReferenceRateResolution
 from cloud_platform.modules.offers.domain import (
     PRICING_MODE_MARKUP,
     CatalogSyncReport,
     CatalogSyncStateRepository,
     OfferCatalogSyncSource,
     PricingPolicy,
+    SellableOffer,
     SellableOfferRepository,
     TechnicalSpec,
-    markup_unit_price,
+    has_valid_pricing_provenance,
+    required_selling_currency,
+    requires_currency_normalization,
 )
+from cloud_platform.modules.offers.pricing import CatalogOfferPricer, ReferenceRateResolver
 
 logger = logging.getLogger(__name__)
+
+
+def _verified_offer_keys(
+    report: CatalogSyncReport,
+) -> tuple[tuple[str | None, str, str], ...]:
+    """Return account-qualified verification keys in deterministic order."""
+    if report.verified_accounts:
+        return tuple(sorted(report.verified_accounts))
+    if report.account_aware:
+        # An empty qualified set is a real failure, not permission to widen a
+        # multi-account observation back to a provider-wide product/location.
+        return ()
+    return tuple(
+        (None, product_id, location_id) for product_id, location_id in sorted(report.verified)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +140,16 @@ def pricing_policies_from_settings(settings: Any) -> dict[str, PricingPolicy]:
     return policies
 
 
+def _exact_provider_rate(row: SellableOffer) -> str | None:
+    params = row.billing_parameters or {}
+    key = "provider_hourly_rate" if row.billing_model == "hourly" else "provider_monthly_rate"
+    value = params.get(key)
+    if isinstance(value, (bool, float)) or value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _valid_currency(value: object) -> str | None:
     """3-letter uppercase ISO code or None (never inferred, never converted)."""
     code = str(value or "").strip().upper()
@@ -135,12 +169,18 @@ class CatalogAutoSyncCoordinator:
         state: CatalogSyncStateRepository,
         lock: CatalogSyncLock,
         pricing_policies: Mapping[str, PricingPolicy] | None = None,
+        reference_rates: ReferenceRateResolver | None = None,
+        catalog_currency: str = "USD",
+        identity_ttl_seconds: int = 3600,
     ) -> None:
         self._sources = list(sources)
         self._offers = offers
         self._state = state
         self._lock = lock
         self._policies = dict(pricing_policies or {})
+        self._reference_rates = reference_rates
+        self._catalog_currency = str(catalog_currency or "USD").strip().upper()
+        self._identity_ttl_seconds = identity_ttl_seconds
 
     async def run(self) -> AutoSyncRunReport:
         """Execute one refresh pass, or skip it when the lock is held."""
@@ -173,6 +213,7 @@ class CatalogAutoSyncCoordinator:
         errors = list(report.errors)
         prices_updated = 0
         published = 0
+        pricing_errors: list[str] = []
         if report.ok and not report.persistence_failures:
             if self._policy_for(provider_key, report.billing_model) is None:
                 warnings.append("no automatic pricing policy configured; costs refreshed only")
@@ -181,7 +222,9 @@ class CatalogAutoSyncCoordinator:
             # sync that repaired catalog data still showed "never" in the
             # doctor. Record the failure visibly and always persist state.
             try:
-                prices_updated = await self._auto_price(provider_key, report, warnings)
+                prices_updated = await self._auto_price(
+                    provider_key, report, warnings, pricing_errors
+                )
                 published = await self._auto_publish(provider_key, report, warnings)
             except Exception as exc:
                 message = f"pricing/publication failed: {type(exc).__name__}: {exc}"
@@ -206,13 +249,15 @@ class CatalogAutoSyncCoordinator:
         # one row overwriting the other. Offers keep provider_key
         # "leaseweb" (pricing/publication look them up by it); only the
         # durable status row is billing-suffixed.
+        if pricing_errors:
+            errors.extend(pricing_errors)
         if report.billing_model == BILLING_MODEL_HOURLY:
             state_key = f"{provider_key}.{report.billing_model}"
         else:
             state_key = provider_key
         outcome = ProviderAutoSyncReport(
             provider_key=state_key,
-            ok=report.ok and not report.persistence_failures,
+            ok=report.ok and not report.persistence_failures and not pricing_errors,
             discovered=report.discovered,
             persisted=report.persisted,
             prices_updated=prices_updated,
@@ -227,8 +272,8 @@ class CatalogAutoSyncCoordinator:
                 ok=outcome.ok,
                 discovered=outcome.discovered,
                 persisted=outcome.persisted,
-                prices_updated=prices_updated,
-                published=published,
+                prices_updated=outcome.prices_updated,
+                published=outcome.published,
                 retired=outcome.retired,
                 warnings=outcome.warnings,
                 errors=outcome.errors,
@@ -258,37 +303,53 @@ class CatalogAutoSyncCoordinator:
             provider_key
         )
 
+    @staticmethod
+    def _pricing_failure_metadata(row: SellableOffer, reason: str) -> dict[str, object]:
+        metadata = dict(row.pricing_metadata or {})
+        metadata.update(
+            {
+                "fx_repricing_pending": True,
+                "fx_last_error": reason,
+                "fx_last_error_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        return metadata
+
     async def _auto_price(
         self,
         provider_key: str,
         report: CatalogSyncReport,
         warnings: list[str],
+        pricing_errors: list[str] | None = None,
     ) -> int:
-        """Refresh selling prices of verified auto-priced rows (same currency)."""
+        """Reprice every verified auto-owned row from current cost and FX.
+
+        Foreign native costs are resolved once per distinct currency pair (the
+        shared resolver owns TTL/singleflight). Native provider cost columns are
+        never written. Manual prices and operator-disabled rows are untouched.
+        """
         updated = 0
-        for product_id, location_id in sorted(report.verified):
-            row = await self._offers.get_by_ref(provider_key, product_id, location_id)
+        eligible: list[tuple[SellableOffer, PricingPolicy]] = []
+        currencies: set[str] = set()
+        for account_id, product_id, location_id in _verified_offer_keys(report):
+            row = await self._offers.get_by_ref(
+                provider_key, product_id, location_id, provider_account_id=account_id
+            )
             if row is None or not row.provider_available:
                 continue
             if row.billing_model != report.billing_model:
                 warnings.append(f"{row.ref}: billing model changed; left untouched")
                 continue
             policy = self._policy_for(provider_key, row.billing_model)
-            if policy is None:
-                continue
-            if row.operator_disabled:
-                # Explicit operator block: automation leaves the row alone
-                # entirely (no pricing, no publishing) — silently, since a
-                # standing block is intended state, not a problem to warn on.
+            if policy is None or row.operator_disabled:
                 continue
             if not row.auto_priced:
-                continue
-            if row.provider_cost_minor <= 0:
-                warnings.append(f"{row.ref}: no usable provider cost; left unpriced")
-                continue
-            currency = _valid_currency(row.provider_cost_currency)
-            if currency is None:
-                warnings.append(f"{row.ref}: provider cost currency missing; fail closed")
+                if requires_currency_normalization(row, self._catalog_currency):
+                    warnings.append(
+                        f"{row.ref}: manual {row.selling_currency} price must be "
+                        f"{required_selling_currency(row, self._catalog_currency)}; "
+                        "not auto-overwritten"
+                    )
                 continue
             if not row.product_id or not row.location_id or not row.name:
                 warnings.append(f"{row.ref}: missing required product identity; skipped")
@@ -296,15 +357,163 @@ class CatalogAutoSyncCoordinator:
             if TechnicalSpec.from_metadata(row.technical_metadata).deprecated:
                 warnings.append(f"{row.ref}: deprecated plan; not auto-priced")
                 continue
-            try:
-                price = markup_unit_price(row.provider_cost_minor, policy.markup_percent)
-            except ValueError as exc:
-                warnings.append(f"{row.ref}: {exc}")
+            currency = _valid_currency(row.provider_cost_currency)
+            if currency is None:
+                warnings.append(f"{row.ref}: provider cost currency missing; fail closed")
                 continue
-            if (row.selling_price_minor, row.selling_currency) != (price, currency):
-                await self._offers.set_selling_price(row.id, price, currency)
-                updated += 1
+            eligible.append((row, policy))
+            if currency not in ("IRT", "IRR", self._catalog_currency):
+                currencies.add(currency)
+
+        # Warm/fetch each distinct pair once. A later per-row resolver call hits
+        # the shared fresh cache, so external calls scale with currencies rather
+        # than offers. Identity USD requires no source and never enters this set.
+        rate_errors: dict[str, str] = {}
+        prefetched_rates: dict[tuple[str, str], ReferenceRateResolution] = {}
+        if currencies and self._reference_rates is None:
+            for currency in sorted(currencies):
+                rate_errors[currency] = "FX unavailable"
+        else:
+            for currency in sorted(currencies):
+                try:
+                    assert self._reference_rates is not None
+                    get_rate = getattr(self._reference_rates, "get_rate", None)
+                    if callable(get_rate):
+                        resolution = await get_rate(
+                            currency,
+                            self._catalog_currency,
+                            allow_catalog_stale=True,
+                        )
+                    else:
+                        get_catalog_rate = getattr(self._reference_rates, "get_catalog_rate", None)
+                        if not callable(get_catalog_rate):
+                            raise FxUnavailableError("global catalog FX resolver is unavailable")
+                        resolution = await get_catalog_rate(currency, self._catalog_currency)
+                    prefetched_rates[(currency, self._catalog_currency)] = resolution
+                except Exception as exc:
+                    rate_errors[currency] = type(exc).__name__
+
+        for row, policy in eligible:
+            currency = _valid_currency(row.provider_cost_currency)
+            if currency is None:
+                continue
+            if currency in rate_errors:
+                reason = f"FX unavailable for {currency}->{self._catalog_currency}"
+                await self._record_fx_failure(row, reason, warnings, pricing_errors)
+                continue
+            # All rows, including domestic IRT/IRR rows, use the same exact
+            # Decimal pricer.  A rounded provider minor value is a display
+            # projection, never the input to a markup decision.
+            try:
+                row_target = currency if currency in {"IRT", "IRR"} else self._catalog_currency
+                row_pricer = CatalogOfferPricer(
+                    self._reference_rates if row_target != currency else None,
+                    row_target,
+                    prefetched_rates=prefetched_rates,
+                    identity_ttl_seconds=self._identity_ttl_seconds,
+                )
+                priced = await row_pricer.price_auto(row, policy)
+                priced.pricing_metadata.update(
+                    {
+                        "provider_cost_minor": row.provider_cost_minor,
+                        "provider_cost_currency": currency,
+                    }
+                )
+            except Exception as exc:
+                reason = (
+                    f"FX pricing failed for {currency}->{self._catalog_currency}: "
+                    f"{type(exc).__name__}"
+                )
+                await self._record_fx_failure(row, reason, warnings, pricing_errors)
+                continue
+            result = await self._offers.set_auto_price_if_current(
+                row.id,
+                expected_cost_minor=row.provider_cost_minor,
+                expected_cost_currency=currency,
+                selling_price_minor=priced.selling_price_minor,
+                selling_currency=priced.selling_currency,
+                pricing_metadata=priced.pricing_metadata,
+                expected_provider_rate=_exact_provider_rate(row),
+            )
+            if result is None:
+                warnings.append(f"{row.ref}: manual/operator change won pricing race")
+                continue
+            updated += 1
         return updated
+
+    @staticmethod
+    def _same_cost_snapshot(row: SellableOffer) -> bool:
+        """Prove the previous price belongs to the exact current provider rate."""
+        metadata = row.pricing_metadata or {}
+        if metadata.get("provider_cost_minor") != row.provider_cost_minor:
+            return False
+        if (
+            str(metadata.get("provider_cost_currency") or "").strip().upper()
+            != (row.provider_cost_currency or "").strip().upper()
+        ):
+            return False
+        key = "provider_hourly_rate" if row.billing_model == "hourly" else "provider_monthly_rate"
+        parameters = row.billing_parameters or {}
+        current = parameters.get(key)
+        recorded = metadata.get(key)
+        if current is None or recorded is None or isinstance(current, (bool, float)):
+            return False
+        try:
+            if Decimal(str(current).strip()) != Decimal(str(recorded).strip()):
+                return False
+            source_amount = Decimal(str(metadata.get("source_amount")))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return source_amount == Decimal(str(current).strip())
+
+    async def _record_fx_failure(
+        self,
+        row: SellableOffer,
+        reason: str,
+        warnings: list[str],
+        pricing_errors: list[str] | None = None,
+    ) -> None:
+        """Keep a valid canonical price, or leave a new/invalid offer unpriced."""
+        metadata = self._pricing_failure_metadata(row, reason)
+        # Preserve only a price whose metadata proves the same native-cost
+        # snapshot. New/legacy rows are cleared but remain retained for a
+        # deterministic later reprice; they are never deleted.
+        preserve = (
+            row.selling_price_minor > 0
+            and row.selling_currency.strip().upper()
+            == required_selling_currency(row, self._catalog_currency)
+            and self._same_cost_snapshot(row)
+            and has_valid_pricing_provenance(
+                row,
+                required_selling_currency(row, self._catalog_currency),
+                catalog_stale_limit_seconds=getattr(
+                    self._reference_rates, "catalog_stale_limit", None
+                ),
+            )
+        )
+        result = await self._offers.record_auto_pricing_failure_if_current(
+            row.id,
+            expected_cost_minor=row.provider_cost_minor,
+            expected_cost_currency=row.provider_cost_currency,
+            expected_price_minor=row.selling_price_minor,
+            expected_selling_currency=row.selling_currency,
+            expected_pricing_metadata=dict(row.pricing_metadata or {}),
+            pricing_metadata=metadata,
+            preserve_valid_price=preserve,
+            expected_provider_rate=_exact_provider_rate(row),
+        )
+        if result is None:
+            warnings.append(f"{row.ref}: manual/operator change won FX-failure race")
+            return
+        if pricing_errors is not None:
+            pricing_errors.append(f"{row.ref}: {reason}")
+        if preserve:
+            warnings.append(
+                f"{row.ref}: {reason}; preserved previous valid "
+                f"{self._catalog_currency} selling price"
+            )
+        else:
+            warnings.append(f"{row.ref}: {reason}; left unpriced and not sellable")
 
     async def _auto_publish(
         self,
@@ -314,8 +523,10 @@ class CatalogAutoSyncCoordinator:
     ) -> int:
         """Put verified, eligible rows on sale (never over an operator block)."""
         published = 0
-        for product_id, location_id in sorted(report.verified):
-            row = await self._offers.get_by_ref(provider_key, product_id, location_id)
+        for account_id, product_id, location_id in _verified_offer_keys(report):
+            row = await self._offers.get_by_ref(
+                provider_key, product_id, location_id, provider_account_id=account_id
+            )
             if row is None:
                 continue
             if row.billing_model != report.billing_model:
@@ -323,7 +534,24 @@ class CatalogAutoSyncCoordinator:
             policy = self._policy_for(provider_key, row.billing_model)
             if policy is None or not policy.auto_publish:
                 continue
-            if not row.provider_available or row.selling_price_minor <= 0:
+            selling_currency = required_selling_currency(row, self._catalog_currency)
+            if (
+                not row.provider_available
+                or row.selling_price_minor <= 0
+                or row.selling_currency.strip().upper() != selling_currency
+                or not has_valid_pricing_provenance(
+                    row,
+                    selling_currency,
+                    catalog_stale_limit_seconds=getattr(
+                        self._reference_rates, "catalog_stale_limit", None
+                    ),
+                )
+            ):
+                if requires_currency_normalization(row, self._catalog_currency):
+                    warnings.append(
+                        f"{row.ref}: selling currency {row.selling_currency} violates "
+                        f"catalog target {self._catalog_currency}; not published"
+                    )
                 continue
             if row.operator_disabled:
                 continue
@@ -331,6 +559,16 @@ class CatalogAutoSyncCoordinator:
                 warnings.append(f"{row.ref}: deprecated plan; not published")
                 continue
             if not row.enabled:
-                await self._offers.set_enabled(row.id, True)
-                published += 1
+                result = await self._offers.publish_if_current(
+                    row.id,
+                    expected_price_minor=row.selling_price_minor,
+                    expected_currency=row.selling_currency,
+                    expected_cost_minor=row.provider_cost_minor,
+                    expected_cost_currency=row.provider_cost_currency,
+                    expected_provider_rate=_exact_provider_rate(row),
+                )
+                if result is None:
+                    warnings.append(f"{row.ref}: operator disable/price race won; not published")
+                else:
+                    published += 1
         return published

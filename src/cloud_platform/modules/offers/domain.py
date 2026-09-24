@@ -1,10 +1,11 @@
-"""Sellable monthly offers domain (LEASEWEB-MVP).
+"""Sellable catalog offers domain (LEASEWEB-MVP).
 
 A **sellable offer** is one provider product at one location with TWO
 explicit money snapshots: the provider cost (from catalog sync, integer
-minor units) and the customer selling price (configured by an admin,
-integer minor units). They are separate by design — the selling price is
-NEVER derived from the provider cost, and no float ever touches either.
+minor units plus exact Decimal rate) and the customer selling price. The
+automatic policy may derive a foreign selling price from that cost through
+exact FX and operator markup; manual prices remain an independent operator
+fact. No float ever touches either snapshot.
 
 The row is the single gate for selling:
 
@@ -16,16 +17,27 @@ The row is the single gate for selling:
    (owned by the automatic pricing policy while ``auto_priced`` is true,
    otherwise by the operator).
 
-All three must hold for the customer to see and buy the offer.
+Foreign customer prices must additionally use the configured canonical catalog
+currency and valid exact-FX provenance. All gates must hold for the customer
+to see and buy the offer.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Protocol
 from uuid import UUID
+
+from cloud_platform.modules.fx.domain import (
+    GLOBAL_FIAT_CURRENCIES,
+    SUPPORTED_CURRENCIES,
+    FxPurpose,
+    major_to_minor,
+    minor_to_major,
+)
 
 #: Billing model of every offer in this module (fixed prepaid monthly).
 BILLING_MODEL_PREPAID_MONTHLY = "prepaid_monthly_fixed"
@@ -37,6 +49,10 @@ BILLING_MODEL_PREPAID_MONTHLY = "prepaid_monthly_fixed"
 BILLING_MODEL_MONTHLY = "prepaid_monthly_fixed"
 BILLING_MODEL_HOURLY = "hourly"
 VALID_BILLING_MODELS = frozenset({BILLING_MODEL_MONTHLY, BILLING_MODEL_HOURLY})
+
+#: Currencies owned by the domestic/payment FX family. Every other audited
+#: provider-cost currency is normalized to the configured catalog currency.
+DOMESTIC_PROVIDER_COST_CURRENCIES = frozenset({"IRT", "IRR"})
 
 #: Display-only monthly equivalent of an hourly rate (730h), for estimates
 #: next to the authoritative hourly price. Never used for charging.
@@ -157,15 +173,48 @@ class SellableOffer:
     #: Normalized customer-visible technical facts (adapters own content;
     #: never secrets, credential ids or raw API payloads).
     technical_metadata: dict[str, object] = field(default_factory=dict)
+    #: Provider-neutral USD pricing audit metadata (price-source, markup-rule,
+    #: FX-observed-at, provider-cost-snapshot). Durable, JSONB-safe.
+    pricing_metadata: dict[str, object] = field(default_factory=dict)
     #: Explicit operator publication block (automatic publishing respects it;
     #: catalog syncs never write it).
     operator_disabled: bool = False
     #: Whether the automatic pricing policy owns the selling price (a manual
     #: price command clears it).
     auto_priced: bool = True
+    #: Legacy/corrupt rows are reconstructed with their raw missing money
+    #: fields for diagnostics, but are deliberately quarantined from sale.
+    legacy_invalid: bool = False
 
     def __post_init__(self) -> None:
-        for name, value in (
+        if self.billing_model not in VALID_BILLING_MODELS:
+            raise ValueError("billing_model is not supported")
+        for boolean_name in (
+            "provider_available",
+            "enabled",
+            "operator_disabled",
+            "auto_priced",
+            "legacy_invalid",
+        ):
+            if not isinstance(getattr(self, boolean_name), bool):
+                raise ValueError(f"{boolean_name} must be boolean")
+        if self.provider_account_id is not None:
+            if (
+                not isinstance(self.provider_account_id, str)
+                or not self.provider_account_id.strip()
+            ):
+                raise ValueError("provider_account_id must be non-empty when supplied")
+            object.__setattr__(self, "provider_account_id", self.provider_account_id.strip())
+        for mapping_name in (
+            "billing_parameters",
+            "technical_metadata",
+            "pricing_metadata",
+        ):
+            mapping_value = getattr(self, mapping_name)
+            if not isinstance(mapping_value, dict):
+                raise ValueError(f"{mapping_name} must be a mapping")
+            object.__setattr__(self, mapping_name, dict(mapping_value))
+        for field_name, field_value in (
             ("provider_key", self.provider_key),
             ("product_id", self.product_id),
             ("location_id", self.location_id),
@@ -173,15 +222,55 @@ class SellableOffer:
             ("provider_cost_currency", self.provider_cost_currency),
             ("selling_currency", self.selling_currency),
         ):
-            if not value or not str(value).strip():
-                raise ValueError(f"{name} must not be empty")
-        if self.provider_cost_minor < 0 or self.selling_price_minor < 0:
-            raise ValueError("prices must not be negative")
+            if not field_value or not str(field_value).strip():
+                if self.legacy_invalid and field_name in {
+                    "provider_cost_currency",
+                    "selling_currency",
+                }:
+                    continue
+                raise ValueError(f"{field_name} must not be empty")
+        supported = DOMESTIC_PROVIDER_COST_CURRENCIES | GLOBAL_FIAT_CURRENCIES
+        for currency_name, currency_value in (
+            ("provider_cost_currency", self.provider_cost_currency),
+            ("selling_currency", self.selling_currency),
+        ):
+            if self.legacy_invalid:
+                continue
+            if str(currency_value).strip().upper() not in supported:
+                raise ValueError(f"{currency_name} is not an audited currency")
+        if not self.legacy_invalid:
+            object.__setattr__(
+                self,
+                "provider_cost_currency",
+                str(self.provider_cost_currency).strip().upper(),
+            )
+            object.__setattr__(self, "selling_currency", str(self.selling_currency).strip().upper())
+        for amount_name, amount_value in (
+            ("provider_cost_minor", self.provider_cost_minor),
+            ("selling_price_minor", self.selling_price_minor),
+        ):
+            if self.legacy_invalid:
+                continue
+            if (
+                isinstance(amount_value, bool)
+                or not isinstance(amount_value, int)
+                or amount_value < 0
+                or amount_value > 9_223_372_036_854_775_807
+            ):
+                raise ValueError(f"{amount_name} must be a non-negative integer")
 
     @property
     def sellable(self) -> bool:
-        """All three gates: provider-reported, enabled, explicitly priced."""
-        return self.provider_available and self.enabled and self.selling_price_minor > 0
+        """Provider-reported, operator-visible, enabled, and explicitly priced."""
+        return (
+            not self.legacy_invalid
+            and self.provider_available
+            and self.enabled
+            and not self.operator_disabled
+            and not bool(self.technical_metadata.get("deprecated"))
+            and not bool(self.pricing_metadata.get("fx_repricing_pending"))
+            and self.selling_price_minor > 0
+        )
 
     @property
     def ref(self) -> str:
@@ -189,13 +278,296 @@ class SellableOffer:
         return f"{self.provider_key}/{self.product_id}/{self.location_id}"
 
 
-#: The three gates, named for diagnostics/reporting (never customer-facing).
+def required_selling_currency(offer: SellableOffer, target_currency: str) -> str:
+    """Return the only valid customer currency for this offer."""
+    native = (offer.provider_cost_currency or "").strip().upper()
+    return (
+        native
+        if native in DOMESTIC_PROVIDER_COST_CURRENCIES
+        else (target_currency or "").strip().upper()
+    )
+
+
+def requires_currency_normalization(offer: SellableOffer, target_currency: str) -> bool:
+    """Whether a sellable row violates its native or canonical currency."""
+    return (offer.selling_currency or "").strip().upper() != required_selling_currency(
+        offer, target_currency
+    )
+
+
+def _valid_pricing_metadata(
+    offer: SellableOffer,
+    source: str,
+    target: str,
+    *,
+    require_exact: bool,
+    catalog_stale_limit_seconds: int | None = None,
+) -> bool:
+    metadata = offer.pricing_metadata
+    if source not in SUPPORTED_CURRENCIES or target not in SUPPORTED_CURRENCIES:
+        return False
+    if str(metadata.get("pricing_schema_version")) != "1":
+        return False
+    if str(metadata.get("target_currency", "")).upper() != target:
+        return False
+    if str(metadata.get("provider_cost_currency", "")).upper() != source:
+        return False
+    pricing_source = str(metadata.get("source_currency", "")).strip().upper()
+    if pricing_source not in SUPPORTED_CURRENCIES:
+        return False
+    if offer.auto_priced and pricing_source != source:
+        return False
+    if (
+        source not in DOMESTIC_PROVIDER_COST_CURRENCIES
+        and pricing_source not in GLOBAL_FIAT_CURRENCIES
+    ):
+        return False
+    try:
+        if int(str(metadata.get("provider_cost_minor"))) != offer.provider_cost_minor:
+            return False
+        if int(str(metadata.get("final_selling_price_minor"))) != offer.selling_price_minor:
+            return False
+        rate = Decimal(str(metadata.get("fx_rate")))
+        source_amount = Decimal(str(metadata.get("source_amount")))
+        converted = Decimal(str(metadata.get("converted_cost_target_exact")))
+        markup = Decimal(str(metadata.get("markup_percent", "0")))
+    except (TypeError, ValueError, InvalidOperation):
+        return False
+    if not all(value.is_finite() and value > 0 for value in (rate, source_amount, converted)):
+        return False
+    if not markup.is_finite() or markup < 0:
+        return False
+    try:
+        with localcontext() as context:
+            context.prec = max(
+                64,
+                len(source_amount.as_tuple().digits)
+                + len(rate.as_tuple().digits)
+                + len(markup.as_tuple().digits)
+                + 24,
+            )
+            expected_converted = source_amount * rate
+            expected_final = major_to_minor(
+                expected_converted * (Decimal(1) + markup / Decimal(100)),
+                target,
+                FxPurpose.CHARGE,
+            )
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+    if converted != expected_converted:
+        return False
+    if str(metadata.get("pricing_mode", "")) not in {"auto", "manual"}:
+        return False
+    if str(metadata.get("rounding", "ROUND_CEILING")) != "ROUND_CEILING":
+        return False
+    if str(metadata.get("fx_purpose", "charge")) != "charge":
+        return False
+    if not isinstance(metadata.get("fx_stale"), bool):
+        return False
+    if not str(metadata.get("fx_provider", "")).strip():
+        return False
+    if not str(metadata.get("fx_source_market", "")).strip():
+        return False
+    try:
+        provider_date = datetime.fromisoformat(str(metadata["fx_provider_date"])).date()
+        observed_at = datetime.fromisoformat(str(metadata["fx_observed_at"]))
+        expires_at = datetime.fromisoformat(str(metadata["fx_expires_at"]))
+        valid_until = datetime.fromisoformat(str(metadata["catalog_valid_until"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if provider_date is None or observed_at.tzinfo is None or expires_at.tzinfo is None:
+        return False
+    if provider_date > datetime.now(UTC).date() or observed_at > datetime.now(UTC):
+        return False
+    if expires_at <= observed_at or observed_at > datetime.now(UTC):
+        return False
+    if valid_until.tzinfo is None or valid_until <= datetime.now(UTC):
+        return False
+    if catalog_stale_limit_seconds is not None:
+        try:
+            active_limit = int(catalog_stale_limit_seconds)
+            if active_limit <= 0:
+                return False
+            if valid_until > observed_at + timedelta(seconds=active_limit):
+                return False
+        except (OverflowError, TypeError, ValueError):
+            return False
+    if not bool(metadata.get("fx_stale")):
+        if valid_until > expires_at:
+            return False
+    else:
+        try:
+            stale_limit = int(str(metadata["fx_stale_limit_seconds"]))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if stale_limit <= 0:
+            return False
+        effective_limit = stale_limit
+        if catalog_stale_limit_seconds is not None:
+            if catalog_stale_limit_seconds <= 0:
+                return False
+            effective_limit = min(effective_limit, catalog_stale_limit_seconds)
+        try:
+            if valid_until > observed_at + timedelta(seconds=effective_limit):
+                return False
+        except (OverflowError, ValueError):
+            return False
+    if pricing_source == target:
+        if str(metadata.get("fx_provider")) != "identity":
+            return False
+        if str(metadata.get("fx_source_market")).upper() != f"{pricing_source}/{target}":
+            return False
+        if rate != Decimal(1):
+            return False
+    elif pricing_source not in DOMESTIC_PROVIDER_COST_CURRENCIES:
+        if str(metadata.get("fx_provider")) != "frankfurter":
+            return False
+        if str(metadata.get("fx_source_market")).upper() != f"{pricing_source}/{target}":
+            return False
+    if require_exact:
+        key = (
+            "provider_hourly_rate"
+            if offer.billing_model == BILLING_MODEL_HOURLY
+            else "provider_monthly_rate"
+        )
+        parameters = offer.billing_parameters or {}
+        exact = parameters.get(key)
+        if exact is None or isinstance(exact, (bool, float)):
+            return False
+        try:
+            exact_value = Decimal(str(exact).strip())
+        except (InvalidOperation, ValueError):
+            return False
+        if not exact_value.is_finite() or exact_value <= 0:
+            return False
+        try:
+            if offer.provider_cost_minor != major_to_minor(exact_value, source, FxPurpose.DISPLAY):
+                return False
+        except (InvalidOperation, ValueError, OverflowError):
+            return False
+        if offer.auto_priced:
+            if exact_value != source_amount:
+                return False
+            if str(metadata.get("source_amount_basis")) != "exact_provider_rate_major":
+                return False
+        else:
+            if str(metadata.get("source_amount_basis")) != "manual_selling_minor_to_major":
+                return False
+            original_currency = str(metadata.get("original_selling_currency", "")).upper()
+            if original_currency != pricing_source:
+                return False
+            try:
+                original_minor = int(str(metadata.get("original_selling_price_minor")))
+                if source_amount != minor_to_major(original_minor, pricing_source):
+                    return False
+            except (InvalidOperation, ValueError, TypeError, OverflowError):
+                return False
+        allowed_sources = {"auto", "markup"}
+        if not offer.auto_priced:
+            allowed_sources.add("manual")
+        if str(metadata.get("price_source", metadata.get("pricing_mode"))) not in allowed_sources:
+            return False
+    return expected_final == offer.selling_price_minor
+
+
+def has_valid_pricing_provenance(
+    offer: SellableOffer,
+    target_currency: str,
+    *,
+    catalog_stale_limit_seconds: int | None = None,
+) -> bool:
+    """Return whether a foreign row proves its canonical conversion.
+
+    A positive target-currency amount without a matching FX/cost audit is
+    legacy or corrupt data, not a safe basis for a new customer purchase.
+    Same-currency domestic/USD rows do not need an FX record.
+    """
+    source = (offer.provider_cost_currency or "").strip().upper()
+    target = (target_currency or "").strip().upper()
+    selling = (offer.selling_currency or "").strip().upper()
+    if not source or not target or not selling:
+        return False
+    if source == selling:
+        if not offer.auto_priced:
+            key = (
+                "provider_hourly_rate"
+                if offer.billing_model == BILLING_MODEL_HOURLY
+                else "provider_monthly_rate"
+            )
+            parameters = offer.billing_parameters or {}
+            exact = parameters.get(key)
+            if exact is None or isinstance(exact, (bool, float)):
+                return False
+            try:
+                expected = Decimal(str(exact).strip())
+                if not expected.is_finite() or expected <= 0:
+                    return False
+                # The integer observation is a rounded audit projection. Bind
+                # it to the exact text using the same half-up boundary, but do
+                # not demand decimal/minor equality (sub-cent rates are valid).
+                if offer.provider_cost_minor != major_to_minor(expected, source, FxPurpose.DISPLAY):
+                    return False
+            except (InvalidOperation, ValueError):
+                return False
+            return offer.selling_price_minor > 0
+        return _valid_pricing_metadata(
+            offer,
+            source,
+            source,
+            require_exact=True,
+            catalog_stale_limit_seconds=catalog_stale_limit_seconds,
+        )
+    if source in DOMESTIC_PROVIDER_COST_CURRENCIES:
+        if selling != source:
+            return False
+        return _valid_pricing_metadata(
+            offer,
+            source,
+            source,
+            require_exact=True,
+            catalog_stale_limit_seconds=catalog_stale_limit_seconds,
+        )
+    if selling != target:
+        return False
+    return _valid_pricing_metadata(
+        offer,
+        source,
+        target,
+        require_exact=True,
+        catalog_stale_limit_seconds=catalog_stale_limit_seconds,
+    )
+
+
+def is_sellable_in_currency(
+    offer: SellableOffer,
+    target_currency: str,
+    *,
+    catalog_stale_limit_seconds: int | None = None,
+) -> bool:
+    """Customer gate including currency and exact FX provenance."""
+    return (
+        offer.sellable
+        and not requires_currency_normalization(offer, target_currency)
+        and has_valid_pricing_provenance(
+            offer,
+            target_currency,
+            catalog_stale_limit_seconds=catalog_stale_limit_seconds,
+        )
+    )
+
+
+#: The customer-facing gates, named for diagnostics/reporting.
 GATE_PROVIDER_UNAVAILABLE = "provider_unavailable"
 GATE_DISABLED = "disabled"
+GATE_OPERATOR_DISABLED = "operator_disabled"
 GATE_UNPRICED = "unpriced"
+GATE_CURRENCY = "selling_currency"
+GATE_PRICING_PENDING = "pricing_pending"
+GATE_PRICING_PROVENANCE = "pricing_provenance"
+GATE_DEPRECATED = "deprecated"
 
 
-def blocking_gate(offer: SellableOffer) -> str | None:
+def blocking_gate(offer: SellableOffer, catalog_currency: str | None = None) -> str | None:
     """The FIRST gate keeping an offer off the storefront (None = on sale).
 
     Evaluated in the same order the domain documents them, so the reported
@@ -206,12 +578,24 @@ def blocking_gate(offer: SellableOffer) -> str | None:
         return GATE_PROVIDER_UNAVAILABLE
     if not offer.enabled:
         return GATE_DISABLED
+    if offer.operator_disabled:
+        return GATE_OPERATOR_DISABLED
+    if offer.technical_metadata.get("deprecated"):
+        return GATE_DEPRECATED
+    if offer.pricing_metadata.get("fx_repricing_pending"):
+        return GATE_PRICING_PENDING
     if offer.selling_price_minor <= 0:
         return GATE_UNPRICED
+    if catalog_currency is not None and requires_currency_normalization(offer, catalog_currency):
+        return GATE_CURRENCY
+    if catalog_currency is not None and not has_valid_pricing_provenance(offer, catalog_currency):
+        return GATE_PRICING_PROVENANCE
     return None
 
 
-def visibility_summary(offers: Iterable[SellableOffer]) -> dict[str, int]:
+def visibility_summary(
+    offers: Iterable[SellableOffer], catalog_currency: str | None = None
+) -> dict[str, int]:
     """Count offers per blocking gate (always every key, plus ``sellable``).
 
     Used by the operator diagnostics: an empty storefront must be explainable
@@ -221,10 +605,16 @@ def visibility_summary(offers: Iterable[SellableOffer]) -> dict[str, int]:
         "sellable": 0,
         GATE_PROVIDER_UNAVAILABLE: 0,
         GATE_DISABLED: 0,
+        GATE_OPERATOR_DISABLED: 0,
+        GATE_PRICING_PENDING: 0,
+        GATE_PRICING_PROVENANCE: 0,
+        GATE_DEPRECATED: 0,
         GATE_UNPRICED: 0,
     }
+    if catalog_currency is not None:
+        summary[GATE_CURRENCY] = 0
     for offer in offers:
-        gate = blocking_gate(offer)
+        gate = blocking_gate(offer, catalog_currency)
         summary["sellable" if gate is None else gate] += 1
     return summary
 
@@ -248,6 +638,49 @@ class OfferSpecUpdate:
     provider_available: bool = True
     #: Credential account this observation came from (provenance, not a price).
     provider_account_id: str | None = None
+    #: True when a read such as image availability was inconclusive. An
+    #: inconclusive observation must never turn a previously sellable row off;
+    #: a newly discovered row is simply kept unsellable until proven.
+    provider_observation_inconclusive: bool = False
+
+    def __post_init__(self) -> None:
+        for name, value, upper in (
+            ("vcpu", self.vcpu, 2_147_483_647),
+            ("ram_gb", self.ram_gb, 2_147_483_647),
+            ("disk_gb", self.disk_gb, 2_147_483_647),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > upper:
+                raise ValueError(f"{name} must be a non-negative PostgreSQL integer")
+        if (
+            isinstance(self.provider_cost_minor, bool)
+            or not isinstance(self.provider_cost_minor, int)
+            or self.provider_cost_minor < 0
+            or self.provider_cost_minor > 9_223_372_036_854_775_807
+        ):
+            raise ValueError("provider_cost_minor must be a non-negative signed int64 integer")
+        if self.billing_model is not None and self.billing_model not in VALID_BILLING_MODELS:
+            raise ValueError("billing_model is not supported")
+        if self.provider_account_id is not None:
+            if (
+                not isinstance(self.provider_account_id, str)
+                or not self.provider_account_id.strip()
+            ):
+                raise ValueError("provider_account_id must be non-empty when supplied")
+            object.__setattr__(self, "provider_account_id", self.provider_account_id.strip())
+        if not isinstance(self.billing_parameters, dict):
+            raise ValueError("billing_parameters must be a mapping")
+        if self.technical_metadata is not None and not isinstance(self.technical_metadata, dict):
+            raise ValueError("technical_metadata must be a mapping")
+        if not isinstance(self.provider_observation_inconclusive, bool):
+            raise ValueError("provider_observation_inconclusive must be boolean")
+        supported = DOMESTIC_PROVIDER_COST_CURRENCIES | GLOBAL_FIAT_CURRENCIES
+        normalized_currency = str(self.provider_cost_currency).strip().upper()
+        if normalized_currency not in supported:
+            raise ValueError("provider_cost_currency is not an audited currency")
+        object.__setattr__(self, "provider_cost_currency", normalized_currency)
+        object.__setattr__(self, "billing_parameters", dict(self.billing_parameters))
+        if self.technical_metadata is not None:
+            object.__setattr__(self, "technical_metadata", dict(self.technical_metadata))
 
 
 def markup_unit_price(cost_minor: int, markup_percent: int) -> int:
@@ -262,11 +695,18 @@ def markup_unit_price(cost_minor: int, markup_percent: int) -> int:
     pricing tool an operator invokes with a markup THEY choose — never an
     automatic repricing of an existing price.
     """
-    if cost_minor <= 0:
+    if isinstance(cost_minor, bool) or not isinstance(cost_minor, int) or cost_minor <= 0:
         raise ValueError("provider cost must be positive minor units to price from")
-    if markup_percent < 0:
-        raise ValueError("markup must not be negative")
-    return -((-cost_minor * (100 + markup_percent)) // 100)
+    if (
+        isinstance(markup_percent, bool)
+        or not isinstance(markup_percent, int)
+        or markup_percent < 0
+    ):
+        raise ValueError("markup must be a non-negative integer")
+    result = -((-cost_minor * (100 + markup_percent)) // 100)
+    if result > 9_223_372_036_854_775_807:
+        raise ValueError("marked-up price is outside signed int64 bounds")
+    return result
 
 
 #: Automatic pricing modes the coordinator understands. Only ``markup``
@@ -281,6 +721,16 @@ class PricingPolicy:
     mode: str = PRICING_MODE_MARKUP
     markup_percent: int = 0
     auto_publish: bool = True
+
+    def __post_init__(self) -> None:
+        if self.mode != PRICING_MODE_MARKUP:
+            raise ValueError("pricing policy mode must be 'markup'")
+        if (
+            isinstance(self.markup_percent, bool)
+            or not isinstance(self.markup_percent, int)
+            or self.markup_percent < 0
+        ):
+            raise ValueError("markup_percent must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,6 +752,15 @@ class CatalogSyncReport:
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
     verified: frozenset[tuple[str, str]] = frozenset()
+    #: Account-qualified verified observations: (provider_account_id, product_id,
+    #: location_id).  ``verified`` remains for legacy providers whose rows are
+    #: intentionally unscoped; account-aware coordinators must populate this
+    #: field so pricing/publication cannot alias two credential accounts.
+    verified_accounts: frozenset[tuple[str, str, str]] = frozenset()
+    #: Whether this source is account-qualified. An account-aware source must
+    #: never fall back to pair-only verification when its qualified set is
+    #: empty, because doing so can price a row through the wrong credential.
+    account_aware: bool = False
     #: Billing model of the verified observations (monthly vs hourly). The
     #: coordinator only prices/publishes rows carrying this model, so two
     #: product lines can never cross-contaminate.
@@ -367,7 +826,11 @@ class SellableOfferRepository(Protocol):
     async def get(self, offer_id: UUID) -> SellableOffer | None: ...
 
     async def get_by_ref(
-        self, provider_key: str, product_id: str, location_id: str
+        self,
+        provider_key: str,
+        product_id: str,
+        location_id: str,
+        provider_account_id: str | None = None,
     ) -> SellableOffer | None: ...
 
     async def list_all(self) -> list[SellableOffer]: ...
@@ -387,6 +850,7 @@ class SellableOfferRepository(Protocol):
         product_id: str,
         location_id: str,
         update: OfferSpecUpdate,
+        provider_account_id: str | None = None,
     ) -> SellableOffer:
         """Create or refresh the row from provider sync data.
 
@@ -397,11 +861,13 @@ class SellableOfferRepository(Protocol):
     async def mark_unavailable(
         self,
         provider_key: str,
-        available: set[tuple[str, str]],
+        available: Collection[tuple[str, ...]],
         billing_model: str | None = None,
+        provider_account_id: str | None = None,
     ) -> int:
         """Set provider_available=False for rows of ``provider_key`` whose
-        (product_id, location_id) is not in ``available``; returns count.
+        (product_id, location_id) or account-scoped tuple is not in ``available``;
+        returns count.
 
         ``billing_model`` scopes the retirement to one commercial product
         line (a monthly sync must never retire hourly rows and vice versa);
@@ -417,6 +883,12 @@ class SellableOfferRepository(Protocol):
         """Persist the explicit operator publication block."""
         ...
 
+    async def set_visibility_state(
+        self, offer_id: UUID, *, enabled: bool, operator_disabled: bool
+    ) -> SellableOffer:
+        """Atomically persist visibility and the explicit operator block."""
+        ...
+
     async def set_auto_priced(self, offer_id: UUID, auto_priced: bool) -> SellableOffer:
         """Hand the selling price to (or take it back from) the auto policy."""
         ...
@@ -425,4 +897,79 @@ class SellableOfferRepository(Protocol):
         self, offer_id: UUID, selling_price_minor: int, currency: str
     ) -> SellableOffer:
         """Set the explicit customer selling price (minor units)."""
+        ...
+
+    async def set_manual_price(
+        self,
+        offer_id: UUID,
+        selling_price_minor: int,
+        currency: str,
+        pricing_metadata: dict[str, object],
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_updated_at: object | None = None,
+    ) -> SellableOffer | None:
+        """Atomically set an operator price, manual intent, and its audit state."""
+        ...
+
+    async def set_auto_price_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        selling_price_minor: int,
+        selling_currency: str,
+        pricing_metadata: dict[str, object],
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        """CAS-style auto-price; ``None`` means a manual/operator race won."""
+        ...
+
+    async def publish_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_price_minor: int,
+        expected_currency: str,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        """Enable only if the validated price/currency still match and no block exists."""
+        ...
+
+    async def record_auto_pricing_failure_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_price_minor: int,
+        expected_selling_currency: str,
+        expected_pricing_metadata: dict[str, object],
+        pricing_metadata: dict[str, object],
+        preserve_valid_price: bool,
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        """Atomically audit an FX failure and optionally clear an unsafe price."""
+        ...
+
+    async def clear_auto_price_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        pricing_metadata: dict[str, object],
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        """Leave a non-canonical auto offer unpriced after FX becomes unusable."""
+        ...
+
+    async def set_pricing_metadata(
+        self, offer_id: UUID, pricing_metadata: dict[str, object]
+    ) -> SellableOffer:
+        """Store provider-neutral USD pricing audit metadata."""
         ...

@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
-from cloud_platform.modules.wallet.domain import WalletRepository
+from cloud_platform.modules.wallet.domain import DEFAULT_WALLET_CURRENCY, WalletRepository
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +64,11 @@ async def handle_start(
         # sqlalchemy IntegrityError → parse into domain error
         raise OnboardingError(f"failed to create user: {exc}") from exc
 
-    # Create wallet for new user
+    # Create wallet for new user in the canonical storefront currency: the
+    # catalog sells USD amounts, so an EUR wallet could only settle a purchase
+    # by relabelling money. Domestic (IRT/IRR) recharges convert at credit time.
     assert user.id is not None
-    await wallet_repo.get_or_create(user.id, currency="EUR")
+    await wallet_repo.get_or_create(user.id, currency=DEFAULT_WALLET_CURRENCY)
     logger.info("Created user %s with wallet", username)
     return user
 

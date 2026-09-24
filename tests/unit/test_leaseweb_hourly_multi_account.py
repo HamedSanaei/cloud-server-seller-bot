@@ -119,6 +119,69 @@ def _region(region_id: str = "eu-west-3") -> CloudRegion:
     return CloudRegion(id=region_id, name="EU West", country_code="NL", city=None)
 
 
+class _DeterministicEurUsdRates:
+    """Fake EUR/USD reference rates (no network): 1.17, frankfurter family."""
+
+    async def get_rate(self, base: str, quote: str, *, allow_catalog_stale: bool = False) -> Any:
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        from cloud_platform.modules.fx.domain import FxReferenceQuote
+        from cloud_platform.modules.fx.service import ReferenceRateResolution
+
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=Decimal("1.17"),
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+    async def get_catalog_rate(self, base: str, quote: str) -> Any:
+        return await self.get_rate(base, quote, allow_catalog_stale=True)
+
+    async def close(self) -> None:
+        return None
+
+
+async def _usd_hourly_offer(**overrides: Any) -> SellableOffer:
+    """Production-shaped hourly offer: native EUR cost, USD selling price.
+
+    Priced with the real CatalogOfferPricer (deterministic fake FX), so the
+    row carries the provenance and exact-rate evidence checkout requires.
+    """
+    import dataclasses
+    from decimal import Decimal
+
+    from cloud_platform.modules.offers.domain import PricingPolicy
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+
+    base = _hourly_offer(**overrides)
+    cost_minor = int(base.provider_cost_minor)
+    base = dataclasses.replace(
+        base,
+        selling_price_minor=0,
+        selling_currency="EUR",
+        billing_parameters={"provider_hourly_rate": str(Decimal(cost_minor) / 100)},
+    )
+    priced = await CatalogOfferPricer(_DeterministicEurUsdRates(), "USD").price_auto(
+        base, PricingPolicy(mode="markup", markup_percent=25, auto_publish=True)
+    )
+    return dataclasses.replace(
+        base,
+        selling_price_minor=priced.selling_price_minor,
+        selling_currency=priced.selling_currency,
+        pricing_metadata=dict(priced.pricing_metadata),
+    )
+
+
 def _ctype(type_id: str = "lsw.mini", region: str = "eu-west-3") -> CloudInstanceType:
     return CloudInstanceType(
         id=type_id,
@@ -222,11 +285,38 @@ class _CloudProviderFake:
             reference=str(kwargs.get("reference") or "srv-x"),
             state="RUNNING",
             region=str(kwargs.get("region") or ""),
+            instance_type=str(kwargs.get("instance_type") or ""),
+            image_id=str(kwargs.get("image_id") or ""),
         )
 
     async def find_by_reference(self, region: str, reference: str) -> Any:
         self.reads.append(f"find:{region}:{reference}")
         return None
+
+    async def validate_hourly_offer_for_checkout(
+        self,
+        *,
+        location_id: str,
+        product_id: str,
+        image_id: str,
+        expected_cost_minor: int,
+        currency: str,
+        expected_cost_exact: str,
+    ) -> Any:
+        """Mirror the production checkout revalidation, simplified."""
+        from cloud_platform.providers.errors import ProviderError, ProviderNotFound
+
+        match = next((t for t in self._types.get(location_id, []) if t.id == product_id), None)
+        if match is None:
+            raise ProviderNotFound(f"instance type {product_id!r} not offered")
+        if match.currency.upper() != str(currency or "").strip().upper():
+            raise ProviderError("provider cost currency changed")
+        if match.hourly_cost_minor != expected_cost_minor:
+            raise ProviderError("provider cost changed")
+        images = await self.list_images(location_id)
+        if not any(image.id == image_id for image in images):
+            raise ProviderNotFound(f"image {image_id!r} not offered")
+        return match
 
     async def close(self) -> None:
         return None
@@ -869,7 +959,7 @@ class TestHourlyProvenanceAndDispatch:
 
         north = _CloudProviderFake(regions=[_region()], types={"eu-west-3": [_ctype()]})
         uk = _CloudProviderFake(regions=[_region()], types={"eu-west-3": [_ctype()]})
-        offer = _hourly_offer(account="uk")
+        offer = await _usd_hourly_offer(account="uk")
         offers = _OffersRepo([offer])
 
         class _Servers:
@@ -988,7 +1078,8 @@ class TestHourlyProvenanceAndDispatch:
             cloud_resolver=_resolver(north, uk),
         )
         # Image reads use the OWNING account (uk), not the dict default.
-        image = await service.cloud_image_by_index(offer, 0)
+        # Images resolve by stable provider id, never by list position.
+        image = await service.cloud_image_by_id(offer, "ubuntu-24.04")
         assert image.label == "Ubuntu 24.04"
         assert uk.reads and not north.reads
 
@@ -1004,41 +1095,27 @@ class TestHourlyProvenanceAndDispatch:
     async def test_process_server_posts_through_pinned_account(self) -> None:
         from cloud_platform.modules.hourly.service import HourlyCloudService
 
-        north = _CloudProviderFake()
-        uk = _CloudProviderFake()
-        offer = _hourly_offer(account="uk")
+        north = _CloudProviderFake(regions=[_region()], types={"eu-west-3": [_ctype()]})
+        uk = _CloudProviderFake(regions=[_region()], types={"eu-west-3": [_ctype()]})
+        offer = await _usd_hourly_offer(account="uk")
         offers = _OffersRepo([offer])
 
-        from cloud_platform.modules.compute.domain import (
-            BILLING_MODEL_HOURLY as _HOURLY,
-        )
-        from cloud_platform.modules.compute.domain import (
-            CloudServer,
-            ServerLifecycleState,
-        )
-
-        server = CloudServer(
-            id=uuid4(),
-            user_id=USER.id,
-            provider_key=PROVIDER,
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.REQUESTED,
-            billing_model=_HOURLY,
-            os="Ubuntu 24.04",
-            credential_account_id="uk",
-        )
-
         class _Servers:
+            def __init__(self) -> None:
+                self.saved: dict[UUID, Any] = {}
+
             async def get(self, server_id: UUID) -> Any:
-                return server
+                return self.saved.get(server_id)
 
             async def save(self, value: Any) -> Any:
+                self.saved[value.id] = value
                 return value
 
             async def get_by_idempotency_key(self, key: str) -> Any:
                 return None
 
             async def create(self, s: Any, intent: Any) -> Any:
+                self.saved[s.id] = s
                 return s
 
             async def list_requested(self) -> list[Any]:
@@ -1047,61 +1124,100 @@ class TestHourlyProvenanceAndDispatch:
             async def list_provisioning(self) -> list[Any]:
                 return []
 
-        class _Snapshots:
-            async def require_snapshot(self, server_id: UUID) -> Any:
+        class _Accounts:
+            async def get_or_create_active(self, user_id: UUID, provider_key: str) -> Any:
                 from types import SimpleNamespace
 
-                return SimpleNamespace(
-                    offer=SimpleNamespace(plan_id=offer.product_id, location_id=offer.location_id)
-                )
+                return SimpleNamespace(id=uuid4())
+
+        class _Wallets:
+            async def get(self, user_id: UUID) -> Any:
+                from types import SimpleNamespace
+
+                return SimpleNamespace(id=uuid4(), currency="USD")
+
+        class _Snapshots:
+            def __init__(self) -> None:
+                self.rows: dict[UUID, Any] = {}
+
+            async def create_snapshot(
+                self, *, server_id: UUID, price: Any, actor: Any, reason: str
+            ) -> Any:
+                from cloud_platform.modules.pricing.domain import snapshot_from_selling_price
+
+                snap = snapshot_from_selling_price(server_id, price)
+                self.rows[server_id] = snap
+                return snap
+
+            async def require_snapshot(self, server_id: UUID) -> Any:
+                return self.rows[server_id]
 
         class _Ops:
+            def __init__(self) -> None:
+                self.rows: dict[str, Any] = {}
+                self._seq = 0
+
             async def get_or_create(self, **kwargs: Any) -> Any:
                 from types import SimpleNamespace
 
-                op = SimpleNamespace(
-                    id=1,
-                    operation_key=kwargs["operation_key"],
-                    is_terminal=False,
-                )
-
-                async def _claim(oid: int) -> Any:
-                    claimed = SimpleNamespace(
-                        id=oid,
+                if kwargs["operation_key"] not in self.rows:
+                    self._seq += 1
+                    op = SimpleNamespace(
+                        id=self._seq,
                         operation_key=kwargs["operation_key"],
-                        mark_outcome_unknown=lambda e: None,
-                        complete=lambda meta: None,
-                        fail=lambda e: None,
+                        status="pending",
+                        is_terminal=False,
+                        claim=lambda oid: None,
                     )
-                    return claimed
 
-                async def _save(value: Any) -> None:
-                    return None
+                    async def _claim(oid: int) -> Any:
+                        from types import SimpleNamespace as _NS
 
-                op.claim = _claim  # type: ignore[attr-defined]
-                op.save = _save  # type: ignore[attr-defined]
-                self._op = op
-                return op
+                        claimed = _NS(
+                            id=oid,
+                            operation_key=kwargs["operation_key"],
+                            mark_outcome_unknown=lambda e: None,
+                            complete=lambda meta: meta,
+                            fail=lambda e: None,
+                            save=lambda: None,
+                        )
+                        return claimed
+
+                    op.claim = _claim  # type: ignore[attr-defined]
+                    self.rows[kwargs["operation_key"]] = op
+                return self.rows[kwargs["operation_key"]]
 
             async def claim(self, oid: int) -> Any:
-                return await self._op.claim(oid)
+                for op in self.rows.values():
+                    if op.id == oid:
+                        return await op.claim(oid)
+                return None
 
             async def save(self, op: Any) -> None:
                 return None
 
+        servers, snapshots, ops = _Servers(), _Snapshots(), _Ops()
         service = HourlyCloudService(
-            server_repo=_Servers(),  # type: ignore[arg-type]
+            server_repo=servers,  # type: ignore[arg-type]
             offers_repo=offers,  # type: ignore[arg-type]
-            account_repo=MagicMock(),
-            wallet_repo=MagicMock(),
-            snapshot_service=_Snapshots(),  # type: ignore[arg-type]
-            operation_repo=_Ops(),  # type: ignore[arg-type]
+            account_repo=_Accounts(),  # type: ignore[arg-type]
+            wallet_repo=_Wallets(),  # type: ignore[arg-type]
+            snapshot_service=snapshots,  # type: ignore[arg-type]
+            operation_repo=ops,  # type: ignore[arg-type]
             audit_repo=AsyncMock(),
             cloud_providers={PROVIDER: north},
             cloud_resolver=_resolver(north, uk),
         )
-        # Images for uk resolve; the POST below must go to uk, not north.
-        outcome = await service.process_server(server.id)
+        created = await service.create_instance(
+            user=USER,
+            offer_id=offer.id,
+            image_id="ubuntu-24.04",
+            image_label="Ubuntu 24.04",
+            idempotency_key="k-process-uk",
+        )
+        assert created.server.credential_account_id == "uk"
+        # The worker POST for the pinned server must go to uk, not north.
+        outcome = await service.process_server(created.server.id)
         assert outcome in ("provisioned", "failed")
         assert uk.posts == (1 if outcome == "provisioned" else 0)
         assert north.posts == 0

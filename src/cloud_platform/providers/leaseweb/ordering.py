@@ -383,6 +383,14 @@ def _minor(value: Any) -> int:
     return to_minor_units(parsed) if parsed is not None else 0
 
 
+def _decimal_text(value: Any) -> str:
+    """Verbatim decimal text of a provider value ("" when not usable text)."""
+    if value is None or isinstance(value, bool):
+        return ""
+    text = str(value).strip()
+    return text if _decimal(text) is not None else ""
+
+
 @dataclass(frozen=True, slots=True)
 class LeasewebProductOption:
     """One configuration option (OS / control panel / SLA / disk)."""
@@ -415,6 +423,11 @@ class LeasewebProduct:
     currency: str
     monthly_price_minor: int
     provider_price_minor: int  # raw ``price.total`` (may include term discounts)
+    #: Verbatim decimal text behind ``monthly_price_minor`` ("" when the
+    #: source value was not usable text). Catalog pricing requires this exact
+    #: input and refuses rounded minor costs, so it travels with the product
+    #: instead of being reconstructed later.
+    monthly_price_exact: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -462,6 +475,7 @@ def _parse_product(item: dict[str, Any], location: str) -> LeasewebProduct | Non
         currency=currency,
         monthly_price_minor=_minor(price_dict.get("total")),
         provider_price_minor=_minor(price_dict.get("total")),
+        monthly_price_exact=_decimal_text(price_dict.get("total")),
         metadata={"base_price_minor": _minor(price_dict.get("basePrice")), **storage_marker},
     )
 
@@ -527,6 +541,20 @@ def _term_totals(price: dict[str, Any]) -> dict[str, int]:
             term_key = str(row.get("key") or "").strip()
             if term_key:
                 out[f"{key[:-1]}:{term_key}"] = _minor(row.get("total"))
+    return out
+
+
+def _term_total_texts(price: dict[str, Any]) -> dict[str, str]:
+    """``contractTerms``/``billingCycles`` -> {key: verbatim decimal text}."""
+    out: dict[str, str] = {}
+    for key in ("contractTerms", "billingCycles"):
+        for row in _as_list(price, key):
+            if not isinstance(row, dict):
+                continue
+            term_key = str(row.get("key") or "").strip()
+            exact = _decimal_text(row.get("total"))
+            if term_key and exact:
+                out[f"{key[:-1]}:{term_key}"] = exact
     return out
 
 
@@ -833,6 +861,15 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
         term_key = f"contractTerm:{self._contract_term}"
         cycle_key = f"billingCycle:{self._billing_cycle}"
         monthly = terms.get(term_key) or terms.get(cycle_key) or _minor(price_dict.get("total"))
+        # The exact text behind the winning monthly value: term text when a
+        # term won, else the verbatim list total. Only exact provider text
+        # travels — never a reconstruction from rounded minor units.
+        term_texts = _term_total_texts(price_dict)
+        monthly_exact = (
+            term_texts.get(term_key)
+            or term_texts.get(cycle_key)
+            or _decimal_text(price_dict.get("total"))
+        )
         product = LeasewebProduct(
             id=product.id,
             name=product.name,
@@ -844,6 +881,7 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
             currency=product.currency,
             monthly_price_minor=monthly,
             provider_price_minor=_minor(price_dict.get("total")),
+            monthly_price_exact=monthly_exact,
             metadata=product.metadata,
         )
 

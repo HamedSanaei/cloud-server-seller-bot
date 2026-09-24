@@ -651,11 +651,14 @@ class TestErrorMapping:
         async def record_wait(seconds: float) -> None:
             waits.append(seconds)
 
+        # ``max_rps=1.0`` gives the throttle a one-second window, so the second
+        # acquire deterministically still owes a delay. A sub-millisecond window
+        # made this assertion a wall-clock race instead of a contract.
         provider = LeaseWebOrderingProvider(
             api_key=KEY,
             base_url="https://api.test",
             locations=("AMS-01",),
-            throttle=Throttle(max_rps=1000.0, wait=record_wait),
+            throttle=Throttle(max_rps=1.0, wait=record_wait),
             max_retries=2,
         )
         provider._client = AsyncMock()  # type: ignore[method-assign]

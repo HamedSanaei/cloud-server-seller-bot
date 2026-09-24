@@ -147,7 +147,7 @@ def syncer(offer_repo: _RecordingOfferRepo) -> HetznerCatalogSyncer:
     instance._client = AsyncMock()
     with patch(
         "cloud_platform.providers.hetzner.sync.SqlAlchemySellableOfferRepository",
-        lambda _factory: offer_repo,
+        lambda _factory, **kwargs: offer_repo,
     ):
         yield instance
 

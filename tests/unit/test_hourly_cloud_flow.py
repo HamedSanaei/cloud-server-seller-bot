@@ -12,13 +12,17 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.modules.catalog.domain import LocationRecord
 from cloud_platform.modules.checkout.service import OfferCatalogViewService
+from cloud_platform.modules.fx.domain import FxReferenceQuote
+from cloud_platform.modules.fx.service import ReferenceRateResolution
 from cloud_platform.modules.markets.domain import ProviderCatalog
 from cloud_platform.modules.navigation.domain import (
     TELEGRAM_CALLBACK_DATA_LIMIT_BYTES,
@@ -28,13 +32,18 @@ from cloud_platform.modules.navigation.domain import (
 from cloud_platform.modules.offers.domain import (
     BILLING_MODEL_HOURLY,
     OfferSpecUpdate,
+    PricingPolicy,
     SellableOffer,
 )
+from cloud_platform.modules.offers.pricing import CatalogOfferPricer
 from cloud_platform.modules.users.domain import Role, User, UserStatus
-from cloud_platform.providers.errors import ProviderOutcomeUnknown
+from cloud_platform.providers.errors import (
+    ProviderError,
+    ProviderNotFound,
+    ProviderOutcomeUnknown,
+)
 from cloud_platform.providers.leaseweb.cloud import (
     CloudImage,
-    CloudInstance,
     CloudInstanceType,
     CloudRegion,
 )
@@ -87,6 +96,76 @@ def _offer(
         provider_available=True,
         enabled=True,
         created_at=datetime.now(UTC),
+    )
+
+
+class _UsdRates:
+    """Deterministic in-test EUR->USD reference rates (no network, no float)."""
+
+    def __init__(self, rate: Decimal) -> None:
+        self.rate = rate
+        self.calls: list[tuple[str, str]] = []
+
+    async def get_rate(
+        self, base: str, quote: str, *, allow_catalog_stale: bool = False
+    ) -> ReferenceRateResolution:
+        self.calls.append((base, quote))
+        now = datetime.now(UTC)
+        return ReferenceRateResolution(
+            FxReferenceQuote(
+                base_currency=base,
+                quote_currency=quote,
+                rate=self.rate,
+                source="frankfurter",
+                source_market=f"{base}/{quote}",
+                provider_date=now.date(),
+                observed_at=now,
+                expires_at=now + timedelta(hours=1),
+            ),
+            stale=False,
+        )
+
+
+async def _usd_offer(
+    *,
+    location_id: str = "eu-west-3",
+    product_id: str = "lsw.mini",
+    name: str = "Mini",
+    offer_id: UUID | None = None,
+    technical_metadata: dict[str, object] | None = None,
+) -> SellableOffer:
+    """Production-shaped hourly offer: EUR provider cost + USD selling price.
+
+    The EUR ``_offer()`` defaults stay for rendering/listing tests; anything
+    going through ``HourlyCloudService.create_instance``/``process_server``
+    must use this helper so the offer is sellable in the configured catalog
+    currency (USD) with valid FX pricing provenance from the real
+    :class:`CatalogOfferPricer`.
+    """
+    base = _offer(
+        location_id=location_id,
+        product_id=product_id,
+        name=name,
+        price_minor=0,
+        currency="EUR",
+        billing_model=BILLING_MODEL_HOURLY,
+        offer_id=offer_id,
+        technical_metadata=technical_metadata,
+    )
+    base = replace(
+        base,
+        provider_cost_minor=2,
+        provider_cost_currency="EUR",
+        billing_parameters={"provider_hourly_rate": "0.02"},
+    )
+    priced = await CatalogOfferPricer(_UsdRates(Decimal("1.17")), "USD").price_auto(
+        base, PricingPolicy(mode="markup", markup_percent=25)
+    )
+    return replace(
+        base,
+        selling_price_minor=priced.selling_price_minor,
+        selling_currency=priced.selling_currency,
+        pricing_metadata=dict(priced.pricing_metadata),
     )
 
 
@@ -150,6 +229,7 @@ class FakeOffersRepo:
                 technical_metadata=dict(update.technical_metadata or {}),
                 provider_available=update.provider_available,
                 enabled=False,
+                provider_account_id=provider_account_id,
                 created_at=None,
             )
             self._rows[key] = offer
@@ -169,15 +249,25 @@ class FakeOffersRepo:
         return updated
 
     async def mark_unavailable(
-        self, provider_key: str, available: set[tuple[str, str]], billing_model: Any = None
+        self, provider_key: str, available: set[tuple[str, ...]], billing_model: Any = None
     ) -> int:
+        # Mirrors production: scoped rows need their exact account triple;
+        # legacy unscoped rows keep pair semantics.
+        qualified = {tuple(item) for item in available if len(tuple(item)) == 3}
+        legacy = {tuple(item) for item in available if len(tuple(item)) == 2}
         changed = 0
         for key, offer in list(self._rows.items()):
             if key[0] != provider_key:
                 continue
             if billing_model is not None and offer.billing_model != billing_model:
                 continue
-            if (key[1], key[2]) not in available and offer.provider_available:
+            account = str(offer.provider_account_id or "")
+            triple = (account, key[1], key[2])
+            if account:
+                is_available = triple in qualified
+            else:
+                is_available = triple in qualified or (key[1], key[2]) in legacy
+            if not is_available and offer.provider_available:
                 from dataclasses import replace
 
                 self._rows[key] = replace(offer, provider_available=False)
@@ -251,6 +341,7 @@ def _cloud_type(**overrides: Any) -> CloudInstanceType:
         architecture="x86_64",
         cpu_type="shared",
         storage_type="ssd",
+        hourly_rate_exact="0.02",
     )
     values.update(overrides)
     return CloudInstanceType(**values)
@@ -295,10 +386,53 @@ class FakeHourlyProvider:
             )
         )
 
+    async def validate_hourly_offer_for_checkout(
+        self,
+        *,
+        location_id: str,
+        product_id: str,
+        image_id: str,
+        expected_cost_minor: int,
+        currency: str,
+        expected_cost_exact: str,
+    ) -> CloudInstanceType:
+        """Fail-closed checkout revalidation over the scripted state."""
+        types = await self.list_instance_types(location_id)
+        match = next((item for item in types if item.id == product_id), None)
+        if match is None:
+            raise ProviderNotFound(
+                f"instance type {product_id!r} is not offered in {location_id!r}"
+            )
+        if match.currency.upper() != str(currency or "").strip().upper():
+            raise ProviderError(
+                f"provider cost currency changed for {product_id!r} in {location_id!r}"
+            )
+        if match.hourly_cost_minor != expected_cost_minor:
+            raise ProviderError(f"provider cost changed for {product_id!r} in {location_id!r}")
+        wanted_exact = str(expected_cost_exact or "").strip()
+        if wanted_exact:
+            try:
+                wanted = Decimal(wanted_exact)
+                live_exact = Decimal(match.hourly_rate_exact)
+            except Exception:
+                raise ProviderError(
+                    f"provider rate for {product_id!r} is not valid Decimal text"
+                ) from None
+            if not wanted.is_finite() or wanted <= 0 or live_exact != wanted:
+                raise ProviderError(
+                    f"exact provider rate changed for {product_id!r} in {location_id!r}"
+                )
+        images = await self.list_images(location_id)
+        if not any(image.id == image_id for image in images):
+            raise ProviderNotFound(f"image {image_id!r} is not offered in {location_id!r}")
+        return match
+
     async def find_by_reference(self, region: str, reference: str) -> Any:
         return None
 
-    async def create_instance(self, **kwargs: Any) -> CloudInstance:
+    async def create_instance(self, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
         from cloud_platform.providers.leaseweb.cloud import build_create_body
 
         body = build_create_body(
@@ -308,11 +442,16 @@ class FakeHourlyProvider:
             reference=kwargs["reference"],
         )
         self.posts.append(body)
-        return CloudInstance(
+        # The production contract requires the provider response to echo the
+        # stable creation identity (type/image/region/reference); the scripted
+        # response carries exactly what was requested, like a real DTO.
+        return SimpleNamespace(
             id="i-1",
             reference=kwargs.get("reference", ""),
-            state="CREATING",
+            state="RUNNING",
             region=kwargs.get("region", ""),
+            instance_type=kwargs.get("instance_type", ""),
+            image_id=kwargs.get("image_id", ""),
         )
 
     async def close(self) -> None:
@@ -807,14 +946,14 @@ class TestHourlyCreate:
         )
 
     async def test_intent_persists_snapshot_without_charging(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyProvider()
         service = self._hourly_service(offers, cloud)
         offer = (await offers.list_all())[0]
         result = await service.create_instance(
             user=USER,
             offer_id=offer.id,
-            image_id="UBUNTU",
+            image_id="UBUNTU_24_04",
             image_label="Ubuntu",
             idempotency_key="k1",
         )
@@ -822,20 +961,20 @@ class TestHourlyCreate:
         assert cloud.posts == [], "no provider mutation on intent"
 
     async def test_replay_is_idempotent(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyProvider()
         service = self._hourly_service(offers, cloud)
         first = await service.create_instance(
             user=USER,
             offer_id=(await offers.list_all())[0].id,
-            image_id="U",
+            image_id="UBUNTU_24_04",
             image_label="Ubuntu",
             idempotency_key="k2",
         )
         second = await service.create_instance(
             user=USER,
             offer_id=(await offers.list_all())[0].id,
-            image_id="U",
+            image_id="UBUNTU_24_04",
             image_label="Ubuntu",
             idempotency_key="k2",
         )
@@ -865,7 +1004,7 @@ class TestHourlyCreate:
         raise AssertionError("monthly offer must not create hourly")
 
     async def test_process_posts_once_then_reconciles(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyProvider()
         service = self._hourly_service(offers, cloud)
         offer = (await offers.list_all())[0]
@@ -886,7 +1025,7 @@ class TestHourlyCreate:
 
     async def test_ambiguous_post_never_reposts_blindly(self) -> None:
 
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyProvider()
 
         async def _flaky(**kwargs: Any) -> Any:
@@ -910,7 +1049,7 @@ class TestHourlyCreate:
         assert len(cloud.posts) == 1
 
     async def test_reconcile_attaches_proven_reference(self) -> None:
-        offers = FakeOffersRepo([_offer()])
+        offers = FakeOffersRepo([await _usd_offer()])
         cloud = FakeHourlyProvider()
         service = self._hourly_service(offers, cloud)
         offer = (await offers.list_all())[0]
@@ -930,9 +1069,16 @@ class TestHourlyCreate:
         assert await service.process_server(result.server.id) == "outcome-unknown"
 
         async def _found(region: str, reference: str) -> Any:
-            from cloud_platform.providers.leaseweb.cloud import CloudInstance
+            from types import SimpleNamespace
 
-            return CloudInstance(id="i-proven", reference=reference, state="RUNNING", region=region)
+            return SimpleNamespace(
+                id="i-proven",
+                reference=reference,
+                state="RUNNING",
+                region=region,
+                instance_type=offer.product_id,
+                image_id="UBUNTU_24_04",
+            )
 
         cloud.find_by_reference = _found  # type: ignore[method-assign]
         assert await service.reconcile_server(result.server.id) == "attached"
@@ -984,7 +1130,7 @@ class FakeAccountRepo:
 
 class FakeWalletRepo2:
     async def get(self, user_id: UUID) -> Any:
-        return type("W", (), {"id": uuid4(), "balance": 50_000})()
+        return type("W", (), {"id": uuid4(), "balance": 50_000, "currency": "USD"})()
 
 
 class FakeSnapshots:

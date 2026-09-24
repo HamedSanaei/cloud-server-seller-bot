@@ -117,6 +117,7 @@ class CloudServer:
     contained_from: ServerLifecycleState | None = None
     idempotency_key: str | None = None
     created_at: datetime | None = None
+    updated_at: datetime | None = None
     last_accrued_at: datetime | None = None
     deleted_at: datetime | None = None
     low_balance_since: datetime | None = None
@@ -134,6 +135,10 @@ class CloudServer:
     #: with THAT account's key even after the location's active route changes.
     #: ``None`` on legacy rows (routed as the ``default`` account).
     credential_account_id: str | None = None
+    #: Stable provider image identity for hourly creates; never a list index.
+    image_id: str | None = None
+    #: Immutable checkout contract used to reject stale/replayed creates.
+    offer_fingerprint: dict[str, object] | None = None
 
     @property
     def is_prepaid_monthly(self) -> bool:
@@ -220,6 +225,9 @@ class ServerCreateIntent:
     cost_minor: int
     currency: str
     idempotency_key: str
+    image_id: str | None = None
+    offer_id: UUID | None = None
+    offer_fingerprint: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.cost_minor < 0:

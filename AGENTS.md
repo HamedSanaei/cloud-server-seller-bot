@@ -309,6 +309,21 @@ Do not repeatedly run expensive commands after every small edit. Expensive check
 - Do not modify git author/committer configuration.
 - After completing every code change task, the agent MUST provide a suggested commit message (even when it did not commit).
 
+### Foreign catalog currency invariant
+
+- Provider-native cost/currency must be preserved exactly for audit.
+- Foreign storefront selling prices use the configured canonical catalog currency; currently USD.
+- Cross-currency auto-pricing converts provider cost before markup.
+- FX arithmetic is Decimal-only and must preserve exact provider hourly rates until the final customer-currency rounding boundary.
+- A sellable foreign offer may not use a selling currency different from the configured catalog currency.
+- Existing order/hourly-instance price snapshots are immutable; later FX movements reprice catalog offers only, not accepted contracts.
+- Temporary FX failure must never cause a guessed rate, 1:1 conversion or mass catalog retirement.
+- External FX calls scale with distinct currency pairs, never offer count.
+- The platform supports two FX families: domestic/Iranian (AbanTether) and global fiat (Frankfurter). Do not conflate them.
+- Wallet settlement is atomic (balance mutation plus its immutable ledger fact
+  in one transaction); a consumed idempotency key with different facts fails
+  closed instead of replaying quietly.
+
 ### Suggested commit message format
 
 Conventional Commits:

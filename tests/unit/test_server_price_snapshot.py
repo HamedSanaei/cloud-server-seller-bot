@@ -129,6 +129,20 @@ class TestSnapshotDomain:
         with pytest.raises(FrozenInstanceError):
             snap.selling_minor = 999  # type: ignore[misc]
 
+    def test_snapshot_copies_fingerprint_without_aliasing(self) -> None:
+        price = _price()
+        fingerprint = {"fingerprint_version": 1, "offer_id": "x"}
+        metadata = {"fx_rate": "1.17"}
+        object.__setattr__(price, "offer_fingerprint", dict(fingerprint))
+        object.__setattr__(price, "pricing_metadata", dict(metadata))
+        snap = snapshot_from_selling_price(SERVER_ID, price)
+        assert snap.offer_fingerprint == fingerprint
+        # Later mutation of the source objects must not reach the snapshot.
+        fingerprint["offer_id"] = "y"
+        metadata["fx_rate"] = "9.99"
+        assert snap.offer_fingerprint == {"fingerprint_version": 1, "offer_id": "x"}
+        assert snap.pricing_metadata == {"fx_rate": "1.17"}
+
 
 class _InMemorySnapshotRepo:
     """Tiny in-memory repo standing in for the DB in service tests."""

@@ -8,11 +8,16 @@ Two boundaries matter here and both are pinned below:
 - browse: only rows passing ALL THREE gates (provider-reported, enabled,
   priced) exist, and location display metadata comes from the synced
   provider-location rows when present — never from a platform assumption.
+
+Foreign provider costs sell in the canonical catalog currency (USD);
+domestic IRT/IRR costs sell natively. Manual EUR on a foreign row is
+refused naming USD, and showing requires valid pricing provenance.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -34,6 +39,7 @@ from cloud_platform.modules.users.domain import (
 )
 
 PROVIDER = "leaseweb"
+CATALOG_CURRENCY = "USD"
 
 
 def _user(*, role: Role = Role.ADMIN) -> User:
@@ -47,6 +53,11 @@ def _user(*, role: Role = Role.ADMIN) -> User:
     )
 
 
+def _exact_monthly_rate(cost_minor: int) -> str:
+    # Decimal-only exact native rate text; never float.
+    return str(Decimal(cost_minor) / 100)
+
+
 def _offer(
     *,
     offer_id: UUID | None = None,
@@ -55,13 +66,25 @@ def _offer(
     location_id: str = "FRA-01",
     name: str = "VPS 1",
     cost_minor: int = 499,
+    cost_currency: str = CATALOG_CURRENCY,
     price_minor: int = 624,
-    currency: str = "EUR",
+    price_currency: str = CATALOG_CURRENCY,
+    currency: str | None = None,
     enabled: bool = True,
     operator_disabled: bool = False,
     auto_priced: bool = False,
     available: bool = True,
+    billing_parameters: dict[str, object] | None = None,
+    technical_metadata: dict[str, object] | None = None,
+    pricing_metadata: dict[str, object] | None = None,
 ) -> SellableOffer:
+    # ``currency`` is a legacy single-currency shortcut for both snapshots;
+    # explicit cost/price currencies win when given.
+    if currency is not None:
+        cost_currency = currency
+        price_currency = currency
+    if billing_parameters is None:
+        billing_parameters = {"provider_monthly_rate": _exact_monthly_rate(cost_minor)}
     return SellableOffer(
         id=offer_id or uuid4(),
         provider_key=provider_key,
@@ -73,11 +96,12 @@ def _offer(
         disk_gb=100,
         traffic=None,
         provider_cost_minor=cost_minor,
-        provider_cost_currency=currency,
+        provider_cost_currency=cost_currency,
         selling_price_minor=price_minor,
-        selling_currency=currency,
-        billing_parameters={},
-        technical_metadata={},
+        selling_currency=price_currency,
+        billing_parameters=dict(billing_parameters),
+        technical_metadata=dict(technical_metadata or {}),
+        pricing_metadata=dict(pricing_metadata or {}),
         provider_available=available,
         enabled=enabled,
         operator_disabled=operator_disabled,
@@ -96,31 +120,141 @@ class FakeOffersRepo:
     async def get(self, offer_id: UUID) -> SellableOffer | None:
         return self.rows.get(offer_id)
 
-    async def set_selling_price(
-        self, offer_id: UUID, selling_price_minor: int, currency: str
-    ) -> SellableOffer:
-        self.calls.append("set_selling_price")
+    async def get_by_ref(
+        self,
+        provider_key: str,
+        product_id: str,
+        location_id: str,
+        provider_account_id: str | None = None,
+    ) -> SellableOffer | None:
+        for offer in self.rows.values():
+            if (
+                offer.provider_key == provider_key
+                and offer.product_id == product_id
+                and offer.location_id == location_id
+            ):
+                if provider_account_id is None:
+                    return offer
+                if offer.provider_account_id == provider_account_id:
+                    return offer
+        return None
+
+    async def set_manual_price(
+        self,
+        offer_id: UUID,
+        selling_price_minor: int,
+        currency: str,
+        pricing_metadata: dict[str, object],
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_updated_at: object | None = None,
+    ) -> SellableOffer | None:
+        self.calls.append("set_manual_price")
+        row = self.rows[offer_id]
+        if (
+            row.provider_cost_minor != expected_cost_minor
+            or row.provider_cost_currency.strip().upper() != expected_cost_currency.strip().upper()
+        ):
+            return None
+        if expected_updated_at is not None and row.updated_at != expected_updated_at:
+            return None
+        # A stored manual price opts out of auto-pricing and clears any
+        # pending auto-repricing flags by replacing the metadata snapshot.
         updated = replace(
-            self.rows[offer_id], selling_price_minor=selling_price_minor, selling_currency=currency
+            row,
+            selling_price_minor=selling_price_minor,
+            selling_currency=currency,
+            auto_priced=False,
+            pricing_metadata=dict(pricing_metadata),
         )
         self.rows[offer_id] = updated
         return updated
 
-    async def set_enabled(self, offer_id: UUID, enabled: bool) -> SellableOffer:
-        self.calls.append("set_enabled")
-        updated = replace(self.rows[offer_id], enabled=enabled)
+    async def set_visibility_state(
+        self, offer_id: UUID, *, enabled: bool, operator_disabled: bool
+    ) -> SellableOffer:
+        self.calls.append("set_visibility_state")
+        if not isinstance(enabled, bool) or not isinstance(operator_disabled, bool):
+            raise ValueError("visibility flags must be boolean")
+        if not enabled and not operator_disabled:
+            raise ValueError("a disabled offer must carry the operator-disabled block")
+        updated = replace(self.rows[offer_id], enabled=enabled, operator_disabled=operator_disabled)
         self.rows[offer_id] = updated
         return updated
 
-    async def set_operator_disabled(self, offer_id: UUID, disabled: bool) -> SellableOffer:
-        self.calls.append("set_operator_disabled")
-        updated = replace(self.rows[offer_id], operator_disabled=disabled)
+    async def set_auto_price_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        selling_price_minor: int,
+        selling_currency: str,
+        pricing_metadata: dict[str, object],
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        self.calls.append("set_auto_price_if_current")
+        row = self.rows[offer_id]
+        if (
+            not row.auto_priced
+            or row.operator_disabled
+            or row.provider_cost_minor != expected_cost_minor
+            or row.provider_cost_currency.strip().upper() != expected_cost_currency.strip().upper()
+        ):
+            return None
+        updated = replace(
+            row,
+            selling_price_minor=selling_price_minor,
+            selling_currency=selling_currency,
+            pricing_metadata=dict(pricing_metadata),
+        )
         self.rows[offer_id] = updated
         return updated
 
-    async def set_auto_priced(self, offer_id: UUID, auto_priced: bool) -> SellableOffer:
-        self.calls.append("set_auto_priced")
-        updated = replace(self.rows[offer_id], auto_priced=auto_priced)
+    async def publish_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_price_minor: int,
+        expected_currency: str,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        self.calls.append("publish_if_current")
+        row = self.rows[offer_id]
+        if (
+            row.operator_disabled
+            or row.provider_cost_minor != expected_cost_minor
+            or row.selling_price_minor != expected_price_minor
+        ):
+            return None
+        updated = replace(row, enabled=True)
+        self.rows[offer_id] = updated
+        return updated
+
+    async def record_auto_pricing_failure_if_current(
+        self,
+        offer_id: UUID,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        expected_price_minor: int,
+        expected_selling_currency: str,
+        expected_pricing_metadata: dict[str, object],
+        pricing_metadata: dict[str, object],
+        preserve_valid_price: bool,
+        expected_provider_rate: str | None = None,
+    ) -> SellableOffer | None:
+        self.calls.append("record_auto_pricing_failure_if_current")
+        row = self.rows[offer_id]
+        if (
+            row.provider_cost_minor != expected_cost_minor
+            or row.selling_price_minor != expected_price_minor
+        ):
+            return None
+        updated = replace(row, pricing_metadata=dict(pricing_metadata))
         self.rows[offer_id] = updated
         return updated
 
@@ -163,6 +297,8 @@ def _admin(offers: FakeOffersRepo, audit: FakeAuditRepo | None = None) -> OfferA
 
 class TestSetSellingPrice:
     async def test_a_manual_price_is_stored_and_opts_out_of_auto_pricing(self) -> None:
+        # USD-native manual price: same-currency provenance via the exact
+        # native rate, auto-pricing cleared by the single manual write.
         offer = _offer(auto_priced=True)
         repo = FakeOffersRepo([offer])
         audit = FakeAuditRepo()
@@ -170,12 +306,12 @@ class TestSetSellingPrice:
             actor=_user(),
             offer_id=offer.id,
             selling_price_minor=780,
-            currency="EUR",
+            currency="USD",
             reason="operator pricing",
         )
-        assert (updated.selling_price_minor, updated.selling_currency) == (780, "EUR")
+        assert (updated.selling_price_minor, updated.selling_currency) == (780, "USD")
         assert updated.auto_priced is False
-        assert repo.calls == ["set_selling_price", "set_auto_priced"]
+        assert repo.calls == ["set_manual_price"]
         assert audit.events
 
     async def test_provider_cost_is_never_touched_by_a_price_change(self) -> None:
@@ -185,11 +321,26 @@ class TestSetSellingPrice:
             actor=_user(),
             offer_id=offer.id,
             selling_price_minor=1_000,
-            currency="EUR",
+            currency="USD",
             reason="reprice",
         )
         assert updated.provider_cost_minor == 499
-        assert updated.provider_cost_currency == "EUR"
+        assert updated.provider_cost_currency == "USD"
+
+    async def test_foreign_manual_eur_is_refused_naming_usd(self) -> None:
+        # Foreign EUR cost sells in catalog USD; a manual EUR relabel is
+        # refused and names the required USD currency (never weakened).
+        offer = _offer(currency="EUR", auto_priced=True)
+        repo = FakeOffersRepo([offer])
+        with pytest.raises(OfferAdminError, match="USD"):
+            await _admin(repo).set_selling_price(
+                actor=_user(),
+                offer_id=offer.id,
+                selling_price_minor=780,
+                currency="EUR",
+                reason="operator pricing",
+            )
+        assert repo.calls == []
 
     async def test_a_missing_reason_is_refused(self) -> None:
         repo = FakeOffersRepo([_offer()])
@@ -198,7 +349,7 @@ class TestSetSellingPrice:
                 actor=_user(),
                 offer_id=next(iter(repo.rows)),
                 selling_price_minor=780,
-                currency="EUR",
+                currency="USD",
                 reason="   ",
             )
 
@@ -209,7 +360,7 @@ class TestSetSellingPrice:
                 actor=_user(),
                 offer_id=next(iter(repo.rows)),
                 selling_price_minor=0,
-                currency="EUR",
+                currency="USD",
                 reason="free",
             )
 
@@ -220,7 +371,7 @@ class TestSetSellingPrice:
                 actor=_user(),
                 offer_id=uuid4(),
                 selling_price_minor=780,
-                currency="EUR",
+                currency="USD",
                 reason="reprice",
             )
 
@@ -231,7 +382,7 @@ class TestSetSellingPrice:
                 actor=_user(role=Role.USER),
                 offer_id=next(iter(repo.rows)),
                 selling_price_minor=780,
-                currency="EUR",
+                currency="USD",
                 reason="reprice",
             )
 
@@ -245,9 +396,11 @@ class TestSetEnabled:
         )
         assert updated.enabled is False
         assert updated.operator_disabled is True
-        assert repo.calls == ["set_enabled", "set_operator_disabled"]
+        assert repo.calls == ["set_visibility_state"]
 
     async def test_showing_clears_the_operator_block(self) -> None:
+        # USD-valid provenance (exact native rate, priced, available) is
+        # required before an offer can be shown.
         offer = _offer(enabled=False, operator_disabled=True)
         repo = FakeOffersRepo([offer])
         updated = await _admin(repo).set_enabled(
@@ -255,6 +408,24 @@ class TestSetEnabled:
         )
         assert updated.enabled is True
         assert updated.operator_disabled is False
+
+    async def test_showing_foreign_without_normalization_is_refused(self) -> None:
+        # Foreign EUR rows must be normalized to USD before they can be shown.
+        offer = _offer(currency="EUR", enabled=False, operator_disabled=True)
+        repo = FakeOffersRepo([offer])
+        with pytest.raises(OfferAdminError, match="USD"):
+            await _admin(repo).set_enabled(
+                actor=_user(), offer_id=offer.id, enabled=True, reason="launch"
+            )
+
+    async def test_showing_without_provenance_is_refused(self) -> None:
+        # USD cost without the exact native rate has no valid provenance.
+        offer = _offer(enabled=False, operator_disabled=True, billing_parameters={})
+        repo = FakeOffersRepo([offer])
+        with pytest.raises(OfferAdminError, match="provenance"):
+            await _admin(repo).set_enabled(
+                actor=_user(), offer_id=offer.id, enabled=True, reason="launch"
+            )
 
     async def test_hiding_an_already_hidden_offer_is_a_no_op(self) -> None:
         offer = _offer(enabled=False, operator_disabled=True)
@@ -301,6 +472,8 @@ class TestAdminReads:
         assert len(await _admin(repo).list_all_rows()) == 2
 
     async def test_list_sellable_returns_only_buyable_rows(self) -> None:
+        # Provenance-filtered: only USD-valid (exact rate, priced,
+        # available, enabled) rows are buyable.
         repo = FakeOffersRepo(
             [
                 _offer(enabled=True, price_minor=624),

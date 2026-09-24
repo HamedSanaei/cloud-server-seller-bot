@@ -20,6 +20,7 @@ from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_sa
 from cloud_platform.modules.businesslog.events import admin_adjustment_event
 from cloud_platform.modules.users.domain import Permission, PermissionChecker, User
 from cloud_platform.modules.wallet.domain import (
+    DEFAULT_WALLET_CURRENCY,
     Hold,
     LedgerEntry,
     LedgerEntryType,
@@ -305,7 +306,10 @@ class WalletHistoryService:
         wallet = await self._wallets.get(user_id)
         if wallet is None:
             return WalletBalanceView(
-                has_wallet=False, balance_minor=0, currency="EUR", formatted=_format_minor(0, "EUR")
+                has_wallet=False,
+                balance_minor=0,
+                currency=DEFAULT_WALLET_CURRENCY,
+                formatted=_format_minor(0, DEFAULT_WALLET_CURRENCY),
             )
         return WalletBalanceView(
             has_wallet=True,

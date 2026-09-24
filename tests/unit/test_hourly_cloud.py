@@ -215,6 +215,131 @@ class TestImages:
         ]
 
 
+class TestInstanceIdentity:
+    def test_identity_fields_parse_when_present(self) -> None:
+        from cloud_platform.providers.leaseweb.cloud import _parse_instance
+
+        parsed = _parse_instance(
+            {
+                "id": "i-1",
+                "reference": "srv-abc",
+                "state": "RUNNING",
+                "region": "eu-west-3",
+                "instanceType": "lsw.m4.large",
+                "imageId": "UBUNTU_24_04",
+            }
+        )
+        assert parsed is not None
+        assert parsed.instance_type == "lsw.m4.large"
+        assert parsed.image_id == "UBUNTU_24_04"
+        assert parsed.account_id is None
+
+    def test_missing_identity_fields_stay_absent(self) -> None:
+        from cloud_platform.providers.leaseweb.cloud import _parse_instance
+
+        parsed = _parse_instance({"id": "i-1", "state": "RUNNING"})
+        assert parsed is not None
+        assert parsed.instance_type is None
+        assert parsed.image_id is None
+        assert parsed.account_id is None
+
+
+class TestCheckoutRevalidation:
+    """The adapter revalidates offer+image facts live before any create."""
+
+    def _validated_provider(self, types: Any, images: Any) -> LeasewebHourlyCloudProvider:
+        provider = _provider()
+
+        async def _request(method: str, path: str, **kwargs: Any) -> Any:
+            assert method == "GET"
+            if path == "/publicCloud/v1/instanceTypes":
+                return types
+            if path == "/publicCloud/v1/images":
+                return images
+            raise AssertionError(f"unexpected provider read: {path}")
+
+        provider._transport.request = _request  # type: ignore[method-assign]
+        return provider
+
+    def _types_payload(self) -> Any:
+        return {
+            "instanceTypes": [
+                {
+                    "name": "lsw.m4.large",
+                    "resources": {
+                        "cpu": {"value": 2, "unit": "vCPU"},
+                        "memory": {"value": 8, "unit": "GiB"},
+                    },
+                    "prices": {"hourly": "0.0395"},
+                    "storageTypes": ["CENTRAL"],
+                    "minDiskSize": 5,
+                }
+            ],
+            "_metadata": {"currency": "EUR", "currencySymbol": "€"},
+        }
+
+    def _images_payload(self) -> Any:
+        return {"images": [{"id": "UBUNTU_24_04", "displayName": "Ubuntu 24.04"}]}
+
+    async def test_matching_facts_validate(self) -> None:
+        provider = self._validated_provider(self._types_payload(), self._images_payload())
+        match = await provider.validate_hourly_offer_for_checkout(
+            location_id="eu-west-3",
+            product_id="lsw.m4.large",
+            image_id="UBUNTU_24_04",
+            expected_cost_minor=4,
+            currency="EUR",
+            expected_cost_exact="0.0395",
+        )
+        assert match.id == "lsw.m4.large"
+
+    async def test_changed_cost_or_currency_fails(self) -> None:
+        from cloud_platform.providers.errors import ProviderError
+
+        provider = self._validated_provider(self._types_payload(), self._images_payload())
+        with pytest.raises(ProviderError):
+            await provider.validate_hourly_offer_for_checkout(
+                location_id="eu-west-3",
+                product_id="lsw.m4.large",
+                image_id="UBUNTU_24_04",
+                expected_cost_minor=99,
+                currency="EUR",
+                expected_cost_exact="0.0395",
+            )
+        with pytest.raises(ProviderError):
+            await provider.validate_hourly_offer_for_checkout(
+                location_id="eu-west-3",
+                product_id="lsw.m4.large",
+                image_id="UBUNTU_24_04",
+                expected_cost_minor=4,
+                currency="USD",
+                expected_cost_exact="0.0395",
+            )
+
+    async def test_missing_type_or_image_fails(self) -> None:
+        from cloud_platform.providers.errors import ProviderNotFound
+
+        provider = self._validated_provider(self._types_payload(), self._images_payload())
+        with pytest.raises(ProviderNotFound):
+            await provider.validate_hourly_offer_for_checkout(
+                location_id="eu-west-3",
+                product_id="lsw.nope",
+                image_id="UBUNTU_24_04",
+                expected_cost_minor=4,
+                currency="EUR",
+                expected_cost_exact="0.0395",
+            )
+        with pytest.raises(ProviderNotFound):
+            await provider.validate_hourly_offer_for_checkout(
+                location_id="eu-west-3",
+                product_id="lsw.m4.large",
+                image_id="DEBIAN_12",
+                expected_cost_minor=4,
+                currency="EUR",
+                expected_cost_exact="0.0395",
+            )
+
+
 class TestCreateBody:
     def test_body_carries_hourly_contract(self) -> None:
         body = build_create_body(

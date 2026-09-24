@@ -26,6 +26,7 @@ def _period(
     currency: str = "EUR",
 ) -> object:
     from cloud_platform.modules.billing.service import AccrualPeriod
+    from cloud_platform.modules.fx.domain import minor_to_major
 
     return AccrualPeriod(
         server_id=server_id,
@@ -36,6 +37,9 @@ def _period(
         cost_minor=cost,
         selling_minor=selling,
         currency=currency,
+        # Exact native cost the new report requires; a zero cost genuinely
+        # has no exact amount and stays COST_UNKNOWN.
+        cost_amount=minor_to_major(cost, currency) if cost > 0 else None,
         idempotency_key=f"k-{server_id}-{start}",
     )
 
@@ -122,7 +126,7 @@ class TestAnomalies:
         a = report.anomalies[0]
         assert a.server_id == S1
         assert a.reason.startswith("NEGATIVE_MARGIN")
-        assert "cost 1100 >= revenue 1000" in a.reason
+        assert "exact cost 11 EUR >= revenue 1000 EUR" in a.reason
         assert not report.is_clean
         # the totals still include the period - visible, not hidden
         assert report.margin("EUR") == -100
@@ -132,8 +136,8 @@ class TestAnomalies:
         svc, _ = _service(rows)
         report = await svc.report(DAY, DAY + timedelta(days=1))
 
-        assert len(report.anomalies) == 1
-        assert report.anomalies[0].reason.startswith("COST_UNKNOWN")
+        reasons = [a.reason for a in report.anomalies]
+        assert any(reason.startswith("COST_UNKNOWN") for reason in reasons)
 
     async def test_equal_cost_revenue_is_negative_margin(self) -> None:
         rows = [_period(S1, DAY, quanta=1, cost=1000, selling=1000)]

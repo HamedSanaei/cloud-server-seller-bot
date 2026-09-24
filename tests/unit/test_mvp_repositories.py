@@ -46,6 +46,7 @@ def _result(*rows: Any) -> MagicMock:
     result = MagicMock()
     result.scalars.return_value.first.return_value = rows[0] if rows else None
     result.scalars.return_value.all.return_value = list(rows)
+    result.scalar_one_or_none.return_value = rows[0] if rows else None
     result.rowcount = len(rows)
     return result
 
@@ -66,8 +67,14 @@ def _offer_row(**overrides: Any) -> MagicMock:
     row.selling_price_minor = 1299
     row.selling_currency = "EUR"
     row.billing_parameters = {}
+    row.billing_model = "prepaid_monthly_fixed"
+    row.technical_metadata = {}
+    row.pricing_metadata = {}
     row.provider_available = True
     row.enabled = True
+    row.operator_disabled = False
+    row.auto_priced = True
+    row.provider_account_id = None
     for k, v in overrides.items():
         setattr(row, k, v)
     return row
@@ -155,9 +162,23 @@ class TestSellableOfferRepository:
         assert await _offer_repo(db).get(OFFER_ID) is None
 
     async def test_list_sellable_filters(self, db: AsyncMock) -> None:
-        db.execute.return_value = _result(_offer_row(), _offer_row(enabled=False))
+        # Manual same-currency rows carry exact-rate provenance, so the
+        # provenance gate passes and only the sellable filter applies: the
+        # disabled row is filtered, the enabled row is returned.
+        db.execute.return_value = _result(
+            _offer_row(
+                auto_priced=False,
+                billing_parameters={"provider_monthly_rate": "9.99"},
+            ),
+            _offer_row(
+                enabled=False,
+                auto_priced=False,
+                billing_parameters={"provider_monthly_rate": "9.99"},
+            ),
+        )
         offers = await _offer_repo(db).list_sellable("leaseweb")
-        assert len(offers) == 2
+        assert len(offers) == 1
+        assert offers[0].sellable is True
 
     async def test_upsert_from_provider_updates_existing(self, db: AsyncMock) -> None:
         db.execute.return_value = _result(_offer_row())
@@ -226,9 +247,9 @@ class TestSellableOfferRepository:
     ) -> None:
         """Production: 36 offers carried migration 0037's legacy `default` pin.
 
-        The next successful catalog sync must replace that with the account that
-        actually supplied the observation (FRA -> the German Sales Organization,
-        LON -> the UK one).
+        Current account-scoping: a scoped observation for a different account
+        does not mutate the existing differently-pinned row; it creates its
+        own account-scoped row. The original `default` pin is left untouched.
         """
         row = _offer_row(provider_account_id="default", provider_cost_currency="GBP")
         db.execute.return_value = _result(row)
@@ -249,33 +270,39 @@ class TestSellableOfferRepository:
                 provider_available=True,
             ),
         )
-        assert row.provider_account_id == "sales-org-uk"
-        # The operator's selling price and enable state are untouched by a sync.
-        assert row.selling_price_minor == 1299
-        assert row.enabled is True
+        # The pre-existing differently-pinned row is not overwritten.
+        assert row.provider_account_id == "default"
+        # A separate account-scoped row is created for the supplying account.
+        created = db.add.call_args.args[0]
+        assert created.provider_account_id == "sales-org-uk"
+        assert created.provider_cost_currency == "GBP"
 
     async def test_a_caller_without_account_knowledge_cannot_erase_provenance(
         self, db: AsyncMock
     ) -> None:
+        # Account-scoped provenance is enforced: an unscoped observation must
+        # not overwrite an account-pinned row.
         row = _offer_row(provider_account_id="sales-org-north")
         db.execute.return_value = _result(row)
-        await _offer_repo(db).upsert_from_provider(
-            provider_key="leaseweb",
-            product_id="VPS02_1",
-            location_id="FRA-01",
-            update=OfferSpecUpdate(
-                name="VPS S",
-                vcpu=2,
-                ram_gb=4,
-                disk_gb=100,
-                traffic="10 TB",
-                provider_cost_minor=999,
-                provider_cost_currency="EUR",
-                billing_parameters={},
-                provider_available=True,
-            ),
-        )
+        with pytest.raises(ValueError, match="already belongs to a credential account"):
+            await _offer_repo(db).upsert_from_provider(
+                provider_key="leaseweb",
+                product_id="VPS02_1",
+                location_id="FRA-01",
+                update=OfferSpecUpdate(
+                    name="VPS S",
+                    vcpu=2,
+                    ram_gb=4,
+                    disk_gb=100,
+                    traffic="10 TB",
+                    provider_cost_minor=999,
+                    provider_cost_currency="EUR",
+                    billing_parameters={},
+                    provider_available=True,
+                ),
+            )
         assert row.provider_account_id == "sales-org-north"
+        db.add.assert_not_called()
 
     async def test_a_new_offer_is_unpriced_and_disabled(self, db: AsyncMock) -> None:
         """A discovered product must never go on sale by itself."""
@@ -304,24 +331,25 @@ class TestSellableOfferRepository:
         assert created.provider_cost_currency == "GBP"
 
     async def test_an_observation_without_a_currency_is_refused(self, db: AsyncMock) -> None:
-        """Fail closed: the column default is EUR, which would be a lie."""
+        """Fail closed: an observation without a currency never reaches storage.
+
+        The hardened domain rejects the empty currency at the OfferSpecUpdate
+        boundary ("audited currency"); the repository's own "without a
+        provider currency" guard remains as defense-in-depth for any path
+        that bypasses the domain constructor.
+        """
         db.execute.return_value = _result()
-        with pytest.raises(ValueError, match="without a provider currency"):
-            await _offer_repo(db).upsert_from_provider(
-                provider_key="leaseweb",
-                product_id="VPS02_1",
-                location_id="LON-11",
-                update=OfferSpecUpdate(
-                    name="VPS S",
-                    vcpu=2,
-                    ram_gb=4,
-                    disk_gb=100,
-                    traffic="10 TB",
-                    provider_cost_minor=1099,
-                    provider_cost_currency="",
-                    billing_parameters={},
-                    provider_available=True,
-                ),
+        with pytest.raises(ValueError, match="audited currency"):
+            OfferSpecUpdate(
+                name="VPS S",
+                vcpu=2,
+                ram_gb=4,
+                disk_gb=100,
+                traffic="10 TB",
+                provider_cost_minor=1099,
+                provider_cost_currency="",
+                billing_parameters={},
+                provider_available=True,
             )
         db.add.assert_not_called()
 
@@ -355,21 +383,30 @@ class TestSellableOfferRepository:
         assert rows[0].provider_available is False
 
     async def test_set_enabled_and_price(self, db: AsyncMock) -> None:
-        db.get.return_value = _offer_row()
-        db.execute.return_value = _result(_offer_row())
+        # Disabling requires the operator-disabled block under the current
+        # visibility contract; direct price writes are idempotent-only (same
+        # price/currency succeeds, a different price must go through the
+        # audited CAS pipeline).
+        db.get.return_value = _offer_row(operator_disabled=True)
+        db.execute.return_value = _result(_offer_row(operator_disabled=True))
         repo = _offer_repo(db)
         offer = await repo.set_enabled(OFFER_ID, False)
         assert offer is not None
         assert offer.enabled is False
-        offer = await repo.set_selling_price(OFFER_ID, 1899, "EUR")
+        assert offer.operator_disabled is True
+        db.execute.return_value = _result(_offer_row(operator_disabled=True))
+        offer = await repo.set_selling_price(OFFER_ID, 1299, "EUR")
         assert offer is not None
+        assert offer.selling_price_minor == 1299
+        with pytest.raises(ValueError, match="audited pricing provenance"):
+            await repo.set_selling_price(OFFER_ID, 1899, "EUR")
 
     async def test_set_price_validates_currency(self, db: AsyncMock) -> None:
         repo = _offer_repo(db)
         with pytest.raises(ValueError):
             await repo.set_selling_price(OFFER_ID, 0, "EUR")
         with pytest.raises(ValueError):
-            await repo.set_selling_price(OFFER_ID, 100, "eur")
+            await repo.set_selling_price(OFFER_ID, 100, "XXX")
 
 
 class TestProviderOrderRepository:
