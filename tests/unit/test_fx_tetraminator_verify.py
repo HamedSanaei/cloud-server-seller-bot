@@ -268,16 +268,34 @@ class TestReconciliation:
                 assert found is not None
                 return [found]
 
+        class _Audit:
+            def __init__(self) -> None:
+                self.events: list[Any] = []
+
+            async def append(self, event: Any) -> Any:
+                self.events.append(event)
+                return event
+
+        audit = _Audit()
         report = await reconcile_tetraminator_pending(
             payments_repo=_Repo(),  # type: ignore[arg-type]
             webhook_service=webhook,
             gateway=_Gateway(_paid_intent()),
             stale_after=timedelta(minutes=10),
             now=datetime.now(UTC),
+            audit_repo=audit,  # type: ignore[arg-type]
         )
         assert report.checked == 1
         assert report.credited == 1
         assert wallet.credits == [1_000]  # frozen credit, exactly once
+        # The audit port takes an EVENT: keyword fields raised TypeError and
+        # silently dropped the run's audit record in production.
+        from cloud_platform.modules.audit.domain import ActorType, AuditEvent
+
+        (event,) = audit.events
+        assert isinstance(event, AuditEvent)
+        assert event.actor_type is ActorType.SYSTEM
+        assert event.metadata == {"checked": 1, "credited": 1, "failed": 0}
         again = await reconcile_tetraminator_pending(
             payments_repo=_Repo(),  # type: ignore[arg-type]
             webhook_service=webhook,

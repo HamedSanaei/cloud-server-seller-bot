@@ -55,6 +55,21 @@ class FakeGateway:
         )
 
 
+class RecordingAuditRepo:
+    """Stands in for ``AuditRepository``: it only accepts an ``AuditEvent``.
+
+    A keyword-argument call (the previous production bug) raises ``TypeError``
+    here exactly as the real repository does.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def append(self, event: Any) -> Any:
+        self.events.append(event)
+        return event
+
+
 def _pending(external_id: str | None = "A0001") -> PaymentSession:
     return PaymentSession(
         user_id=uuid4(),
@@ -67,6 +82,26 @@ def _pending(external_id: str | None = "A0001") -> PaymentSession:
 
 
 class TestReconciliation:
+    async def test_run_appends_one_system_audit_event(self) -> None:
+        from cloud_platform.modules.audit.domain import ActorType, AuditEvent
+
+        audit = RecordingAuditRepo()
+        service = PaymentReconciliationService(
+            payments_repo=FakePaymentsRepo([_pending()]),
+            webhook_service=FakeWebhook(),
+            gateway=FakeGateway(PaymentStatus.SUCCEEDED),
+            audit_repo=audit,
+        )
+        report = await service.run(now=datetime.now(UTC))
+        assert report.credited == 1
+        (event,) = audit.events
+        # The audit port persists an EVENT, never loose keyword fields.
+        assert isinstance(event, AuditEvent)
+        assert event.actor_type is ActorType.SYSTEM
+        assert event.action == "payments.reconcile"
+        assert event.resource_type == "payment"
+        assert event.metadata == {"checked": 1, "credited": 1, "failed": 0}
+
     async def test_succeeded_verify_credits_via_webhook(self) -> None:
         webhook = FakeWebhook()
         service = PaymentReconciliationService(

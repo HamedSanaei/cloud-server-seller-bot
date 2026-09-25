@@ -22,7 +22,25 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from cloud_platform.modules.audit.domain import ActorType, AuditEvent
+
 logger = logging.getLogger(__name__)
+
+
+def _reconcile_audit_event(*, checked: int, credited: int, marked_failed: int) -> AuditEvent:
+    """SYSTEM audit event for one reconciliation run (counts only).
+
+    ``AuditRepository.append`` takes an :class:`AuditEvent`; passing the fields
+    as keyword arguments raised ``TypeError`` inside the job's best-effort
+    handler, so every run silently lost its audit record.
+    """
+    return AuditEvent(
+        actor_type=ActorType.SYSTEM,
+        actor_id=UUID(int=0),
+        action="payments.reconcile",
+        resource_type="payment",
+        metadata={"checked": checked, "credited": credited, "failed": marked_failed},
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,16 +123,9 @@ class PaymentReconciliationService:
         if self.audit_repo is not None:
             try:
                 await self.audit_repo.append(
-                    actor_type="system",
-                    actor_id=UUID(int=0),
-                    action="payments.reconcile",
-                    resource_type="payment",
-                    resource_id=None,
-                    metadata={
-                        "checked": checked,
-                        "credited": credited,
-                        "failed": marked_failed,
-                    },
+                    _reconcile_audit_event(
+                        checked=checked, credited=credited, marked_failed=marked_failed
+                    )
                 )
             except Exception:
                 logger.warning("reconcile audit append failed", exc_info=True)
@@ -226,16 +237,9 @@ async def reconcile_tetraminator_pending(
     if audit_repo is not None:
         try:
             await audit_repo.append(
-                actor_type="system",
-                actor_id=UUID(int=0),
-                action="payments.reconcile",
-                resource_type="payment",
-                resource_id=None,
-                metadata={
-                    "checked": checked,
-                    "credited": credited,
-                    "failed": marked_failed,
-                },
+                _reconcile_audit_event(
+                    checked=checked, credited=credited, marked_failed=marked_failed
+                )
             )
         except Exception:
             logger.warning("reconcile audit append failed", exc_info=True)
