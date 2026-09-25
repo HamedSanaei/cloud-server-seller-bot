@@ -100,4 +100,27 @@ def image_compatible(
     return True
 
 
-__all__ = ["image_compatible", "image_restriction_values"]
+def image_architecture_conflict(image: Any, architecture: str | None) -> bool:
+    """Whether an image contradicts a pinned plan architecture.
+
+    Only a POSITIVE mismatch counts: when either side states nothing (many
+    providers list instance architectures but not image ones), the image is
+    kept instead of silently disappearing, and the create-time gate stays the
+    authority for the remaining unknown.
+    """
+    expected = str(architecture or "").strip().lower()
+    if not expected:
+        return False
+    values = _metadata(image) or {}
+    declared = str(getattr(image, "architecture", "") or values.get("architecture", ""))
+    declared = declared.strip().lower()
+    if not declared:
+        return False
+    return declared != expected
+
+
+__all__ = [
+    "image_architecture_conflict",
+    "image_compatible",
+    "image_restriction_values",
+]

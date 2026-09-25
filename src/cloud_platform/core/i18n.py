@@ -347,7 +347,11 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.cloud_detail_price": "\U0001f4b5 \u0642\u06cc\u0645\u062a:\n{hourly}\n\u0628\u0631\u0622\u0648\u0631\u062f \u0645\u0627\u0647\u0627\u0646\u0647:\n{monthly}",  # noqa: E501
         "store.price_per_hour": "{price} / \u0633\u0627\u0639\u062a",
         "store.price_per_month": "{price} / \u0645\u0627\u0647",
-        "store.cloud_images_title": "\U0001f4bf \u0627\u06cc\u0645\u06cc\u062c \u0631\u0627 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f:",  # noqa: E501
+        "store.cloud_images_title": "💿 سیستم‌عامل را انتخاب کنید:",
+        "store.cloud_selected_plan": "🖥 پلن انتخابی: {name}",
+        "store.cloud_selected_specs": "⚙️ {vcpu} vCPU · 🧠 {ram} GB · 💾 {disk} GB",
+        "store.cloud_selected_price": "💵 {price}",
+        "store.cloud_no_images": "در حال حاضر سیستم‌عامل قابل نصب برای این پلن در دسترس نیست.",
         "store.cloud_confirm_title": "\u2601\ufe0f \u062a\u0627\u06cc\u06cc\u062f \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc",  # noqa: E501
         "store.cloud_confirm_provider": "\u0627\u0631\u0627\u0626\u0647\u200c\u062f\u0647\u0646\u062f\u0647: {provider}",  # noqa: E501
         "store.cloud_confirm_kind": "\u0646\u0648\u0639: {kind}",
@@ -735,7 +739,11 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.cloud_detail_price": "\U0001f4b5 Price:\n{hourly}\nMonthly estimate:\n{monthly}",
         "store.price_per_hour": "{price} / hour",
         "store.price_per_month": "{price} / month",
-        "store.cloud_images_title": "\U0001f4bf Choose an image:",
+        "store.cloud_images_title": "💿 Choose an operating system:",
+        "store.cloud_selected_plan": "🖥 Selected plan: {name}",
+        "store.cloud_selected_specs": "⚙️ {vcpu} vCPU · 🧠 {ram} GB · 💾 {disk} GB",
+        "store.cloud_selected_price": "💵 {price}",
+        "store.cloud_no_images": "No installable operating system is available for this plan right now.",  # noqa: E501
         "store.cloud_confirm_title": "\u2601\ufe0f Confirm hourly server creation",
         "store.cloud_confirm_provider": "Provider: {provider}",
         "store.cloud_confirm_kind": "Type: {kind}",

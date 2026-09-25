@@ -27,6 +27,7 @@ from cloud_platform.core.config import (
     ConfigFileError,
     get_settings,
     load_settings,
+    looks_corrupted_label,
     reset_settings_cache,
     resolve_config_file,
     toml_to_settings,
@@ -418,6 +419,68 @@ class TestCommittedExample:
         # security model did not change, only the duplicated template did.
         assert "!deploy/**/configuration.example.toml" not in ignored
 
+    def test_leaseweb_family_labels_are_real_customer_names(self) -> None:
+        """The template ships the real Persian names, not placeholders.
+
+        The production ``????`` labels came from a broken paste into the
+        operator's own file, so the committed contract pins what a customer
+        must read for the two commercial families.
+        """
+        document = _example_document()
+        for family, expected in (("vps", "وی‌پی‌اس"), ("cloud", "کلود")):
+            found, value = _nested(
+                document, ("providers", "leaseweb", "families", family, "display_name")
+            )
+            assert found is True, f"providers.leaseweb.families.{family}.display_name missing"
+            assert value == expected
+            assert not looks_corrupted_label(value)
+
+
+class TestCustomerFacingLabels:
+    """A corrupted configured label must never become customer-facing text."""
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "وی‌پی‌اس",
+            "کلود",
+            "Leaseweb",
+            "General Purpose",
+            "Compute Optimized",
+            "  Hetzner  ",
+            "میزبانی ۲",
+        ],
+    )
+    def test_real_labels_are_accepted(self, label: str) -> None:
+        assert looks_corrupted_label(label) is False
+
+    @pytest.mark.parametrize("label", ["????????", "????", "? ? ?", "....", "\ufffd\ufffd"])
+    def test_question_mark_garbage_is_rejected(self, label: str) -> None:
+        assert looks_corrupted_label(label) is True
+
+    @pytest.mark.parametrize("label", ["", "   ", None])
+    def test_an_unset_label_is_not_corrupted(self, label: object) -> None:
+        """Empty means "not configured": the caller applies its own fallback."""
+        assert looks_corrupted_label(label) is False
+
+    def test_catalog_never_renders_a_corrupted_name(self) -> None:
+        from cloud_platform.modules.markets.domain import ProviderCatalog
+
+        catalog = ProviderCatalog(
+            markets={"leaseweb": "foreign"},
+            display_names={"leaseweb": "????????"},
+            families={
+                "leaseweb": {
+                    "vps": {"billing_model": "prepaid_monthly_fixed", "display_name": "????"},
+                    "cloud": {"billing_model": "hourly", "display_name": "کلود"},
+                }
+            },
+        )
+        assert catalog.display_name_of("leaseweb") == "leaseweb"
+        families = {f.family_key: f.display_name for f in catalog.families_of("leaseweb")}
+        assert families == {"vps": "vps", "cloud": "کلود"}
+        assert catalog.listing("leaseweb", ordering_capable=True).display_name == "leaseweb"  # type: ignore[union-attr]
+
 
 class TestConfigDoctor:
     """`config doctor`: read-only drift detection, never a printed value.
@@ -471,6 +534,44 @@ class TestConfigDoctor:
         assert "old.provider" in out
         # Only key paths, never a value.
         assert secret not in out
+        assert "config doctor: OK" in out
+
+    async def test_corrupted_customer_facing_label_fails_the_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        path = _write(
+            tmp_path,
+            '[app]\nenvironment = "development"\n\n'
+            '[providers.leaseweb.families.vps]\ndisplay_name = "????????"\n\n'
+            '[providers.leaseweb.families.cloud]\ndisplay_name = "کلود"\n',
+        )
+        self._point_at(monkeypatch, path)
+        assert await cli_module.config_doctor() == 1
+        out = capsys.readouterr().out
+        assert "customer-facing labels that look corrupted" in out
+        # The KEY PATH only: never the corrupted value, never a secret.
+        assert "providers.leaseweb.families.vps.display_name" in out
+        assert "????" not in out
+        assert "config doctor: FAIL" in out
+
+    async def test_real_customer_labels_do_not_fail_the_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        path = _write(
+            tmp_path,
+            '[app]\nenvironment = "development"\n\n'
+            '[providers.leaseweb]\nenabled = true\ndisplay_name = "Leaseweb"\n\n'
+            '[providers.leaseweb.families.vps]\ndisplay_name = "وی‌پی‌اس"\n\n'
+            '[providers.leaseweb.families.cloud]\ndisplay_name = "کلود"\n',
+        )
+        self._point_at(monkeypatch, path)
+        assert await cli_module.config_doctor() == 0
+        out = capsys.readouterr().out
+        assert "customer-facing labels that look corrupted" not in out
         assert "config doctor: OK" in out
 
     async def test_unreplaced_placeholder_fails_a_production_file(

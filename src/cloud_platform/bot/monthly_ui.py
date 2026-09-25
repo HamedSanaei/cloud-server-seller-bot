@@ -1020,14 +1020,19 @@ class MonthlyBotUi:
         return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def store_cloud_images_screen(self, offer_ref: str) -> BotScreen:
-        """Supported images, read live (label and provider id stay apart)."""
+        """Supported operating systems, read live (label and provider id
+        apart), under the summary of the plan the customer just picked."""
         offer_id = self._resolve_offer_id(offer_ref)
         if offer_id is None:
             return self._expired_screen()
         try:
-            _offer, options, back_callback, cancel_callback = await self._view.cloud_images_screen(
+            offer, options, back_callback, cancel_callback = await self._view.cloud_images_screen(
                 offer_id
             )
+        except OsUnavailableError:
+            # The plan is sellable; the provider exposes no usable image for
+            # it right now. Say exactly that instead of "unavailable".
+            return BotScreen(self._t.t("store.cloud_no_images"), self._menu_only())
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
         rows = [
@@ -1045,9 +1050,25 @@ class MonthlyBotUi:
                 InlineKeyboardButton(text=self._t.t("nav.cancel"), callback_data=cancel_callback),
             ]
         )
-        return BotScreen(
-            self._t.t("store.cloud_images_title"), InlineKeyboardMarkup(inline_keyboard=rows)
+        # For a hourly offer the offer view's price field IS the hourly
+        # selling price (never a monthly estimate).
+        hourly = self._t.t(
+            "store.price_per_hour",
+            price=await self._price_label(offer.monthly_price_minor, offer.currency),
         )
+        header = [
+            self._t.t("store.cloud_images_title"),
+            "",
+            self._t.t("store.cloud_selected_plan", name=offer.name),
+            self._t.t(
+                "store.cloud_selected_specs",
+                vcpu=offer.vcpu,
+                ram=offer.ram_gb,
+                disk=offer.disk_gb,
+            ),
+            self._t.t("store.cloud_selected_price", price=hourly),
+        ]
+        return BotScreen("\n".join(header), InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def store_cloud_buy_screen(
         self, user: User | None, offer_ref: str, image_index: int, cb_key: str

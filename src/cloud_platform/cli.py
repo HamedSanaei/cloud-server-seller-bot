@@ -1689,11 +1689,15 @@ async def config_doctor() -> int:
     * keys the file sets that the loader does not know (silently ignored today,
       which is how a typo or a removed setting stays unnoticed);
     * the documented ``CHANGE_ME`` placeholders still present in a
-      ``production`` file, which is an invalid configuration rather than drift.
+      ``production`` file, which is an invalid configuration rather than drift;
+    * configured customer-facing labels (every ``display_name``) that are
+      obviously corrupted — terminal mojibake such as ``"????????"`` is never
+      a customer-facing name, so it fails the file.
 
     It never rewrites anything: the operator merges the missing keys and
     uploads the file. Exit 1 for an unreadable/invalid file, a missing required
-    key or an unreplaced placeholder in production; otherwise 0.
+    key, an unreplaced placeholder in production or a corrupted label;
+    otherwise 0.
     """
     import tomllib
 
@@ -1702,6 +1706,7 @@ async def config_doctor() -> int:
         TOML_LEGACY_ALIAS_KEYS,
         ConfigFileError,
         Settings,
+        looks_corrupted_label,
         resolve_config_file,
     )
 
@@ -1757,6 +1762,13 @@ async def config_doctor() -> int:
         for leaf in _toml_leaf_paths(document)
         if _toml_leaf_value(document, leaf) == "CHANGE_ME"
     ]
+    # Customer-facing names only. The value is never printed — the key path
+    # alone identifies the operator's paste accident.
+    corrupted_labels = [
+        ".".join(leaf)
+        for leaf in _toml_leaf_paths(document)
+        if leaf[-1] == "display_name" and looks_corrupted_label(_toml_leaf_value(document, leaf))
+    ]
 
     if missing_required:
         print("missing REQUIRED keys:")
@@ -1779,10 +1791,16 @@ async def config_doctor() -> int:
         print(f"{label}:")
         for name in sorted(placeholders):
             print(f"  {name}")
-    if not (missing_required or missing_defaulted or unknown or placeholders):
+    if corrupted_labels:
+        print("customer-facing labels that look corrupted (never shown to customers):")
+        for name in sorted(corrupted_labels):
+            print(f"  [FAIL] {name}: customer-facing label appears corrupted")
+    if not (missing_required or missing_defaulted or unknown or placeholders or corrupted_labels):
         print("every supported key is present, no unknown keys, no placeholders")
 
-    unusable = bool(missing_required) or (production and bool(placeholders))
+    unusable = (
+        bool(missing_required) or (production and bool(placeholders)) or bool(corrupted_labels)
+    )
     print(f"config doctor: {'FAIL' if unusable else 'OK'}")
     return 1 if unusable else 0
 

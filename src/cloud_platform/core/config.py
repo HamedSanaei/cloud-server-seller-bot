@@ -1182,6 +1182,27 @@ class Settings(BaseSettings):
             _ACTIVE_CONFIG_FILE = previous
 
 
+def looks_corrupted_label(value: object) -> bool:
+    """Whether a configured customer-facing label is obviously corrupted.
+
+    Operator configuration carries the names customers read (provider
+    ``display_name``, product-family ``display_name``). A value made only of
+    question marks, replacement characters, punctuation or whitespace —
+    ``"????"``, ``"????????"``, ``"..."`` — is the signature of a broken
+    terminal paste, not a name, and must never be rendered.
+
+    The rule is deliberately locale-neutral: the label only has to contain at
+    least one letter or digit, so ``Leaseweb``, ``General Purpose``,
+    ``وی‌پی‌اس`` and ``کلود`` all pass, while ``????????`` fails. An empty
+    value is NOT corrupted: it means "not configured" and the caller applies
+    its own fallback.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return False
+    return not any(character.isalnum() for character in text)
+
+
 def load_settings(config_file: str | Path | None = None) -> Settings:
     """Load settings, optionally from an explicit configuration file."""
     return Settings.model_validate_toml(config_file)

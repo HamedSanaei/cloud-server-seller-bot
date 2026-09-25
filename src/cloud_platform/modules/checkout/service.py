@@ -36,6 +36,10 @@ from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
 from cloud_platform.modules.businesslog.events import purchase_requested_event
 from cloud_platform.modules.catalog.domain import LocationRepository
+from cloud_platform.modules.catalog.image_compatibility import (
+    image_architecture_conflict,
+    image_compatible,
+)
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_PREPAID_MONTHLY,
     CloudServer,
@@ -59,6 +63,7 @@ from cloud_platform.modules.offers.domain import (
     HOURLY_MONTHLY_ESTIMATE_HOURS,
     SellableOffer,
     SellableOfferRepository,
+    TechnicalSpec,
 )
 from cloud_platform.modules.operations.domain import OperationRepository, OperationType
 from cloud_platform.modules.orders.domain import ProviderOrder, ProviderOrderRepository
@@ -1868,9 +1873,12 @@ class OfferCatalogViewService:
                 traffic=offer.traffic,
                 monthly_price_minor=offer.selling_price_minor,
                 currency=offer.selling_currency,
-                select_callback=self._store_nav_callback(
-                    "cloud_detail", provider_key, location_id, offer.product_id
-                ),
+                # A concrete plan goes STRAIGHT to the OS/image picker: the
+                # plan is already fully identified by this button, so an
+                # extra detail screen would only add a click. The legacy
+                # ``cloud_detail`` route stays decodable for buttons already
+                # sitting in customer chats.
+                select_callback=self._store_nav_callback("cloud_images", self._offer_ref(offer.id)),
                 technical_metadata=dict(offer.technical_metadata or {}),
             )
             for offer in offers[(current - 1) * size : current * size]
@@ -1947,12 +1955,39 @@ class OfferCatalogViewService:
             cancel_callback=self._store_nav_callback("market"),
         )
 
+    @staticmethod
+    def _selectable_images(offer: SellableOffer, images: list[Any]) -> list[Any]:
+        """Images this exact offer may actually be created with.
+
+        Provider-neutral and deliberately conservative:
+
+        * a restriction the provider states (plan/location/account) is honoured
+          fail-closed, exactly like the creation gate;
+        * an architecture is dropped only on a POSITIVE mismatch — a provider
+          that does not state an architecture for its images must not lose
+          every image because a plan states one.
+        """
+        architecture = TechnicalSpec.from_metadata(offer.technical_metadata).architecture
+        account_id = getattr(offer, "provider_account_id", None)
+        return [
+            image
+            for image in images
+            if image_compatible(
+                image,
+                plan_id=offer.product_id,
+                location_id=offer.location_id,
+                account_id=account_id,
+            )
+            and not image_architecture_conflict(image, architecture)
+        ]
+
     async def cloud_images_screen(
         self, offer_id: UUID
     ) -> tuple[OfferCatalogView, list[PanelOptionView], str, str]:
         # Supported images, read live from the provider (label and provider
         # id stay separate; selection travels as an index and is re-resolved
-        # server-side, like OS options).
+        # server-side against the same filtered list, so an index can never
+        # point at an image the pinned offer cannot use).
         offer = await self._offers.get(offer_id)
         if offer is None or not offer.sellable:
             raise OfferUnavailableError(f"offer {offer_id} is not sellable")
@@ -1962,11 +1997,14 @@ class OfferCatalogViewService:
             offer.provider_key, getattr(offer, "provider_account_id", None)
         )
         try:
-            images = await provider.list_images(offer.location_id)
+            images = self._selectable_images(offer, await provider.list_images(offer.location_id))
         except Exception as exc:
             raise OfferUnavailableError(f"images currently unavailable for {offer.ref}") from exc
         if not images:
-            raise OfferUnavailableError(f"no images for {offer.ref}")
+            # Not "this offer is unavailable": the plan is sellable, the
+            # provider simply exposes no usable image for it right now. The
+            # customer gets the honest, specific reason.
+            raise OsUnavailableError(f"no images for {offer.ref}")
         options = [
             PanelOptionView(
                 name=f"{image.label} ({image.architecture})" if image.architecture else image.label,
@@ -1977,20 +2015,27 @@ class OfferCatalogViewService:
             )
             for index, image in enumerate(images)
         ]
+        # Back returns to the plan list of this plan's own instance family at
+        # the same location — the context the customer came from.
         back_callback = self._store_nav_callback(
-            "cloud_detail", offer.provider_key, offer.location_id, offer.product_id
+            "cloud_plans",
+            offer.provider_key,
+            offer.location_id,
+            self._plan_family_of(offer)[0],
+            "1",
         )
         cancel_callback = self._store_nav_callback("market")
         return self._view(offer), options, back_callback, cancel_callback
 
     async def cloud_image_by_index(self, offer: SellableOffer, index: int) -> Any:
         # Resolve a callback-encoded image index back to its record
-        # (re-fetched live, so a stale index simply fails).
+        # (re-fetched live and filtered exactly like the picker, so a stale
+        # index simply fails).
         provider = self._hourly_provider(
             offer.provider_key, getattr(offer, "provider_account_id", None)
         )
         try:
-            images = await provider.list_images(offer.location_id)
+            images = self._selectable_images(offer, await provider.list_images(offer.location_id))
         except Exception as exc:
             raise OfferUnavailableError(f"images currently unavailable for {offer.ref}") from exc
         if index < 0 or index >= len(images):

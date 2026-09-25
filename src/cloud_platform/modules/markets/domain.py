@@ -26,9 +26,14 @@ application code never branch on a concrete provider name.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+
+from cloud_platform.core.config import looks_corrupted_label
+
+logger = logging.getLogger(__name__)
 
 
 class MarketError(Exception):
@@ -151,12 +156,20 @@ class ProviderCatalog:
                         f"provider {provider_key!r} declares two families for billing {billing!r}"
                     )
                 seen_billing.add((provider_key, billing))
+                label = str(attrs.get("display_name") or "").strip()
+                if label and looks_corrupted_label(label):
+                    logger.warning(
+                        "family %r of provider %r has a corrupted configured "
+                        "display_name; falling back to the family key",
+                        family_key,
+                        provider_key,
+                    )
+                    label = ""
                 out[(str(provider_key), str(family_key))] = ProviderProductFamily(
                     provider_key=str(provider_key),
                     family_key=str(family_key),
                     billing_model=billing,
-                    display_name=str(attrs.get("display_name") or family_key).strip()
-                    or str(family_key),
+                    display_name=label or str(family_key),
                 )
         return out
 
@@ -184,8 +197,22 @@ class ProviderCatalog:
             return None
 
     def display_name_of(self, provider_key: str) -> str:
-        """The customer-facing provider name (never an internal key)."""
-        return self._display_names.get(provider_key) or provider_key
+        """The customer-facing provider name (never an internal key).
+
+        A configured name is only shown when it is a real label; a value the
+        operator's terminal corrupted into question marks falls back to the
+        provider key instead of becoming customer-facing text (``config
+        doctor`` reports it as a hard finding).
+        """
+        configured = self._display_names.get(provider_key)
+        if configured and not looks_corrupted_label(configured):
+            return configured
+        if configured:
+            logger.warning(
+                "provider %r has a corrupted configured display_name; using the key",
+                provider_key,
+            )
+        return provider_key
 
     def is_enabled(self, provider_key: str) -> bool:
         """Operator switch: unset means enabled (credentials still decide)."""
