@@ -210,7 +210,7 @@ uv run python -m cloud_platform.cli fx rates --target USD
 uv run alembic current
 ```
 
-Confirm migration `0043` (current head) applied cleanly, the configured `[fx]`
+Confirm migrations `0043` and `0044` (current head) applied cleanly, the configured `[fx]`
 family switches and blocks, provider-cost columns still show their original
 currencies, and every sellable foreign row has
 `pricing_metadata.fx_provider = "frankfurter"`, `selling_currency = "USD"`, and
@@ -224,8 +224,14 @@ balances are NEVER silently rewritten: checkout and accrual fail closed when
 the wallet currency does not match the selling currency, and the mismatch is
 surfaced as a `ValueError` naming both currencies.
 
-To migrate a legacy wallet, the operator must do all of the following
-deliberately, per wallet:
+Migration `0044` repairs one safe legacy edge case automatically: an
+already-existing wallet with a zero balance and no ledger entries, holds,
+servers, or payment sessions is still pristine, so changing its empty
+denomination to USD cannot reinterpret any money or service history. Every
+non-pristine wallet remains untouched.
+
+To migrate a legacy wallet that is not pristine, the operator must do all of
+the following deliberately, per wallet:
 
 1. Confirm the wallet has no RUNNING hourly server and no CAPTURED hold
    (an active contract keeps its frozen snapshot regardless).
