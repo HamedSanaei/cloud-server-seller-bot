@@ -47,7 +47,8 @@
 # Sequence: validate files -> save rollback image -> switch PLATFORM_IMAGE ->
 # pull -> postgres/redis healthy -> migrate (alembic upgrade head) ->
 # database migration head == image head -> database PHYSICAL schema matches the
-# release -> catalog canonicalization (offers normalize-selling-currency) ->
+# release -> catalog refresh (catalog auto-sync run: provider facts, pricing,
+# publication) -> catalog canonicalization (offers normalize-selling-currency) ->
 # api, worker, exactly one bot -> health/readiness -> STOREFRONT READINESS
 # (offers readiness: an enabled+credentialed+auto-priced provider with stored
 # offers but none sellable fails the release) -> report. On failure the
@@ -424,6 +425,28 @@ deploy() {
         return 1
     fi
     log "database physical schema verified against the release"
+
+    # GATE: refresh provider facts first (bounded, idempotent release transition).
+    #
+    # Canonicalization below cannot invent a provider fact that was never
+    # stored: a row whose exact provider rate is missing, or whose integer cost
+    # was stored under a wrong minor-unit assumption, is left fail-closed until
+    # the provider is re-observed. So the release runs ONE complete catalog
+    # refresh through the same advisory-locked coordinator the worker cron uses
+    # (official read-only APIs, server-owned markup, publication), bounded by
+    # the DEDICATED catalog timeout — not the generic 120s job timeout whose
+    # cancellation is what left a production catalog unpriced.
+    #
+    # A non-zero exit is NOT fatal — a provider/API outage must not block an
+    # unrelated release — but it is never silent, and the storefront readiness
+    # gate after the services start stays authoritative.
+    log "refreshing provider catalog facts (bounded one-shot sync)"
+    if PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        python -m cloud_platform.cli catalog auto-sync run; then
+        log "catalog refresh completed"
+    else
+        log "[WARN] catalog refresh reported provider errors (counts above); the storefront readiness gate below is authoritative"
+    fi
 
     # GATE: catalog canonicalization (idempotent release transition).
     #

@@ -939,6 +939,19 @@ case " $* " in
         printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
         exit 0
         ;;
+    *"catalog auto-sync run"*)
+        # Bounded provider-fact refresh release transition (one-shot container).
+        if [ "$FAIL_CATALOG_REFRESH" = "1" ]; then
+            echo "running one complete catalog refresh (timeout 600s)"
+            echo "  leaseweb: ok=False discovered=0 persisted=0 prices=0 published=0 errors=1"
+            echo "catalog refresh completed with provider errors: leaseweb"
+            exit 1
+        fi
+        echo "running one complete catalog refresh (timeout 600s)"
+        echo "  leaseweb: ok=True discovered=507 persisted=507 prices=456 published=456"
+        echo "catalog refresh completed"
+        exit 0
+        ;;
     *"normalize-selling-currency"*)
         # Catalog canonicalization release transition (one-shot container).
         if [ "$FAIL_NORMALIZE" = "1" ]; then
@@ -993,6 +1006,7 @@ def _release_harness(
     fail_ready: bool = False,
     fail_up_api: bool = False,
     fail_schema_parity: bool = False,
+    fail_catalog_refresh: bool = False,
     fail_normalize: bool = False,
     fail_storefront_readiness: bool = False,
     crash_loop: bool = False,
@@ -1050,6 +1064,7 @@ def _release_harness(
         f"FAIL_MIGRATE='{'1' if fail_migrate else ''}' "
         f"FAIL_UP_API='{'1' if fail_up_api else ''}' "
         f"FAIL_SCHEMA_PARITY='{'1' if fail_schema_parity else ''}' "
+        f"FAIL_CATALOG_REFRESH='{'1' if fail_catalog_refresh else ''}' "
         f"FAIL_NORMALIZE='{'1' if fail_normalize else ''}' "
         f"FAIL_STOREFRONT_READINESS='{'1' if fail_storefront_readiness else ''}' "
         f"ALEMBIC_IMAGE_HEAD='{alembic_image_head}' "
@@ -1323,12 +1338,52 @@ class TestStorefrontReadinessGate:
         assert 'PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}"' in window
         assert "compose_candidate run --rm --no-deps migrate" in window
 
+    def test_catalog_refresh_runs_before_canonicalization_and_services(self) -> None:
+        """Provider facts are re-observed BEFORE the catalog is canonicalized.
+
+        Canonicalization can only convert against facts the row already has: a
+        manual/auto row whose exact provider rate or integer cost is stale or
+        missing is left fail-closed by the price book. So the release refreshes
+        provider facts first (the same advisory-locked coordinator the worker
+        runs, bounded by the DEDICATED catalog budget — never the 120s generic
+        job timeout), then canonicalizes, then starts services.
+        """
+        script = _script()
+        refresh = script.index("python -m cloud_platform.cli catalog auto-sync run")
+        normalize = script.index("offers normalize-selling-currency --execute")
+        assert refresh > script.index("database physical schema verified against the release")
+        assert refresh < normalize < script.index("starting api + worker + bot")
+        window = script[max(0, refresh - 300) : normalize]
+        # The supported CLI path with the RELEASE image, in one-shot containers.
+        assert 'PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}"' in window
+        assert "compose_candidate run --rm --no-deps migrate" in window
+        # No bespoke SQL and no ad-hoc data surgery.
+        assert "UPDATE" not in script
+        assert "psql" not in script
+
     def test_storefront_readiness_runs_after_health_and_before_promotion(self) -> None:
         script = _script()
         readiness = script.index("python -m cloud_platform.cli offers readiness")
         assert script.index("API readiness: ok") < readiness
         assert script.index("worker + bot stable") < readiness
         assert readiness < script.index("promoting release compose to canonical")
+
+    @needs_bash
+    def test_refresh_failure_is_reported_and_never_fatal(self, tmp_path: Path) -> None:
+        """A provider/API outage must not block an unrelated release.
+
+        It is never silent either: the counters are printed, the step is logged
+        as a WARN, and the storefront readiness gate stays authoritative.
+        """
+        result, _, _, _, _, _ = _release_harness(tmp_path, fail_catalog_refresh=True)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=0" in result.stdout
+        assert "[WARN] catalog refresh reported provider errors" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        assert "catalog auto-sync run" in calls
+        # The release still canonicalizes and still gates on readiness.
+        assert "normalize-selling-currency --execute" in calls
+        assert "storefront readiness: ok" in result.stdout
 
     @needs_bash
     def test_normalization_is_idempotent_and_never_fatal(self, tmp_path: Path) -> None:

@@ -169,15 +169,21 @@ repository secrets are needed: application secrets live only in the server
 7. Start/verify `postgres` + `redis` (bounded health waits, candidate contract).
 8. Run migrations (`alembic upgrade head` in the one-shot `migrate`
    service); on failure restore the previous reference and stop.
-9. Canonicalize the catalog (`offers normalize-selling-currency --execute`,
+9. Refresh provider facts (`catalog auto-sync run`, one-shot container,
+   idempotent): exactly one complete catalog pass — the worker coordinator with
+   the DEDICATED catalog timeout, never the generic 120s job timeout whose
+   cancellation left a production catalog unpriced. It must come first because
+   a price can only be converted against provider facts the row already
+   carries. A non-zero exit is logged with its counters and NOT fatal.
+10. Canonicalize the catalog (`offers normalize-selling-currency --execute`,
    one-shot container, idempotent). A schema migration refuses to invent
    financial history, and the release that made canonical currency +
    FX provenance a visibility requirement could not enforce it either — the
    global-USD rollout deployed GREEN with 507 stored offers and ZERO on sale.
    A non-zero exit here is logged with its counters and NOT fatal (an FX
-   outage must not block an unrelated release); step 11 is authoritative.
-10. Start/update `api`, `worker`, and exactly one `bot` (candidate contract).
-11. Health gates (all bounded, no infinite waits):
+   outage must not block an unrelated release); step 12 is authoritative.
+11. Start/update `api`, `worker`, and exactly one `bot` (candidate contract).
+12. Health gates (all bounded, no infinite waits):
     * `GET /health/ready` reports `{"status": "ok"}` (strongest readiness gate);
     * `postgres` + `redis` containers healthy; `worker` running;
     * exactly one `bot` container running (long-polling single consumer);
@@ -194,9 +200,9 @@ repository secrets are needed: application secrets live only in the server
       Disabled/uncredentialed/policy-less providers are never required to have
       offers, and an all-operator-disabled catalog is operator intent. A
       failure here refuses to promote the release (rollback path runs).
-12. Atomically promote the candidate compose to the canonical path
+13. Atomically promote the candidate compose to the canonical path
     (same-filesystem rename, mode 0644) and log its SHA-256.
-13. Print service status; on success prune older local images (current +
+14. Print service status; on success prune older local images (current +
     rollback images are always kept).
 
 ## 6. Migration and rollback behavior
