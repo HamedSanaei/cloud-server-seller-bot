@@ -22,6 +22,11 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.modules.fx.domain import (
+    FxPurpose,
+    FxUnsupportedCurrencyError,
+    major_to_minor,
+)
 from cloud_platform.modules.offers.domain import HOURLY_MONTHLY_ESTIMATE_HOURS
 from cloud_platform.providers.errors import (
     ProviderError,
@@ -63,17 +68,36 @@ def _decimal(value: Any) -> Decimal | None:
         return None
 
 
-def _hourly_minor(value: Any) -> int | None:
-    """Provider hourly price -> minor units (None when absent/invalid).
+def _price_present(value: Any) -> bool:
+    """True when a provider value is a usable positive price in major units.
 
-    Sub-cent rates round half up: money stays integer minor units
-    everywhere, and the rounding is the documented sync semantic (the same
-    conversion the Hetzner sync applies to provider prices).
+    Currency-independent on purpose: "this response carries a price" is a
+    different fact from "this price is convertible in the envelope
+    currency", and the diagnostics must be able to tell them apart.
+    """
+    parsed = _decimal(value)
+    return parsed is not None and parsed > 0
+
+
+def _provider_minor(value: Any, currency: str) -> int | None:
+    """Provider major-unit price -> integer minor units for ``currency``.
+
+    The provider's native currency owns its minor-unit exponent: JPY/KRW are
+    zero-decimal, EUR/USD two-decimal. Conversion uses the canonical audited
+    money helper (``major_to_minor`` with DISPLAY rounding = HALF_UP), which
+    is exactly the rule ``CatalogOfferPricer.price_auto`` re-derives from the
+    verbatim provider rate — so sub-cent rates keep the same HALF_UP
+    semantic as before while zero-decimal currencies stop being inflated by
+    a hardcoded ``* 100``. A currency whose exponent is not audited fails
+    closed (``None``) rather than assuming two decimals.
     """
     parsed = _decimal(value)
     if parsed is None or parsed <= 0:
         return None
-    return int((parsed * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    try:
+        return major_to_minor(parsed, currency, FxPurpose.DISPLAY)
+    except (FxUnsupportedCurrencyError, ValueError):
+        return None
 
 
 def _monthly_estimate_minor(hourly_minor: int) -> int:
@@ -147,8 +171,9 @@ class CloudRegion:
 class CloudInstanceType:
     """One hourly instance type at one region (list payload, normalized).
 
-    ``hourly_cost_minor`` is the provider rate in integer minor units
-    (HALF_UP, same convention as the monthly syncs); ``hourly_rate_exact``
+    ``hourly_cost_minor`` is the provider rate in integer minor units of the
+    provider's own currency, converted with that currency's audited exponent
+    (HALF_UP, the canonical DISPLAY rounding); ``hourly_rate_exact``
     preserves the provider's verbatim decimal rate (e.g. ``"0.0395"``) so
     sub-cent precision is never silently lost — downstream integer money
     math stays exact while margin audit keeps the true rate.
@@ -361,15 +386,19 @@ def _parse_instance_type(
     raw_id = str(item.get("name") or item.get("id") or "").strip()
     if not raw_id:
         return None
+    # Currency is normalized FIRST: it owns the minor-unit exponent every
+    # monetary field below is converted with.
     code = _normalize_currency(currency)
+    if code is None:
+        return None
     raw_money = item.get("prices")
     money: dict[str, Any] = raw_money if isinstance(raw_money, dict) else {}
     hourly_raw = money.get("hourly", item.get("pricePerHour", item.get("price_per_hour")))
     hourly_text = _decimal_string(hourly_raw)
-    hourly = _hourly_minor(hourly_raw)
-    if hourly is None or hourly_text is None or code is None:
+    hourly = _provider_minor(hourly_raw, code)
+    if hourly is None or hourly_text is None:
         return None
-    monthly_minor = _hourly_minor(money.get("monthly", item.get("pricePerMonth")))
+    monthly_minor = _provider_minor(money.get("monthly", item.get("pricePerMonth")), code)
     raw = item.get("resources")
     resources: dict[str, Any] = raw if isinstance(raw, dict) else {}
     cpu_value, _cpu_unit = _resource_amount(resources, "cpu")
@@ -629,21 +658,32 @@ class LeasewebHourlyCloudProvider:
             for item in self._items(payload, "instanceTypes", "types", "data", "items")
             if isinstance(item, dict)
         ]
-        parsed = [
+        parsed = tuple(
             entry for entry in (_parse_instance_type(item, region, currency) for item in items)
-        ]
+        )
         priced = sum(
             1
             for item in items
-            if _hourly_minor(
+            if _price_present(
                 (item.get("prices") or {}).get("hourly")
                 if isinstance(item.get("prices"), dict)
                 else item.get("pricePerHour", item.get("price_per_hour"))
             )
-            is not None
         )
+        types = tuple(entry for entry in parsed if entry is not None)
+        if priced and not types and currency is not None:
+            # Diagnosable, non-silent drop: the response carries prices, but
+            # the envelope currency has no audited minor-unit exponent, so
+            # every conversion fails closed instead of assuming cents.
+            logger.warning(
+                "leaseweb public cloud region %s: %d priced instance type(s) dropped "
+                "because currency %s has no audited minor-unit exponent",
+                region,
+                priced,
+                currency,
+            )
         return CloudInstanceTypesRead(
-            types=tuple(entry for entry in parsed if entry is not None),
+            types=types,
             raw_items=len(items),
             priced_items=priced,
             currency=currency,

@@ -27,6 +27,8 @@ from typing import Any
 from unittest import mock
 from uuid import UUID, uuid4
 
+import pytest
+
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.providers.leaseweb.cloud import (
     LeasewebHourlyCloudProvider,
@@ -528,6 +530,224 @@ class TestOfficialHourlySyncAcceptance:
         assert [(g.country_code, g.city) for g in cities.items] == [("DE", "Frankfurt")]
         for button in [cities.items[0].select_callback]:
             assert len(button.encode("utf-8")) <= 64
+
+
+_JPY_REGION = "ap-northeast-1"
+_KRW_REGION = "ap-northeast-2"
+
+
+def _single_region_payload(region_id: str, country: str, city: str) -> dict[str, Any]:
+    return {"regions": [{"name": region_id, "country": country, "displayName": city, "city": city}]}
+
+
+def _priced_types_payload(currency: str, *, name: str, hourly: str, monthly: str) -> dict[str, Any]:
+    """Official ``instanceTypes`` shape in one envelope currency."""
+    return {
+        "instanceTypes": [
+            {
+                "name": name,
+                "resources": {
+                    "cpu": {"value": 2, "unit": "vCPU"},
+                    "memory": {"value": 3, "unit": "GiB"},
+                },
+                "prices": {"hourly": hourly, "monthly": monthly},
+                "storageTypes": ["CENTRAL"],
+                "minDiskSize": 5,
+            }
+        ],
+        "_metadata": {"currency": currency, "currencySymbol": ""},
+    }
+
+
+class TestZeroDecimalProviderCurrency:
+    """P0 production fix: the provider's own exponent owns minor units.
+
+    The adapter previously multiplied every provider price by 100. For a
+    zero-decimal currency (JPY/KRW) that stored ``rate * 100`` while
+    ``CatalogOfferPricer`` correctly re-derived ``rate`` itself, so every
+    ap-northeast-1 hourly offer died with "exact provider rate does not
+    match the provider_cost_minor observation" — 50 production rows.
+    """
+
+    async def test_jpy_hourly_and_monthly_use_the_zero_decimal_exponent(self) -> None:
+        provider = _provider(
+            {
+                "/publicCloud/v1/instanceTypes": _priced_types_payload(
+                    "JPY", name="lsw.c3.large", hourly="150", monthly="25000"
+                )
+            }
+        )
+        read = await provider.read_instance_types(_JPY_REGION)
+        (item,) = read.types
+        assert read.currency == "JPY"
+        # JPY 150 is ¥150 exactly; the old *100 stored 15000 minor units.
+        assert item.hourly_cost_minor == 150
+        assert item.hourly_cost_minor != 15000
+        assert item.monthly_cost_minor == 25000
+        assert item.monthly_cost_minor != 2500000
+        assert item.hourly_rate_exact == "150"
+        assert item.currency == "JPY"
+
+    async def test_krw_hourly_uses_the_zero_decimal_exponent(self) -> None:
+        provider = _provider(
+            {
+                "/publicCloud/v1/instanceTypes": _priced_types_payload(
+                    "KRW", name="lsw.c3.large", hourly="250", monthly="180000"
+                )
+            }
+        )
+        read = await provider.read_instance_types(_KRW_REGION)
+        (item,) = read.types
+        assert item.hourly_cost_minor == 250
+        assert item.monthly_cost_minor == 180000
+        assert item.currency == "KRW"
+
+    @pytest.mark.parametrize(
+        ("currency", "hourly", "expected_minor"),
+        [
+            ("EUR", "0.0395", 4),
+            ("USD", "0.0395", 4),
+            ("GBP", "0.0099", 1),
+            ("EUR", "26.0200", 2602),
+            ("JPY", "691", 691),
+            ("KRW", "691", 691),
+        ],
+    )
+    def test_conversion_matches_the_canonical_money_helper(
+        self, currency: str, hourly: str, expected_minor: int
+    ) -> None:
+        from decimal import Decimal
+
+        from cloud_platform.modules.fx.domain import FxPurpose, major_to_minor
+        from cloud_platform.providers.leaseweb.cloud import _provider_minor
+
+        assert _provider_minor(hourly, currency) == expected_minor
+        # The observation is exactly what the pricer re-derives, by
+        # construction, for every audited currency.
+        assert _provider_minor(hourly, currency) == major_to_minor(
+            Decimal(hourly), currency, FxPurpose.DISPLAY
+        )
+
+    def test_unaudited_currency_fails_closed_instead_of_assuming_cents(self) -> None:
+        from cloud_platform.providers.leaseweb.cloud import _provider_minor
+
+        assert _provider_minor("12.50", "CHF") is None
+        assert _provider_minor("12.50", "XYZ") is None
+
+    async def test_unaudited_envelope_currency_drops_types_without_deleting_facts(
+        self,
+    ) -> None:
+        provider = _provider(
+            {
+                "/publicCloud/v1/instanceTypes": _priced_types_payload(
+                    "CHF", name="lsw.c3.large", hourly="12.50", monthly="2000"
+                )
+            }
+        )
+        read = await provider.read_instance_types("eu-west-3")
+        assert read.currency == "CHF"
+        assert read.raw_items == 1
+        # The price IS present (diagnostic), but nothing is convertible.
+        assert read.priced_items == 1
+        assert read.types == ()
+
+    @pytest.mark.parametrize(
+        ("currency", "region", "country", "city", "hourly", "rate", "expected_usd_minor"),
+        [
+            ("JPY", _JPY_REGION, "JP", "Tokyo", "150", "0.0068", 128),
+            ("KRW", _KRW_REGION, "KR", "Seoul", "250", "0.00072", 23),
+        ],
+    )
+    async def test_zero_decimal_offer_prices_to_usd_with_valid_provenance(
+        self,
+        currency: str,
+        region: str,
+        country: str,
+        city: str,
+        hourly: str,
+        rate: str,
+        expected_usd_minor: int,
+    ) -> None:
+        """End-to-end: parse -> offer -> 25% pricing -> publish -> sellable."""
+        import cloud_platform.providers.leaseweb.cloud_sync as cloud_sync_mod
+        from cloud_platform.modules.offers.auto_sync import (
+            CatalogAutoSyncCoordinator,
+            PricingPolicy,
+        )
+        from cloud_platform.modules.offers.domain import has_valid_pricing_provenance
+        from cloud_platform.providers.leaseweb.cloud_auto_sync import (
+            LeasewebHourlyCloudSyncSource,
+        )
+        from cloud_platform.providers.leaseweb.cloud_sync import LeasewebHourlyCloudSyncer
+
+        provider = _provider(
+            {
+                "/publicCloud/v1/regions": _single_region_payload(region, country, city),
+                "/publicCloud/v1/instanceTypes": _priced_types_payload(
+                    currency, name="lsw.c3.large", hourly=hourly, monthly="100000"
+                ),
+            }
+        )
+        offers = _BookOffersRepo()
+        locations = _BookLocationsRepo()
+        state = _BookStateRepo()
+        syncer = LeasewebHourlyCloudSyncer(
+            lambda: None,  # type: ignore[arg-type]
+            accounts={"north": provider},  # type: ignore[arg-type]
+        )
+        with (
+            mock.patch.object(
+                cloud_sync_mod, "SqlAlchemySellableOfferRepository", lambda sf: offers
+            ),
+            mock.patch(
+                "cloud_platform.modules.catalog.repository.SqlAlchemyLocationRepository",
+                lambda sf: locations,
+            ),
+        ):
+            coordinator = CatalogAutoSyncCoordinator(
+                sources=[LeasewebHourlyCloudSyncSource(syncer)],
+                offers=offers,  # type: ignore[arg-type]
+                state=state,  # type: ignore[arg-type]
+                lock=_AllowLock(),  # type: ignore[arg-type]
+                pricing_policies={
+                    "leaseweb.hourly": PricingPolicy(
+                        mode="markup", markup_percent=25, auto_publish=True
+                    )
+                },
+                reference_rates=_DeterministicEurUsdRates(rate),
+            )
+            report = await coordinator.run()
+
+        assert report.ran is True
+        run = report.providers[0]
+        # No pricing failure: this is the bug that killed all 50 JP rows.
+        assert run.ok is True, (run.errors, run.warnings)
+        assert run.prices_updated == 1
+        assert run.published == 1
+        stored = await offers.get_by_ref("leaseweb", "lsw.c3.large", region)
+        assert stored is not None
+        assert stored.provider_cost_currency == currency
+        assert stored.selling_currency == "USD"
+        assert stored.selling_price_minor == expected_usd_minor
+        assert stored.enabled is True
+        assert stored.sellable is True
+        assert has_valid_pricing_provenance(stored, "USD") is True
+        metadata = stored.pricing_metadata
+        assert metadata["markup_percent"] == "25"
+        assert metadata["source_currency"] == currency
+        # The exact provider rate — never the rounded minor observation —
+        # is what the FX/markup arithmetic consumed.
+        assert metadata["source_amount"] == hourly
+        assert metadata["source_amount_basis"] == "exact_provider_rate_major"
+        assert metadata["fx_provider"] == "frankfurter"
+        # Both parametrized currencies are zero-decimal, so the stored
+        # observation is the major amount itself.
+        assert metadata["provider_cost_minor"] == int(hourly) == stored.provider_cost_minor
+        # Verbatim provider rate still carried, and the monthly provider
+        # price stayed a reference fact — it never priced the offer.
+        assert stored.billing_parameters["provider_hourly_rate"] == hourly
+        assert stored.billing_parameters["monthly_estimate_source"] == "hourly_rate"
+        assert stored.billing_parameters["provider_monthly_cost_minor"] == 100000
 
 
 class _NoRegistry:
