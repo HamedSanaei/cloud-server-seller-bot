@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -11,6 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import TermsVersion as SQLAlchemyTermsVersion
 from cloud_platform.db.base import User as SQLAlchemyUser
+from cloud_platform.db.timestamps import (
+    from_db_utc,
+    from_db_utc_or_none,
+    to_db_utc,
+    to_db_utc_or_none,
+    utc_now,
+)
 from cloud_platform.modules.users.domain import (
     Role,
     TermsVersion,
@@ -34,10 +40,12 @@ def _to_domain(row: SQLAlchemyUser) -> User:
         status=UserStatus(_attr(row, "status")),
         role=Role(_attr(row, "role")),
         terms_version=_attr(row, "terms_version"),
-        terms_accepted_at=_attr(row, "terms_accepted_at"),
+        # users.terms_accepted_at/created_at/updated_at are legacy naive-UTC
+        # columns: rehydrate them as aware UTC for the domain.
+        terms_accepted_at=from_db_utc_or_none(_attr(row, "terms_accepted_at")),
         telegram_user_id=_attr(row, "telegram_user_id"),
-        created_at=_attr(row, "created_at"),
-        updated_at=_attr(row, "updated_at"),
+        created_at=from_db_utc_or_none(_attr(row, "created_at")),
+        updated_at=from_db_utc_or_none(_attr(row, "updated_at")),
     )
 
 
@@ -59,10 +67,10 @@ def _to_row(domain: User) -> SQLAlchemyUser:
             status=domain.status.value,
             role=domain.role.value,
             terms_version=domain.terms_version,
-            terms_accepted_at=domain.terms_accepted_at,
+            terms_accepted_at=to_db_utc_or_none(domain.terms_accepted_at),
             telegram_user_id=domain.telegram_user_id,
-            created_at=domain.created_at,
-            updated_at=datetime.now(UTC),
+            created_at=to_db_utc_or_none(domain.created_at),
+            updated_at=to_db_utc(utc_now()),
         )
     return row
 
@@ -151,7 +159,7 @@ class SqlAlchemyUserRepository:
                 raise UserNotFound(f"User with id {user_id} not found")
 
             cast(Any, row).terms_version = terms_version
-            cast(Any, row).terms_accepted_at = datetime.now(UTC)
+            cast(Any, row).terms_accepted_at = to_db_utc(utc_now())
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)
@@ -186,7 +194,8 @@ def _terms_to_domain(row: SQLAlchemyTermsVersion) -> TermsVersion:
     return TermsVersion(
         version=int(_attr(row, "version")),
         body=str(_attr(row, "body")),
-        effective_at=_attr(row, "effective_at"),
+        # terms_versions.effective_at is a legacy naive-UTC column.
+        effective_at=from_db_utc(_attr(row, "effective_at")),
         summary=str(_attr(row, "summary") or ""),
     )
 
@@ -226,7 +235,7 @@ class SqlAlchemyTermsVersionRepository:
             row = SQLAlchemyTermsVersion(
                 version=terms.version,
                 body=terms.body,
-                effective_at=terms.effective_at,
+                effective_at=to_db_utc(terms.effective_at),
                 summary=terms.summary,
             )
             session.add(row)

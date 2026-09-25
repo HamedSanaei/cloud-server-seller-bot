@@ -150,10 +150,17 @@ jobs:
           echo "alembic head=$head_rev current=$current_rev"
           test -n "$head_rev"
           test "$head_rev" = "$current_rev"
-      # P0 advisory-lock contract: the catalog-sync lock key, the coordinator
-      # run past lock acquisition, and stale-row repair execute against this
-      # REAL PostgreSQL (mock-only tests missed the signed-BIGINT contract).
-      - name: Live PostgreSQL catalog-sync contract
+      # Real-PostgreSQL contracts that mocks cannot express:
+      # - the catalog-sync lock key is a signed int64 and the coordinator runs
+      #   past lock acquisition;
+      # - the legacy TIMESTAMP WITHOUT TIME ZONE boundary: binding an aware
+      #   datetime into operations.updated_at / payment_sessions.created_at
+      #   raised asyncpg DataError, which aborted operation claiming BEFORE the
+      #   provider POST (a server stuck in "creating" with attempts=0);
+      # - wallet adjustment atomicity (balance mutation + ledger fact).
+      # Mock-only coverage silently let the datetime incident through, so
+      # every tests/live/test_postgres_*.py file runs on this gate.
+      - name: Live PostgreSQL contracts
         env:
           CLOUD_PLATFORM_TEST_POSTGRES_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
-        run: uv run pytest tests/live/test_postgres_catalog_sync.py -q --no-cov
+        run: uv run pytest tests/live/test_postgres_*.py -q --no-cov

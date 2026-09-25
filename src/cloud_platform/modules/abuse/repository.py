@@ -19,6 +19,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cloud_platform.db.base import AbuseCase as _AbuseModel
 from cloud_platform.db.base import Provider as _ProviderModel
 from cloud_platform.db.base import Server as _ServerModel
+from cloud_platform.db.timestamps import (
+    from_db_utc_or_none,
+    to_db_utc_or_none,
+)
 from cloud_platform.modules.abuse.domain import (
     AbuseCase,
     AbuseStatus,
@@ -47,9 +51,11 @@ def _to_domain(row: _AbuseModel) -> AbuseCase:
         reporter=str(_attr(row, "reporter")),
         status=AbuseStatus(_attr(row, "status")),
         id=_attr(row, "id"),
-        created_at=_attr(row, "created_at"),
-        updated_at=_attr(row, "updated_at"),
-        resolved_at=_attr(row, "resolved_at"),
+        # abuse_cases.created_at/updated_at/resolved_at are legacy naive-UTC
+        # columns; the domain compares/renders them as aware UTC.
+        created_at=from_db_utc_or_none(_attr(row, "created_at")),
+        updated_at=from_db_utc_or_none(_attr(row, "updated_at")),
+        resolved_at=from_db_utc_or_none(_attr(row, "resolved_at")),
     )
 
 
@@ -63,9 +69,9 @@ def _to_row(case: AbuseCase) -> _AbuseModel:
         reason=case.reason,
         reporter=case.reporter,
         status=case.status.value,
-        created_at=case.created_at,
-        updated_at=case.updated_at,
-        resolved_at=case.resolved_at,
+        created_at=to_db_utc_or_none(case.created_at),
+        updated_at=to_db_utc_or_none(case.updated_at),
+        resolved_at=to_db_utc_or_none(case.resolved_at),
     )
 
 
@@ -166,8 +172,8 @@ class SqlAlchemyAbuseCaseRepository:
                 raise LookupError(f"abuse case {case_id} not found")
             cast_any: Any = row
             cast_any.status = case.status.value
-            cast_any.updated_at = case.updated_at
-            cast_any.resolved_at = case.resolved_at
+            cast_any.updated_at = to_db_utc_or_none(case.updated_at)
+            cast_any.resolved_at = to_db_utc_or_none(case.resolved_at)
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)

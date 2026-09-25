@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -22,6 +22,7 @@ from cloud_platform.db.base import CostLimit as _CostLimitModel
 from cloud_platform.db.base import MaintenanceBlock as _MaintenanceBlockModel
 from cloud_platform.db.base import Provider as _ProviderModel
 from cloud_platform.db.base import Server as _ServerModel
+from cloud_platform.db.timestamps import from_db_utc, from_db_utc_or_none, to_db_utc_or_none
 from cloud_platform.modules.compute.domain import (
     CloudServer,
     CostLimit,
@@ -47,13 +48,10 @@ def _state_or_none(value: Any) -> ServerLifecycleState | None:
 
 
 def _aware_or_none(value: Any) -> datetime | None:
-    """DB timestamps are naive UTC; normalize to aware."""
+    """DB timestamps are naive UTC; normalize to aware UTC (see db.timestamps)."""
     if value is None:
         return None
-    dt: datetime = value
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt
+    return from_db_utc_or_none(value)
 
 
 def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
@@ -318,7 +316,10 @@ class SqlAlchemyServerRepository:
             )
             cast_any.provider_server_id = server.provider_server_id
             cast_any.last_accrued_at = server.last_accrued_at
-            cast_any.deleted_at = server.deleted_at
+            # servers.deleted_at is a legacy naive-UTC column while the domain
+            # carries an aware UTC value (last_accrued_at / low_balance_since
+            # are real timestamptz columns and stay aware).
+            cast_any.deleted_at = to_db_utc_or_none(server.deleted_at)
             cast_any.low_balance_since = server.low_balance_since
             cast_any.os = server.os
             if hasattr(cast_any, "image_id"):
@@ -417,7 +418,7 @@ class SqlAlchemyMaintenanceSwitchRepository:
             scope=MaintenanceScope(provider_key=str(row.provider_key), location_id=location_id),
             reason=str(row.reason),
             created_by=_attr(row, "created_by"),
-            created_at=_attr(row, "created_at"),
+            created_at=from_db_utc(_attr(row, "created_at")),
             updated_at=_aware_or_none(_attr(row, "updated_at")),
         )
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID
@@ -24,6 +23,11 @@ from cloud_platform.core.money import Money
 from cloud_platform.db.base import Hold as _HoldModel
 from cloud_platform.db.base import LedgerEntry as _LEModel
 from cloud_platform.db.base import Wallet as SQLAlchemyWallet
+from cloud_platform.db.timestamps import (
+    from_db_utc_or_none,
+    to_db_utc,
+    utc_now,
+)
 from cloud_platform.modules.wallet.domain import (
     DEFAULT_WALLET_CURRENCY,
     DuplicateIdempotencyError,
@@ -63,8 +67,9 @@ def _wallet_to_domain(row: SQLAlchemyWallet) -> Wallet:
         balance=int(bal) if bal is not None else 0,
         currency=str(_attr(row, "currency")),
         status=WalletStatus(status_val) if status_val else WalletStatus.ACTIVE,
-        created_at=_attr(row, "created_at"),
-        updated_at=_attr(row, "updated_at"),
+        # wallets.created_at/updated_at are legacy naive-UTC columns.
+        created_at=from_db_utc_or_none(_attr(row, "created_at")),
+        updated_at=from_db_utc_or_none(_attr(row, "updated_at")),
     )
 
 
@@ -392,7 +397,8 @@ def _ledger_entry_to_domain(row: _LEModel) -> LedgerEntry:
         reference_id=str(ref_id) if ref_id else "",
         description=_attr(row, "description") or "",
         idempotency_key=str(_attr(row, "idempotency_key")),
-        created_at=_attr(row, "created_at"),
+        # ledger.created_at is a legacy naive-UTC column.
+        created_at=from_db_utc_or_none(_attr(row, "created_at")),
     )
 
 
@@ -508,9 +514,11 @@ def _hold_to_domain(row: _HoldModel) -> Hold:
         idempotency_key=str(_attr(row, "idempotency_key")),
         id=_attr(row, "id"),
         status=HoldStatus(status_val),
-        created_at=_attr(row, "created_at"),
-        captured_at=_attr(row, "captured_at"),
-        released_at=_attr(row, "released_at"),
+        # holds.created_at/captured_at/released_at are legacy naive-UTC
+        # columns; the domain compares them against aware clock values.
+        created_at=from_db_utc_or_none(_attr(row, "created_at")),
+        captured_at=from_db_utc_or_none(_attr(row, "captured_at")),
+        released_at=from_db_utc_or_none(_attr(row, "released_at")),
     )
 
 
@@ -631,7 +639,7 @@ class SqlAlchemyHoldRepository:
                 return None
 
             cast(Any, row).status = "released"  # legacy Column attribute
-            cast(Any, row).released_at = datetime.now(UTC)
+            cast(Any, row).released_at = to_db_utc(utc_now())
             await session.commit()
             await session.refresh(row)
             return _hold_to_domain(row)
@@ -676,7 +684,7 @@ class SqlAlchemyHoldRepository:
 
             cast(Any, wallet_row).balance = balance - hold_amount
             cast(Any, hold_row).status = "captured"  # legacy Column attribute
-            cast(Any, hold_row).captured_at = datetime.now(UTC)
+            cast(Any, hold_row).captured_at = to_db_utc(utc_now())
             await session.commit()
             await session.refresh(hold_row)
             return _hold_to_domain(hold_row)

@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from cloud_platform.db.timestamps import from_db_utc
 from cloud_platform.modules.audit.domain import ActorType, AuditEvent
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,16 @@ class PaymentReconciliationService:
             out: list[Any] = []
             for item in sessions:
                 created = getattr(item, "created_at", None)
-                if created is None or created <= cutoff:
+                if created is None:
+                    out.append(item)
+                    continue
+                if not isinstance(created, datetime):
+                    continue
+                # Repositories rehydrate legacy naive-UTC columns as aware
+                # UTC, but a non-SQLAlchemy/legacy reader may still hand back a
+                # naive value: normalize before comparing, never guess a local
+                # timezone.
+                if from_db_utc(created) <= cutoff:
                     out.append(item)
             return out
         return []

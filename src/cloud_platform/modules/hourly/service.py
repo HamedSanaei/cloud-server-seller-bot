@@ -55,6 +55,7 @@ from cloud_platform.modules.provider_accounts.domain import (
 )
 from cloud_platform.modules.users.domain import User, UserStatus
 from cloud_platform.modules.wallet.domain import WalletRepository, WalletStatus
+from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderConflict,
@@ -1079,7 +1080,19 @@ class HourlyCloudService:
         _validate_hourly_operation(operation, server)
         if operation.is_terminal:
             return "skipped"
-        claimed = await self._ops.claim(operation.id)
+        try:
+            claimed = await self._ops.claim(operation.id)
+        except Exception as exc:
+            # An infrastructure failure while claiming (a DB bind error, a
+            # connection loss) happens BEFORE any provider POST, so nothing
+            # billable was sent and the attempt count did not move. It must
+            # never be swallowed as "still in progress": record it as a
+            # provisioning failure so the failure/queue-age signals see a
+            # request that is not progressing, then re-raise for the job's
+            # own error accounting.
+            metrics.record_provisioning_failure("worker")
+            logger.exception("hourly claim failed for server %s: %s", server.id, exc)
+            raise
         if claimed is None:
             return await self._reconcile_inflight(server, operation)
         try:

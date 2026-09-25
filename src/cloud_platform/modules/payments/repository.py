@@ -13,6 +13,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import PaymentSession as _PaymentModel
+from cloud_platform.db.timestamps import (
+    from_db_utc_or_none,
+    to_db_utc,
+    to_db_utc_or_none,
+    utc_now,
+)
 from cloud_platform.modules.payments.domain import (
     DuplicateExternalIdError,
     PaymentSession,
@@ -27,9 +33,12 @@ def _attr(row: Any, name: str) -> Any:
 
 def _to_domain(row: _PaymentModel) -> PaymentSession:
     status = PaymentSessionStatus(_attr(row, "status"))
-    credited_at = _attr(row, "credited_at")
-    created = _attr(row, "created_at")
-    updated = _attr(row, "updated_at")
+    # created_at/updated_at/credited_at are legacy TIMESTAMP WITHOUT TIME ZONE
+    # (naive UTC) columns; fx_observed_at is genuinely timestamptz. Only the
+    # legacy trio is rehydrated as aware UTC.
+    credited_at = from_db_utc_or_none(_attr(row, "credited_at"))
+    created = from_db_utc_or_none(_attr(row, "created_at"))
+    updated = from_db_utc_or_none(_attr(row, "updated_at"))
     # Migration 0036 columns are nullable and absent on legacy rows: read
     # defensively so old sessions stay readable (credit == settlement).
     # isinstance guards matter: test doubles and partial rows may carry
@@ -77,7 +86,7 @@ def _to_row(aggregate: PaymentSession) -> _PaymentModel:
         currency=aggregate.currency,
         status=aggregate.status.value,
         idempotency_key=aggregate.idempotency_key,
-        credited_at=aggregate.credited_at,
+        credited_at=to_db_utc_or_none(aggregate.credited_at),
         credit_amount_minor=aggregate.credit_amount_minor,
         credit_currency=aggregate.credit_currency,
         fx_source=aggregate.fx_source,
@@ -150,13 +159,21 @@ class SqlAlchemyPaymentSessionRepository:
     async def list_pending_before(
         self, gateway_key: str, before: datetime, limit: int = 100
     ) -> list[PaymentSession]:
+        """PENDING sessions older than ``before`` (reconciliation cutoff).
+
+        ``created_at`` is a legacy naive-UTC column, so the aware cutoff is
+        normalized at the boundary; binding it verbatim made asyncpg raise
+        ``can't subtract offset-naive and offset-aware datetimes`` and killed
+        Tetraminator reconciliation.
+        """
+        cutoff = to_db_utc(before)
         async with self._session_factory() as db:
             stmt = (
                 select(_PaymentModel)
                 .where(
                     _PaymentModel.gateway_key == gateway_key,
                     _PaymentModel.status == PaymentSessionStatus.PENDING.value,
-                    _PaymentModel.created_at <= before,
+                    _PaymentModel.created_at <= cutoff,
                 )
                 .order_by(_PaymentModel.created_at.asc())
                 .limit(limit)
@@ -175,7 +192,8 @@ class SqlAlchemyPaymentSessionRepository:
             cast_any: Any = row
             cast_any.status = session.status.value
             cast_any.gateway_payment_id = session.gateway_payment_id
-            cast_any.credited_at = session.credited_at
+            cast_any.credited_at = to_db_utc_or_none(session.credited_at)
+            cast_any.updated_at = to_db_utc(utc_now())
             # Cross-currency snapshot columns (nullable; legacy rows keep NULL).
             for field_name in (
                 "credit_amount_minor",

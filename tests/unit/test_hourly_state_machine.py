@@ -13,6 +13,7 @@ lifecycle branches of :class:`~cloud_platform.modules.hourly.service.HourlyCloud
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -833,3 +834,124 @@ class TestCatalogRepriceImmutability:
         assert outcome == "provisioned"
         snapshot = await snapshots.require_snapshot(server.id)
         assert snapshot.selling_minor == before
+
+
+# ---------------------------------------------------------------------------
+# claim boundary: no provider POST without a durable claim, and an
+# infrastructure failure while claiming is loud instead of a silent spin
+# ---------------------------------------------------------------------------
+
+
+class _ClaimFailingOps(FakeOpsRepo):
+    """Scripted claim(): fail the first ``failures`` attempts (the incident).
+
+    The production stack trace was ``asyncpg ... can't subtract offset-naive
+    and offset-aware datetimes`` raised from
+    ``SqlAlchemyOperationRepository.claim``; any exception type must behave
+    the same way.
+    """
+
+    def __init__(self, *, failures: int = 1, error: Exception | None = None) -> None:
+        super().__init__()
+        self.failures = failures
+        self.error = error or RuntimeError(
+            "asyncpg.exceptions.DataError: invalid input for query argument $3: "
+            "(can't subtract offset-naive and offset-aware datetimes)"
+        )
+        self.claim_attempts = 0
+        self.claims_completed = 0
+
+    async def claim(self, operation_id: Any) -> Any:
+        self.claim_attempts += 1
+        if self.claim_attempts <= self.failures:
+            raise self.error
+        claimed = await super().claim(operation_id)
+        if claimed is not None:
+            self.claims_completed += 1
+        return claimed
+
+
+class _ClaimOrderAdapter(FakeHourlyAdapter):
+    """The provider adapter refuses to be mutated before a durable claim."""
+
+    def __init__(self, ops: FakeOpsRepo) -> None:
+        super().__init__()
+        self._ops = ops
+
+    async def create_instance(self, **kwargs: Any) -> Any:
+        assert self._ops.claims_completed >= 1, "provider POST before a durable claim"
+        return await super().create_instance(**kwargs)
+
+
+def _accepted_response(server: Any) -> Any:
+    """The provider's accepted-POST response for ``server`` (real identity)."""
+    return SimpleNamespace(
+        id="lsw-created",
+        state="RUNNING",
+        region="eu-west-3",
+        reference=hourly_reference_name(server.id),
+        instance_type="lsw.mini",
+        image_id="UBUNTU",
+    )
+
+
+class TestClaimBoundary:
+    async def test_provider_post_requires_a_completed_claim(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
+        ops = _ClaimFailingOps(failures=0)
+        cloud = _ClaimOrderAdapter(ops)
+        service, _servers, _snapshots, _ops = _service(offers, cloud, ops=ops)
+        server = await _requested_server(service, offers)
+        cloud.create_result = _accepted_response(server)
+
+        assert await service.process_server(server.id) == "provisioned"
+
+        assert cloud.posts == 1
+        assert ops.claims_completed == 1
+        operation = ops.ops[f"server-create:{server.id}"]
+        assert operation.attempts == 1
+        assert operation.status.value == "completed"
+
+    async def test_claim_failure_is_loud_and_never_posts(self, monkeypatch: Any) -> None:
+        stages: list[str] = []
+        monkeypatch.setattr(
+            "cloud_platform.modules.hourly.service.metrics.record_provisioning_failure",
+            stages.append,
+        )
+        offers = FakeOffersRepo([await _usd_offer()])
+        ops = _ClaimFailingOps(failures=99)
+        cloud = _ClaimOrderAdapter(ops)
+        service, _servers, _snapshots, _ops = _service(offers, cloud, ops=ops)
+        server = await _requested_server(service, offers)
+        cloud.create_result = _accepted_response(server)
+
+        # The caller (worker job) sees the failure: it is NOT reported as
+        # "still in progress", so the request cannot spin silently forever.
+        with pytest.raises(RuntimeError, match="offset-naive"):
+            await service.process_server(server.id)
+
+        assert cloud.posts == 0
+        assert stages == ["worker"]
+        operation = ops.ops[f"server-create:{server.id}"]
+        assert operation.status.value == "pending"
+        assert operation.attempts == 0
+
+    async def test_claim_failure_does_not_duplicate_the_later_post(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
+        ops = _ClaimFailingOps(failures=1)
+        cloud = _ClaimOrderAdapter(ops)
+        service, _servers, _snapshots, _ops = _service(offers, cloud, ops=ops)
+        server = await _requested_server(service, offers)
+        cloud.create_result = _accepted_response(server)
+
+        with pytest.raises(RuntimeError):
+            await service.process_server(server.id)
+        # The next tick retries the SAME durable operation: exactly one POST,
+        # one attempt, and the same operation key (no duplicate provider work).
+        assert await service.process_server(server.id) == "provisioned"
+
+        assert cloud.posts == 1
+        assert ops.claim_attempts == 2
+        operation = ops.ops[f"server-create:{server.id}"]
+        assert operation.attempts == 1
+        assert operation.operation_key == f"server-create:{server.id}"

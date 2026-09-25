@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -194,10 +195,13 @@ class TestAbuseCaseRepository:
         row = _case_row("open")
         target_id = row.id
         db.execute = AsyncMock(return_value=MagicMock(scalars=lambda: MagicMock(first=lambda: row)))
+        # Real PostgreSQL hands back a NAIVE datetime for the legacy
+        # TIMESTAMP WITHOUT TIME ZONE column; the adapter rehydrates it as
+        # aware UTC.
         db.refresh = AsyncMock(
             side_effect=lambda r: (
                 setattr(r, "status", "resolved"),
-                setattr(r, "resolved_at", "2026-08-22"),
+                setattr(r, "resolved_at", datetime(2026, 8, 22, 10, 30)),
             )
         )
 
@@ -214,6 +218,7 @@ class TestAbuseCaseRepository:
 
         assert saved.id == target_id
         assert saved.status is AbuseStatus.RESOLVED
+        assert saved.resolved_at == datetime(2026, 8, 22, 10, 30, tzinfo=UTC)
         db.commit.assert_awaited_once()
 
     async def test_save_missing_raises_lookup_error(self, repo, db: AsyncMock) -> None:

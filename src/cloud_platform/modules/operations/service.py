@@ -32,6 +32,7 @@ from typing import Any, ClassVar, NoReturn, Protocol
 from uuid import UUID, uuid4
 
 from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.db.timestamps import from_db_utc
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.billing.service import FinalChargeService, MissingSnapshotError
@@ -692,10 +693,15 @@ class CreateTimeoutReconciler:
     # ------------------------------------------------------------------
 
     def _age(self, operation: Operation) -> timedelta | None:
-        """Time since the operation last moved; None means unknown (treat as stale)."""
+        """Time since the operation last moved; None means unknown (treat as stale).
+
+        Both sides are normalized to aware UTC: repositories rehydrate the
+        legacy naive-UTC ``operations.updated_at`` column as aware, and an
+        injected clock may still be naive in tests.
+        """
         if operation.updated_at is None:
             return None
-        return self._now() - operation.updated_at
+        return from_db_utc(self._now()) - from_db_utc(operation.updated_at)
 
     async def _reconcile_in_flight(self, op: Operation) -> ReconciliationOutcome:
         """Re-resolve an ambiguous IN_FLIGHT create with the SAME idempotency key."""
@@ -2755,7 +2761,11 @@ class DeleteTimeoutReconciler:
                 await self._ops.save(op)
                 bump(DeleteReconciliationOutcome.FAILED)
                 continue
-            age = None if op.updated_at is None else self._now() - op.updated_at
+            age = (
+                None
+                if op.updated_at is None
+                else from_db_utc(self._now()) - from_db_utc(op.updated_at)
+            )
             if age is not None and age < self._in_flight_timeout:
                 bump(DeleteReconciliationOutcome.SKIPPED)
                 continue

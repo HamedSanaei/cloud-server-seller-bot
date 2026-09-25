@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -12,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import ProviderOrder as _ProviderOrderModel
+from cloud_platform.db.timestamps import from_db_utc_or_none, to_db_utc, utc_now
 from cloud_platform.modules.orders.domain import (
     OrderStatus,
     ProviderOrder,
@@ -39,8 +39,11 @@ def _to_domain(row: _ProviderOrderModel) -> ProviderOrder:
         error=_attr(row, "error"),
         attempts=int(_attr(row, "attempts") or 0),
         last_polled_at=_attr(row, "last_polled_at"),
-        created_at=_attr(row, "created_at"),
-        updated_at=_attr(row, "updated_at"),
+        # provider_orders.created_at/updated_at are legacy naive-UTC columns
+        # (last_polled_at/post_attempted_at/settlement_attempted_at are real
+        # timestamptz columns and stay aware).
+        created_at=from_db_utc_or_none(_attr(row, "created_at")),
+        updated_at=from_db_utc_or_none(_attr(row, "updated_at")),
         product_id=_attr(row, "product_id"),
         location_id=_attr(row, "location_id"),
         os_name=_attr(row, "os_name"),
@@ -199,7 +202,7 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
             cast_any.settlement_attempted_at = order.settlement_attempted_at
             cast_any.settlement_attempts = order.settlement_attempts
             cast_any.settlement_error = order.settlement_error
-            cast_any.updated_at = datetime.now(UTC)
+            cast_any.updated_at = to_db_utc(utc_now())
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)

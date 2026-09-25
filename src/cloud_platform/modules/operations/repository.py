@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -13,6 +13,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import Operation as _OperationModel
+from cloud_platform.db.timestamps import (
+    from_db_utc,
+    from_db_utc_or_none,
+    to_db_utc,
+    utc_now,
+)
 from cloud_platform.modules.operations.domain import (
     Operation,
     OperationStatus,
@@ -37,8 +43,11 @@ def _to_domain(row: _OperationModel) -> Operation:
         provider_response=_attr(row, "provider_response"),
         error=_attr(row, "error"),
         attempts=int(_attr(row, "attempts")),
-        created_at=_attr(row, "created_at"),
-        updated_at=_attr(row, "updated_at"),
+        # operations.created_at/updated_at are legacy TIMESTAMP WITHOUT TIME
+        # ZONE (naive UTC) columns: rehydrate them as aware UTC so the domain
+        # never mixes naive and aware arithmetic.
+        created_at=from_db_utc_or_none(_attr(row, "created_at")),
+        updated_at=from_db_utc_or_none(_attr(row, "updated_at")),
         traceparent=_attr(row, "traceparent"),
     )
 
@@ -188,12 +197,14 @@ class SqlAlchemyOperationRepository:
             )
             if oldest is None:
                 return None
-            if oldest.tzinfo is None:
-                oldest = oldest.replace(tzinfo=UTC)
-            return (now - oldest).total_seconds()
+            return (from_db_utc(now) - from_db_utc(oldest)).total_seconds()
 
     async def claim(self, operation_id: UUID) -> Operation | None:
-        """Atomically claim a PENDING operation; None when the race is lost."""
+        """Atomically claim a PENDING operation; None when the race is lost.
+
+        The claim is one conditional UPDATE (PENDING -> IN_FLIGHT,
+        attempts+1): two workers can never both own the same attempt.
+        """
         async with self._session_factory() as session:
             result = await session.execute(
                 update(_OperationModel)
@@ -204,7 +215,10 @@ class SqlAlchemyOperationRepository:
                 .values(
                     status=OperationStatus.IN_FLIGHT.value,
                     attempts=_OperationModel.attempts + 1,
-                    updated_at=datetime.now(UTC),
+                    # Legacy naive-UTC column: an aware datetime here raises
+                    # asyncpg DataError and aborts the claim BEFORE the
+                    # provider POST (the production incident).
+                    updated_at=to_db_utc(utc_now()),
                 )
             )
             rowcount: int = cast(Any, result).rowcount
@@ -241,7 +255,7 @@ class SqlAlchemyOperationRepository:
             cast_any.provider_response = operation.provider_response
             cast_any.error = operation.error
             cast_any.attempts = operation.attempts
-            cast_any.updated_at = datetime.now(UTC)
+            cast_any.updated_at = to_db_utc(utc_now())
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)
