@@ -15,38 +15,31 @@ repos:
       - id: ruff-format
 
   # MyPy: Static type checker
-  # Pin tracks the mypy version in pyproject.toml's dev dependencies and runs
-  # the same scope as the repository gate (`uv run mypy src`) so the hook and
-  # the gate enforce the same policy.
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.20.2
+  # This is deliberately a LOCAL hook running mypy in the project's own
+  # uv.lock-backed environment, NOT a mirrors-mypy hook with its own
+  # `additional_dependencies` list. A range-based second dependency set is an
+  # independently resolved universe: it drifts from the lockfile and reports
+  # findings (generic-inference differences in SQLAlchemy/pydantic) that the
+  # locked environment does not have, so the hook and the CI gate could
+  # disagree while both claim to enforce "mypy on src".
+  #
+  # Invariants:
+  #   * the lockfile (uv.lock) is the single source of truth for this project,
+  #     including mypy and the libraries it introspects;
+  #   * `--frozen` refuses to silently re-resolve if pyproject.toml and
+  #     uv.lock drift apart;
+  #   * the checked scope is exactly `src`, identical to the repository gate
+  #     (`uv run mypy src`); staged filenames are never appended, which would
+  #     drag in tests/ and scripts/ and duplicate src/cloud_platform;
+  #   * no second dependency list is maintained here.
+  - repo: local
     hooks:
       - id: mypy
+        name: mypy
+        entry: uv run --frozen mypy
         args: [src]
-        # The hook appends every staged filename by default; that would check
-        # scripts/ and tests/ too (yaml stubs, module-layout conflicts) and
-        # duplicate src/cloud_platform. Restrict it to the repository gate's
-        # scope: `uv run mypy src`.
+        language: system
         pass_filenames: false
-        additional_dependencies:
-          - pydantic>=2.11,<3
-          - pydantic-settings>=2.10,<3
-          - sqlalchemy[asyncio]>=2.0.40,<3
-          - fastapi>=0.116,<1
-          - aiogram>=3.20,<4
-          - httpx>=0.28,<1
-          - redis>=5,<6
-          - asyncpg>=0.30,<1
-          - alembic>=1.16,<2
-          - arq>=0.26,<1
-          - python-json-logger>=3.3,<4
-          - structlog>=25,<26
-          - uvicorn[standard]>=0.35,<1
-          - prometheus-client>=0.20,<1
-          - pytest>=8,<9
-          - cryptography>=43,<46
-          - opentelemetry-sdk>=1.24,<2
-          - opentelemetry-exporter-otlp-proto-grpc>=1.24,<2
 
   # Secret detection
   - repo: https://github.com/Yelp/detect-secrets

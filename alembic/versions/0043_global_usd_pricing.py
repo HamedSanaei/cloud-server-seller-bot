@@ -28,6 +28,8 @@ it does not use raw SQL.
 
 from __future__ import annotations
 
+from typing import Any
+
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -55,20 +57,73 @@ def _existing_column(table: str, name: str) -> dict[str, object] | None:
     return None
 
 
+def _normalize_default(value: object) -> str:
+    """Normalize a catalog server default FOR COMPARISON ONLY.
+
+    PostgreSQL echoes a default back in its canonical form, so the literal this
+    migration sets is not the literal it reads back: ``{}`` on a JSONB column
+    introspects as ``'{}'::jsonb`` and ``USD`` as ``'USD'::character varying``.
+    Comparing those verbatim would re-issue the identical ``SET DEFAULT`` on
+    every repair pass.  The cast suffix and the literal quotes are therefore
+    dropped here; nothing is ever written from this value, so a wrong
+    normalization can only cost a redundant (idempotent) ALTER, never a guessed
+    default.  Values that do not look like a quoted literal - for example
+    ``nextval('seq'::regclass)`` - are returned unchanged.
+    """
+    text = str(value or "").strip()
+    if text.startswith("'"):
+        closing = text.find("'", 1)
+        if closing > 0:
+            remainder = text[closing + 1 :].strip()
+            if not remainder or remainder.startswith("::"):
+                return text[1:closing].strip()
+    return text.strip("'").strip()
+
+
+def _type_matches(current_type: object, expected_type: sa.types.TypeEngine[Any]) -> bool:
+    """Whether a reflected column type already has the intended shape.
+
+    ``current_type`` comes from ``sqlalchemy.inspect`` on a live database, so
+    it is a DIALECT type (``postgresql.VARCHAR``, ``postgresql.TEXT``,
+    ``postgresql.JSONB``), not necessarily the generic class declared above.
+    Identity/name comparison would report drift for every healthy column and
+    re-run ``ALTER COLUMN ... TYPE`` on each pass, so a SUBCLASS check is used:
+    dialect subclasses of the expected type match, while a genuinely different
+    shape (INTEGER where TEXT is intended) does not.
+
+    ``isinstance`` takes a type or a tuple of types - never an instance - so
+    this compares against ``type(expected_type)``.  Feeding the TypeEngine
+    instance itself to ``isinstance`` is what crashed the fresh-database
+    migration with ``TypeError: isinstance() arg 2 must be a type...``.
+    """
+    if not isinstance(current_type, type(expected_type)):
+        return False
+    if isinstance(expected_type, sa.String) and expected_type.length is not None:
+        # The intended width is part of the shape: VARCHAR(3) and VARCHAR(255)
+        # must stay distinguishable so drift is repaired, not masked.
+        return getattr(current_type, "length", None) == expected_type.length
+    return True
+
+
 def _repair_column_shape(
     table: str,
     name: str,
     *,
-    type_: sa.types.TypeEngine,
+    type_: sa.types.TypeEngine[Any],
     nullable: bool,
     server_default: object | None,
 ) -> None:
-    """Repair drift in a pre-existing pricing column without guessing money."""
+    """Repair drift in a pre-existing pricing column without guessing money.
+
+    ``type_`` is always a SQLAlchemy type INSTANCE (``sa.Text()``,
+    ``sa.String(length=3)``, ``JSONB()``); never a type CLASS, which would
+    change the meaning of the comparison below.
+    """
     current = _existing_column(table, name)
     if current is None:
         return
     current_type = current.get("type")
-    if current_type is not None and not isinstance(current_type, type_):
+    if current_type is not None and not _type_matches(current_type, type_):
         kwargs: dict[str, object] = {
             "type_": type_,
             "existing_type": current_type,
@@ -77,6 +132,7 @@ def _repair_column_shape(
         if str(current.get("default") or "").strip():
             kwargs["existing_server_default"] = current.get("default")
         if table == "server_price_snapshots" and name == "provider_rate_exact":
+            # Textual widening only: the stored digits are preserved verbatim.
             kwargs["postgresql_using"] = f"{name}::text"
         op.alter_column(table, name, **kwargs)
     if bool(current.get("nullable", True)) != nullable:
@@ -88,12 +144,8 @@ def _repair_column_shape(
             existing_server_default=current.get("default"),
         )
     current_default = current.get("default")
-    desired_default = None if server_default is None else str(server_default)
-    if desired_default is not None:
-        # Textual PostgreSQL defaults are commonly quoted; normalize only for
-        # comparison, never by guessing a value for an existing row.
-        normalized = str(current_default or "").strip().strip("'")
-        if normalized != str(server_default).strip().strip("'"):
+    if server_default is not None:
+        if _normalize_default(current_default) != _normalize_default(server_default):
             op.alter_column(
                 table,
                 name,
@@ -125,7 +177,7 @@ def upgrade() -> None:
     if "pricing_metadata" not in _column_names("sellable_offers"):
         op.add_column(
             "sellable_offers",
-            sa.Column("pricing_metadata", JSONB, nullable=False, server_default="{}"),
+            sa.Column("pricing_metadata", JSONB(), nullable=False, server_default="{}"),
         )
         added.append("sellable_offers.pricing_metadata")
 
@@ -146,14 +198,14 @@ def upgrade() -> None:
     if "pricing_metadata" not in _column_names("server_price_snapshots"):
         op.add_column(
             "server_price_snapshots",
-            sa.Column("pricing_metadata", JSONB, nullable=False, server_default="{}"),
+            sa.Column("pricing_metadata", JSONB(), nullable=False, server_default="{}"),
         )
         added.append("server_price_snapshots.pricing_metadata")
 
     if "offer_fingerprint" not in _column_names("server_price_snapshots"):
         op.add_column(
             "server_price_snapshots",
-            sa.Column("offer_fingerprint", JSONB, nullable=True),
+            sa.Column("offer_fingerprint", JSONB(), nullable=True),
         )
         added.append("server_price_snapshots.offer_fingerprint")
 
@@ -162,7 +214,7 @@ def upgrade() -> None:
         added.append("servers.image_id")
 
     if "offer_fingerprint" not in _column_names("servers"):
-        op.add_column("servers", sa.Column("offer_fingerprint", JSONB, nullable=True))
+        op.add_column("servers", sa.Column("offer_fingerprint", JSONB(), nullable=True))
         added.append("servers.offer_fingerprint")
 
     if "cost_currency" not in _column_names("accrual_periods"):
@@ -197,7 +249,7 @@ def upgrade() -> None:
     if "pricing_metadata" not in _column_names("provider_orders"):
         op.add_column(
             "provider_orders",
-            sa.Column("pricing_metadata", JSONB, nullable=False, server_default="{}"),
+            sa.Column("pricing_metadata", JSONB(), nullable=False, server_default="{}"),
         )
         added.append("provider_orders.pricing_metadata")
 
@@ -208,21 +260,24 @@ def upgrade() -> None:
 
     # Repair shape for columns that a partially applied build may already have
     # created.  Every exact-money field is text; JSON audit objects are NOT
-    # NULL; and the currency fields retain their intended defaults.
+    # NULL; and the currency fields retain their intended defaults.  The
+    # expected types are INSTANCES (``JSONB()``, not the ``JSONB`` class): the
+    # comparison in ``_repair_column_shape`` is an ``isinstance`` check, which
+    # requires a type, and the reflected type is always an instance.
     for table, column, type_, nullable, default in (
-        ("sellable_offers", "pricing_metadata", JSONB, False, "{}"),
+        ("sellable_offers", "pricing_metadata", JSONB(), False, "{}"),
         ("server_price_snapshots", "provider_rate_exact", sa.Text(), True, None),
-        ("server_price_snapshots", "pricing_metadata", JSONB, False, "{}"),
+        ("server_price_snapshots", "pricing_metadata", JSONB(), False, "{}"),
         ("server_price_snapshots", "selling_currency", sa.String(length=3), True, None),
-        ("server_price_snapshots", "offer_fingerprint", JSONB, True, None),
+        ("server_price_snapshots", "offer_fingerprint", JSONB(), True, None),
         ("servers", "image_id", sa.String(), True, None),
-        ("servers", "offer_fingerprint", JSONB, True, None),
+        ("servers", "offer_fingerprint", JSONB(), True, None),
         ("accrual_periods", "cost_currency", sa.String(length=3), True, None),
         ("accrual_periods", "selling_currency", sa.String(length=3), True, None),
         ("accrual_periods", "cost_amount", sa.Text(), True, None),
         ("accrual_periods", "rule_key", sa.String(), True, None),
         ("provider_orders", "provider_monthly_rate_exact", sa.Text(), True, None),
-        ("provider_orders", "pricing_metadata", JSONB, False, "{}"),
+        ("provider_orders", "pricing_metadata", JSONB(), False, "{}"),
     ):
         _repair_column_shape(
             table,
