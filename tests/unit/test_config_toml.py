@@ -11,12 +11,19 @@ The runtime configuration contract is:
 
 from __future__ import annotations
 
+import os
+import tomllib
 from pathlib import Path
 
 import pytest
 
+# Private on purpose: this mapping IS the configuration contract the canonical
+# template has to document, so the completeness test reads the same table the
+# loader uses instead of duplicating a key list here.
 from cloud_platform.core.config import (
+    _TOML_FIELDS,
     CONFIG_FILE_ENV,
+    TOML_LEGACY_ALIAS_KEYS,
     ConfigFileError,
     get_settings,
     load_settings,
@@ -228,6 +235,64 @@ class TestPrecedence:
         assert get_settings().log_level == "DEBUG"
 
 
+#: Directories that never carry a configuration template.
+_SKIPPED_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        ".ci-artifacts",
+        "htmlcov",
+    }
+)
+
+#: The ONE canonical template, relative to the repository root.
+CANONICAL_EXAMPLE = "configuration.example.toml"
+
+#: Contract keys deliberately NOT in the template: legacy aliases kept only so
+#: an old server file keeps loading (the canonical spelling is documented
+#: instead). Imported from the loader so the guard cannot drift from it.
+LEGACY_ALIAS_KEYS = TOML_LEGACY_ALIAS_KEYS
+
+#: Settings the production-only sections own, asserted individually below.
+TETRAMINATOR_KEYS = (
+    ("payments", "tetraminator", "enabled"),
+    ("payments", "tetraminator", "api_key"),
+    ("payments", "tetraminator", "base_url"),
+    ("payments", "tetraminator", "callback_url"),
+    ("payments", "tetraminator", "timeout_seconds"),
+)
+
+
+def _example_document() -> dict:
+    return tomllib.loads((REPO_ROOT / CANONICAL_EXAMPLE).read_text(encoding="utf-8"))
+
+
+def _nested(document: dict, path: tuple[str, ...]) -> tuple[bool, object]:
+    node: object = document
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            return False, None
+        node = node[part]
+    return True, node
+
+
+def _configuration_examples() -> list[str]:
+    """Every file in the working tree named ``configuration.example.toml``."""
+    found: list[str] = []
+    for root, dirs, files in os.walk(REPO_ROOT):
+        dirs[:] = sorted(directory for directory in dirs if directory not in _SKIPPED_DIRS)
+        for name in sorted(files):
+            if name == "configuration.example.toml":
+                found.append((Path(root) / name).relative_to(REPO_ROOT).as_posix())
+    return found
+
+
 class TestCommittedExample:
     """The committed example must parse and stay secret-free."""
 
@@ -236,7 +301,7 @@ class TestCommittedExample:
         # variable that switches validation into production-strict mode so
         # the test is deterministic on any machine.
         monkeypatch.delenv("APP_ENV", raising=False)
-        example = REPO_ROOT / "configuration.example.toml"
+        example = REPO_ROOT / CANONICAL_EXAMPLE
         assert example.is_file(), "configuration.example.toml must ship in the repo"
         settings = load_settings(example)
         assert settings.leaseweb_api_base_url == "https://api.leaseweb.com"
@@ -244,6 +309,87 @@ class TestCommittedExample:
         assert settings.provider_markets["arvancloud"] == "iran"
         assert settings.telegram_logger_enabled is True
         assert settings.providers_enabled["hetzner"] is False
+        # Tetraminator ships (placeholder-safe) and stays disabled by default.
+        assert settings.tetraminator_enabled is False
+        assert settings.tetraminator_api_key == "CHANGE_ME"  # pragma: allowlist secret
+        assert settings.tetraminator_timeout_seconds == 30
+        # The operator ids map from [telegram], never from [telegram.sessions].
+        assert settings.telegram_admin_chat_id == 0
+        assert settings.support_contact == "@support"
+        # The catalog refresh budget (release-transition setting) is documented.
+        assert settings.storefront_catalog_sync_timeout_seconds == 600
+        assert settings.storefront_catalog_sync_interval_seconds == 900
+        assert settings.storefront_pricing["leaseweb"]["markup_percent"] == 25
+
+    def test_only_one_configuration_example_exists(self) -> None:
+        """Exactly ONE canonical template — no per-environment copies.
+
+        The deleted production-flavoured copy proved why: two templates drift,
+        and the drift is invisible until a setting is missing in production.
+        """
+        assert _configuration_examples() == [CANONICAL_EXAMPLE]
+
+    def test_no_live_reference_to_a_second_template(self) -> None:
+        """No tracked document still points at a second example file."""
+        stale = "deploy/production/configuration.example.toml"
+        documents = (
+            "README.md",
+            "docs/operations/INSTALL.md",
+            "docs/operations/PRODUCTION_DEPLOY.md",
+            "docs/operations/RUNBOOK.md",
+            "deploy/production/docker-compose.yml",
+        )
+        for name in documents:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+            assert stale not in text, f"{name} still references {stale}"
+        assert not (REPO_ROOT / "deploy/production/configuration.example.toml").exists()
+
+    def test_template_documents_every_supported_key(self) -> None:
+        """Completeness: the template and the parser cannot drift apart.
+
+        Adding an operator-facing setting without documenting it in the
+        canonical template fails here, which is the guard the duplicate example
+        never provided.
+        """
+        document = _example_document()
+        missing = [
+            ".".join(path)
+            for path in sorted(_TOML_FIELDS)
+            if path not in LEGACY_ALIAS_KEYS and not _nested(document, path)[0]
+        ]
+        assert missing == [], f"undocumented configuration keys: {missing}"
+
+    def test_telegram_operator_ids_are_not_nested_under_sessions(self) -> None:
+        """The two operator ids belong to [telegram]; sessions owns bot state."""
+        document = _example_document()
+        assert _nested(document, ("telegram", "admin_chat_id"))[0] is True
+        assert _nested(document, ("telegram", "support_contact"))[0] is True
+        sessions = document["telegram"]["sessions"]
+        assert "admin_chat_id" not in sessions
+        assert "support_contact" not in sessions
+
+    def test_tetraminator_section_is_documented(self) -> None:
+        document = _example_document()
+        missing = [".".join(path) for path in TETRAMINATOR_KEYS if not _nested(document, path)[0]]
+        assert missing == [], f"missing payments.tetraminator keys: {missing}"
+        _, block = _nested(document, ("payments", "tetraminator"))
+        assert isinstance(block, dict)
+        assert block["enabled"] is False
+        assert str(block["callback_url"]).startswith("https://")
+
+    def test_catalog_and_fx_keys_are_documented(self) -> None:
+        """The current storefront/catalog/FX contract is in the template."""
+        document = _example_document()
+        for path in (
+            ("storefront", "catalog_sync", "enabled"),
+            ("storefront", "catalog_sync", "interval_seconds"),
+            ("storefront", "catalog_sync", "timeout_seconds"),
+            ("fx", "catalog_pricing_currency"),
+            ("fx", "global_enabled"),
+            ("fx", "global_fiat_provider"),
+            ("fx", "frankfurter", "catalog_max_stale_seconds"),
+        ):
+            assert _nested(document, path)[0] is True, f"missing {'.'.join(path)}"
 
     def test_example_file_contains_no_real_secret(self) -> None:
         text = (REPO_ROOT / "configuration.example.toml").read_text(encoding="utf-8")
@@ -268,3 +414,104 @@ class TestCommittedExample:
         ignored = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
         assert "configuration.toml" in ignored
         assert "!configuration.example.toml" in ignored
+        # The obsolete allowlist for the deleted production copy is gone: the
+        # security model did not change, only the duplicated template did.
+        assert "!deploy/**/configuration.example.toml" not in ignored
+
+
+class TestConfigDoctor:
+    """`config doctor`: read-only drift detection, never a printed value.
+
+    The duplicate template drifted silently because nothing compared the real
+    file with the supported contract. The command reports BOTH directions
+    (missing keys the loader defaults, unknown keys it ignores) and fails only
+    on something that is really unusable: an unreadable/invalid file, a
+    model-required key the file does not set, or an unreplaced placeholder in a
+    production file.
+    """
+
+    def _point_at(self, monkeypatch: pytest.MonkeyPatch, path: Path | None) -> None:
+        monkeypatch.setattr(
+            "cloud_platform.core.config.resolve_config_file",
+            lambda *args, **kwargs: path,
+        )
+
+    async def test_passes_on_the_canonical_template(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        self._point_at(monkeypatch, REPO_ROOT / CANONICAL_EXAMPLE)
+        assert await cli_module.config_doctor() == 0
+        out = capsys.readouterr().out
+        assert "config doctor: OK" in out
+        # A development file may keep the documented placeholders...
+        assert "placeholders (fine outside production)" in out
+        # ...and every supported key is documented in the template itself.
+        assert "missing keys (the Settings default applies)" not in out
+        assert "unknown keys" not in out
+
+    async def test_missing_and_unknown_keys_are_reported_without_values(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        secret = "super-secret-value"  # pragma: allowlist secret (a fixture, not a credential)
+        path = _write(
+            tmp_path,
+            f'[app]\nenvironment = "development"\nlog_level = "{secret}"\n'
+            '[old]\nprovider = "foo"\n',
+        )
+        self._point_at(monkeypatch, path)
+        assert await cli_module.config_doctor() == 0
+        out = capsys.readouterr().out
+        assert "missing keys (the Settings default applies):" in out
+        assert "storefront.catalog_sync.timeout_seconds" in out
+        assert "unknown keys" in out
+        assert "old.provider" in out
+        # Only key paths, never a value.
+        assert secret not in out
+        assert "config doctor: OK" in out
+
+    async def test_unreplaced_placeholder_fails_a_production_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        path = _write(
+            tmp_path,
+            '[app]\nenvironment = "production"\n[security]\nbackup_encryption_key = "CHANGE_ME"\n',
+        )
+        self._point_at(monkeypatch, path)
+        assert await cli_module.config_doctor() == 1
+        out = capsys.readouterr().out
+        assert "placeholders that must be replaced:" in out
+        assert "security.backup_encryption_key" in out
+        assert "config doctor: FAIL" in out
+
+    async def test_unreadable_or_missing_file_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import cloud_platform.cli as cli_module
+        from cloud_platform.core.config import ConfigFileError
+
+        def _raise(*args: object, **kwargs: object) -> Path:
+            raise ConfigFileError("configuration file not found: /nope.toml")
+
+        monkeypatch.setattr("cloud_platform.core.config.resolve_config_file", _raise)
+        assert await cli_module.config_doctor() == 1
+        assert "config doctor: FAIL" in capsys.readouterr().out
+
+        self._point_at(monkeypatch, None)
+        assert await cli_module.config_doctor() == 1
+        assert "no configuration file found" in capsys.readouterr().out
+
+    async def test_invalid_toml_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        path = _write(tmp_path, "[app\nbroken")
+        self._point_at(monkeypatch, path)
+        assert await cli_module.config_doctor() == 1
+        assert "not readable valid TOML" in capsys.readouterr().out

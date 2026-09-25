@@ -6,10 +6,12 @@
 .envrc
 
 # --- Runtime configuration (the real TOML holds secrets; the example ships) ---
+# The real config is operator-owned and never committed. The repository ships
+# exactly ONE canonical template, at the repository root; a test enforces that
+# (`tests/unit/test_config_toml.py::TestCommittedExample`).
 configuration.toml
 config/configuration.toml
 !configuration.example.toml
-!deploy/**/configuration.example.toml
 
 # --- Python ---
 __pycache__/

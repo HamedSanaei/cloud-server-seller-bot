@@ -202,6 +202,12 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("storefront", "catalog_sync", "timeout_seconds"): ("storefront_catalog_sync_timeout_seconds"),
 }
 
+#: Contract keys that are deliberately NOT part of the canonical template:
+#: legacy aliases kept only so an old server file keeps loading. The canonical
+#: spelling of the same setting is documented in ``configuration.example.toml``
+#: instead, and ``config doctor`` never reports these as missing.
+TOML_LEGACY_ALIAS_KEYS: frozenset[tuple[str, ...]] = frozenset({("fx", "provider")})
+
 #: TOML keys that are lists in the file but a comma-separated ``Settings``
 #: string (so one flat field covers both the TOML and the environment form).
 _SEQUENCE_FIELDS: frozenset[str] = frozenset(

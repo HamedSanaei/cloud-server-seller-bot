@@ -95,9 +95,12 @@ Runtime configuration lives in ONE operator-managed TOML file:
 | development / tests | `./configuration.toml` |
 | anywhere | `$CLOUD_PLATFORM_CONFIG_FILE` (bootstrap: only says *where*) |
 
-`configuration.example.toml` (committed) documents every section with safe
-fake values; `deploy/production/configuration.example.toml` is the production
-flavoured copy. The real `configuration.toml` is git-ignored.
+`configuration.example.toml` (committed) is the ONE canonical template: it
+documents every supported section with safe fake values, and each
+environment-dependent setting carries its production form in a comment next to
+the single key. The real `configuration.toml` is git-ignored locally and is
+uploaded by the operator to
+`/etc/cloud-server-seller/configuration.toml` in production.
 
 Value precedence (highest first): **explicit arguments → environment variables
 → `configuration.toml` → `.env` → field defaults**. Environment variables and

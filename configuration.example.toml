@@ -1,11 +1,27 @@
-# Cloud Server Seller — runtime configuration (EXAMPLE).
+# Cloud Server Seller — the ONE canonical runtime configuration template.
 #
-# Copy to `configuration.toml` and fill in the real values:
+# This file is the single configuration contract of the repository: it
+# documents EVERY supported section/key, and a new operator-facing setting must
+# be added here in the same change that introduces it. There is deliberately no
+# second, environment-flavoured copy — an older production-flavoured example
+# lived under `deploy/production/`, drifted out of sync and was deleted, which
+# is exactly the failure this single template prevents.
+#
+# Local development:
 #
 #   cp configuration.example.toml configuration.toml
 #
-# Production path (mounted into the containers):
-#   /etc/cloud-server-seller/configuration.toml
+# Production (server-owned file, mounted read-only into every container):
+#
+#   sudo install -d -m 0750 -o root -g docker /etc/cloud-server-seller
+#   sudo install -m 0640 -o root -g docker \
+#       configuration.example.toml /etc/cloud-server-seller/configuration.toml
+#   sudo "$EDITOR" /etc/cloud-server-seller/configuration.toml   # fill secrets
+#
+# The operator keeps the REAL `configuration.toml` locally (git-ignored) and
+# uploads/copies it to that server path. A deployment NEVER writes it: the
+# release only mounts it read-only. When upgrading, compare this template with
+# the real file, merge what is missing, validate, then upload.
 #
 # The application finds the file in this order:
 #   1. $CLOUD_PLATFORM_CONFIG_FILE   (bootstrap: only says WHERE the file is)
@@ -17,24 +33,38 @@
 # Environment variables exist for bootstrap and tests only. Production keeps
 # every secret in this file, which is why `configuration.toml` is git-ignored.
 #
-# NEVER commit a real configuration.toml. Every value below is a fake example.
+# Every value below is a safe FAKE placeholder: never commit a real
+# configuration.toml. Environment-dependent settings show the production form
+# in a comment next to the SINGLE supported key.
 
 [app]
+# Local development (the value that keeps this template self-consistent):
+#   environment = "development"
+# Production MUST say "production": that is what enables the production-only
+# validation (public https payment callbacks, redis Telegram session backend).
 environment = "development"        # development | staging | production
 log_level = "INFO"
 default_currency = "USD"
 
 [database]
 # Local example has no password; production inserts it after "cloud"
-# (percent-encoded when it contains special characters).
+# (percent-encoded when it contains special characters) and points at the
+# compose service instead of localhost:
+#   url = "postgresql+asyncpg://cloud@postgres:5432/cloud"
 url = "postgresql+asyncpg://cloud@localhost:5432/cloud"
 
 [redis]
+# Local development; the production compose service is `redis`:
+#   url = "redis://redis:6379/0"
 url = "redis://localhost:6379/0"
 
 [telegram]
 bot_token = "CHANGE_ME"
 callback_signing_key = "CHANGE_ME"
+# The two operator ids belong to THIS section (never to [telegram.sessions],
+# which only owns transient bot state):
+#   admin_chat_id    renewals / attention alerts, 0 = unset
+#   support_contact  shown to customers as the support handle
 admin_chat_id = 0                  # renewals / attention alerts (0 = unset)
 support_contact = "@support"
 
@@ -44,7 +74,10 @@ support_contact = "@support"
 # `redis` is REQUIRED in production. This state is disposable (it only ever
 # expires), but it must be SHARED: with `memory` a bot restart loses the
 # buttons a customer is holding, and a second replica would resolve the same
-# reference differently. The factory refuses `memory` outside development.
+# reference differently. The factory refuses `memory` outside development, and
+# the release-owned production compose additionally forces
+# TELEGRAM_SESSIONS_BACKEND=redis, so an older server file that still says
+# `memory` resolves to redis at runtime — keep this value correct anyway.
 #
 # Safety note: losing Redis blocks mutations (fail closed), it never permits
 # one. Nothing here is a secret: no API key, password, credential or console
@@ -108,25 +141,41 @@ billing_cycle = "1_MONTH"
 #   api_key  the provider credential — never logged, never printed
 #   enabled  false keeps the account configured but unusable
 #   priority lower wins when several accounts can serve the same location
+#   label    optional operator-facing text (`leaseweb accounts doctor`)
 #   state    "active"   -> discovery + new orders + manages what it owns
 #            "draining" -> no new orders; existing servers stay manageable
 #            "disabled" -> not used at all (operator intervention required)
+#
+# These keys live ONLY in this server-owned file (mounted read-only into the
+# containers). Never put them in deploy.env, the release compose or a CI
+# variable: the deployment workflow must never carry provider credentials.
 #
 # Leaving every account commented out keeps the deprecated single `api_key`
 # above working exactly as before: it becomes the account id "default",
 # which is also what rows created before multi-account support are routed to.
 #
+# Preferred form — the table key IS the account id, so nothing is repeated and
+# nothing can drift out of sync:
+#
+# [providers.leaseweb.accounts.sales-org-north]
+# api_key = "CHANGE_ME"
+# enabled = true
+# label = "Frankfurt Sales Organization"
+# priority = 100
+#
+# [providers.leaseweb.accounts.sales-org-uk]
+# api_key = "CHANGE_ME"
+# enabled = true
+# label = "UK Sales Organization"
+# priority = 200
+#
+# Equivalent list form (the id is a field):
+#
 # [[providers.leaseweb.accounts]]
-# id = "lw-eu"
+# id = "sales-org-north"
 # enabled = true
 # api_key = "CHANGE_ME"
 # priority = 100
-#
-# [[providers.leaseweb.accounts]]
-# id = "lw-asia"
-# enabled = true
-# api_key = "CHANGE_ME"
-# priority = 200
 
 [providers.arvancloud]
 enabled = true
@@ -206,7 +255,21 @@ enabled = false
 merchant_id = "CHANGE_ME"
 base_url = "https://sandbox.zarinpal.com/pg/v4/payment"
 sandbox = true
+# Production MUST be an absolute, PUBLIC https URL on the real domain, e.g.
+#   https://your-domain.example/api/v1/payments/zarinpal/callback
 callback_url = "https://example.com/api/v1/payments/zarinpal/callback"
+
+[payments.tetraminator]
+# Second Iranian gateway (Toman). Disabled until the operator opts in by
+# setting enabled = true AND a real api_key below. Amounts are integer Toman;
+# the documented minimum invoice is 50,000 Toman.
+enabled = false
+api_key = "CHANGE_ME"  # pragma: allowlist secret
+base_url = "https://api.tetraminator.com/v1"
+# Production MUST be https on the real public domain, e.g.
+#   https://your-domain.example/webhooks/payments/tetraminator
+callback_url = "https://example.com/webhooks/payments/tetraminator"
+timeout_seconds = 30
 
 # ---------------------------------------------------------------------------
 # Currency / FX resolution (platform-level, provider-neutral)
@@ -252,6 +315,10 @@ max_stale_seconds = 345600
 catalog_max_stale_seconds = 86400
 
 [security]
+# 32-byte url-safe base64 keys. Generate with:
+#   python -c "import base64; from cloud_platform.core.secrets import MasterKey; print(base64.urlsafe_b64encode(MasterKey.generate().material).decode())"
+# Both are REQUIRED in production; changing the credential key makes existing
+# encrypted provider credentials unreadable, so back it up before rotating.
 provider_credential_encryption_key = "CHANGE_ME"
 backup_encryption_key = "CHANGE_ME"
 

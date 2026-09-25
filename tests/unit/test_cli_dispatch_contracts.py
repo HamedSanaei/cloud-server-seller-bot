@@ -199,6 +199,15 @@ class TestCatalogAndProviderOperatorSurface:
         assert await _dispatch(monkeypatch, ["catalog", "auto-sync", "doctor"]) == SENTINEL
         stub.assert_awaited_once_with()
 
+    async def test_config_doctor_routes_without_arguments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Read-only operator drift check: no flags, verdict in the exit code.
+        stub = _stub(monkeypatch, "config_doctor")
+
+        assert await _dispatch(monkeypatch, ["config", "doctor"]) == SENTINEL
+        stub.assert_awaited_once_with()
+
     async def test_catalog_auto_sync_run_routes_without_arguments(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

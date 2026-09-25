@@ -66,12 +66,17 @@ production model, however, is a single operator-managed TOML file:
 ```bash
 sudo install -d -m 0750 -o root -g 999 /etc/cloud-server-seller
 sudo install -m 0640 -o root -g 999 \
-    deploy/production/configuration.example.toml \
+    configuration.example.toml \
     /etc/cloud-server-seller/configuration.toml
 sudo "$EDITOR" /etc/cloud-server-seller/configuration.toml    # fill in secrets
 export CLOUD_PLATFORM_CONFIG_FILE=/etc/cloud-server-seller/configuration.toml
 cd deploy/production && docker compose up -d
 ```
+
+`configuration.example.toml` in the repository ROOT is the single canonical
+template (there is no second, production-flavoured copy). Keep the real
+`configuration.toml` locally next to it — git-ignored, never committed — merge
+new keys from the template before you upload it to the server path above.
 
 `deploy/production/docker-compose.yml` mounts the file read-only into every
 container and sets only that one non-secret bootstrap variable — no provider

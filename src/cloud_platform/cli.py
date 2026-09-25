@@ -1643,6 +1643,150 @@ async def catalog_auto_sync_run() -> int:
     return 0
 
 
+def _toml_leaf_paths(document: dict[str, Any]) -> list[tuple[str, ...]]:
+    """Every leaf key path of a parsed configuration document."""
+    leaves: list[tuple[str, ...]] = []
+
+    def walk(node: dict[str, Any], prefix: tuple[str, ...]) -> None:
+        for key, value in node.items():
+            path = (*prefix, key)
+            if isinstance(value, dict):
+                walk(value, path)
+            else:
+                leaves.append(path)
+
+    walk(document, ())
+    return leaves
+
+
+def _toml_leaf_value(document: dict[str, Any], path: tuple[str, ...]) -> Any:
+    """Value at a leaf path (``None`` when the path does not exist)."""
+    node: Any = document
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _toml_has(document: dict[str, Any], path: tuple[str, ...]) -> bool:
+    node: Any = document
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+async def config_doctor() -> int:
+    """Read-only: compare the real configuration with the canonical contract.
+
+    Reports configuration drift in both directions WITHOUT ever printing a
+    value — only key paths:
+
+    * keys the loader supports but the file does not set (the Settings default
+      applies; a model-required key is a hard failure);
+    * keys the file sets that the loader does not know (silently ignored today,
+      which is how a typo or a removed setting stays unnoticed);
+    * the documented ``CHANGE_ME`` placeholders still present in a
+      ``production`` file, which is an invalid configuration rather than drift.
+
+    It never rewrites anything: the operator merges the missing keys and
+    uploads the file. Exit 1 for an unreadable/invalid file, a missing required
+    key or an unreplaced placeholder in production; otherwise 0.
+    """
+    import tomllib
+
+    from cloud_platform.core.config import _TOML_FIELDS as toml_contract
+    from cloud_platform.core.config import (
+        TOML_LEGACY_ALIAS_KEYS,
+        ConfigFileError,
+        Settings,
+        resolve_config_file,
+    )
+
+    try:
+        path = resolve_config_file()
+    except ConfigFileError as exc:
+        print(f"error: {exc}")
+        print("config doctor: FAIL")
+        return 1
+    if path is None:
+        print(
+            "no configuration file found (CLOUD_PLATFORM_CONFIG_FILE, "
+            "./configuration.toml, /etc/cloud-server-seller/configuration.toml); "
+            "built-in defaults are in effect"
+        )
+        print("config doctor: FAIL")
+        return 1
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"error: {path} is not readable valid TOML ({type(exc).__name__})")
+        print("config doctor: FAIL")
+        return 1
+    print(f"configuration contract: {path}")
+
+    missing_required: list[str] = []
+    missing_defaulted: list[str] = []
+    for section_key, field_name in toml_contract.items():
+        if section_key in TOML_LEGACY_ALIAS_KEYS or _toml_has(document, section_key):
+            continue
+        name = ".".join(section_key)
+        model_field = Settings.model_fields.get(field_name)
+        if model_field is not None and model_field.is_required():
+            missing_required.append(name)
+        else:
+            missing_defaulted.append(name)
+
+    supported = set(toml_contract)
+    unknown: list[str] = []
+    for leaf in _toml_leaf_paths(document):
+        if leaf in supported:
+            continue
+        # Schema-driven subtrees: providers (accounts/families/nested sections)
+        # and the per-provider automatic pricing policies.
+        if leaf[0] == "providers" or leaf[:2] == ("storefront", "pricing"):
+            continue
+        unknown.append(".".join(leaf))
+
+    environment = _toml_leaf_value(document, ("app", "environment"))
+    production = str(environment or "").strip().lower() == "production"
+    placeholders = [
+        ".".join(leaf)
+        for leaf in _toml_leaf_paths(document)
+        if _toml_leaf_value(document, leaf) == "CHANGE_ME"
+    ]
+
+    if missing_required:
+        print("missing REQUIRED keys:")
+        for name in sorted(missing_required):
+            print(f"  {name}")
+    if missing_defaulted:
+        print("missing keys (the Settings default applies):")
+        for name in sorted(missing_defaulted):
+            print(f"  {name}")
+    if unknown:
+        print("unknown keys (ignored by the loader; typo or removed setting):")
+        for name in sorted(unknown):
+            print(f"  {name}")
+    if placeholders:
+        label = (
+            "placeholders that must be replaced"
+            if production
+            else "placeholders (fine outside production)"
+        )
+        print(f"{label}:")
+        for name in sorted(placeholders):
+            print(f"  {name}")
+    if not (missing_required or missing_defaulted or unknown or placeholders):
+        print("every supported key is present, no unknown keys, no placeholders")
+
+    unusable = bool(missing_required) or (production and bool(placeholders))
+    print(f"config doctor: {'FAIL' if unusable else 'OK'}")
+    return 1 if unusable else 0
+
+
 async def catalog_auto_sync_doctor() -> int:
     """Read-only: automatic catalog sync configuration and per-provider status.
 
@@ -3363,6 +3507,12 @@ def _parser() -> argparse.ArgumentParser:
         "run", help="run one complete catalog refresh now (bounded release budget)"
     )
 
+    config = sub.add_parser("config", help="operator configuration diagnostics")
+    config_sub = config.add_subparsers(dest="subcommand", required=True)
+    config_sub.add_parser(
+        "doctor", help="read-only: compare the real config with the canonical template"
+    )
+
     users = sub.add_parser("users")
     users_sub = users.add_subparsers(dest="subcommand", required=True)
     find = users_sub.add_parser("find")
@@ -3523,6 +3673,11 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.subcommand == "normalize-selling-currency":
             return await offers_normalize_selling_currency(args.dry_run, args.target)
         return await offers_set(args.offer_id, args.subcommand, None, None)
+    if args.command == "config":
+        if args.subcommand == "doctor":
+            return await config_doctor()
+        print(f"unknown command config {args.subcommand}")  # pragma: no cover
+        return 2
     if args.command == "catalog":
         if args.subcommand == "auto-sync" and args.subsubcommand == "doctor":
             return await catalog_auto_sync_doctor()

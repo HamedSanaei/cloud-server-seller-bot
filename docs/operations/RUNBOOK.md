@@ -186,8 +186,12 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
 ### Launch sequence (monthly track)
 
 1. **Config** — fill in `configuration.toml` (production:
-   `/etc/cloud-server-seller/configuration.toml`; see
-   `configuration.example.toml`): `[providers.leaseweb].api_key`,
+   `/etc/cloud-server-seller/configuration.toml`; the repository root
+   `configuration.example.toml` is the ONE canonical template — keep your real
+   file next to it locally, merge new keys from it, then upload). Validate the
+   result read-only with `python -m cloud_platform.cli config doctor` (key paths
+   only, never values; non-zero means unusable). Then set:
+   `[providers.leaseweb].api_key`,
    `[providers.leaseweb].locations` (optional discovery seeds; eligibility is probed live),
    `[telegram].bot_token`, `[telegram].callback_signing_key`,
    `[telegram].admin_chat_id` and the `[telegram.logger]` channel. `.env`

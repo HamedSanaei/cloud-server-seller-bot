@@ -6,8 +6,10 @@
 #     file (default /etc/cloud-server-seller/configuration.toml), mounted
 #     read-only into every container. It is NEVER committed, uploaded from
 #     the repository, or overwritten by a deployment. Bootstrap it once from
-#     deploy/production/configuration.example.toml (see
-#     docs/operations/PRODUCTION_DEPLOY.md).
+#     the repository's canonical template `configuration.example.toml`, which
+#     documents every supported key (see docs/operations/PRODUCTION_DEPLOY.md).
+#     There is deliberately no second, production-flavoured example: this
+#     compose file consumes ONLY the server-owned real config.
 #   * The only environment variable the platform needs is the NON-SECRET
 #     bootstrap path CLOUD_PLATFORM_CONFIG_FILE.
 #   * The deployment env file (server-side, e.g. /opt/cloud-server-seller/

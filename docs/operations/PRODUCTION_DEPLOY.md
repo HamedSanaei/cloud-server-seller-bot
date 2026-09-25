@@ -96,12 +96,44 @@ systemctl enable --now docker
 install -d -m 0750 -o deploy -g docker /opt/cloud-server-seller
 install -d -m 0750 -o root -g docker /etc/cloud-server-seller
 
-# 3. application configuration (copy the example OUT of a checkout, edit it)
+# 3. application configuration (the ONE canonical template lives at the
+#    repository root; copy it OUT of a checkout, then edit it)
 install -m 0640 -o root -g docker \
-  deploy/production/configuration.example.toml \
+  configuration.example.toml \
   /etc/cloud-server-seller/configuration.toml
 "$EDITOR" /etc/cloud-server-seller/configuration.toml   # fill in every secret
+```
 
+**Configuration contract (one template, one real file).**
+
+| File | Owner | Purpose |
+| --- | --- | --- |
+| `configuration.example.toml` (repository root) | repository | the SINGLE canonical template: every supported key, safe fake values, production form documented in a comment next to each environment-dependent key |
+| `configuration.toml` | operator, local only | the real values; git-ignored, never committed, never printed |
+| `/etc/cloud-server-seller/configuration.toml` | operator, server | the real values the containers mount read-only |
+
+The template is the contract, and a check enforces it: a new operator-facing
+setting must be added to `configuration.example.toml` in the same change that
+introduces it (see `tests/unit/test_config_toml.py`). There is deliberately no
+second, production-flavoured example — the deleted `deploy/production/` copy
+had drifted and silently lost/duplicated keys.
+
+To upgrade an existing server: diff the template against your local real
+`configuration.toml`, merge the missing keys, validate, then install it. A
+deployment only ever mounts that file; it never writes or overwrites it.
+
+Validate before installing — the read-only drift check prints KEY PATHS only,
+never a value:
+
+```bash
+python -m cloud_platform.cli config doctor
+```
+
+Exit 0 = every supported key accounted for, no unknown keys, no unreplaced
+`CHANGE_ME` placeholder in a production file; exit 1 = the file is unreadable or
+invalid, a required key is missing, or a production placeholder survives.
+
+```bash
 # 4. deployment env only (the release compose arrives automatically;
 #    do NOT copy configuration.toml here and do NOT copy docker-compose.yml —
 #    the first successful deploy promotes its own canonical compose file)
