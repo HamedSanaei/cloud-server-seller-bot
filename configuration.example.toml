@@ -171,6 +171,16 @@ display_name = "کلود"
 [storefront.catalog_sync]
 enabled = true
 interval_seconds = 900
+# Dedicated timeout for ONE catalog refresh job, in seconds. A full Leaseweb
+# pass walks hundreds of products across every account/region with optional
+# detail calls, so it legitimately exceeds the generic 120s worker job
+# timeout; ARQ would otherwise cancel a healthy run mid-way and leave the
+# affected rows unpriced. Only this cron job gets the longer budget:
+# payment/order/reconciliation jobs keep `WorkerSettings.job_timeout`.
+# A value above `interval_seconds` is clamped to it, because a job must not
+# outlive its own cadence (overlapping runs also serialize on the catalog
+# advisory lock).
+timeout_seconds = 600
 
 [storefront.pricing.leaseweb]
 mode = "markup"

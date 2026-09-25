@@ -199,6 +199,7 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("storefront", "catalog_sync", "interval_seconds"): (
         "storefront_catalog_sync_interval_seconds"
     ),
+    ("storefront", "catalog_sync", "timeout_seconds"): ("storefront_catalog_sync_timeout_seconds"),
 }
 
 #: TOML keys that are lists in the file but a comma-separated ``Settings``
@@ -667,6 +668,12 @@ class Settings(BaseSettings):
     # manual sync-offers / price-book / enable commands needed afterwards.
     storefront_catalog_sync_enabled: bool = True
     storefront_catalog_sync_interval_seconds: int = Field(default=900, ge=60)
+    #: Dedicated job timeout for ONE ``catalog_auto_sync`` cron run. The
+    #: periodic refresh walks every product of every account/region, so it
+    #: legitimately outlives the generic worker job timeout; the catalog is
+    #: the ONLY job granted the longer budget (see
+    #: :func:`cloud_platform.worker.settings.catalog_auto_sync_timeout`).
+    storefront_catalog_sync_timeout_seconds: int = Field(default=600, gt=0)
     # ``[storefront.pricing.<provider>]`` sections as parsed above, e.g.
     # ``{"leaseweb": {"mode": "markup", "markup_percent": 25,
     # "auto_publish": True}}``. Absent = no automatic pricing/publication

@@ -58,7 +58,11 @@ def _fake_container() -> MagicMock:
 
 class TestSyncLeasewebOffers:
     async def test_skipped_without_key(self, settings: MagicMock) -> None:
+        # Fully uncredentialed: blanking the key must also drop the
+        # validator-synthesized default account, otherwise the job builds a
+        # real router and reaches the network instead of skipping.
         settings.leaseweb_api_key = ""
+        settings.leaseweb_accounts = []
         await ws.sync_leaseweb_offers({})
 
     async def test_runs_syncer_and_logs(

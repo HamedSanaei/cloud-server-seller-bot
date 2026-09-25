@@ -41,6 +41,10 @@ def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     return fake
 
 
+def _cron_by_name(jobs: list[Any]) -> dict[str, Any]:
+    return {getattr(job, "coroutine", getattr(job, "func", None)).__name__: job for job in jobs}
+
+
 def _coordinator(
     monkeypatch: pytest.MonkeyPatch, report: AutoSyncRunReport | None = None
 ) -> AsyncMock:
@@ -157,6 +161,64 @@ class TestCatalogAutoSyncSchedule:
         }
         assert by_name["catalog_auto_sync"].minute == set(range(0, 60, 15))
         assert getattr(by_name["catalog_auto_sync"], "run_at_startup", False) is True
+
+    def test_catalog_cron_carries_its_own_dedicated_timeout(self, settings: Settings) -> None:
+        by_name = _cron_by_name(ws._cron_jobs())
+        catalog = by_name["catalog_auto_sync"]
+        assert catalog.timeout_s == ws.CATALOG_AUTO_SYNC_TIMEOUT_SECONDS == 600
+        # The whole point: a complete provider walk must not be cancelled by
+        # the generic job timeout that other jobs keep.
+        assert catalog.timeout_s > ws.WorkerSettings.job_timeout == 120
+        # Startup pass and periodic cadence are unchanged by the timeout.
+        assert catalog.run_at_startup is True
+        assert catalog.minute == set(range(0, 60, 15))
+
+    def test_only_the_catalog_job_gets_the_longer_timeout(self, settings: Settings) -> None:
+        by_name = _cron_by_name(ws._cron_jobs())
+        others = {name: job for name, job in by_name.items() if name != "catalog_auto_sync"}
+        assert len(others) == 13
+        assert all(job.timeout_s is None for job in others.values())
+        # And no worker role widened the generic timeout itself.
+        for settings_cls in (
+            ws.WorkerSettings,
+            ws.ProvisioningWorkerSettings,
+            ws.BillingWorkerSettings,
+            ws.NotifyWorkerSettings,
+        ):
+            assert settings_cls.job_timeout == 120
+
+    def test_provisioning_role_uses_the_dedicated_timeout(self, settings: Settings) -> None:
+        by_name = _cron_by_name(ws._role_cron_jobs("provisioning"))
+        catalog = by_name["catalog_auto_sync"]
+        assert catalog.timeout_s == ws.catalog_auto_sync_timeout() == 600
+        assert catalog.run_at_startup is True
+        assert catalog.minute == set(range(0, 60, 15))
+        assert all(
+            job.timeout_s is None for name, job in by_name.items() if name != "catalog_auto_sync"
+        )
+
+    def test_configured_timeout_reaches_the_cron_entry(self, settings: Settings) -> None:
+        settings.storefront_catalog_sync_timeout_seconds = 750
+        assert ws.catalog_auto_sync_timeout() == 750
+        assert _cron_by_name(ws._cron_jobs())["catalog_auto_sync"].timeout_s == 750
+        assert (
+            _cron_by_name(ws._role_cron_jobs("provisioning"))["catalog_auto_sync"].timeout_s == 750
+        )
+
+    def test_timeout_above_the_interval_is_clamped(self, settings: Settings, caplog: Any) -> None:
+        settings.storefront_catalog_sync_interval_seconds = 600
+        settings.storefront_catalog_sync_timeout_seconds = 900
+        with caplog.at_level("WARNING", logger="cloud_platform.worker.settings"):
+            assert ws.catalog_auto_sync_timeout() == 600
+        assert any("clamping" in record.message for record in caplog.records)
+
+    def test_invalid_timeout_falls_back_to_the_default(
+        self, settings: Settings, caplog: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "storefront_catalog_sync_timeout_seconds", "oops")
+        with caplog.at_level("WARNING", logger="cloud_platform.worker.settings"):
+            assert ws.catalog_auto_sync_timeout() == ws.CATALOG_AUTO_SYNC_TIMEOUT_SECONDS
+        assert any("not a positive integer" in record.message for record in caplog.records)
 
 
 class _DeterministicEurUsdRates:

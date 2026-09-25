@@ -430,6 +430,51 @@ async def _close_telegram_notifiers(notifiers: tuple[Any, Any] | None) -> None:
                 logger.warning("worker Telegram session close failed", exc_info=True)
 
 
+#: Built-in dedicated timeout (seconds) for one ``catalog_auto_sync`` run.
+#: A Leaseweb refresh discovers hundreds of products across every account and
+#: region with optional detail calls, which legitimately exceeds the generic
+#: ``WorkerSettings.job_timeout``; the previous 120s cancellation killed the
+#: run before pricing/publication ever executed.
+CATALOG_AUTO_SYNC_TIMEOUT_SECONDS = 600
+
+
+def catalog_auto_sync_timeout() -> int:
+    """Dedicated ``catalog_auto_sync`` cron timeout in seconds.
+
+    Only the catalog refresh is granted this budget: payment, order and
+    reconciliation jobs keep the generic worker job timeout, so a stuck
+    billing job can never hold a worker for minutes. A configured value is
+    clamped to the sync interval — a job must not outlive its own cadence, and
+    overlapping runs would only queue behind the catalog advisory lock.
+    """
+    from cloud_platform.core.config import get_settings
+
+    default = CATALOG_AUTO_SYNC_TIMEOUT_SECONDS
+    try:
+        settings = get_settings()
+        raw_timeout = settings.storefront_catalog_sync_timeout_seconds
+        interval = int(settings.storefront_catalog_sync_interval_seconds)
+    except Exception:
+        return default
+    if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int) or raw_timeout <= 0:
+        logger.warning(
+            "catalog auto-sync timeout %r is not a positive integer; using %ss",
+            raw_timeout,
+            default,
+        )
+        timeout = default
+    else:
+        timeout = raw_timeout
+    if interval > 0 and timeout > interval:
+        logger.warning(
+            "catalog auto-sync timeout %ss exceeds the %ss sync interval; clamping to the interval",
+            timeout,
+            interval,
+        )
+        timeout = interval
+    return timeout
+
+
 def catalog_auto_sync_minutes() -> set[int]:
     """Cron minute set from the configured sync interval (default: 15 min).
 
@@ -1005,15 +1050,27 @@ def _cron_jobs() -> list[Any]:
     order worker claims through the operation ledger and the reconciler
     never mutates. The catalog auto-sync runs at the configured interval
     (default 15 minutes) so account eligibility changes surface without
-    operator action."""
+    operator action, and carries its own dedicated job timeout
+    (:func:`catalog_auto_sync_timeout`) because a complete provider walk does
+    not fit the generic worker job timeout."""
     from arq.cron import cron
 
     every_minute = set(range(0, 60))
     every_two_minutes = set(range(0, 60, 2))
     every_three_minutes = set(range(0, 60, 3))
     every_fifteen_minutes = set(range(0, 60, 15))
+    # The catalog refresh is the only schedule with an explicit timeout: a
+    # full provider walk (hundreds of products x accounts x regions) does not
+    # fit the generic worker job timeout, while every other job deliberately
+    # keeps it.
+    catalog_timeout = catalog_auto_sync_timeout()
     return [
-        cron(catalog_auto_sync, minute=catalog_auto_sync_minutes(), run_at_startup=True),
+        cron(
+            catalog_auto_sync,
+            minute=catalog_auto_sync_minutes(),
+            run_at_startup=True,
+            timeout=catalog_timeout,
+        ),
         cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
         cron(reconcile_provider_resources, minute=every_three_minutes, run_at_startup=True),
@@ -1055,6 +1112,9 @@ class WorkerSettings:
     on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(get_settings().redis_url)
     max_jobs = 20
+    # Generic per-job timeout. The catalog refresh is the one exception: its
+    # cron entry sets an explicit, larger timeout (a full provider walk would
+    # otherwise be cancelled mid-run).
     job_timeout = 120
 
 
@@ -1092,7 +1152,12 @@ def _role_cron_jobs(role: str) -> list[Any]:
     every_fifteen_minutes = set(range(0, 60, 15))
     if role == "provisioning":
         return [
-            cron(catalog_auto_sync, minute=catalog_auto_sync_minutes(), run_at_startup=True),
+            cron(
+                catalog_auto_sync,
+                minute=catalog_auto_sync_minutes(),
+                run_at_startup=True,
+                timeout=catalog_auto_sync_timeout(),
+            ),
             cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
             cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
             cron(reconcile_provider_resources, minute=every_three_minutes, run_at_startup=True),
