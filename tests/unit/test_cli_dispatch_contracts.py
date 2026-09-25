@@ -182,6 +182,15 @@ class TestOfferOperatorSurface:
         with pytest.raises(SystemExit):
             cli._parser().parse_args(["offers", "normalize-selling-currency"])
 
+    async def test_offers_readiness_routes_without_arguments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The release gate: read-only, no flags, exit code carries the verdict.
+        stub = _stub(monkeypatch, "offers_readiness")
+
+        assert await _dispatch(monkeypatch, ["offers", "readiness"]) == SENTINEL
+        stub.assert_awaited_once_with()
+
 
 class TestCatalogAndProviderOperatorSurface:
     async def test_catalog_auto_sync_doctor_routes(self, monkeypatch: pytest.MonkeyPatch) -> None:

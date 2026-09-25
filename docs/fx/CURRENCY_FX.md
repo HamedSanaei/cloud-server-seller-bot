@@ -153,6 +153,7 @@ uv run python -m cloud_platform.cli fx rates --target USD
 uv run python -m cloud_platform.cli offers doctor
 uv run python -m cloud_platform.cli offers normalize-selling-currency --target USD --dry-run
 uv run python -m cloud_platform.cli offers normalize-selling-currency --target USD --execute
+uv run python -m cloud_platform.cli offers readiness
 uv run python -m cloud_platform.cli catalog auto-sync doctor
 ```
 
@@ -161,6 +162,23 @@ uv run python -m cloud_platform.cli catalog auto-sync doctor
 intent, recomputes auto rows from native cost plus policy markup, converts
 manual rows from their existing selling amount without a second markup, and is
 idempotent. It never changes provider-native cost or an operator-disabled row.
+
+Its result is classified, and the exit code reports only REAL failures:
+`normalized` (or `WOULD` in dry-run), `intentionally skipped` (operator-disabled
+rows, a provider without an automatic pricing policy, manual domestic IRT/IRR
+prices) and `failed` (pricing/FX/conversion errors, plus a row whose price
+changed under us — a simple re-run resolves those). Exit 0 means "nothing was
+left fail-closed", exit 1 means at least one row is still not canonical.
+
+`offers readiness` is the machine-usable release gate (exit 0 = ready): for
+every provider that is configured with a market, enabled, credentialed and
+auto-priced, a catalog with stored offers must have at least one sellable row
+in the catalog currency, and it must not have discovered plans that persisted
+nothing. Providers the operator never configured (no market, `enabled = false`,
+no credential, no pricing policy) are never required to have offers, and a
+catalog whose stored offers are ALL operator-disabled is reported as operator
+intent rather than an outage. `scripts/deploy-production.sh` runs this before
+promoting a release, because green health checks cannot see an empty store.
 
 All customer browse/checkout/create paths reject a foreign offer unless its
 selling currency is the configured target, and a wallet must match the offer's
@@ -176,6 +194,7 @@ are not shown to customers.
 ```bash
 uv run python -m cloud_platform.cli fx doctor
 uv run python -m cloud_platform.cli offers doctor
+uv run python -m cloud_platform.cli offers readiness
 uv run python -m cloud_platform.cli catalog auto-sync doctor
 uv run python -m cloud_platform.cli fx rates --target USD
 uv run alembic current

@@ -47,7 +47,10 @@
 # Sequence: validate files -> save rollback image -> switch PLATFORM_IMAGE ->
 # pull -> postgres/redis healthy -> migrate (alembic upgrade head) ->
 # database migration head == image head -> database PHYSICAL schema matches the
-# release -> api, worker, exactly one bot -> health/readiness -> report. On failure the
+# release -> catalog canonicalization (offers normalize-selling-currency) ->
+# api, worker, exactly one bot -> health/readiness -> STOREFRONT READINESS
+# (offers readiness: an enabled+credentialed+auto-priced provider with stored
+# offers but none sellable fails the release) -> report. On failure the
 # previous image is restored and restarted (the database is NEVER downgraded:
 # migrations stay forward-compatible so image rollback is always possible).
 # A successful rollback is still a FAILED deployment (exit 1).
@@ -422,6 +425,30 @@ deploy() {
     fi
     log "database physical schema verified against the release"
 
+    # GATE: catalog canonicalization (idempotent release transition).
+    #
+    # Migration 0043 deliberately refuses to invent financial history, and the
+    # release that switched the storefront to canonical-currency/provenance
+    # visibility could not enforce it either: every pre-existing foreign row
+    # became invisible while every health check stayed green — a GREEN deploy
+    # with an EMPTY customer catalog. So the release canonicalizes the catalog
+    # itself through the supported, audited CLI path an operator would use
+    # (exact FX, single markup on auto-priced rows, NO second markup on manual
+    # prices, operator-disabled rows untouched, fail-closed on missing facts),
+    # in a one-shot container BEFORE any customer-facing service is replaced.
+    # It is idempotent: an already canonical catalog is a no-op.
+    #
+    # A non-zero exit is NOT fatal here — an FX outage must not block an
+    # unrelated release — but it is never silent: the counters are printed and
+    # the storefront readiness gate after the services start is authoritative.
+    log "canonicalizing catalog selling currency (idempotent release transition)"
+    if PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        python -m cloud_platform.cli offers normalize-selling-currency --execute; then
+        log "catalog selling currency is canonical"
+    else
+        log "[WARN] catalog normalization reported failures (counts above); the storefront readiness gate below is authoritative"
+    fi
+
     log "starting api + worker + bot (bot replicas = 1)"
     compose_candidate up -d api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
 
@@ -520,6 +547,23 @@ deploy() {
         [ -n "${current}" ] || { fail "alembic current is empty"; return 1; }
         log "alembic current: ${current}"
     fi
+
+    # GATE: the customer-facing catalog must actually be open.
+    #
+    # Healthy services are NOT evidence that a customer can buy anything: the
+    # global-USD release deployed green with 507 stored offers and ZERO on
+    # sale. This runs the machine-usable, provider-neutral readiness assertion
+    # INSIDE the running release (read-only, no provider call) before the
+    # compose contract is promoted, so a release that would leave an enabled, credentialed
+    # and auto-priced provider with nothing on sale fails here — with the
+    # rollback the caller performs on any failure — instead of silently
+    # showing every customer "nothing is for sale".
+    log "verifying storefront readiness (sellable offers per enabled provider)"
+    if ! compose_candidate exec -T api python -m cloud_platform.cli offers readiness; then
+        fail "storefront readiness failed: an enabled, credentialed, auto-priced provider has NOTHING on sale; refusing to promote this release (see the action above, then redeploy)"
+        return 1
+    fi
+    log "storefront readiness: ok"
 
     # Atomic promotion: every gate above passed, so the release candidate
     # becomes the canonical contract. Same-filesystem rename: either the

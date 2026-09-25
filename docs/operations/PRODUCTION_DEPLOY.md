@@ -169,8 +169,15 @@ repository secrets are needed: application secrets live only in the server
 7. Start/verify `postgres` + `redis` (bounded health waits, candidate contract).
 8. Run migrations (`alembic upgrade head` in the one-shot `migrate`
    service); on failure restore the previous reference and stop.
-9. Start/update `api`, `worker`, and exactly one `bot` (candidate contract).
-10. Health gates (all bounded, no infinite waits):
+9. Canonicalize the catalog (`offers normalize-selling-currency --execute`,
+   one-shot container, idempotent). A schema migration refuses to invent
+   financial history, and the release that made canonical currency +
+   FX provenance a visibility requirement could not enforce it either — the
+   global-USD rollout deployed GREEN with 507 stored offers and ZERO on sale.
+   A non-zero exit here is logged with its counters and NOT fatal (an FX
+   outage must not block an unrelated release); step 11 is authoritative.
+10. Start/update `api`, `worker`, and exactly one `bot` (candidate contract).
+11. Health gates (all bounded, no infinite waits):
     * `GET /health/ready` reports `{"status": "ok"}` (strongest readiness gate);
     * `postgres` + `redis` containers healthy; `worker` running;
     * exactly one `bot` container running (long-polling single consumer);
@@ -178,10 +185,18 @@ repository secrets are needed: application secrets live only in the server
       unchanged restart counts after a short bounded wait (a crash loop must
       fail the deploy even if a container looks running for a moment);
     * `alembic current` inside `api` reports the expected head
-      (`EXPECTED_HEAD`, resolved from the deployed commit in CI).
-11. Atomically promote the candidate compose to the canonical path
+      (`EXPECTED_HEAD`, resolved from the deployed commit in CI);
+    * `offers readiness` inside `api` (read-only, provider-neutral) proves the
+      customer catalog is actually OPEN: every provider that is configured
+      with a market, enabled, credentialed and auto-priced and has stored
+      offers must have at least one sellable row in the catalog currency, and
+      a provider whose last run discovered plans but persisted none fails.
+      Disabled/uncredentialed/policy-less providers are never required to have
+      offers, and an all-operator-disabled catalog is operator intent. A
+      failure here refuses to promote the release (rollback path runs).
+12. Atomically promote the candidate compose to the canonical path
     (same-filesystem rename, mode 0644) and log its SHA-256.
-12. Print service status; on success prune older local images (current +
+13. Print service status; on success prune older local images (current +
     rollback images are always kept).
 
 ## 6. Migration and rollback behavior

@@ -2397,6 +2397,18 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
     Auto-priced rows are recomputed from immutable provider cost + policy
     markup. Manual rows convert their existing selling amount with no second
     markup. FX is shared across the whole command and closed in one place.
+
+    Idempotent and safe to re-run, including as a release transition (see
+    ``scripts/deploy-production.sh``). Results are classified so the exit code
+    reflects only REAL failures:
+
+    - ``normalized`` — rows made canonical this run (or, in dry-run, that would be);
+    - ``intentionally skipped`` — operator-disabled rows, rows whose provider
+      has no automatic pricing policy, and manual domestic (IRT/IRR) prices.
+      These are operator/user intent and never fail the command;
+    - ``failed`` — pricing/FX/conversion errors and rows whose price changed
+      under us (a re-run resolves those). Exit 1, because the row was left
+      fail-closed and the catalog may still be incomplete.
     """
     from cloud_platform.core.container import create_container
     from cloud_platform.db.session import SessionFactory
@@ -2469,14 +2481,15 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                         )
                 except Exception:
                     continue
-        applied = 0
-        skipped = 0
+        normalized = 0
+        intentionally_skipped = 0
+        failed = 0
         for row in sorted(rows, key=lambda o: (o.provider_key, o.location_id, o.product_id)):
             priced_minor = 0
             priced_currency = target
             if row.operator_disabled:
                 print(f"  SKIP {row.ref}: operator-disabled; left untouched")
-                skipped += 1
+                intentionally_skipped += 1
                 continue
             native = (row.provider_cost_currency or "").strip().upper()
             if row.auto_priced:
@@ -2485,7 +2498,7 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                 )
                 if policy is None:
                     print(f"  SKIP {row.ref}: no automatic pricing policy")
-                    skipped += 1
+                    intentionally_skipped += 1
                     continue
                 try:
                     native_currency = (row.provider_cost_currency or "").strip().upper()
@@ -2527,15 +2540,17 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                         else None
                     )
                 except Exception as exc:
-                    print(f"  SKIP {row.ref}: pricing failed ({type(exc).__name__})")
-                    skipped += 1
+                    print(
+                        f"  FAIL {row.ref}: pricing failed ({type(exc).__name__}); left fail-closed"
+                    )
+                    failed += 1
                     continue
             elif native in {"IRT", "IRR"}:
                 print(
                     f"  SKIP {row.ref}: manual domestic price must remain in {native}; "
                     "operator repair required"
                 )
-                skipped += 1
+                intentionally_skipped += 1
                 continue
             else:
                 try:
@@ -2567,9 +2582,10 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                     )
                 except Exception as exc:
                     print(
-                        f"  SKIP {row.ref}: selling-price conversion failed ({type(exc).__name__})"
+                        f"  FAIL {row.ref}: selling-price conversion failed "
+                        f"({type(exc).__name__}); left fail-closed"
                     )
-                    skipped += 1
+                    failed += 1
                     continue
             if dry_run:
                 metadata = dict(priced.pricing_metadata)
@@ -2595,19 +2611,183 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
             else:
                 result = await execute  # type: ignore[misc]
                 if result is None:
-                    print(f"  SKIP {row.ref}: concurrent pricing/manual change won")
-                    skipped += 1
+                    print(
+                        f"  FAIL {row.ref}: concurrent pricing/manual change won; "
+                        "re-run to normalize it"
+                    )
+                    failed += 1
                     continue
                 print(f"  OK   {row.ref}: {priced_minor} {priced_currency}")
-            applied += 1
+            normalized += 1
         verb = "would normalize" if dry_run else "normalized"
-        print(f"{verb} {applied} offer(s) to {target}; skipped/failed: {skipped}")
-        return 0 if skipped == 0 else 1
+        print(
+            f"{verb} {normalized} offer(s) to {target}; "
+            f"intentionally skipped: {intentionally_skipped}; failed: {failed}"
+        )
+        # An operator-disabled plan is INTENT, not a failure: only rows left
+        # fail-closed (unpriced or unpriced-able) fail the command.
+        return 0 if failed == 0 else 1
     finally:
         await container.close()
         from cloud_platform.core.container import Container
 
         await Container.aclose_fx(resolver)
+
+
+async def offers_readiness() -> int:
+    """Read-only release gate: is the customer-facing catalog actually open?
+
+    Machine-usable (exit 0 = ready, 1 = not) and provider-neutral. A release
+    must never end with a configured, enabled, credentialed and auto-priced
+    provider having NOTHING on sale: that is exactly how the global-USD
+    release shipped a green deployment with an empty storefront (507 stored
+    rows, every one hidden by the canonical-currency/provenance gates).
+
+    Only providers the operator actually serves are considered, so a provider
+    without a market, disabled with ``enabled = false``, without a credential,
+    or without an automatic pricing policy is never required to have offers.
+    Operator intent is preserved as well: when EVERY stored offer of such a
+    provider is operator-disabled, the closed store is reported, not failed.
+    Read-only; never prints a credential.
+    """
+    from cloud_platform.core.container import create_container
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+    from cloud_platform.modules.offers.domain import is_sellable_in_currency
+    from cloud_platform.modules.offers.repository import (
+        SqlAlchemyCatalogSyncStateRepository,
+        SqlAlchemySellableOfferRepository,
+    )
+
+    settings = get_settings()
+    catalog_currency = str(settings.fx_catalog_pricing_currency).strip().upper()
+    policies = pricing_policies_from_settings(settings)
+    try:
+        rows = await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+    except Exception as exc:
+        print(f"[FAIL] the offer price book could not be read ({type(exc).__name__})")
+        print("storefront readiness: FAIL")
+        return 1
+    states: dict[str, Any] = {}
+    try:
+        states = {
+            state.provider_key: state
+            for state in await SqlAlchemyCatalogSyncStateRepository(SessionFactory).list_all()
+        }
+    except Exception:
+        states = {}
+
+    # Which providers the operator actually serves: the provider registry is
+    # built from credentials, exactly like the API/worker/bot processes.
+    catalog: Any = None
+    registry_keys: set[str] = set()
+    registry_available = False
+    container = None
+    try:
+        container = create_container()
+        await container.initialize()
+        catalog = container.market_catalog()
+        registry_keys = {str(key) for key in container.provider_registry.keys()}
+        registry_available = True
+    except Exception as exc:  # pragma: no cover - depends on local settings
+        print(f"[WARN] provider registry unavailable ({type(exc).__name__})")
+    finally:
+        if container is not None:
+            await container.close()
+
+    stored: dict[str, int] = {}
+    sellable: dict[str, int] = {}
+    operator_disabled: dict[str, int] = {}
+    for row in rows:
+        key = str(row.provider_key)
+        stored[key] = stored.get(key, 0) + 1
+        if is_sellable_in_currency(row, catalog_currency):
+            sellable[key] = sellable.get(key, 0) + 1
+        if getattr(row, "operator_disabled", False):
+            operator_disabled[key] = operator_disabled.get(key, 0) + 1
+
+    # A pricing policy may be family-specific ("leaseweb.hourly"); such a
+    # family belongs to its base provider.
+    policy_bases: set[str] = set()
+    for policy_key in policies:
+        policy_bases.add(policy_key.partition(".")[0])
+    # Without a registry (unbuildable container) the providers that own stored
+    # rows are the only ones we can prove are served. Requiring a credential is
+    # a SAFETY property here: disabled/uncredentialed providers are never
+    # forced to have offers.
+    served = registry_keys if registry_available else set(stored)
+
+    lines: list[str] = []
+    failures: list[str] = []
+    for provider_key in sorted(set(stored) | policy_bases | served):
+        # Configuration gates are only applied when the configuration could be
+        # READ: an unbuildable container must never turn "I cannot see the
+        # market configuration" into a passing readiness gate.
+        if catalog is not None:
+            market = catalog.market_of(provider_key)
+            enabled = catalog.is_enabled(provider_key)
+            if market is None or not enabled:
+                lines.append(f"[SKIP] {provider_key}: not configured/enabled in the storefront")
+                continue
+        if provider_key not in served:
+            lines.append(f"[SKIP] {provider_key}: no credential configured")
+            continue
+        if provider_key not in policy_bases:
+            lines.append(
+                f"[SKIP] {provider_key}: no automatic pricing policy "
+                "(costs refresh only; pricing is manual)"
+            )
+            continue
+        total = stored.get(provider_key, 0)
+        if total == 0:
+            # A provider that has never synced is NOT a release failure: the
+            # periodic refresh (and its startup pass) is exactly what lands
+            # the catalog. A recorded run that DISCOVERED products but stored
+            # none is a failure.
+            discovered = sum(
+                int(getattr(state, "discovered", 0) or 0)
+                for key, state in states.items()
+                if key == provider_key or key.startswith(f"{provider_key}.")
+            )
+            if discovered > 0:
+                failures.append(
+                    f"{provider_key}: the last catalog run discovered {discovered} "
+                    "plan(s) but stored no offer"
+                )
+            else:
+                lines.append(
+                    f"[WARN] {provider_key}: no stored offers yet (catalog sync has not landed)"
+                )
+            continue
+        on_sale = sellable.get(provider_key, 0)
+        if on_sale > 0:
+            lines.append(f"[OK  ] {provider_key}: {on_sale} sellable of {total} stored")
+            continue
+        if operator_disabled.get(provider_key, 0) == total:
+            lines.append(
+                f"[WARN] {provider_key}: all {total} stored offer(s) are "
+                "operator-disabled (store closed by operator intent)"
+            )
+            continue
+        failures.append(
+            f"{provider_key}: {total} stored offer(s) but ZERO sellable in "
+            f"{catalog_currency} (none has a canonical currency plus valid FX provenance)"
+        )
+
+    for line in lines:
+        print(line)
+    if failures:
+        for message in failures:
+            print(f"[FAIL] {message}")
+        print("storefront readiness: FAIL")
+        print(
+            "  action: python -m cloud_platform.cli offers normalize-selling-currency "
+            f"--target {catalog_currency} --dry-run, then --execute, then re-run the "
+            "catalog sync"
+        )
+        return 1
+    print("storefront readiness: OK")
+    return 0
 
 
 async def users_find(telegram_id: int) -> int:
@@ -3049,6 +3229,10 @@ def _parser() -> argparse.ArgumentParser:
     offers_list_p = offers_sub.add_parser("list")
     offers_list_p.add_argument("--all", action="store_true", help="include disabled/unpriced")
     offers_sub.add_parser("doctor", help="read-only: why the catalog is empty")
+    offers_sub.add_parser(
+        "readiness",
+        help="release gate: is anything actually on sale for an enabled provider?",
+    )
     preview = offers_sub.add_parser(
         "preview", help="print the customer catalog exactly as the bot builds it"
     )
@@ -3236,6 +3420,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
             result = await offers_doctor()
             print("\n".join(result.lines))
             return 0 if result.ok else 1
+        if args.subcommand == "readiness":
+            return await offers_readiness()
         if args.subcommand == "preview":
             return await offers_preview(args.market)
         if args.subcommand == "price-book":

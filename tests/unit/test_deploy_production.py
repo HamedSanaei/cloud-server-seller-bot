@@ -939,6 +939,16 @@ case " $* " in
         printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
         exit 0
         ;;
+    *"normalize-selling-currency"*)
+        # Catalog canonicalization release transition (one-shot container).
+        if [ "$FAIL_NORMALIZE" = "1" ]; then
+            echo "  FAIL leaseweb/lsw.c3.2xlarge/ap-northeast-1: pricing failed (OfferPricingError)"
+            echo "normalized 0 offer(s) to USD; intentionally skipped: 1; failed: 1"
+            exit 1
+        fi
+        echo "normalized 456 offer(s) to USD; intentionally skipped: 1; failed: 0"
+        exit 0
+        ;;
     *" run "*)
         [ "$FAIL_MIGRATE" = "1" ] && exit 1
         exit 0
@@ -951,6 +961,16 @@ case " $* " in
             echo "failed to bind host port 0.0.0.0:8000/tcp: address already in use" >&2
             exit 1
         fi
+        exit 0
+        ;;
+    *"offers readiness"*)
+        if [ "$FAIL_STOREFRONT_READINESS" = "1" ]; then
+            echo "[FAIL] leaseweb: 507 stored offer(s) but ZERO sellable in USD"
+            echo "storefront readiness: FAIL"
+            exit 1
+        fi
+        echo "[OK  ] leaseweb: 12 sellable of 507 stored"
+        echo "storefront readiness: OK"
         exit 0
         ;;
     *" exec "*)
@@ -973,6 +993,8 @@ def _release_harness(
     fail_ready: bool = False,
     fail_up_api: bool = False,
     fail_schema_parity: bool = False,
+    fail_normalize: bool = False,
+    fail_storefront_readiness: bool = False,
     crash_loop: bool = False,
     alembic_image_head: str = "0034 (head)",
     alembic_db_head: str = "0034 (head)",
@@ -1028,6 +1050,8 @@ def _release_harness(
         f"FAIL_MIGRATE='{'1' if fail_migrate else ''}' "
         f"FAIL_UP_API='{'1' if fail_up_api else ''}' "
         f"FAIL_SCHEMA_PARITY='{'1' if fail_schema_parity else ''}' "
+        f"FAIL_NORMALIZE='{'1' if fail_normalize else ''}' "
+        f"FAIL_STOREFRONT_READINESS='{'1' if fail_storefront_readiness else ''}' "
         f"ALEMBIC_IMAGE_HEAD='{alembic_image_head}' "
         f"ALEMBIC_DB_HEAD='{alembic_db_head}' "
         f"DEPLOY_PATH='{_deploy_path(deploy_dir)}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
@@ -1272,6 +1296,77 @@ class TestReleaseComposeContract:
         assert (deploy_dir / "deploy.env").read_bytes() == env_before
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
         assert (tmp_path / "configuration.toml").read_bytes() == config_before
+
+
+class TestStorefrontReadinessGate:
+    """A green deploy must never leave the customer catalog EMPTY.
+
+    Regression cover for the global-USD release: migrations green, services
+    green, API ready — and 507 stored offers with ZERO sellable because every
+    row still carried a legacy currency/provenance. The release therefore
+    canonicalizes the catalog itself and then asserts that an enabled,
+    credentialed, auto-priced provider actually has something on sale, all
+    BEFORE the compose contract is promoted.
+    """
+
+    def test_catalog_canonicalization_runs_before_any_service_starts(self) -> None:
+        script = _script()
+        normalize = script.index("offers normalize-selling-currency --execute")
+        # The supported operator CLI path, not a bespoke SQL mutation.
+        assert "UPDATE" not in script
+        assert "psql" not in script
+        assert normalize > script.index("database physical schema verified against the release")
+        assert normalize > script.index("python -m cloud_platform.db.schema_parity")
+        assert normalize < script.index("starting api + worker + bot")
+        # It runs in a one-shot container with the RELEASE image.
+        window = script[max(0, normalize - 200) : normalize]
+        assert 'PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}"' in window
+        assert "compose_candidate run --rm --no-deps migrate" in window
+
+    def test_storefront_readiness_runs_after_health_and_before_promotion(self) -> None:
+        script = _script()
+        readiness = script.index("python -m cloud_platform.cli offers readiness")
+        assert script.index("API readiness: ok") < readiness
+        assert script.index("worker + bot stable") < readiness
+        assert readiness < script.index("promoting release compose to canonical")
+
+    @needs_bash
+    def test_normalization_is_idempotent_and_never_fatal(self, tmp_path: Path) -> None:
+        """An FX outage must not block an unrelated release, but is never silent."""
+        result, _, _, _, _, _ = _release_harness(tmp_path, fail_normalize=True)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=0" in result.stdout
+        assert "[WARN] catalog normalization reported failures" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        assert "normalize-selling-currency --execute" in calls
+
+    @needs_bash
+    def test_empty_storefront_for_an_enabled_provider_fails_the_release(
+        self, tmp_path: Path
+    ) -> None:
+        result, deploy_dir, canonical, candidate, env_before, config_before = _release_harness(
+            tmp_path, fail_storefront_readiness=True
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "storefront readiness failed" in result.stderr
+        assert "nothing on sale" in result.stderr.lower() or "NOTHING on sale" in result.stderr
+        # The release is NOT promoted and the previous image is restored.
+        assert "release compose promoted" not in result.stdout
+        assert "DEPLOYMENT SUCCEEDED" not in result.stdout
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (tmp_path / "configuration.toml").read_bytes() == config_before
+        assert not candidate.exists(), "a failed release must not leave a stale candidate"
+
+    @needs_bash
+    def test_open_storefront_lets_the_release_promote(self, tmp_path: Path) -> None:
+        result, _, _, _, _, _ = _release_harness(tmp_path)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=0" in result.stdout
+        assert "storefront readiness: ok" in result.stdout
+        assert "DEPLOYMENT SUCCEEDED" in result.stdout
 
 
 class TestReleaseComposeDelivery:

@@ -248,12 +248,32 @@ class TestNormalizeExecute:
             auto_priced=False,
         )
         repo, _rates = _patch(monkeypatch, [disabled, foreign, domestic])
-        assert await cli.offers_normalize_selling_currency(False, "USD") == 1
+        # Skipping INTENT (operator-disabled, no policy, manual domestic) is
+        # not a failure: the command exits 0 and says so explicitly.
+        assert await cli.offers_normalize_selling_currency(False, "USD") == 0
         out = capsys.readouterr().out
         assert "operator-disabled; left untouched" in out
         assert "no automatic pricing policy" in out
         assert "must remain in IRT" in out
-        assert "skipped/failed: 3" in out
+        assert "intentionally skipped: 3; failed: 0" in out
+        assert repo.auto_prices == [] and repo.manual_prices == []
+
+    async def test_real_failures_are_reported_and_exit_non_zero(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        """A row left fail-closed is a FAILURE, unlike an intentional skip.
+
+        Stored provider cost 1300 minor does not match the verbatim provider
+        rate 4.49 EUR (the zero-decimal pitfall), so the pricer refuses to
+        guess: the row keeps its old price and the command exits 1.
+        """
+        broken = _base_offer(provider_cost_minor=1300)
+        repo, _rates = _patch(monkeypatch, [broken])
+        assert await cli.offers_normalize_selling_currency(False, "USD") == 1
+        out = capsys.readouterr().out
+        assert f"FAIL {broken.ref}: pricing failed (OfferPricingError)" in out
+        assert "left fail-closed" in out
+        assert "intentionally skipped: 0; failed: 1" in out
         assert repo.auto_prices == [] and repo.manual_prices == []
 
     async def test_clean_catalog_reports_current(
