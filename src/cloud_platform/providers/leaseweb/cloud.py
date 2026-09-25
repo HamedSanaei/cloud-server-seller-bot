@@ -32,6 +32,7 @@ from cloud_platform.providers.errors import (
     ProviderError,
     ProviderNotFound,
 )
+from cloud_platform.providers.leaseweb.errors import LeasewebValidationError
 from cloud_platform.providers.leaseweb.transport import (
     DEFAULT_BASE_URL,
     DEFAULT_TIMEOUT_SECONDS,
@@ -695,8 +696,29 @@ class LeasewebHourlyCloudProvider:
         return list((await self.read_instance_types(region)).types)
 
     async def list_images(self, region: str) -> list[CloudImage]:
-        """``GET /publicCloud/v1/images?region=`` (live, for the image screen)."""
-        payload = await self._get("/publicCloud/v1/images", {"region": region})
+        """Live installable images for one region (the OS/image screen).
+
+        The documented ``?region=`` filter is attempted first. The provider's
+        image catalog is however GLOBAL — every entry states ``region: null``,
+        and the filter currently accepts only one region id, rejecting any
+        other sellable region with HTTP 400 "not valid region" (observed
+        2026-09-25 for eu-west-3, ap-northeast-1, us-east-1, ... while
+        ``/regions`` and ``/instanceTypes`` accept all ten). A rejected request
+        shape therefore falls back to the same endpoint's global read instead
+        of reporting a sellable plan as having no operating system; every other
+        failure (auth, forbidden, not found, rate limit, unavailable) still
+        propagates and fails closed.
+        """
+        try:
+            payload = await self._get("/publicCloud/v1/images", {"region": region})
+        except LeasewebValidationError as exc:
+            logger.warning(
+                "images: provider rejected the region filter for %r (%s); "
+                "reading the global image catalog",
+                region,
+                type(exc).__name__,
+            )
+            payload = await self._get("/publicCloud/v1/images")
         return [
             parsed
             for item in self._items(payload, "images", "data", "items")

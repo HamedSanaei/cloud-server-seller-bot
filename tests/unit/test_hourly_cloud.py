@@ -24,6 +24,7 @@ from cloud_platform.providers.leaseweb.cloud import (
     build_create_body,
     classify_instance_family,
 )
+from cloud_platform.providers.leaseweb.errors import LeasewebValidationError
 
 
 def _provider(**overrides: Any) -> LeasewebHourlyCloudProvider:
@@ -213,6 +214,55 @@ class TestImages:
             ("UBUNTU_24_04", "Ubuntu 24.04"),
             ("Debian 12", "Debian 12"),
         ]
+
+    async def test_rejected_region_filter_falls_back_to_the_global_catalog(self) -> None:
+        """The provider rejects every region but one and serves a GLOBAL list.
+
+        Observed 2026-09-25: ``?region=eu-west-3`` (and every other sellable
+        region) answers HTTP 400 "not valid region", while the endpoint's own
+        payload states ``region: null`` for every image. A rejected request
+        shape must fall back to the global read instead of reporting a sellable
+        plan as having no operating system.
+        """
+        provider = _provider()
+        calls: list[dict[str, Any]] = []
+
+        async def _request(
+            method: str, path: str, *, params: dict[str, Any] | None = None, **kw: Any
+        ) -> Any:
+            calls.append({"method": method, "path": path, "params": dict(params or {})})
+            if params:
+                raise LeasewebValidationError("errorCode=400; Validation Failed; HTTP 400")
+            return {
+                "images": [
+                    {
+                        "id": "UBUNTU_24_04_64BIT",
+                        "name": "Ubuntu 24.04 LTS (x86_64)",
+                        "family": "linux",
+                        "architecture": "x86_64",
+                        "region": None,
+                        "state": "READY",
+                    }
+                ]
+            }
+
+        provider._transport.request = _request
+        images = await provider.list_images("eu-west-3")
+        assert [image.id for image in images] == ["UBUNTU_24_04_64BIT"]
+        assert images[0].architecture == "x86_64"
+        assert [call["params"] for call in calls] == [{"region": "eu-west-3"}, {}]
+
+    async def test_other_read_failures_do_not_fall_back(self) -> None:
+        """Only a rejected request SHAPE widens the read; nothing else does."""
+        from cloud_platform.providers.leaseweb.errors import LeasewebAuthenticationError
+
+        provider = _provider()
+        provider._transport.request = AsyncMock(
+            side_effect=LeasewebAuthenticationError("errorCode=401; HTTP 401")
+        )
+        with pytest.raises(LeasewebAuthenticationError):
+            await provider.list_images("eu-west-3")
+        assert provider._transport.request.await_count == 1
 
 
 class TestInstanceIdentity:

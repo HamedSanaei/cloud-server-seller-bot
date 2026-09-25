@@ -18,7 +18,7 @@ Observations: _(none yet — verify on first `GET /publicCloud/v1/regions`)_
 | --- | --- |
 | list regions | `GET /publicCloud/v1/regions` |
 | list instance types | `GET /publicCloud/v1/instanceTypes?region=` |
-| list images | `GET /publicCloud/v1/images?region=` |
+| list images | `GET /publicCloud/v1/images?region=` (see live observation below) |
 | list instances | `GET /publicCloud/v1/instances?region=&limit=&offset=` |
 | get instance | `GET /publicCloud/v1/instances/{id}` |
 | launch instance | `POST /publicCloud/v1/instances` |
@@ -29,7 +29,36 @@ Response envelopes are parsed defensively (bare list or
 `{regions,instanceTypes,types,images,instances,data,items}` keys;
 single-resource reads accept a bare object or `{instance: {...}}`).
 
-Observations: _(none yet)_
+Observations (live account, 2026-09-25):
+
+- `GET /publicCloud/v1/regions` returns **ten** regions (`eu-central-1`,
+  `eu-west-2`, `eu-west-3`, `ca-central-1`, `ap-northeast-1`,
+  `ap-southeast-1`, `ap-southeast-2`, `us-east-1`, `us-west-1`,
+  `us-west-2`), and `GET /publicCloud/v1/instanceTypes?region=` accepts all
+  ten.
+- The **image** catalog is GLOBAL, not region-scoped: every entry states
+  `"region": null`, and `?region=` currently accepts only `eu-central-1`.
+  Any other sellable region id is rejected with
+  `HTTP 400 {"errorCode":"400","errorMessage":"Validation Failed",
+  "errorDetails":{"region":["The value \"eu-west-3\" is not valid region.
+  Valid regions are: eu-central-1"]}}`.
+  `GET /publicCloud/v1/images` **without** the filter answers `200` with the
+  same 19 `READY` images, so the region-scoped read is attempted first and a
+  rejected request shape falls back to the global read (warning logged).
+  An unknown parameter name (`regionId`) is silently ignored and returns the
+  unfiltered list, which is why the filter is never trusted as a
+  region-scoping guarantee.
+- Instance types state **no** `architecture` (50/50 blank in `eu-west-3`)
+  while every image states `x86_64`; the storefront therefore only drops an
+  image on a positive architecture conflict and never hides the catalog
+  because a plan is silent.
+- Image payload fields: `id`, `name`, `version`, `family`, `flavour`,
+  `architecture`, `storageSize`, `state` (`READY`), `stateReason`, `region`,
+  `createdAt`, `updatedAt`. The adapter keeps `id` and the customer label
+  apart.
+- Instance types carry prices under `prices` with the envelope's
+  `_metadata.currency` (JPY/KRW/EUR observed), so hourly cost parsing needs
+  the currency's own exponent (`JPY`/`KRW` are zero-decimal).
 
 ## 3. Status vocabulary
 

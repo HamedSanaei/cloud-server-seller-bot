@@ -1999,11 +1999,12 @@ class OfferCatalogViewService:
         try:
             images = self._selectable_images(offer, await provider.list_images(offer.location_id))
         except Exception as exc:
-            raise OfferUnavailableError(f"images currently unavailable for {offer.ref}") from exc
+            # Not "this offer is unavailable": the plan is sellable and only
+            # the IMAGE catalog is unreadable right now, which is the OS
+            # question the customer is actually answering.
+            raise OsUnavailableError(f"images currently unavailable for {offer.ref}") from exc
         if not images:
-            # Not "this offer is unavailable": the plan is sellable, the
-            # provider simply exposes no usable image for it right now. The
-            # customer gets the honest, specific reason.
+            # Same distinction, empty catalog instead of a failed read.
             raise OsUnavailableError(f"no images for {offer.ref}")
         options = [
             PanelOptionView(
@@ -2037,7 +2038,7 @@ class OfferCatalogViewService:
         try:
             images = self._selectable_images(offer, await provider.list_images(offer.location_id))
         except Exception as exc:
-            raise OfferUnavailableError(f"images currently unavailable for {offer.ref}") from exc
+            raise OsUnavailableError(f"images currently unavailable for {offer.ref}") from exc
         if index < 0 or index >= len(images):
             raise OsUnavailableError(f"image option {index} is not available for {offer.ref}")
         return images[index]
