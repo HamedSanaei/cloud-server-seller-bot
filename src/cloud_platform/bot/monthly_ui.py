@@ -70,7 +70,11 @@ from cloud_platform.modules.checkout.service import (
     UserNotActiveError,
 )
 from cloud_platform.modules.compute.domain import ServerLifecycleState, ServerRepository
-from cloud_platform.modules.hourly.service import HourlyError
+from cloud_platform.modules.hourly.service import (
+    HourlyNotAvailableError,
+    HourlyProviderUnavailableError,
+    HourlyRequestFailedError,
+)
 from cloud_platform.modules.navigation.domain import (
     Callback,
     CallbackError,
@@ -1093,8 +1097,20 @@ class MonthlyBotUi:
                 image_label=image.label,
                 idempotency_key=idempotency_key,
             )
-        except (OfferUnavailableError, OsUnavailableError, HourlyError) as exc:
-            logger.warning("hourly create rejected: %s", exc)
+        except HourlyRequestFailedError as exc:
+            # The confirmation belongs to an intent that already ended in
+            # failure. Telling the customer "this offer is unavailable" is
+            # both wrong and misleading: the same stale button would loop.
+            logger.warning("hourly create rejected (previous request failed): %s", exc)
+            return BotScreen(self._t.t("store.cloud_previous_failed"), self._menu_only())
+        except HourlyProviderUnavailableError as exc:
+            logger.warning("hourly create rejected (provider unreachable): %s", exc)
+            return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
+        except OsUnavailableError as exc:
+            logger.warning("hourly create rejected (os unavailable): %s", exc)
+            return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
+        except (OfferUnavailableError, HourlyNotAvailableError) as exc:
+            logger.warning("hourly create rejected (offer unavailable): %s", exc)
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
         except Exception as exc:
             logger.warning("hourly create rejected: %s", exc)

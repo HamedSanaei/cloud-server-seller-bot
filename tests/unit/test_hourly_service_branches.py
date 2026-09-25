@@ -36,6 +36,11 @@ from cloud_platform.modules.offers.pricing import CatalogOfferPricer
 from cloud_platform.modules.operations.domain import Operation, OperationStatus
 from cloud_platform.modules.users.domain import Role, User, UserStatus
 from cloud_platform.providers.errors import ProviderOutcomeUnknown
+from cloud_platform.providers.leaseweb.cloud import (
+    CloudInstanceType,
+    CloudRootDisk,
+    HourlyCheckoutFacts,
+)
 
 PROVIDER = "leaseweb"
 
@@ -91,6 +96,9 @@ def _base_offer() -> SellableOffer:
         selling_currency="EUR",
         billing_parameters={"provider_hourly_rate": "0.02"},
         billing_model=BILLING_MODEL_HOURLY,
+        # The catalog sync writes the provider's storage facts onto the offer;
+        # they are what the launch root disk is pinned from.
+        technical_metadata={"storage_type": "CENTRAL", "storage_types": ["CENTRAL"]},
         provider_available=True,
         enabled=True,
         created_at=datetime.now(UTC),
@@ -227,11 +235,38 @@ class FakeCloud:
         self.create_error: Exception | None = None
         self.find_result: Any = None
 
-    async def validate_hourly_offer_for_checkout(self, **kwargs: Any) -> None:
-        return None
+    async def validate_hourly_offer_for_checkout(self, **kwargs: Any) -> Any:
+        """Return the pinned launch facts (the real adapter derives them)."""
+        return HourlyCheckoutFacts(
+            instance_type=CloudInstanceType(
+                id="lsw.mini",
+                name="Mini",
+                region="eu-west-3",
+                family_key="general",
+                family_name="General Purpose",
+                vcpu=1,
+                ram_gb=1,
+                disk_gb=25,
+                traffic=None,
+                hourly_cost_minor=2,
+                currency="EUR",
+                storage_type="CENTRAL",
+                storage_types=("CENTRAL",),
+                hourly_rate_exact="0.02",
+            ),
+            root_disk=CloudRootDisk(size_gb=25, storage_type="CENTRAL"),
+        )
 
     async def list_images(self, region: str) -> list[Any]:
-        return [SimpleNamespace(id="UBUNTU", label="Ubuntu")]
+        return [
+            SimpleNamespace(
+                id="UBUNTU",
+                label="Ubuntu 24.04",
+                os_family="linux",
+                min_disk_size_gb=5,
+                storage_types=("CENTRAL",),
+            )
+        ]
 
     async def create_instance(self, **kwargs: Any) -> Any:
         self.posts += 1
@@ -575,7 +610,7 @@ class TestReplayAndRepairContracts:
         blob = await self._committed("replay-terminal")
         blob.server.state = ServerLifecycleState.ERROR
 
-        with pytest.raises(HourlyError, match="not allowed for server state error"):
+        with pytest.raises(HourlyError, match="a new order is required"):
             await self._replay(blob)
 
     async def test_replay_for_a_different_image_is_refused(self) -> None:
@@ -605,7 +640,7 @@ class TestReplayAndRepairContracts:
         operation = blob.ops.ops[f"server-create:{blob.server.id}"]
         operation.status = OperationStatus.FAILED
 
-        with pytest.raises(HourlyError, match="manual recovery is required"):
+        with pytest.raises(HourlyError, match="a new order is required"):
             await self._replay(blob)
 
     async def test_missing_snapshot_is_repaired_without_a_provider_call(self) -> None:

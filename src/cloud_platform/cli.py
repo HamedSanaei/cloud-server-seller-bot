@@ -2362,20 +2362,66 @@ async def leaseweb_cloud_catalog(region: str | None) -> int:
 
 
 async def leaseweb_cloud_create_preview(
-    region: str, instance_type: str, image_id: str, reference: str
+    region: str,
+    instance_type: str,
+    image_id: str,
+    reference: str,
+    root_disk_size: int | None = None,
+    root_disk_storage_type: str | None = None,
 ) -> int:
-    """Print the exact hourly POST body WITHOUT sending it (never mutates)."""
+    """Print the exact hourly POST body WITHOUT sending it (never mutates).
+
+    The launch root disk is a REQUIRED provider field; when it is not passed
+    explicitly it is derived read-only from live provider facts (the type's
+    ``minDiskSize`` plus the image's own ``minDiskSize`` and storage types),
+    which is exactly what checkout pins into the contract.
+    """
     import json
 
-    from cloud_platform.providers.leaseweb.cloud import build_create_body
-
-    body = build_create_body(
-        instance_type=instance_type,
-        image_id=image_id,
-        region=region,
-        reference=reference,
-        labels={"platform-operation": "preview-only"},
+    from cloud_platform.providers.leaseweb.cloud import (
+        build_create_body,
+        resolve_root_disk,
     )
+
+    provider = await _hourly_cloud_provider_or_error()
+    if provider is None:
+        return 1
+    try:
+        try:
+            types = await provider.list_instance_types(region)
+            images = await provider.list_images(region)
+        except Exception as exc:
+            print(f"error: provider catalog unreadable ({type(exc).__name__})")
+            return 1
+        match = next((item for item in types if item.id == instance_type), None)
+        if match is None:
+            print(f"error: instance type {instance_type!r} is not offered in {region!r}")
+            return 1
+        image = next((item for item in images if item.id == image_id), None)
+        if image is None:
+            print(f"error: image {image_id!r} is not offered in {region!r}")
+            return 1
+        effective = resolve_root_disk(
+            disk_gb=match.disk_gb,
+            storage_type=match.storage_type,
+            image=image,
+            type_storage_types=match.storage_types,
+        )
+        body = build_create_body(
+            instance_type=instance_type,
+            image_id=image_id,
+            region=region,
+            reference=reference,
+            root_disk_size_gb=root_disk_size or effective.size_gb,
+            root_disk_storage_type=root_disk_storage_type or effective.storage_type,
+            image_label=image.label,
+            os_family=image.os_family,
+        )
+    finally:
+        try:
+            await provider.close()
+        except Exception:
+            pass
     print("POST /publicCloud/v1/instances (NOT SENT — preview only):")
     print(json.dumps(body, indent=2, sort_keys=True))
     print("no provider mutation occurred")
@@ -3441,6 +3487,19 @@ def _parser() -> argparse.ArgumentParser:
     lsw_cloud_preview.add_argument("--type", required=True)
     lsw_cloud_preview.add_argument("--image", required=True)
     lsw_cloud_preview.add_argument("--reference", default="preview-only")
+    lsw_cloud_preview.add_argument(
+        "--root-disk-size",
+        dest="root_disk_size",
+        type=int,
+        default=None,
+        help="rootDiskSize in GB (default: derive from live provider facts)",
+    )
+    lsw_cloud_preview.add_argument(
+        "--root-disk-storage-type",
+        dest="root_disk_storage_type",
+        default=None,
+        help="rootDiskStorageType (default: derive from live provider facts)",
+    )
     lsw_cloud_create = lsw_cloud_sub.add_parser(
         "create", help="create an hourly instance intent (BILLABLE)"
     )
@@ -3637,7 +3696,12 @@ async def _dispatch(args: argparse.Namespace) -> int:
                 return await leaseweb_cloud_catalog(args.region)
             if args.leaseweb_cloud == "create-preview":
                 return await leaseweb_cloud_create_preview(
-                    args.region, args.type, args.image, args.reference
+                    args.region,
+                    args.type,
+                    args.image,
+                    args.reference,
+                    args.root_disk_size,
+                    args.root_disk_storage_type,
                 )
             if args.leaseweb_cloud == "create":
                 return await leaseweb_cloud_create(

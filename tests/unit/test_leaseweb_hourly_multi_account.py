@@ -32,7 +32,14 @@ from cloud_platform.modules.offers.domain import (
 )
 from cloud_platform.modules.users.domain import Role, User, UserStatus
 from cloud_platform.providers.errors import ProviderAuthError, ProviderUnavailable
-from cloud_platform.providers.leaseweb.cloud import CloudInstanceType, CloudRegion
+from cloud_platform.providers.leaseweb.cloud import (
+    CloudInstanceType,
+    CloudRegion,
+    CloudRootDisk,
+    HourlyCheckoutFacts,
+    resolve_root_disk,
+    validate_root_disk,
+)
 from cloud_platform.providers.routing import CredentialAccountState
 
 PROVIDER = "leaseweb"
@@ -75,7 +82,13 @@ def _hourly_offer(
         selling_currency="EUR",
         billing_parameters={},
         billing_model=BILLING_MODEL_HOURLY,
-        technical_metadata={"plan_family": "general", "plan_family_name": "General Purpose"},
+        technical_metadata={
+            "plan_family": "general",
+            "plan_family_name": "General Purpose",
+            # Sync-written provider storage facts (launch root disk input).
+            "storage_type": "CENTRAL",
+            "storage_types": ["CENTRAL"],
+        },
         provider_available=available,
         enabled=enabled,
         operator_disabled=operator_disabled,
@@ -321,6 +334,8 @@ class _CloudProviderFake:
         expected_cost_minor: int,
         currency: str,
         expected_cost_exact: str,
+        root_disk_size_gb: int | None = None,
+        root_disk_storage_type: str | None = None,
     ) -> Any:
         """Mirror the production checkout revalidation, simplified."""
         from cloud_platform.providers.errors import ProviderError, ProviderNotFound
@@ -333,9 +348,29 @@ class _CloudProviderFake:
         if match.hourly_cost_minor != expected_cost_minor:
             raise ProviderError("provider cost changed")
         images = await self.list_images(location_id)
-        if not any(image.id == image_id for image in images):
+        image = next((item for item in images if item.id == image_id), None)
+        if image is None:
             raise ProviderNotFound(f"image {image_id!r} not offered")
-        return match
+        live = resolve_root_disk(
+            disk_gb=match.disk_gb,
+            storage_type=match.storage_type,
+            image=image,
+            type_storage_types=match.storage_types,
+        )
+        if root_disk_size_gb is not None or root_disk_storage_type is not None:
+            pinned = validate_root_disk(
+                size_gb=root_disk_size_gb,
+                storage_type=root_disk_storage_type,
+                image_label=image.label,
+                os_family=getattr(image, "os_family", None),
+            )
+            if pinned[0] < live.size_gb:
+                raise ProviderError("pinned root disk is below the provider minimum")
+            return HourlyCheckoutFacts(
+                instance_type=match,
+                root_disk=CloudRootDisk(size_gb=pinned[0], storage_type=pinned[1]),
+            )
+        return HourlyCheckoutFacts(instance_type=match, root_disk=live)
 
     async def close(self) -> None:
         return None

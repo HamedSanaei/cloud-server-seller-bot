@@ -1511,6 +1511,48 @@ class TestSecretHygiene:
         assert payload.error_details == {"field": ("a", "b")}
         assert PASSWORD not in payload.summary
 
+    def test_error_details_survive_into_the_summary(self) -> None:
+        """A validation failure is only actionable with its rejected fields.
+
+        Production observed exactly this for a launch POST: the 400 summary
+        carried ``errorCode``/``errorMessage``/``correlationId`` but dropped
+        ``errorDetails``, leaving an operator with "Validation Failed" and no
+        field to fix.
+        """
+        response = httpx.Response(
+            400,
+            headers={"APIGW-CORRELATION-ID": "corr-400"},
+            json={
+                "errorCode": "400",
+                "errorMessage": "Validation Failed",
+                "errorDetails": {
+                    "region": ['The value "eu-west-3" is not valid region.'],
+                    "rootDiskSize": ["This value should be 5 or more."],
+                },
+            },
+            request=httpx.Request("POST", f"{BASE}/publicCloud/v1/instances"),
+        )
+        summary = parse_error_payload(response).summary
+        assert "region" in summary
+        assert "rootDiskSize" in summary
+        assert "This value should be 5 or more." in summary
+        assert "correlationId=corr-400" in summary
+        assert len(summary) <= 300
+
+    def test_error_details_are_scrubbed_against_known_secrets(self) -> None:
+        response = httpx.Response(
+            400,
+            json={
+                "errorCode": "400",
+                "errorMessage": "Validation Failed",
+                "errorDetails": {"key": [f"bad key {API_KEY_SENTINEL}"]},
+            },
+            request=httpx.Request("POST", f"{BASE}/publicCloud/v1/instances"),
+        )
+        payload = parse_error_payload(response, secrets=[API_KEY_SENTINEL])
+        assert API_KEY_SENTINEL not in payload.summary
+        assert API_KEY_SENTINEL not in str(dict(payload.error_details))
+
     def test_transport_error_messages_are_redacted(self) -> None:
         api = _api()
         error = api.transport._transport_error(

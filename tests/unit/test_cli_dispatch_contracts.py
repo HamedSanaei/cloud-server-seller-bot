@@ -302,7 +302,9 @@ class TestCatalogAndProviderOperatorSurface:
 
         doctor.assert_awaited_once_with()
         catalog.assert_awaited_once_with("eu-west-1")
-        preview.assert_awaited_once_with("eu-west-1", "lsw.c3.large", "img-1", "preview-only")
+        preview.assert_awaited_once_with(
+            "eu-west-1", "lsw.c3.large", "img-1", "preview-only", None, None
+        )
         create.assert_awaited_once_with("u1", "o1", "img-1", False)
 
     async def test_leaseweb_cloud_create_live_flag_is_forwarded(

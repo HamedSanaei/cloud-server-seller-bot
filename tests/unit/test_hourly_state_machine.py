@@ -12,6 +12,7 @@ lifecycle branches of :class:`~cloud_platform.modules.hourly.service.HourlyCloud
 
 from __future__ import annotations
 
+import dataclasses
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,12 @@ from cloud_platform.providers.errors import (
     ProviderError,
     ProviderNotFound,
     ProviderOutcomeUnknown,
+)
+from cloud_platform.providers.leaseweb.cloud import (
+    CloudRootDisk,
+    HourlyCheckoutFacts,
+    resolve_root_disk,
+    validate_root_disk,
 )
 from tests.unit.test_hourly_cloud_flow import (
     PROVIDER,
@@ -58,12 +65,28 @@ class FakeHourlyAdapter:
         self.posts = 0
         self.create_result: Any = type("C", (), {"id": "lsw-created", "state": "RUNNING"})()
         self.create_error: Exception | None = None
-        self.images: list[Any] = [type("I", (), {"id": "UBUNTU", "label": "Ubuntu"})()]
+        self.images: list[Any] = [
+            type(
+                "I",
+                (),
+                {
+                    "id": "UBUNTU",
+                    "label": "Ubuntu 24.04",
+                    "os_family": "linux",
+                    "min_disk_size_gb": 5,
+                    "storage_types": ("CENTRAL",),
+                },
+            )()
+        ]
         self.types: dict[str, list[Any]] = {}
         self.list_images_error: Exception | None = None
         self.find_result: Any = None
         self.find_error: Exception | None = None
         self.listed_regions: list[str] = []
+        #: Every create kwargs the worker sent (launch body proof).
+        self.created_kwargs: list[dict[str, Any]] = []
+        #: Pinned root-disk pairs the worker re-verified before the POST.
+        self.verified_pinned: list[tuple[Any, Any]] = []
 
     async def validate_hourly_offer_for_checkout(
         self,
@@ -74,8 +97,15 @@ class FakeHourlyAdapter:
         expected_cost_minor: int,
         currency: str,
         expected_cost_exact: str,
+        root_disk_size_gb: int | None = None,
+        root_disk_storage_type: str | None = None,
     ) -> Any:
-        """Fail-closed checkout revalidation over the scripted state."""
+        """Fail-closed checkout revalidation over the scripted state.
+
+        Mirrors the production adapter: the launch root disk is derived from
+        the scripted provider facts, and values the caller pinned are
+        re-verified instead of replaced.
+        """
         scripted = self.types.get(location_id)
         if scripted is None:
             scripted = [_cloud_type()]
@@ -104,9 +134,32 @@ class FakeHourlyAdapter:
                     f"exact provider rate changed for {product_id!r} in {location_id!r}"
                 )
         images = await self.list_images(location_id)
-        if not any(image.id == image_id for image in images):
+        image = next((item for item in images if item.id == image_id), None)
+        if image is None:
             raise ProviderNotFound(f"image {image_id!r} is not offered in {location_id!r}")
-        return match
+        live = resolve_root_disk(
+            disk_gb=match.disk_gb,
+            storage_type=match.storage_type,
+            image=image,
+            type_storage_types=match.storage_types,
+        )
+        if root_disk_size_gb is not None or root_disk_storage_type is not None:
+            self.verified_pinned.append((root_disk_size_gb, root_disk_storage_type))
+            pinned = validate_root_disk(
+                size_gb=root_disk_size_gb,
+                storage_type=root_disk_storage_type,
+                image_label=image.label,
+                os_family=getattr(image, "os_family", None),
+            )
+            if pinned[0] < live.size_gb:
+                raise ProviderError(
+                    f"pinned root disk {pinned[0]} GB is below the provider minimum"
+                )
+            return HourlyCheckoutFacts(
+                instance_type=match,
+                root_disk=CloudRootDisk(size_gb=pinned[0], storage_type=pinned[1]),
+            )
+        return HourlyCheckoutFacts(instance_type=match, root_disk=live)
 
     async def list_images(self, region: str) -> list[Any]:
         self.listed_regions.append(region)
@@ -116,6 +169,7 @@ class FakeHourlyAdapter:
 
     async def create_instance(self, **kwargs: Any) -> Any:
         self.posts += 1
+        self.created_kwargs.append(dict(kwargs))
         if self.create_error is not None:
             raise self.create_error
         return self.create_result
@@ -893,6 +947,94 @@ def _accepted_response(server: Any) -> Any:
         instance_type="lsw.mini",
         image_id="UBUNTU",
     )
+
+
+class TestPinnedLaunchRootDisk:
+    """The leaseweb POST needs a root disk, so the accepted contract pins it.
+
+    Production observation 2026-09-25: a create reached Leaseweb without
+    ``rootDiskSize``/``rootDiskStorageType`` (both REQUIRED) and collected a
+    definitive 400. The two values now travel from the pinned contract into
+    the POST, and are re-verified against live provider facts first.
+    """
+
+    async def test_the_post_carries_the_pinned_root_disk(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
+        cloud = FakeHourlyAdapter()
+        service, _servers, _snapshots, _ops = _service(offers, cloud)
+        server = await _requested_server(service, offers)
+        cloud.create_result = _accepted_response(server)
+
+        assert await service.process_server(server.id) == "provisioned"
+
+        assert cloud.verified_pinned == [(25, "CENTRAL")]
+        sent = cloud.created_kwargs[0]
+        assert sent["root_disk_size_gb"] == 25
+        assert sent["root_disk_storage_type"] == "CENTRAL"
+        assert sent["instance_type"] == "lsw.mini"
+        assert sent["region"] == "eu-west-3"
+        assert sent["image_label"] == "Ubuntu 24.04"
+
+    async def test_the_accepted_intent_pins_the_root_disk_in_its_fingerprint(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
+        cloud = FakeHourlyAdapter()
+        service, _servers, _snapshots, _ops = _service(offers, cloud)
+        server = await _requested_server(service, offers)
+
+        fingerprint = server.offer_fingerprint
+        assert fingerprint["fingerprint_version"] == 2
+        assert fingerprint["root_disk_size_gb"] == 25
+        assert fingerprint["root_disk_storage_type"] == "CENTRAL"
+
+    async def test_a_legacy_contract_without_a_root_disk_fails_without_posting(self) -> None:
+        """A pre-root-disk contract cannot be re-created: fail closed, explain."""
+        offers = FakeOffersRepo([await _usd_offer()])
+        cloud = FakeHourlyAdapter()
+        service, servers, snapshots, ops = _service(offers, cloud)
+        server = await _requested_server(service, offers)
+        await snapshots.require_snapshot(server.id)
+        legacy = dict(server.offer_fingerprint)
+        legacy["fingerprint_version"] = 1
+        legacy.pop("root_disk_size_gb")
+        legacy.pop("root_disk_storage_type")
+        server.offer_fingerprint = legacy
+        # The immutable snapshot is frozen: rewrite the stored row as a
+        # pre-root-disk version-1 contract (both sides must agree).
+        snapshots.created = [
+            (
+                sid,
+                dataclasses.replace(price, offer_fingerprint=legacy) if sid == server.id else price,
+            )
+            for sid, price in snapshots.created
+        ]
+        await servers.save(server)
+        cloud.create_result = _accepted_response(server)
+
+        assert await service.process_server(server.id) == "failed"
+        assert cloud.posts == 0
+        operation = ops.ops[f"server-create:{server.id}"]
+        assert operation.status.value == "failed"
+        assert "root disk" in str(operation.error)
+        # Still no duplicate provider create on a second worker pass.
+        assert await service.process_server(server.id) == "skipped"
+        assert cloud.posts == 0
+
+    async def test_the_claim_and_the_post_stay_exactly_once(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
+        cloud = FakeHourlyAdapter()
+        ops = _ClaimFailingOps(failures=0)
+        service, _servers, _snapshots, _ops = _service(offers, cloud, ops=ops)
+        server = await _requested_server(service, offers)
+        cloud.create_result = _accepted_response(server)
+
+        assert await service.process_server(server.id) == "provisioned"
+        assert await service.process_server(server.id) == "skipped"
+
+        assert cloud.posts == 1
+        assert ops.claims_completed == 1
+        key = f"server-create:{server.id}"
+        assert ops.ops[key].operation_key == key
+        assert len(cloud.created_kwargs) == 1
 
 
 class TestClaimBoundary:

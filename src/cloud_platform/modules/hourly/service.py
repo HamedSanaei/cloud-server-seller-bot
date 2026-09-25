@@ -69,6 +69,17 @@ from cloud_platform.providers.routing import DEFAULT_CREDENTIAL_ACCOUNT
 logger = logging.getLogger(__name__)
 
 RESOURCE_TYPE_CLOUD_SERVER = "cloud_server"
+
+#: Immutable-contract fingerprint version. Version 2 additionally pins the
+#: launch root disk (size + storage type) because the provider REQUIRES both
+#: on create; version 1 accepted contracts cannot be re-created and therefore
+#: fail closed instead of guessing a disk after the customer confirmed.
+FINGERPRINT_VERSION = 2
+#: Fingerprint versions this build still understands (v1 = pre-root-disk rows).
+SUPPORTED_FINGERPRINT_VERSIONS = frozenset({1, FINGERPRINT_VERSION})
+#: Bound for a pinned root-disk size. The real provider range (5-1000 GB) is
+#: enforced by the adapter at the POST boundary; this only rejects nonsense.
+MAX_PINNED_ROOT_DISK_GB = 9_223_372_036_854_775_807
 REPLAYABLE_HOURLY_STATES = frozenset(
     {
         ServerLifecycleState.REQUESTED,
@@ -126,13 +137,72 @@ def _validate_hourly_operation(operation: Any, server: CloudServer) -> None:
         raise HourlyError("operation provider key does not match the hourly server")
 
 
+def _pinned_root_disk_value(value: Any) -> tuple[int, str]:
+    """Normalize pinned root-disk facts (adapter fact object or ``(size, type)``)."""
+    size: Any = getattr(value, "size_gb", None)
+    storage: Any = getattr(value, "storage_type", None)
+    if size is None and storage is None and isinstance(value, tuple | list) and len(value) == 2:
+        size, storage = value
+    return _validated_root_disk_pair(size, storage)
+
+
+def _validated_root_disk_pair(size: Any, storage: Any) -> tuple[int, str]:
+    """Validate a pinned root-disk pair (provider-neutral sanity only)."""
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+        or size > MAX_PINNED_ROOT_DISK_GB
+    ):
+        raise HourlyNotAvailableError("hourly root-disk size must be a positive signed int64")
+    if not isinstance(storage, str) or not storage.strip():
+        raise HourlyNotAvailableError("hourly root-disk storage type must be non-empty")
+    return size, storage.strip().upper()
+
+
+def _offer_root_disk(offer: Any) -> tuple[int, str]:
+    """Root-disk facts of a sellable offer row (sync-time provider facts).
+
+    ``disk_gb`` is the provider's own minimum root disk for that instance
+    type (``minDiskSize``) and ``technical_metadata`` carries the storage
+    types it accepts. Unusable facts fail closed here — never a guessed disk
+    at POST time.
+    """
+    metadata = getattr(offer, "technical_metadata", None) or {}
+    storage: Any = None
+    if isinstance(metadata, dict):
+        raw_type = metadata.get("storage_type")
+        if isinstance(raw_type, str) and raw_type.strip():
+            storage = raw_type
+        else:
+            raw_types = metadata.get("storage_types")
+            if isinstance(raw_types, (list, tuple)) and raw_types:
+                storage = raw_types[0]
+    return _validated_root_disk_pair(getattr(offer, "disk_gb", None), storage)
+
+
+def _fingerprint_root_disk(fingerprint: Any) -> tuple[int, str] | None:
+    """Pinned root disk from a contract fingerprint (None for legacy v1)."""
+    if not isinstance(fingerprint, dict):
+        return None
+    size = fingerprint.get("root_disk_size_gb")
+    storage = fingerprint.get("root_disk_storage_type")
+    if size is None and storage is None:
+        return None
+    return _validated_root_disk_pair(size, storage)
+
+
 def _offer_fingerprint(
     offer: Any,
     credential_account_id: str | None = None,
     image_id: str | None = None,
+    root_disk: Any = None,
 ) -> dict[str, object]:
+    size_gb, storage_type = (
+        _offer_root_disk(offer) if root_disk is None else _pinned_root_disk_value(root_disk)
+    )
     fingerprint: dict[str, object] = {
-        "fingerprint_version": 1,
+        "fingerprint_version": FINGERPRINT_VERSION,
         "offer_id": str(getattr(offer, "id", "")),
         "provider_key": str(getattr(offer, "provider_key", "")),
         "product_id": str(getattr(offer, "product_id", "")),
@@ -149,6 +219,8 @@ def _offer_fingerprint(
         "provider_cost_minor": offer.provider_cost_minor,
         "provider_cost_currency": offer.provider_cost_currency.strip().upper(),
         "provider_rate_exact": _provider_hourly_rate(offer),
+        "root_disk_size_gb": size_gb,
+        "root_disk_storage_type": storage_type,
         "billing_parameters": dict(offer.billing_parameters or {}),
         "pricing_metadata": dict(offer.pricing_metadata or {}),
         "technical_metadata": dict(offer.technical_metadata or {}),
@@ -164,8 +236,13 @@ def _offer_fingerprint(
 def _validate_hourly_contract(server: Any, snapshot: Any) -> None:
     """Fail closed unless the complete accepted hourly contract agrees."""
     fingerprint = getattr(server, "offer_fingerprint", None)
-    if not isinstance(fingerprint, dict) or fingerprint.get("fingerprint_version") != 1:
+    if not isinstance(fingerprint, dict):
         raise HourlyNotAvailableError("hourly server has no versioned offer fingerprint")
+    version = fingerprint.get("fingerprint_version")
+    if isinstance(version, bool) or version not in SUPPORTED_FINGERPRINT_VERSIONS:
+        raise HourlyNotAvailableError("hourly server has no versioned offer fingerprint")
+    if version >= FINGERPRINT_VERSION and _fingerprint_root_disk(fingerprint) is None:
+        raise HourlyNotAvailableError("hourly fingerprint has no pinned root disk")
     if getattr(snapshot, "offer_fingerprint", None) != fingerprint:
         raise HourlyNotAvailableError("hourly snapshot fingerprint does not match the server")
     required_text = (
@@ -199,6 +276,8 @@ def _validate_hourly_contract(server: Any, snapshot: Any) -> None:
     for key in ("billing_parameters", "pricing_metadata", "technical_metadata"):
         if not isinstance(fingerprint.get(key), dict):
             raise HourlyNotAvailableError(f"hourly fingerprint field {key!r} is not a mapping")
+    if version >= FINGERPRINT_VERSION and _fingerprint_root_disk(fingerprint) is None:
+        raise HourlyNotAvailableError("hourly fingerprint has no pinned root disk")
     try:
         exact_rate = Decimal(str(fingerprint["provider_rate_exact"]).strip())
         expected_cost_minor = major_to_minor(
@@ -320,6 +399,19 @@ class HourlyError(Exception):
 
 class HourlyNotAvailableError(HourlyError):
     """The hourly offer/image selection is not currently creatable."""
+
+
+class HourlyRequestFailedError(HourlyError):
+    """This confirmation belongs to a request that already ended in failure.
+
+    Distinct from "the offer is unavailable": the intent exists, is terminal
+    (failed / errored / unrecoverable), and MUST NOT invite the customer to
+    keep pressing the same stale button. The customer starts a new order.
+    """
+
+
+class HourlyProviderUnavailableError(HourlyError):
+    """A TRANSIENT provider problem blocked checkout (retry later)."""
 
 
 class HourlyCloudResolver:
@@ -595,8 +687,12 @@ class HourlyCloudService:
         if existing.user_id != user.id:
             raise HourlyError("idempotency key belongs to another user")
         if existing.state not in REPLAYABLE_HOURLY_STATES:
-            raise HourlyError(
-                f"hourly replay is not allowed for server state {existing.state.value}"
+            # The intent is terminal (failed, errored, unrecoverable): this
+            # confirmation cannot be replayed into a working order, and the
+            # customer must start a new one instead of pressing it again.
+            raise HourlyRequestFailedError(
+                f"the previous hourly request for this order ended as "
+                f"{existing.state.value}; a new order is required"
             )
         if str(getattr(existing, "image_id", "") or "") != str(image_id):
             raise HourlyError("idempotency key was reused for a different image")
@@ -649,9 +745,8 @@ class HourlyCloudService:
                 if operation is not None:
                     _validate_hourly_operation(operation, existing)
                     if operation.status is OperationStatus.FAILED:
-                        raise HourlyError(
-                            "idempotency key refers to a failed hourly operation; "
-                            "manual recovery is required"
+                        raise HourlyRequestFailedError(
+                            "the previous hourly request already failed; a new order is required"
                         )
                     return HourlyCreateResult(server=existing, replayed=True)
                 if await self._repair_hourly_bundle(
@@ -665,9 +760,9 @@ class HourlyCloudService:
                     if operation is not None:
                         _validate_hourly_operation(operation, existing)
                         if operation.status is OperationStatus.FAILED:
-                            raise HourlyError(
-                                "idempotency key refers to a failed hourly operation; "
-                                "manual recovery is required"
+                            raise HourlyRequestFailedError(
+                                "the previous hourly request already failed; "
+                                "a new order is required"
                             ) from None
                         return HourlyCreateResult(server=existing, replayed=True)
             except HourlyError:
@@ -686,9 +781,9 @@ class HourlyCloudService:
                     if operation is not None:
                         _validate_hourly_operation(operation, existing)
                         if operation.status is OperationStatus.FAILED:
-                            raise HourlyError(
-                                "idempotency key refers to a failed hourly operation; "
-                                "manual recovery is required"
+                            raise HourlyRequestFailedError(
+                                "the previous hourly request already failed; "
+                                "a new order is required"
                             ) from None
                         return HourlyCreateResult(server=existing, replayed=True)
             if asyncio.get_running_loop().time() >= deadline:
@@ -814,7 +909,7 @@ class HourlyCloudService:
                 "provider adapter lacks hourly image compatibility validation"
             )
         try:
-            await validator(
+            facts = await validator(
                 location_id=offer.location_id,
                 product_id=offer.product_id,
                 image_id=image_id,
@@ -822,10 +917,25 @@ class HourlyCloudService:
                 currency=offer.provider_cost_currency,
                 expected_cost_exact=_provider_hourly_rate(offer),
             )
+        except ProviderUnavailable as exc:
+            # A transient provider problem is NOT an unavailable offer: the
+            # customer may retry the same selection in a moment.
+            raise HourlyProviderUnavailableError(
+                f"hourly checkout revalidation is unavailable: {exc}"
+            ) from exc
         except Exception as exc:
             raise HourlyNotAvailableError(
                 f"hourly image is not compatible with the pinned offer: {exc}"
             ) from exc
+        # The launch root disk (size + storage type) is a MANDATORY provider
+        # create input, so it becomes part of the immutable contract here:
+        # derived by the adapter from live provider facts (type minimum, image
+        # minimum, both storage-type sets) and never re-guessed after accept.
+        if facts is None or getattr(facts, "root_disk", None) is None:
+            raise HourlyNotAvailableError(
+                "provider adapter could not pin the launch root disk for this offer"
+            )
+        root_disk = _pinned_root_disk_value(facts.root_disk)
 
         # Re-read immediately before creating the durable server bundle. The
         # initial catalog read can race an automatic reprice; a stale displayed
@@ -837,9 +947,9 @@ class HourlyCloudService:
             catalog_stale_limit_seconds=self._catalog_stale_limit_seconds,
         ):
             raise HourlyNotAvailableError("offer became unavailable during checkout")
-        if _offer_fingerprint(latest_offer, pinned_account, image_id) != _offer_fingerprint(
-            offer, pinned_account, image_id
-        ):
+        if _offer_fingerprint(
+            latest_offer, pinned_account, image_id, root_disk=root_disk
+        ) != _offer_fingerprint(offer, pinned_account, image_id, root_disk=root_disk):
             raise HourlyNotAvailableError("offer facts changed during checkout")
         offer = latest_offer
         latest_account = str(latest_offer.provider_account_id or "").strip() or None
@@ -885,7 +995,9 @@ class HourlyCloudService:
             version=1,
             priced_at=datetime.now(UTC),
             pricing_metadata=hourly_pricing_metadata,
-            offer_fingerprint=_offer_fingerprint(offer, pinned_account, image_id),
+            offer_fingerprint=_offer_fingerprint(
+                offer, pinned_account, image_id, root_disk=root_disk
+            ),
         )
 
         # Hourly offer provenance: the credential account that actually
@@ -904,7 +1016,9 @@ class HourlyCloudService:
             os=image_label,
             image_id=image_id,
             credential_account_id=pinned_account,
-            offer_fingerprint=_offer_fingerprint(offer, pinned_account, image_id),
+            offer_fingerprint=_offer_fingerprint(
+                offer, pinned_account, image_id, root_disk=root_disk
+            ),
         )
         intent = ServerCreateIntent(
             # No legacy-catalog pin (that FK points at the hourly catalog
@@ -916,7 +1030,9 @@ class HourlyCloudService:
             idempotency_key=idempotency_key,
             image_id=image_id,
             offer_id=offer.id,
-            offer_fingerprint=_offer_fingerprint(offer, pinned_account, image_id),
+            offer_fingerprint=_offer_fingerprint(
+                offer, pinned_account, image_id, root_disk=root_disk
+            ),
         )
         try:
             created = await self._servers.create(server, intent)
@@ -1103,6 +1219,20 @@ class HourlyCloudService:
             _validate_hourly_contract(server, snapshot)
         except HourlyError as exc:
             return await self._fail_operation(claimed, server, str(exc))
+        # The launch root disk is a REQUIRED provider create input, so it must
+        # come from the accepted contract. A legacy (pre-root-disk) contract
+        # cannot supply it and is failed with an actionable reason instead of
+        # guessing a disk after the customer confirmed.
+        try:
+            pinned_root_disk = _fingerprint_root_disk(server.offer_fingerprint)
+        except HourlyError as exc:
+            return await self._fail_operation(claimed, server, str(exc))
+        if pinned_root_disk is None:
+            return await self._fail_operation(
+                claimed,
+                server,
+                "hourly request predates the pinned launch root disk; a new order is required",
+            )
         # The exact credential account pinned at creation owns the POST —
         # never an arbitrary configured key.
         pinned_account = getattr(server, "credential_account_id", None)
@@ -1130,6 +1260,8 @@ class HourlyCloudService:
                 expected_cost_minor=snapshot.offer.cost_minor,
                 currency=snapshot.offer.currency,
                 expected_cost_exact=snapshot.offer.provider_rate_exact or "",
+                root_disk_size_gb=pinned_root_disk[0],
+                root_disk_storage_type=pinned_root_disk[1],
             )
         except (ProviderAuthError, ProviderNotFound, ProviderConflict) as exc:
             return await self._fail_operation(
@@ -1171,6 +1303,10 @@ class HourlyCloudService:
                 image_id=image.id,
                 region=snapshot.offer.location_id,
                 reference=reference,
+                root_disk_size_gb=pinned_root_disk[0],
+                root_disk_storage_type=pinned_root_disk[1],
+                image_label=image.label,
+                os_family=image.os_family,
                 idempotency_key=IdempotencyKey(claimed.operation_key),
             )
         except ProviderOutcomeUnknown as exc:

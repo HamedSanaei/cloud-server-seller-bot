@@ -266,6 +266,43 @@ class TestLeasewebCloudCatalog:
 
 
 class TestLeasewebCloudCreatePreview:
+    def _provider(self, *, types: list[Any], images: list[Any]) -> Any:
+        return SimpleNamespace(
+            list_instance_types=AsyncMock(return_value=list(types)),
+            list_images=AsyncMock(return_value=list(images)),
+            close=AsyncMock(),
+        )
+
+    def _facts(self) -> tuple[Any, Any]:
+        from cloud_platform.providers.leaseweb.cloud import CloudImage, CloudInstanceType
+
+        return (
+            CloudInstanceType(
+                id="lsw.m3.large",
+                name="lsw.m3.large",
+                region="eu-central-1",
+                family_key="general",
+                family_name="General Purpose",
+                vcpu=2,
+                ram_gb=7,
+                disk_gb=5,
+                traffic=None,
+                hourly_cost_minor=4,
+                currency="EUR",
+                storage_type="CENTRAL",
+                storage_types=("CENTRAL", "LOCAL"),
+                hourly_rate_exact="0.0442",
+            ),
+            CloudImage(
+                id="UBUNTU_26_04_64BIT",
+                label="Ubuntu 26.04 LTS (x86_64)",
+                os_family="linux",
+                architecture="x86_64",
+                min_disk_size_gb=5,
+                storage_types=("LOCAL", "CENTRAL"),
+            ),
+        )
+
     async def test_body_printed_and_no_post(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:
@@ -283,12 +320,68 @@ class TestLeasewebCloudCreatePreview:
             "cloud_platform.providers.leaseweb.transport.LeasewebTransport.request_raw",
             _no_post,
         )
+        match, image = self._facts()
+        monkeypatch.setattr(
+            cli,
+            "_hourly_cloud_provider_or_error",
+            AsyncMock(return_value=self._provider(types=[match], images=[image])),
+        )
         rc = await cli.leaseweb_cloud_create_preview(
-            "eu-central-1", "lsw.c3.large", "img-1", "preview-only"
+            "eu-central-1", "lsw.m3.large", "UBUNTU_26_04_64BIT", "preview-only"
         )
         assert rc == 0
         out = capsys.readouterr().out
         assert "POST /publicCloud/v1/instances (NOT SENT" in out
-        assert '"instanceType"' in out or '"type"' in out
         assert "no provider mutation occurred" in out
         assert post_calls == []
+        # The launch root disk is derived from the live provider facts and both
+        # required fields appear; no undocumented field is sent.
+        import json
+
+        body = json.loads(out.split("preview only):", 1)[1].split("no provider mutation")[0])
+        assert body == {
+            "type": "lsw.m3.large",
+            "imageId": "UBUNTU_26_04_64BIT",
+            "region": "eu-central-1",
+            "reference": "preview-only",
+            "contractType": "HOURLY",
+            "rootDiskSize": 5,
+            "rootDiskStorageType": "CENTRAL",
+        }
+        assert "labels" not in body
+
+    async def test_an_explicit_root_disk_is_honoured(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        match, image = self._facts()
+        monkeypatch.setattr(
+            cli,
+            "_hourly_cloud_provider_or_error",
+            AsyncMock(return_value=self._provider(types=[match], images=[image])),
+        )
+        rc = await cli.leaseweb_cloud_create_preview(
+            "eu-central-1", "lsw.m3.large", "UBUNTU_26_04_64BIT", "ref", 50, "local"
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert '"rootDiskSize": 50' in out
+        assert '"rootDiskStorageType": "LOCAL"' in out
+
+    async def test_an_unknown_type_or_image_returns_one(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        match, image = self._facts()
+        monkeypatch.setattr(
+            cli,
+            "_hourly_cloud_provider_or_error",
+            AsyncMock(return_value=self._provider(types=[match], images=[image])),
+        )
+        assert await cli.leaseweb_cloud_create_preview("eu-central-1", "lsw.nope", "x", "r") == 1
+        assert "not offered" in capsys.readouterr().out
+        assert (
+            await cli.leaseweb_cloud_create_preview(
+                "eu-central-1", "lsw.m3.large", "NO_SUCH_IMAGE", "r"
+            )
+            == 1
+        )
+        assert "not offered" in capsys.readouterr().out

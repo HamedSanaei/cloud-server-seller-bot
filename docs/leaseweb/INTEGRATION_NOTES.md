@@ -21,7 +21,7 @@ Observations: _(none yet — verify on first `GET /publicCloud/v1/regions`)_
 | list images | `GET /publicCloud/v1/images?region=` (see live observation below) |
 | list instances | `GET /publicCloud/v1/instances?region=&limit=&offset=` |
 | get instance | `GET /publicCloud/v1/instances/{id}` |
-| launch instance | `POST /publicCloud/v1/instances` |
+| launch instance | `POST /publicCloud/v1/instances` (see launch contract below) |
 | terminate instance | `DELETE /publicCloud/v1/instances/{id}` |
 | start / stop / reboot | `POST /publicCloud/v1/instances/{id}/start\|stop\|reboot` |
 
@@ -69,6 +69,54 @@ Observations (live account, 2026-09-25):
 - Instance types carry prices under `prices` with the envelope's
   `_metadata.currency` (JPY/KRW/EUR observed), so hourly cost parsing needs
   the currency's own exponent (`JPY`/`KRW` are zero-decimal).
+- `minDiskSize` and `storageTypes` exist on BOTH instance types and images,
+  and they are the launch constraints, not display text. Observed
+  `eu-central-1` facts: `lsw.m3.large` states `minDiskSize: 5` and
+  `storageTypes: ["CENTRAL", "LOCAL"]`; Linux/FreeBSD images state 5 GB, some
+  Enterprise Linux images (`ALMALINUX_8/10`, `ROCKY_LINUX_10`) state 10 GB,
+  Windows images state 50 GB **and only `["CENTRAL"]`**. `rootDiskSize` must
+  therefore satisfy the type AND the image floor (the adapter pins the larger
+  of the two), and `rootDiskStorageType` must be accepted by both sides.
+
+### Launch contract (`POST /publicCloud/v1/instances`)
+
+Official schema (`publicCloud/components/schemas/launchInstanceOpts.yaml`,
+Leaseweb `api-definitions`):
+
+- REQUIRED: `region`, `imageId`, `contractType`, `rootDiskSize`,
+  `rootDiskStorageType`, `type`.
+- OPTIONAL: `reference`, `contractTerm`, `billingFrequency`, `sshKey`,
+  `userData`, `marketAppId`.
+- `rootDiskSize`: integer, **minimum 5** (Linux/FreeBSD) / **50** (Windows),
+  **maximum 1000**.
+- `rootDiskStorageType`: enum `LOCAL` | `CENTRAL`.
+- There is **no `labels`** field on this endpoint.
+
+Incident 2026-09-25 (production): the adapter sent `labels` and omitted both
+root-disk fields, so Leaseweb answered
+`400 {errorCode: "400", errorMessage: "Validation Failed"}` and the instance
+was never created (`provider_server_id` stayed NULL, operation failed at
+attempt 1). Two follow-on contracts now hold:
+
+1. The launch body is exactly the documented schema — `build_create_body`
+   validates the pinned `(size, storage type)` pair and can never emit an
+   undocumented field.
+2. The launch root disk is pinned INTO the accepted hourly contract: the
+   fingerprint (version 2) carries `root_disk_size_gb` /
+   `root_disk_storage_type`, derived at checkout from live provider facts
+   (type minimum + image minimum + both storage-type sets). The create worker
+   re-verifies those exact values against live facts and fails closed instead
+   of guessing. Version-1 (pre-root-disk) contracts are still readable but
+   cannot be re-created, so they fail with an actionable reason and the
+   customer starts a new order — never a silent re-POST.
+3. Exactly-once is unchanged and does NOT depend on provider labels: durable
+   operation ledger (`server-create:<server id>`), deterministic `reference`
+   (`srv-<server id>`), and a read-only `find_by_reference` correlation before
+   any create/recovery.
+
+A `400` now also preserves `errorDetails` in the safe one-line summary
+(field + reason, redacted and bounded), because `errorCode`/`errorMessage`
+alone are not actionable.
 
 ## 3. Status vocabulary
 
@@ -92,7 +140,9 @@ that way are tagged `price-source:operator-price-list` in the plan
 description so the margin report can tell them apart. There are no
 hard-coded provider prices anywhere.
 
-Observations: _(none yet — confirm whether instanceTypes carry prices)_
+Observations: `prices.hourly` is the authoritative hourly rate and the
+envelope's `_metadata.currency` is the only currency source (observed EUR for
+the EU regions). No per-item currency exists in the payload.
 
 ## 5. Idempotency
 

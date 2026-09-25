@@ -144,14 +144,35 @@ class LeasewebErrorPayload:
     error_details: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
+    def details_summary(self) -> str:
+        """Bounded ``field: reason`` text for ``errorDetails`` (safe for logs)."""
+        parts: list[str] = []
+        for field_name, reasons in self.error_details.items():
+            joined = " | ".join(reason for reason in reasons if reason)
+            if joined:
+                parts.append(f"{field_name}: {joined}")
+        return "; ".join(parts)
+
+    @property
     def summary(self) -> str:
-        """A bounded, redacted one-line description (safe for logs)."""
+        """A bounded, redacted one-line description (safe for logs).
+
+        Per-field ``errorDetails`` are included: a provider validation failure
+        is only actionable when the rejected field and its reason survive. A
+        summary that drops them (as production observed for the 400 on
+        ``/instances``) leaves an operator with "Validation Failed" and
+        nothing to fix. Every string here is already redacted/scrubbed and the
+        whole line is bounded.
+        """
         parts: list[str] = []
         if self.error_code:
             parts.append(f"errorCode={self.error_code}")
         message = self.error_message or self.user_message
         if message:
             parts.append(message)
+        details = self.details_summary
+        if details:
+            parts.append(details)
         if self.correlation_id:
             parts.append(f"correlationId={self.correlation_id}")
         parts.append(f"HTTP {self.http_status}")
@@ -239,6 +260,10 @@ def parse_error_payload(
                     if text:
                         message = text
                         break
+        details = {
+            field: tuple(scrub(value) for value in values)
+            for field, values in _parse_error_details(payload.get("errorDetails")).items()
+        }
         return LeasewebErrorPayload(
             http_status=response.status_code,
             correlation_id=correlation or body_correlation,
@@ -246,7 +271,7 @@ def parse_error_payload(
             error_message=scrub(message)[:_MAX_MESSAGE] if message else None,
             user_message=scrub(_as_str(payload.get("userMessage")) or "")[:_MAX_MESSAGE] or None,
             reference=_as_str(payload.get("reference")),
-            error_details=_parse_error_details(payload.get("errorDetails")),
+            error_details=details,
         )
 
     fallback = scrub((response.text or "").strip())[:_MAX_MESSAGE]

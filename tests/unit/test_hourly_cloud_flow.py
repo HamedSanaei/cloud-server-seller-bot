@@ -48,6 +48,10 @@ from cloud_platform.providers.leaseweb.cloud import (
     CloudImage,
     CloudInstanceType,
     CloudRegion,
+    CloudRootDisk,
+    HourlyCheckoutFacts,
+    resolve_root_disk,
+    validate_root_disk,
 )
 
 SIGNING_KEY = "hourly-flow-signing-key"
@@ -93,7 +97,13 @@ def _offer(
         technical_metadata=dict(
             technical_metadata
             if technical_metadata is not None
-            else {"plan_family": "general", "plan_family_name": "General Purpose"}
+            else {
+                "plan_family": "general",
+                "plan_family_name": "General Purpose",
+                # Sync-written provider storage facts (launch root disk input).
+                "storage_type": "CENTRAL",
+                "storage_types": ["CENTRAL"],
+            }
         ),
         provider_available=True,
         enabled=True,
@@ -342,7 +352,8 @@ def _cloud_type(**overrides: Any) -> CloudInstanceType:
         currency="EUR",
         architecture="x86_64",
         cpu_type="shared",
-        storage_type="ssd",
+        storage_type="CENTRAL",
+        storage_types=("CENTRAL", "LOCAL"),
         hourly_rate_exact="0.02",
     )
     values.update(overrides)
@@ -401,8 +412,15 @@ class FakeHourlyProvider:
         expected_cost_minor: int,
         currency: str,
         expected_cost_exact: str,
-    ) -> CloudInstanceType:
-        """Fail-closed checkout revalidation over the scripted state."""
+        root_disk_size_gb: int | None = None,
+        root_disk_storage_type: str | None = None,
+    ) -> Any:
+        """Fail-closed checkout revalidation over the scripted state.
+
+        Mirrors the real adapter: derives the launch root disk from the
+        scripted provider facts, and re-verifies values the caller already
+        pinned before any create can happen.
+        """
         types = await self.list_instance_types(location_id)
         match = next((item for item in types if item.id == product_id), None)
         if match is None:
@@ -429,9 +447,32 @@ class FakeHourlyProvider:
                     f"exact provider rate changed for {product_id!r} in {location_id!r}"
                 )
         images = await self.list_images(location_id)
-        if not any(image.id == image_id for image in images):
+        image = next((item for item in images if item.id == image_id), None)
+        if image is None:
             raise ProviderNotFound(f"image {image_id!r} is not offered in {location_id!r}")
-        return match
+        live = resolve_root_disk(
+            disk_gb=match.disk_gb,
+            storage_type=match.storage_type,
+            image=image,
+            type_storage_types=match.storage_types,
+        )
+        if root_disk_size_gb is not None or root_disk_storage_type is not None:
+            pinned = validate_root_disk(
+                size_gb=root_disk_size_gb,
+                storage_type=root_disk_storage_type,
+                image_label=image.label,
+                os_family=image.os_family,
+            )
+            if pinned[0] < live.size_gb:
+                raise ProviderError(
+                    f"pinned root disk {pinned[0]} GB is below the provider minimum "
+                    f"{live.size_gb} GB for image {image_id!r}"
+                )
+            return HourlyCheckoutFacts(
+                instance_type=match,
+                root_disk=CloudRootDisk(size_gb=pinned[0], storage_type=pinned[1]),
+            )
+        return HourlyCheckoutFacts(instance_type=match, root_disk=live)
 
     async def find_by_reference(self, region: str, reference: str) -> Any:
         return None
@@ -446,6 +487,10 @@ class FakeHourlyProvider:
             image_id=kwargs["image_id"],
             region=kwargs["region"],
             reference=kwargs["reference"],
+            root_disk_size_gb=kwargs["root_disk_size_gb"],
+            root_disk_storage_type=kwargs["root_disk_storage_type"],
+            image_label=kwargs.get("image_label"),
+            os_family=kwargs.get("os_family"),
         )
         self.posts.append(body)
         # The production contract requires the provider response to echo the
@@ -1219,7 +1264,19 @@ class TestHourlyCreate:
         outcome = await service.process_server(result.server.id)
         assert outcome == "provisioned"
         assert len(cloud.posts) == 1
-        assert cloud.posts[0]["contractType"] == "HOURLY"
+        # The transmitted body IS the documented launch contract: every
+        # required field present (including the pinned root disk), no field
+        # the endpoint does not document (a real POST with ``labels`` was
+        # rejected with 400 Validation Failed).
+        assert cloud.posts[0] == {
+            "type": "lsw.mini",
+            "imageId": "UBUNTU_24_04",
+            "region": "eu-west-3",
+            "reference": f"srv-{result.server.id}",
+            "contractType": "HOURLY",
+            "rootDiskSize": 25,
+            "rootDiskStorageType": "CENTRAL",
+        }
         # Second run: terminal operation, no second POST.
         assert await service.process_server(result.server.id) in ("skipped", "provisioned")
         assert len(cloud.posts) == 1

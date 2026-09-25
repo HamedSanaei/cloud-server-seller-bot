@@ -352,6 +352,8 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.cloud_selected_specs": "⚙️ {vcpu} vCPU · 🧠 {ram} GB · 💾 {disk} GB",
         "store.cloud_selected_price": "💵 {price}",
         "store.cloud_no_images": "در حال حاضر سیستم‌عامل قابل نصب برای این پلن در دسترس نیست.",
+        "store.cloud_previous_failed": "درخواست قبلی ساخت سرور ناموفق شده است.\nلطفاً یک سفارش جدید ایجاد کنید.",  # noqa: E501, RUF001
+        "store.cloud_retry_later": "ارتباط با تأمین‌کننده سرویس در حال حاضر برقرار نیست.\nلطفاً چند دقیقه دیگر دوباره تلاش کنید.",  # noqa: E501, RUF001
         "store.cloud_confirm_title": "\u2601\ufe0f \u062a\u0627\u06cc\u06cc\u062f \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc",  # noqa: E501
         "store.cloud_confirm_provider": "\u0627\u0631\u0627\u0626\u0647\u200c\u062f\u0647\u0646\u062f\u0647: {provider}",  # noqa: E501
         "store.cloud_confirm_kind": "\u0646\u0648\u0639: {kind}",
@@ -744,6 +746,8 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.cloud_selected_specs": "⚙️ {vcpu} vCPU · 🧠 {ram} GB · 💾 {disk} GB",
         "store.cloud_selected_price": "💵 {price}",
         "store.cloud_no_images": "No installable operating system is available for this plan right now.",  # noqa: E501
+        "store.cloud_previous_failed": "The previous server request failed.\nPlease create a new order.",  # noqa: E501
+        "store.cloud_retry_later": "The provider is currently unreachable.\nPlease try again in a few minutes.",  # noqa: E501
         "store.cloud_confirm_title": "\u2601\ufe0f Confirm hourly server creation",
         "store.cloud_confirm_provider": "Provider: {provider}",
         "store.cloud_confirm_kind": "Type: {kind}",

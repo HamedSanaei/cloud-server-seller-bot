@@ -18,6 +18,7 @@ import pytest
 
 from cloud_platform.modules.hourly.service import (
     HourlyNotAvailableError,
+    _fingerprint_root_disk,
     _provider_hourly_rate,
     _validate_hourly_contract,
 )
@@ -39,7 +40,9 @@ SELLING_MINOR = 6
 
 def _fingerprint(**overrides: object) -> dict[str, Any]:
     fingerprint: dict[str, Any] = {
-        "fingerprint_version": 1,
+        "fingerprint_version": 2,
+        "root_disk_size_gb": 5,
+        "root_disk_storage_type": "CENTRAL",
         "offer_id": str(uuid4()),
         "provider_key": PROVIDER_KEY,
         "product_id": PRODUCT_ID,
@@ -142,10 +145,48 @@ class TestFingerprintShapeViolations:
             _validate_hourly_contract(server, snapshot)
 
     def test_wrong_fingerprint_version_fails_closed(self) -> None:
-        server, snapshot = _contract(fingerprint_version=2)
+        server, snapshot = _contract(fingerprint_version=3)
 
         with pytest.raises(HourlyNotAvailableError, match="no versioned offer fingerprint"):
             _validate_hourly_contract(server, snapshot)
+
+    def test_a_legacy_version_one_contract_is_still_readable(self) -> None:
+        """Pre-root-disk contracts stay valid; the create worker refuses them."""
+        server, snapshot = _contract(
+            fingerprint_version=1, root_disk_size_gb=None, root_disk_storage_type=None
+        )
+
+        _validate_hourly_contract(server, snapshot)
+        assert _fingerprint_root_disk(server.offer_fingerprint) is None
+
+    @pytest.mark.parametrize(
+        ("overrides", "match"),
+        [
+            ({"root_disk_size_gb": 0}, "root-disk size"),
+            ({"root_disk_size_gb": True}, "root-disk size"),
+            ({"root_disk_size_gb": "5"}, "root-disk size"),
+            ({"root_disk_storage_type": ""}, "storage type"),
+            ({"root_disk_storage_type": 7}, "storage type"),
+        ],
+    )
+    def test_an_invalid_pinned_root_disk_fails_closed(
+        self, overrides: dict[str, object], match: str
+    ) -> None:
+        server, snapshot = _contract(**overrides)
+
+        with pytest.raises(HourlyNotAvailableError, match=match):
+            _validate_hourly_contract(server, snapshot)
+
+    def test_a_version_two_contract_without_a_root_disk_fails_closed(self) -> None:
+        server, snapshot = _contract(root_disk_size_gb=None, root_disk_storage_type=None)
+
+        with pytest.raises(HourlyNotAvailableError, match="no pinned root disk"):
+            _validate_hourly_contract(server, snapshot)
+
+    def test_the_pinned_root_disk_is_readable_from_the_fingerprint(self) -> None:
+        server, _snapshot = _contract(root_disk_size_gb=50, root_disk_storage_type="local")
+
+        assert _fingerprint_root_disk(server.offer_fingerprint) == (50, "LOCAL")
 
     def test_snapshot_fingerprint_must_match_the_server(self) -> None:
         server, snapshot = _contract()

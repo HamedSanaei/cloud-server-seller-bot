@@ -11,7 +11,13 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
-from cloud_platform.modules.hourly.service import HourlyError
+from cloud_platform.core.i18n import Translator
+from cloud_platform.modules.hourly.service import (
+    HourlyError,
+    HourlyNotAvailableError,
+    HourlyProviderUnavailableError,
+    HourlyRequestFailedError,
+)
 from cloud_platform.modules.navigation.domain import encode_offer_ref
 from tests.unit.test_hourly_cloud_flow import (
     FakeOffersRepo,
@@ -232,11 +238,49 @@ class TestHourlyBuyScreens:
 
         class _Reject:
             async def create_instance(self, **kwargs: Any) -> Any:
-                raise HourlyError("not sellable")
+                raise HourlyNotAvailableError("not sellable")
 
         bot._hourly = _Reject()
         screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
-        assert screen.text
+        assert screen.text.strip() == Translator().t("offers.unavailable")
+
+    async def test_a_failed_previous_request_does_not_look_unavailable(self) -> None:
+        """The stale confirmation of a failed intent must say what happened.
+
+        Production logged the old wording ("این آفر در دسترس نیست.") for a
+        request that had ALREADY failed at the provider — the customer was
+        invited to press the same dead button again.
+        """
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+
+        class _Failed:
+            async def create_instance(self, **kwargs: Any) -> Any:
+                raise HourlyRequestFailedError(
+                    "the previous hourly request for this order ended as error; "
+                    "a new order is required"
+                )
+
+        bot._hourly = _Failed()
+        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        text = screen.text.strip()
+        assert text == Translator().t("store.cloud_previous_failed")
+        assert "a new order is required" not in text
+        assert text != Translator().t("offers.unavailable")
+
+    async def test_a_transient_provider_failure_invites_a_retry(self) -> None:
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+
+        class _Busy:
+            async def create_instance(self, **kwargs: Any) -> Any:
+                raise HourlyProviderUnavailableError("timed out")
+
+        bot._hourly = _Busy()
+        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        text = screen.text.strip()
+        assert text == Translator().t("store.cloud_retry_later")
+        assert text != Translator().t("offers.unavailable")
 
     async def test_buy_rejects_unexpected_error_to_error_screen(self) -> None:
         offers = FakeOffersRepo([_offer()])

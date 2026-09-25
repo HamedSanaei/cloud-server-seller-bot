@@ -58,6 +58,165 @@ OTHER_FAMILY_NAME = "Other"
 #: one value.
 HOURS_PER_MONTH_ESTIMATE = HOURLY_MONTHLY_ESTIMATE_HOURS
 
+# ---------------------------------------------------------------------------
+# Launch contract (POST /publicCloud/v1/instances)
+# ---------------------------------------------------------------------------
+#
+# The official create schema REQUIRES ``region``, ``type``, ``imageId``,
+# ``contractType``, ``rootDiskSize`` and ``rootDiskStorageType``. Optional
+# fields are ``reference``, ``contractTerm``, ``billingFrequency``,
+# ``sshKey``, ``userData`` and ``marketAppId``. There is NO ``labels`` field
+# on this endpoint (unlike Hetzner, whose create endpoint documents labels).
+#
+# Observed 2026-09-25 in production: the platform sent no rootDiskSize /
+# rootDiskStorageType and did send ``labels``, and Leaseweb answered
+# ``errorCode=400; Validation Failed`` — the create never reached the
+# provider as a valid request.
+
+#: Minimum root disk size for Linux/FreeBSD images (documented provider rule).
+ROOT_DISK_MIN_GB = 5
+#: Minimum root disk size for Windows images (documented provider rule).
+ROOT_DISK_MIN_GB_WINDOWS = 50
+#: Maximum root disk size accepted by the launch endpoint.
+ROOT_DISK_MAX_GB = 1000
+#: Documented ``rootDiskStorageType`` enum values.
+ROOT_DISK_STORAGE_TYPES = frozenset({"LOCAL", "CENTRAL"})
+
+
+def minimum_root_disk_gb(image_label: str | None, os_family: str | None = None) -> int:
+    """Documented minimum root-disk size for an image (Windows vs Unix).
+
+    Windows images cannot be launched at the Linux/FreeBSD minimum, so the
+    installer OS decides the floor. Detection is textual and case-insensitive
+    because the provider states the OS in the image label/family, and a false
+    positive would only raise the required size (never silently lower it).
+    """
+    text = f"{os_family or ''} {image_label or ''}".strip().lower()
+    if "windows" in text:
+        return ROOT_DISK_MIN_GB_WINDOWS
+    return ROOT_DISK_MIN_GB
+
+
+#: Preference order for ``rootDiskStorageType`` when the pinned offer does
+#: not state one: CENTRAL is the provider default in its own launch example.
+ROOT_DISK_STORAGE_PREFERENCE = ("CENTRAL", "LOCAL")
+
+
+def _normalized_storage_types(values: Any) -> tuple[str, ...]:
+    """Upper-cased, de-duplicated storage-type list (empty when unusable)."""
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return ()
+    seen: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str):
+            continue
+        code = raw.strip().upper()
+        if code and code not in seen:
+            seen.append(code)
+    return tuple(seen)
+
+
+def image_root_disk_floor(image: Any) -> int:
+    """Documented minimum root disk for ONE image.
+
+    The provider states ``minDiskSize`` per image — 5 GB for most Linux/FreeBSD
+    images, 10 GB for some Enterprise Linux images, 50 GB for Windows — so the
+    image's own fact wins. When an image states none, the textual OS floor is
+    used; a false positive there can only raise the floor, never lower it.
+    """
+    declared = getattr(image, "min_disk_size_gb", None)
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+        return max(declared, ROOT_DISK_MIN_GB)
+    return minimum_root_disk_gb(getattr(image, "label", None), getattr(image, "os_family", None))
+
+
+def resolve_root_disk(
+    *,
+    disk_gb: Any,
+    storage_type: Any,
+    image: Any,
+    type_storage_types: Any = (),
+) -> CloudRootDisk:
+    """Effective launch root disk for one pinned type + image pair.
+
+    ``rootDiskSize`` must satisfy every documented floor at once: the instance
+    type's own minimum (``minDiskSize``, carried on the offer as ``disk_gb``)
+    AND the image's ``minDiskSize``. The pinned size is therefore the larger
+    of the two — never a hardcoded constant, never below either fact.
+
+    ``rootDiskStorageType`` must be offered by both the image and the instance
+    type; the offer's stated type is preferred, then the documented order.
+
+    Raises :class:`ProviderError` when the pair cannot be launched at all, so
+    the platform can fail closed before any billable POST.
+    """
+    if isinstance(disk_gb, bool) or not isinstance(disk_gb, int) or disk_gb <= 0:
+        raise ProviderError("the pinned instance type states no usable minimum root disk size")
+    size_gb = max(disk_gb, image_root_disk_floor(image))
+    if size_gb > ROOT_DISK_MAX_GB:
+        raise ProviderError(
+            f"rootDiskSize {size_gb} GB exceeds the provider maximum {ROOT_DISK_MAX_GB} GB"
+        )
+    by_image = _normalized_storage_types(getattr(image, "storage_types", ()))
+    by_type = _normalized_storage_types(type_storage_types)
+    preferred = str(storage_type or "").strip().upper()
+    if preferred and preferred not in ROOT_DISK_STORAGE_TYPES:
+        # A storage type the provider does not document is never silently
+        # swapped for another one: the pinned fact would stop describing the
+        # contract the customer accepted.
+        raise ProviderError(
+            f"root-disk storage type {storage_type!r} is not one of "
+            f"{sorted(ROOT_DISK_STORAGE_TYPES)}"
+        )
+    candidates = [preferred] if preferred else []
+    candidates.extend(code for code in ROOT_DISK_STORAGE_PREFERENCE if code != preferred)
+    for candidate in candidates:
+        if candidate not in ROOT_DISK_STORAGE_TYPES:
+            continue
+        if by_image and candidate not in by_image:
+            continue
+        if by_type and candidate not in by_type:
+            continue
+        return CloudRootDisk(size_gb=size_gb, storage_type=candidate)
+    raise ProviderError(
+        "no common root-disk storage type between the instance type "
+        f"{sorted(by_type) or 'any'} and the image {sorted(by_image) or 'any'}"
+    )
+
+
+def validate_root_disk(
+    *,
+    size_gb: Any,
+    storage_type: Any,
+    image_label: str | None = None,
+    os_family: str | None = None,
+) -> tuple[int, str]:
+    """Validate the pinned root-disk facts against the documented contract.
+
+    Returns the normalized ``(size_gb, storage_type)`` pair. Raises
+    :class:`ProviderError` (never a provider call) so an invalid launch body
+    can never be sent: the create worker fails the operation with an
+    actionable reason instead of collecting a provider 400.
+    """
+    if isinstance(size_gb, bool) or not isinstance(size_gb, int):
+        raise ProviderError(
+            f"rootDiskSize must be an integer number of GB, got {type(size_gb).__name__}"
+        )
+    floor = minimum_root_disk_gb(image_label, os_family)
+    if size_gb < floor or size_gb > ROOT_DISK_MAX_GB:
+        raise ProviderError(
+            f"rootDiskSize {size_gb} GB is outside the provider range "
+            f"{floor}-{ROOT_DISK_MAX_GB} GB for this image"
+        )
+    if not isinstance(storage_type, str) or not storage_type.strip():
+        raise ProviderError("rootDiskStorageType is required by the provider (LOCAL or CENTRAL)")
+    normalized_storage = storage_type.strip().upper()
+    if normalized_storage not in ROOT_DISK_STORAGE_TYPES:
+        raise ProviderError(
+            f"rootDiskStorageType {storage_type!r} is not one of {sorted(ROOT_DISK_STORAGE_TYPES)}"
+        )
+    return size_gb, normalized_storage
+
 
 def _decimal(value: Any) -> Decimal | None:
     """Parse a provider value into Decimal (never float arithmetic)."""
@@ -209,12 +368,43 @@ class CloudInstanceType:
 
 @dataclass(frozen=True, slots=True)
 class CloudImage:
-    """One installable image (label and provider id stay separate)."""
+    """One installable image (label and provider id stay separate).
+
+    ``min_disk_size_gb`` and ``storage_types`` are the provider's OWN launch
+    constraints for this image (``minDiskSize`` / ``storageTypes``): Windows
+    images require 50 GB and boot only from CENTRAL storage, some Enterprise
+    Linux images require 10 GB, and every image lists the storage types it
+    accepts. They are facts to validate against, never display text.
+    """
 
     id: str
     label: str
     os_family: str
     architecture: str | None = None
+    min_disk_size_gb: int | None = None
+    storage_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CloudRootDisk:
+    """The launch root disk pinned for one accepted hourly contract."""
+
+    size_gb: int
+    storage_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class HourlyCheckoutFacts:
+    """Live provider facts proving one hourly offer+image is launchable.
+
+    Returned by :meth:`LeasewebHourlyCloudProvider.validate_hourly_offer_for_checkout`:
+    the caller pins ``root_disk`` into the immutable contract, and the create
+    worker re-verifies the SAME pinned values against live facts before the
+    provider POST.
+    """
+
+    instance_type: CloudInstanceType
+    root_disk: CloudRootDisk
 
 
 @dataclass(frozen=True, slots=True)
@@ -475,11 +665,14 @@ def _parse_image(item: dict[str, Any]) -> CloudImage | None:
     if not raw_id:
         return None
     architecture = item.get("architecture")
+    declared_min = _int_of(item.get("minDiskSize"))
     return CloudImage(
         id=raw_id,
         label=str(item.get("displayName") or item.get("name") or raw_id),
         os_family=str(item.get("os") or item.get("family") or "unknown"),
         architecture=str(architecture).strip() if architecture else None,
+        min_disk_size_gb=declared_min if declared_min > 0 else None,
+        storage_types=_normalized_storage_types(item.get("storageTypes")),
     )
 
 
@@ -529,26 +722,37 @@ def build_create_body(
     image_id: str,
     region: str,
     reference: str,
+    root_disk_size_gb: int,
+    root_disk_storage_type: str,
     ssh_key_id: str | None = None,
-    labels: dict[str, str] | None = None,
+    image_label: str | None = None,
+    os_family: str | None = None,
 ) -> dict[str, Any]:
     """Exact POST body for an hourly instance (no mutation, preview-safe).
 
     ``contractType`` is always hourly: this adapter never creates monthly
-    contracts. Root disk follows the provider default (the type's disk is
-    shown, never invented as a create parameter).
+    contracts. Required launch fields are always present; the root disk comes
+    from the PINNED offer facts (size + storage type), never from a provider
+    default and never invented per plan. Unsupported fields (for example the
+    undocumented ``labels``) are never sent.
     """
+    size_gb, storage_type = validate_root_disk(
+        size_gb=root_disk_size_gb,
+        storage_type=root_disk_storage_type,
+        image_label=image_label,
+        os_family=os_family,
+    )
     body: dict[str, Any] = {
         "type": instance_type,
         "imageId": image_id,
         "region": region,
         "reference": reference[:64],
         "contractType": CONTRACT_TYPE_HOURLY,
+        "rootDiskSize": size_gb,
+        "rootDiskStorageType": storage_type,
     }
     if ssh_key_id:
         body["sshKey"] = ssh_key_id
-    merged = dict(labels or {})
-    body["labels"] = merged
     return body
 
 
@@ -754,13 +958,22 @@ class LeasewebHourlyCloudProvider:
         expected_cost_minor: int,
         currency: str,
         expected_cost_exact: str,
-    ) -> CloudInstanceType:
+        root_disk_size_gb: int | None = None,
+        root_disk_storage_type: str | None = None,
+    ) -> HourlyCheckoutFacts:
         """Revalidate an offer+image against live provider facts (read-only).
 
         Checkout-time guard required by the hourly service: the pinned type
         must still exist at the region with the same provider cost (minor
         units AND verbatim exact rate) and currency, and the image must be
         listed for the region. Anything else fails closed without mutating.
+
+        The launch root disk is derived here from live provider facts (type
+        ``minDiskSize`` + image ``minDiskSize`` + both storage-type sets) and
+        returned so the caller pins it into the immutable contract. When the
+        caller passes the values it already pinned, they are re-verified
+        against today's facts instead of being replaced — a pinned request
+        that the provider would now reject fails closed before the POST.
         """
         types = await self.list_instance_types(location_id)
         match = next((item for item in types if item.id == product_id), None)
@@ -788,9 +1001,43 @@ class LeasewebHourlyCloudProvider:
                     f"exact provider rate changed for {product_id!r} in {location_id!r}"
                 )
         images = await self.list_images(location_id)
-        if not any(image.id == image_id for image in images):
+        image = next((item for item in images if item.id == image_id), None)
+        if image is None:
             raise ProviderNotFound(f"image {image_id!r} is not offered in {location_id!r}")
-        return match
+        # The launch root disk is pinned from BOTH provider floors (type and
+        # image) and from the storage types both sides accept; an impossible
+        # pair fails closed here, long before a billable POST could collect a
+        # provider 400.
+        live = resolve_root_disk(
+            disk_gb=match.disk_gb,
+            storage_type=match.storage_type,
+            image=image,
+            type_storage_types=match.storage_types,
+        )
+        if root_disk_size_gb is not None or root_disk_storage_type is not None:
+            pinned = validate_root_disk(
+                size_gb=root_disk_size_gb,
+                storage_type=root_disk_storage_type,
+                image_label=image.label,
+                os_family=image.os_family,
+            )
+            if pinned[0] < live.size_gb:
+                raise ProviderError(
+                    f"pinned root disk {pinned[0]} GB is below the provider minimum "
+                    f"{live.size_gb} GB for image {image_id!r} in {location_id!r}"
+                )
+            by_image = _normalized_storage_types(image.storage_types)
+            by_type = _normalized_storage_types(match.storage_types)
+            if (by_image and pinned[1] not in by_image) or (by_type and pinned[1] not in by_type):
+                raise ProviderError(
+                    f"pinned root disk storage type {pinned[1]!r} is not accepted by "
+                    f"image {image_id!r} or type {product_id!r}"
+                )
+            return HourlyCheckoutFacts(
+                instance_type=match,
+                root_disk=CloudRootDisk(size_gb=pinned[0], storage_type=pinned[1]),
+            )
+        return HourlyCheckoutFacts(instance_type=match, root_disk=live)
 
     async def list_instances(self, region: str) -> list[CloudInstance]:
         """``GET /publicCloud/v1/instances?region=`` (reconciliation reads)."""
@@ -833,8 +1080,12 @@ class LeasewebHourlyCloudProvider:
         image_id: str,
         region: str,
         reference: str,
+        root_disk_size_gb: int,
+        root_disk_storage_type: str,
         idempotency_key: IdempotencyKey,
         ssh_key_id: str | None = None,
+        image_label: str | None = None,
+        os_family: str | None = None,
     ) -> CloudInstance:
         """``POST /publicCloud/v1/instances`` with the hourly contract.
 
@@ -842,19 +1093,24 @@ class LeasewebHourlyCloudProvider:
         that already materialized is returned as-is instead of launching a
         second billable instance. The platform ledger (not the provider)
         owns exactly-once across processes — concurrent callers serialize
-        on the claimed operation before reaching here.
+        on the claimed operation before reaching here. ``idempotency_key``
+        is NOT sent to the provider: this endpoint documents no labels field,
+        so the deterministic ``reference`` is the correlation identity (and
+        proves non-creation through ``find_by_reference`` before a retry).
         """
         existing = await self.find_by_reference(region, reference)
         if existing is not None:
             return existing
-        labels = {"platform-operation": idempotency_key.value[:63]}
         body = build_create_body(
             instance_type=instance_type,
             image_id=image_id,
             region=region,
             reference=reference,
+            root_disk_size_gb=root_disk_size_gb,
+            root_disk_storage_type=root_disk_storage_type,
             ssh_key_id=ssh_key_id,
-            labels=labels,
+            image_label=image_label,
+            os_family=os_family,
         )
         # Mutating call: transport errors/5xx/429 become ambiguous-outcome
         # errors (never retried inside the transport, never a blind re-POST
