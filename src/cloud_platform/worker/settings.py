@@ -586,16 +586,31 @@ async def catalog_auto_sync(ctx: dict[str, object]) -> None:
     """Provider-neutral periodic offer refresh: sync, price, publish.
 
     One coordinator run over every configured provider (Leaseweb
-    multi-account ordering, Hetzner Cloud): official read-only APIs refresh
-    costs and availability, the server-owned markup policy reprices
-    auto-priced rows, and eligible rows are published unless the operator
-    blocked them. A provider failure is isolated (logged, never raised), an
-    operator-disabled provider is skipped, and overlapping runs serialize on
-    the catalog advisory lock. Runs at the configured interval with a prompt
-    initial pass (``run_at_startup``) that never blocks process readiness
-    (arq executes it as a job after startup).
+    multi-account ordering + Public Cloud, Hetzner Cloud): official read-only
+    APIs refresh costs and availability, the server-owned markup policy
+    reprices auto-priced rows, and eligible rows are published unless the
+    operator blocked them. A provider failure is isolated (logged, never
+    raised), an operator-disabled provider is skipped, and overlapping runs
+    serialize on the catalog advisory lock. Runs at the configured interval
+    with a prompt initial pass (``run_at_startup``) that never blocks process
+    readiness (arq executes it as a job after startup). The refresh itself is
+    :func:`run_catalog_auto_sync_once`, so the cron run, an operator run and
+    the deployment release transition cannot drift apart.
     """
     del ctx
+    await run_catalog_auto_sync_once()
+
+
+async def run_catalog_auto_sync_once() -> Any:
+    """Run exactly one complete catalog refresh and return its report.
+
+    Shared by the periodic job above, the ``catalog auto-sync run`` CLI command
+    and the deployment release transition, so an operator-triggered or
+    release-triggered refresh is the SAME audited code path as the cron run:
+    advisory-locked, provider-isolated, and including pricing + publication.
+    Returns ``None`` when the refresh is disabled by configuration, has no
+    configured provider, or the coordinator declined to run (overlap).
+    """
     async with metrics.job("catalog_auto_sync"):
         from cloud_platform.core.config import get_settings
         from cloud_platform.core.container import Container, create_container
@@ -749,6 +764,7 @@ async def catalog_auto_sync(ctx: dict[str, object]) -> None:
                     len(provider.warnings),
                     len(provider.errors),
                 )
+            return report
         finally:
             if container is not None:
                 try:

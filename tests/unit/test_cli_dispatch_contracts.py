@@ -199,6 +199,16 @@ class TestCatalogAndProviderOperatorSurface:
         assert await _dispatch(monkeypatch, ["catalog", "auto-sync", "doctor"]) == SENTINEL
         stub.assert_awaited_once_with()
 
+    async def test_catalog_auto_sync_run_routes_without_arguments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The release transition / operator repair path: one complete refresh,
+        # bounded by the dedicated catalog budget, verdict in the exit code.
+        stub = _stub(monkeypatch, "catalog_auto_sync_run")
+
+        assert await _dispatch(monkeypatch, ["catalog", "auto-sync", "run"]) == SENTINEL
+        stub.assert_awaited_once_with()
+
     async def test_unknown_catalog_subcommand_fails_closed(self) -> None:
         args = SimpleNamespace(command="catalog", subcommand="auto-sync", subsubcommand="go")
 

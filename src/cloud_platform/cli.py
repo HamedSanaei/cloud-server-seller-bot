@@ -1576,6 +1576,73 @@ async def offers_preview(market: str | None) -> int:
     return 0
 
 
+async def catalog_auto_sync_run() -> int:
+    """Run ONE complete automatic catalog refresh now (the periodic job).
+
+    The same advisory-locked, provider-isolated coordinator pass the worker
+    cron runs: official read-only APIs refresh provider costs/availability, the
+    markup policy reprices auto-priced rows, and eligible rows are published.
+    Unlike the 120-second generic worker job timeout this is bounded by the
+    dedicated catalog budget, which is why it is the supported way to repair a
+    catalog whose provider facts are stale (a hand-rolled timeout that cancels
+    the run mid-walk is what left a whole storefront unpriced).
+
+    Exit 0 only when the refresh really ran and every provider finished without
+    errors; exit 1 when it was disabled, unconfigured, cancelled at its
+    budget, or a provider reported errors. Availability itself is asserted by
+    ``offers readiness``.
+    """
+    import asyncio
+
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.worker.settings import (
+        catalog_auto_sync_timeout,
+        run_catalog_auto_sync_once,
+    )
+
+    settings = get_settings()
+    if not settings.storefront_catalog_sync_enabled:
+        print("catalog auto-sync is disabled by configuration; nothing to run")
+        return 1
+    budget = catalog_auto_sync_timeout()
+    print(f"running one complete catalog refresh (timeout {budget}s)")
+    try:
+        async with asyncio.timeout(budget):
+            report = await run_catalog_auto_sync_once()
+    except TimeoutError:
+        print(
+            f"catalog refresh did NOT finish within {budget}s and was cancelled; "
+            "the advisory lock is released and the next run resumes"
+        )
+        return 1
+    except Exception as exc:
+        print(f"catalog refresh failed ({type(exc).__name__}); see the worker log")
+        return 1
+    if report is None:
+        print(
+            "catalog refresh did not run: it is disabled, no provider is configured, "
+            "or another run holds the catalog advisory lock"
+        )
+        return 1
+    for provider in report.providers:
+        print(
+            f"  {provider.provider_key}: ok={provider.ok} "
+            f"discovered={provider.discovered} persisted={provider.persisted} "
+            f"prices={provider.prices_updated} published={provider.published} "
+            f"retired={provider.retired} warnings={len(provider.warnings)} "
+            f"errors={len(provider.errors)}"
+        )
+    degraded = [provider for provider in report.providers if not provider.ok or provider.errors]
+    if degraded:
+        print(
+            "catalog refresh completed with provider errors: "
+            + ", ".join(provider.provider_key for provider in degraded)
+        )
+        return 1
+    print("catalog refresh completed")
+    return 0
+
+
 async def catalog_auto_sync_doctor() -> int:
     """Read-only: automatic catalog sync configuration and per-provider status.
 
@@ -2609,7 +2676,24 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                     f"stale={fx_stale} valid_until={valid_until}"
                 )
             else:
-                result = await execute  # type: ignore[misc]
+                try:
+                    result = await execute  # type: ignore[misc]
+                except Exception as exc:
+                    # The price book re-validates the converted price against
+                    # the row's OWN provider facts (exact provider rate +
+                    # provider minor cost) and refuses a price it cannot prove.
+                    # That is a row-level failure, never a whole-run abort: the
+                    # row stays fail-closed, the counters show it, and the
+                    # usual cause is a stale/missing provider observation that
+                    # the catalog refresh repairs.
+                    print(
+                        f"  FAIL {row.ref}: the price book rejected the converted "
+                        f"price ({type(exc).__name__}); left fail-closed. A stale or "
+                        "missing provider cost/rate fact is the usual cause; run "
+                        "'catalog auto-sync run' to refresh provider facts, then re-run"
+                    )
+                    failed += 1
+                    continue
                 if result is None:
                     print(
                         f"  FAIL {row.ref}: concurrent pricing/manual change won; "
@@ -3275,6 +3359,9 @@ def _parser() -> argparse.ArgumentParser:
     auto_sync = catalog_sub.add_parser("auto-sync", help="periodic offer refresh")
     auto_sync_sub = auto_sync.add_subparsers(dest="subsubcommand", required=True)
     auto_sync_sub.add_parser("doctor", help="read-only sync configuration and status")
+    auto_sync_sub.add_parser(
+        "run", help="run one complete catalog refresh now (bounded release budget)"
+    )
 
     users = sub.add_parser("users")
     users_sub = users.add_subparsers(dest="subcommand", required=True)
@@ -3439,6 +3526,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "catalog":
         if args.subcommand == "auto-sync" and args.subsubcommand == "doctor":
             return await catalog_auto_sync_doctor()
+        if args.subcommand == "auto-sync" and args.subsubcommand == "run":
+            return await catalog_auto_sync_run()
         print(f"unknown command catalog {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "users":

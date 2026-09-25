@@ -16,7 +16,7 @@ import pytest
 
 import cloud_platform.worker.settings as ws
 from cloud_platform.core.config import Settings
-from cloud_platform.modules.offers.auto_sync import AutoSyncRunReport
+from cloud_platform.modules.offers.auto_sync import AutoSyncRunReport, ProviderAutoSyncReport
 from cloud_platform.modules.offers.domain import CatalogSyncState
 
 
@@ -439,3 +439,105 @@ class TestCatalogAutoSyncDoctor:
         )
         assert await cli_module.catalog_auto_sync_doctor() == 1
         assert "unreadable" in capsys.readouterr().out
+
+
+class TestCatalogAutoSyncRunCommand:
+    """`catalog auto-sync run`: one COMPLETE refresh on demand.
+
+    The release transition needs the provider facts the storefront prices from
+    (a row whose provider observation is stale or missing cannot be
+    canonicalized at all), and an operator needs the same repair path. Both use
+    the worker's own coordinator pass with the DEDICATED catalog budget, never a
+    second implementation and never the generic 120s job timeout whose
+    cancellation left a production catalog unpriced forever.
+    """
+
+    async def test_arq_entry_point_delegates_to_the_shared_pass(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pass_once = AsyncMock(return_value=AutoSyncRunReport(ran=True))
+        monkeypatch.setattr(ws, "run_catalog_auto_sync_once", pass_once)
+        await ws.catalog_auto_sync({})
+        pass_once.assert_awaited_once_with()
+
+    async def test_disabled_catalog_is_not_reported_as_success(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        settings.storefront_catalog_sync_enabled = False
+        pass_once = AsyncMock()
+        monkeypatch.setattr(ws, "run_catalog_auto_sync_once", pass_once)
+        assert await cli_module.catalog_auto_sync_run() == 1
+        assert "disabled by configuration" in capsys.readouterr().out
+        pass_once.assert_not_awaited()
+
+    async def test_run_reports_provider_counters(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        report = AutoSyncRunReport(
+            ran=True,
+            providers=(
+                ProviderAutoSyncReport(
+                    provider_key="leaseweb",
+                    ok=True,
+                    discovered=507,
+                    persisted=507,
+                    prices_updated=456,
+                    published=456,
+                ),
+            ),
+        )
+        monkeypatch.setattr(ws, "run_catalog_auto_sync_once", AsyncMock(return_value=report))
+        assert await cli_module.catalog_auto_sync_run() == 0
+        out = capsys.readouterr().out
+        assert f"timeout {ws.catalog_auto_sync_timeout()}s" in out
+        assert (
+            "leaseweb: ok=True discovered=507 persisted=507 prices=456 "
+            "published=456 retired=0 warnings=0 errors=0"
+        ) in out
+        assert "catalog refresh completed" in out
+
+    async def test_provider_errors_are_not_reported_as_success(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        report = AutoSyncRunReport(
+            ran=True,
+            providers=(
+                ProviderAutoSyncReport(
+                    provider_key="leaseweb", ok=False, errors=("provider unavailable",)
+                ),
+            ),
+        )
+        monkeypatch.setattr(ws, "run_catalog_auto_sync_once", AsyncMock(return_value=report))
+        assert await cli_module.catalog_auto_sync_run() == 1
+        assert "completed with provider errors: leaseweb" in capsys.readouterr().out
+
+    async def test_skipped_run_is_not_reported_as_success(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        import cloud_platform.cli as cli_module
+
+        monkeypatch.setattr(ws, "run_catalog_auto_sync_once", AsyncMock(return_value=None))
+        assert await cli_module.catalog_auto_sync_run() == 1
+        assert "did not run" in capsys.readouterr().out
+
+    async def test_run_is_cancelled_at_its_own_budget(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        """The dedicated budget bounds the run (never an unbounded hang)."""
+        import asyncio
+
+        import cloud_platform.cli as cli_module
+
+        async def _hang() -> Any:
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr(ws, "catalog_auto_sync_timeout", lambda: 0.05)
+        monkeypatch.setattr(ws, "run_catalog_auto_sync_once", _hang)
+        assert await cli_module.catalog_auto_sync_run() == 1
+        assert "was cancelled" in capsys.readouterr().out

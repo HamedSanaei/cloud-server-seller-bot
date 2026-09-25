@@ -157,10 +157,31 @@ class _BookRepo:
         return self._rows[offer_id]
 
 
+class _RejectingBookRepo(_BookRepo):
+    """The real price book's refusal: an unprovable price is rejected.
+
+    ``set_manual_price`` re-validates the converted price against the row's own
+    provider facts (exact provider rate + integer cost) and raises instead of
+    writing a price it cannot prove — the production behaviour that a fake
+    in-memory book cannot reproduce.
+    """
+
+    def __init__(self, rows: list[SellableOffer], reject: set[UUID]) -> None:
+        super().__init__(rows)
+        self.rejected = set(reject)
+
+    async def set_manual_price(self, offer_id: UUID, *args: Any, **kwargs: Any) -> Any:
+        if offer_id in self.rejected:
+            raise ValueError("manual price lacks valid pricing provenance")
+        return await super().set_manual_price(offer_id, *args, **kwargs)
+
+
 def _patch(
-    monkeypatch: pytest.MonkeyPatch, rows: list[SellableOffer]
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[SellableOffer],
+    repo: _BookRepo | None = None,
 ) -> tuple[_BookRepo, _DeterministicRates]:
-    repo = _BookRepo(rows)
+    repo = repo if repo is not None else _BookRepo(rows)
     rates = _DeterministicRates()
     monkeypatch.setattr(
         "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
@@ -297,3 +318,97 @@ class TestNormalizeExecute:
         _patch(monkeypatch, [current])
         assert await cli.offers_normalize_selling_currency(True, "USD") == 0
         assert "already use USD" in capsys.readouterr().out
+
+
+class TestNormalizeAgainstTheRealPriceBook:
+    """The persisted conversion must satisfy the REAL provenance rule.
+
+    The in-memory book in this module writes whatever the command hands it, so
+    only the real validator can prove a write is acceptable — which is exactly
+    how production shipped a normalization pass that raised
+    ``manual price lacks valid pricing provenance`` on a legacy row and aborted
+    the whole run, leaving 456 repairable rows unnormalized.
+    """
+
+    async def test_manual_conversion_passes_the_real_provenance_rule(self) -> None:
+        import dataclasses
+
+        from cloud_platform.modules.offers.domain import has_valid_pricing_provenance
+        from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+
+        row = _base_offer(
+            provider_cost_minor=80900,
+            provider_cost_currency="GBP",
+            selling_price_minor=809,
+            selling_currency="GBP",
+            billing_parameters={"provider_monthly_rate": "809"},
+            auto_priced=False,
+        )
+        priced = await CatalogOfferPricer(_DeterministicRates(), "USD").price_manual(row)
+        candidate = dataclasses.replace(
+            row,
+            selling_price_minor=priced.selling_price_minor,
+            selling_currency=priced.selling_currency,
+            auto_priced=False,
+            pricing_metadata=dict(priced.pricing_metadata),
+        )
+        # GBP 8.09 at 1.27 = 10.2743 -> 1028 USD cents (never a bare 809 relabel)
+        # and the price book accepts it because the provider fact is present.
+        assert (priced.selling_price_minor, priced.selling_currency) == (1028, "USD")
+        assert has_valid_pricing_provenance(candidate, "USD") is True
+
+    async def test_legacy_row_without_the_provider_fact_is_not_repriced(self) -> None:
+        """A stale/missing provider observation stays fail-closed.
+
+        The legacy row has no exact provider rate, so no conversion of it can be
+        proven: the real validator refuses it, which is why the release
+        transition refreshes provider facts BEFORE it canonicalizes.
+        """
+        import dataclasses
+
+        from cloud_platform.modules.offers.domain import has_valid_pricing_provenance
+        from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+
+        legacy = _manual_gbp_offer()
+        assert legacy.billing_parameters == {}
+        priced = await CatalogOfferPricer(_DeterministicRates(), "USD").price_manual(legacy)
+        candidate = dataclasses.replace(
+            legacy,
+            selling_price_minor=priced.selling_price_minor,
+            selling_currency=priced.selling_currency,
+            auto_priced=False,
+            pricing_metadata=dict(priced.pricing_metadata),
+        )
+        assert has_valid_pricing_provenance(candidate, "USD") is False
+
+    async def test_a_rejected_row_never_aborts_the_whole_run(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        """One unprovable row is a counted failure, not a fatal exception.
+
+        Rows are processed in a stable order, so the rejected row is handled
+        FIRST and the repairable row behind it must still be normalized.
+        """
+        legacy = _base_offer(
+            product_id="VPS01_1",
+            provider_cost_minor=700,
+            provider_cost_currency="GBP",
+            selling_price_minor=809,
+            selling_currency="GBP",
+            billing_parameters={},
+            auto_priced=False,
+        )
+        healable = _base_offer(product_id="VPS02_1")
+        repo = _RejectingBookRepo([legacy, healable], {legacy.id})
+        _patch(monkeypatch, [legacy, healable], repo=repo)
+        assert await cli.offers_normalize_selling_currency(False, "USD") == 1
+        out = capsys.readouterr().out
+        assert "the price book rejected the converted price (ValueError)" in out
+        assert f"FAIL {legacy.ref}" in out
+        assert "normalized 1 offer(s) to USD; intentionally skipped: 0; failed: 1" in out
+        # The row behind the rejection was still repaired...
+        assert [entry["id"] for entry in repo.auto_prices] == [healable.id]
+        # ...and the rejected row kept its old price (fail-closed, no guessing).
+        rows = {row.id: row for row in await repo.list_all()}
+        assert rows[legacy.id].selling_currency == "GBP"
+        assert rows[legacy.id].selling_price_minor == 809

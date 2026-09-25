@@ -152,6 +152,7 @@ uv run python -m cloud_platform.cli fx doctor
 uv run python -m cloud_platform.cli fx rates --target USD
 uv run python -m cloud_platform.cli offers doctor
 uv run python -m cloud_platform.cli offers normalize-selling-currency --target USD --dry-run
+uv run python -m cloud_platform.cli catalog auto-sync run
 uv run python -m cloud_platform.cli offers normalize-selling-currency --target USD --execute
 uv run python -m cloud_platform.cli offers readiness
 uv run python -m cloud_platform.cli catalog auto-sync doctor
@@ -162,6 +163,15 @@ uv run python -m cloud_platform.cli catalog auto-sync doctor
 intent, recomputes auto rows from native cost plus policy markup, converts
 manual rows from their existing selling amount without a second markup, and is
 idempotent. It never changes provider-native cost or an operator-disabled row.
+
+`catalog auto-sync run` executes exactly one complete provider refresh (the
+worker cron pass: official read-only APIs, server-owned markup, publication)
+with the DEDICATED catalog timeout. It comes BEFORE canonicalization because a
+row's price can only be converted against provider facts the row already
+carries: a row whose exact provider rate is missing, or whose integer cost was
+stored under a wrong minor-unit assumption, is refused by the price book until
+the provider is re-observed. Canonicalization first, without the refresh, can
+only report it as `failed`.
 
 Its result is classified, and the exit code reports only REAL failures:
 `normalized` (or `WOULD` in dry-run), `intentionally skipped` (operator-disabled
