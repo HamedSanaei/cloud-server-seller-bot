@@ -217,6 +217,7 @@ class _CloudProviderFake:
         types_currency: str | None = None,
         images: dict[str, list[Any]] | None = None,
         images_error: Exception | None = None,
+        global_images: bool = False,
     ) -> None:
         self._regions = regions or []
         self._types = types or {}
@@ -232,6 +233,11 @@ class _CloudProviderFake:
         # legacy default), {} means "conclusively none everywhere".
         self._images = images
         self._images_error = images_error
+        # The real customer-facing read falls back to the provider's GLOBAL
+        # image catalog when the region filter is rejected, so the double can
+        # serve images for every region while the region-scoped routing probe
+        # keeps its own scripted answer.
+        self._global_images = global_images
         self.reads: list[str] = []
         self.posts = 0
 
@@ -267,14 +273,27 @@ class _CloudProviderFake:
         )
 
     async def list_images(self, region: str) -> list[Any]:
+        """Customer-facing read (the real adapter falls back to the global
+        catalog when the provider rejects a region filter)."""
         self.reads.append(f"images:{region}")
         if self._images_error is not None:
             raise self._images_error
+        if self._global_images:
+            return [_image()]
         if self._images is not None:
             return list(self._images.get(region, []))
         from cloud_platform.providers.leaseweb.cloud import CloudImage
 
         return [CloudImage(id="ubuntu-24.04", label="Ubuntu 24.04", os_family="ubuntu")]
+
+    async def probe_region_images(self, region: str) -> list[Any]:
+        """Region-scoped routing probe: scripted per region, NO fallback."""
+        self.reads.append(f"probe:{region}")
+        if self._images_error is not None:
+            raise self._images_error
+        if self._images is not None:
+            return list(self._images.get(region, []))
+        return [_image()]
 
     async def create_instance(self, **kwargs: Any) -> Any:
         self.posts += 1
@@ -608,8 +627,53 @@ class TestImageAwareRouting:
         }
         assert ("lsw.mini", "eu-central-1") in result.verified
         assert ("lsw.mini", "eu-west-2") in result.verified
-        assert "images:eu-west-2" in north.reads
-        assert "images:eu-west-2" in uk.reads
+        assert "probe:eu-west-2" in north.reads
+        assert "probe:eu-west-2" in uk.reads
+
+    async def test_global_fallback_never_moves_a_region_owner(self) -> None:
+        """The customer-facing read must not drive ownership.
+
+        Observed in production: the adapter's global image fallback made every
+        credential look capable for every region, which moved eu-west-2 to the
+        priority-first account — an INSERT the (provider, product, location)
+        offer identity rejects, so the whole region stopped refreshing. The
+        sync therefore asks the region-scoped probe, and this test pins that:
+        both accounts can SERVE images for eu-west-2, yet the owner stays uk.
+        """
+        shared = {
+            "eu-central-1": [_ctype("lsw.mini", "eu-central-1")],
+            "eu-west-2": [_ctype("lsw.mini", "eu-west-2")],
+        }
+        north = _CloudProviderFake(
+            regions=[_region("eu-central-1"), _region("eu-west-2")],
+            types=dict(shared),
+            images={"eu-central-1": [_image()], "eu-west-2": []},
+            global_images=True,
+        )
+        uk = _CloudProviderFake(
+            regions=[_region("eu-central-1"), _region("eu-west-2")],
+            types=dict(shared),
+            images={"eu-central-1": [], "eu-west-2": [_image()]},
+            global_images=True,
+        )
+        # Both credentials can list images for eu-west-2 through the
+        # customer-facing read (that is exactly what the fallback does).
+        assert await north.list_images("eu-west-2")
+        assert await uk.list_images("eu-west-2")
+
+        _result, offers, _locations = await _run_hourly_sync(
+            {"north": north, "uk": uk}, {"north": 10, "uk": 20}
+        )
+        owners = {
+            (call["product_id"], call["location_id"]): call["provider_account_id"]
+            for call in offers.upserts
+        }
+        assert owners == {
+            ("lsw.mini", "eu-central-1"): "north",
+            ("lsw.mini", "eu-west-2"): "uk",
+        }
+        assert "probe:eu-west-2" in north.reads
+        assert "probe:eu-west-2" in uk.reads
 
     async def test_pair_without_images_is_known_but_not_sellable(self) -> None:
         solo = _CloudProviderFake(

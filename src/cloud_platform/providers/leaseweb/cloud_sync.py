@@ -239,8 +239,16 @@ class LeasewebHourlyCloudSyncer:
                 # account, so ownership below prefers image-capable accounts.
                 # A failed read is "unknown" (never penalized); only a
                 # conclusive empty read routes away.
+                #
+                # The STRICT region-scoped probe is used on purpose: the
+                # customer-facing read falls back to the provider's global
+                # image catalog, which would make every credential look
+                # capable for every region and silently move a region's owner
+                # to the priority-first account (the offer identity is
+                # (provider, product, location) and cannot express two
+                # owners).
                 try:
-                    images = await provider.list_images(region.id)
+                    images = await provider.probe_region_images(region.id)
                     images_state = "ok" if images else "empty"
                 except Exception as exc:
                     logger.warning(

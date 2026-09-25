@@ -700,14 +700,18 @@ class LeasewebHourlyCloudProvider:
 
         The documented ``?region=`` filter is attempted first. The provider's
         image catalog is however GLOBAL — every entry states ``region: null``,
-        and the filter currently accepts only one region id, rejecting any
-        other sellable region with HTTP 400 "not valid region" (observed
-        2026-09-25 for eu-west-3, ap-northeast-1, us-east-1, ... while
+        and the filter currently accepts only the credential's own region id,
+        rejecting any other sellable region with HTTP 400 "not valid region"
+        (observed 2026-09-25 for eu-west-3, ap-northeast-1, us-east-1, ... while
         ``/regions`` and ``/instanceTypes`` accept all ten). A rejected request
         shape therefore falls back to the same endpoint's global read instead
         of reporting a sellable plan as having no operating system; every other
         failure (auth, forbidden, not found, rate limit, unavailable) still
         propagates and fails closed.
+
+        Ownership/routing decisions must NOT use this method: the fallback
+        makes every credential look capable for every region. Call
+        :meth:`probe_region_images` for that.
         """
         try:
             payload = await self._get("/publicCloud/v1/images", {"region": region})
@@ -719,6 +723,22 @@ class LeasewebHourlyCloudProvider:
                 type(exc).__name__,
             )
             payload = await self._get("/publicCloud/v1/images")
+        return self._images_from(payload)
+
+    async def probe_region_images(self, region: str) -> list[CloudImage]:
+        """Region-scoped image read: does THIS credential serve this region?
+
+        Unlike :meth:`list_images` there is deliberately NO global fallback.
+        The provider rejects the region filter with HTTP 400 for every region
+        except the credential's own one, so the outcome is exactly the routing
+        fact the catalog sync needs (a Leaseweb Sales Organization lists and
+        bills its own locations). The documented request shape is sent
+        unchanged, and a rejection propagates.
+        """
+        payload = await self._get("/publicCloud/v1/images", {"region": region})
+        return self._images_from(payload)
+
+    def _images_from(self, payload: Any) -> list[CloudImage]:
         return [
             parsed
             for item in self._items(payload, "images", "data", "items")

@@ -252,6 +252,22 @@ class TestImages:
         assert images[0].architecture == "x86_64"
         assert [call["params"] for call in calls] == [{"region": "eu-west-3"}, {}]
 
+    async def test_region_scoped_probe_never_falls_back(self) -> None:
+        """Ownership routing needs the rejection, not a global list.
+
+        The region filter's accepted value identifies the credential's own
+        Sales Organization location; the fallback that fixes the customer
+        screen must therefore never be used for routing.
+        """
+        provider = _provider()
+        provider._transport.request = AsyncMock(
+            side_effect=LeasewebValidationError("errorCode=400; Validation Failed; HTTP 400")
+        )
+        with pytest.raises(LeasewebValidationError):
+            await provider.probe_region_images("eu-west-3")
+        assert provider._transport.request.await_count == 1
+        assert provider._transport.request.await_args.args[1] == "/publicCloud/v1/images"
+
     async def test_other_read_failures_do_not_fall_back(self) -> None:
         """Only a rejected request SHAPE widens the read; nothing else does."""
         from cloud_platform.providers.leaseweb.errors import LeasewebAuthenticationError

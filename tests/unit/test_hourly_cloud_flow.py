@@ -388,6 +388,10 @@ class FakeHourlyProvider:
             )
         )
 
+    async def probe_region_images(self, region: str) -> list[CloudImage]:
+        """Region-scoped routing probe (the real adapter has no fallback here)."""
+        return await self.list_images(region)
+
     async def validate_hourly_offer_for_checkout(
         self,
         *,

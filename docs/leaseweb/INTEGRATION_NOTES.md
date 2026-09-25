@@ -43,8 +43,18 @@ Observations (live account, 2026-09-25):
   "errorDetails":{"region":["The value \"eu-west-3\" is not valid region.
   Valid regions are: eu-central-1"]}}`.
   `GET /publicCloud/v1/images` **without** the filter answers `200` with the
-  same 19 `READY` images, so the region-scoped read is attempted first and a
-  rejected request shape falls back to the global read (warning logged).
+  same 19 `READY` images, so the CUSTOMER-facing read
+  (`list_images`, used by the OS picker and create-time image validation)
+  attempts the region-scoped request first and falls back to the global read
+  when the request shape is rejected (warning logged).
+  The fallback must never be used for ROUTING: it makes every credential look
+  image-capable for every region, which moved eu-west-2's owner to the
+  priority-first account and broke that region's refresh (the offer identity
+  is `(provider, product, location)` and cannot express two owners). The
+  catalog sync therefore calls the strict region-scoped probe
+  (`probe_region_images`, no fallback); the accepted region id identifies the
+  account's own Sales Organization location (north: `eu-central-1`,
+  uk: `eu-west-2`).
   An unknown parameter name (`regionId`) is silently ignored and returns the
   unfiltered list, which is why the filter is never trusted as a
   region-scoping guarantee.
