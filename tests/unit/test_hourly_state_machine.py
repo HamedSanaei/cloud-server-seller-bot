@@ -184,6 +184,71 @@ def _snapshot(price: FakeSnapshots) -> Any:
     return price.created[0][1]
 
 
+class FakeCapacityRepo:
+    """In-memory durable capacity store (the SQL adapter has a live PG test)."""
+
+    def __init__(self, records: dict[str, Any] | None = None) -> None:
+        self.records: dict[str, Any] = dict(records or {})
+        self.writes: list[dict[str, Any]] = []
+
+    async def get(self, provider_key: str, credential_account_id: str) -> Any:
+        return self.records.get(credential_account_id)
+
+    async def list_for_provider(self, provider_key: str) -> list[Any]:
+        return list(self.records.values())
+
+    async def limit_reached_accounts(self, provider_key: str, *, now: Any = None) -> frozenset[str]:
+        return frozenset(
+            account_id
+            for account_id, record in self.records.items()
+            if record.is_limit_reached(now=now)
+        )
+
+    async def record_limit_reached(
+        self,
+        *,
+        provider_key: str,
+        credential_account_id: str,
+        observation: Any,
+        ttl_seconds: int = 3600,
+        now: Any = None,
+    ) -> Any:
+        from cloud_platform.modules.provider_capacity.domain import AccountCapacity
+
+        current = self.records.get(credential_account_id) or AccountCapacity(
+            provider_key=provider_key,
+            credential_account_id=credential_account_id,
+            observations=0,
+        )
+        updated = current.with_limit_reached(
+            observation=observation, ttl_seconds=ttl_seconds, now=now
+        )
+        self.records[credential_account_id] = updated
+        self.writes.append(
+            {
+                "account": credential_account_id,
+                "error_code": observation.error_code,
+                "correlation_id": observation.correlation_id,
+                "location_id": observation.location_id,
+                "product_id": observation.product_id,
+                "ttl_seconds": ttl_seconds,
+            }
+        )
+        return updated
+
+
+class _DictResolver:
+    """Account-aware adapter resolution without any provider-specific branching."""
+
+    def __init__(self, adapters: dict[str, Any]) -> None:
+        self._adapters = dict(adapters)
+        self.resolved: list[str | None] = []
+
+    def adapter_for(self, provider_key: str, credential_account_id: str | None = None) -> Any:
+        self.resolved.append(credential_account_id)
+        return self._adapters.get(str(credential_account_id or ""))
+
+
 def _service(
     offers: FakeOffersRepo,
     cloud: FakeHourlyAdapter,
@@ -191,6 +256,9 @@ def _service(
     servers: FakeServerRepo | None = None,
     snapshots: FakeSnapshots | None = None,
     ops: FakeOpsRepo | None = None,
+    capacity: Any | None = None,
+    resolver: Any | None = None,
+    capacity_ttl_seconds: int = 3600,
 ) -> tuple[HourlyCloudService, FakeServerRepo, FakeSnapshots, FakeOpsRepo]:
     servers = servers or FakeServerRepo()
     snapshots = snapshots or FakeSnapshots()
@@ -204,6 +272,9 @@ def _service(
         operation_repo=ops,  # type: ignore[arg-type]
         audit_repo=FakeAuditRepo(),
         cloud_providers={PROVIDER: cloud},
+        capacity_repo=capacity,
+        capacity_ttl_seconds=capacity_ttl_seconds,
+        cloud_resolver=resolver,
     )
     return service, servers, snapshots, ops
 

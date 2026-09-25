@@ -15,6 +15,7 @@ from cloud_platform.db.base import CatalogSyncState as _CatalogSyncStateModel
 from cloud_platform.db.base import SellableOffer as _SellableOfferModel
 from cloud_platform.modules.fx.domain import SUPPORTED_CURRENCIES
 from cloud_platform.modules.offers.domain import (
+    BILLING_MODEL_HOURLY,
     DOMESTIC_PROVIDER_COST_CURRENCIES,
     CatalogSyncState,
     OfferNotFoundError,
@@ -321,7 +322,28 @@ class SqlAlchemySellableOfferRepository:
                     )
                 if len(matching) > 1:
                     raise ValueError("duplicate account-scoped provider observations exist")
-                row = matching[0] if matching else None
+                if matching:
+                    row = matching[0]
+                elif len(candidates) == 1:
+                    # ELIGIBILITY CHANGE: the pair moved to another credential
+                    # account (the previous owner was drained/removed or hit its
+                    # provider limit, and a higher-priority account newly proved
+                    # it). The offer identity is
+                    # ``(provider_key, product_id, location_id)`` — the row is
+                    # UNIQUE on exactly that — so the observation is re-pinned
+                    # in place instead of inserted (which would violate the
+                    # constraint and, as production showed, fail the whole sync
+                    # source). Accepted contracts are unaffected: a server or
+                    # order carries its own pinned account and immutable
+                    # fingerprint, and no accepted row is ever rewritten here.
+                    row = candidates[0]
+                elif not candidates:
+                    row = None
+                else:
+                    raise ValueError(
+                        "provider observation is ambiguous; a credential account "
+                        "cannot be reassigned across duplicate rows"
+                    )
             if row is None:
                 row = _SellableOfferModel(
                     provider_key=provider_key,
@@ -389,6 +411,37 @@ class SqlAlchemySellableOfferRepository:
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)
+
+    async def hourly_account_owners(self, provider_key: str) -> dict[tuple[str, str], str]:
+        """``(product_id, location_id) -> credential account`` for hourly rows.
+
+        Read-only ownership map used by the hourly catalog sync to keep a pair's
+        publisher STABLE: an inconclusive provider read must never move a
+        region to an account that has never proved it, and a capacity-limited
+        account must be able to keep the row it already owns (the offer's
+        fingerprint provenance) while simply not being published for NEW
+        orders. Rows without a credential account are omitted rather than
+        guessed.
+        """
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        _SellableOfferModel.product_id,
+                        _SellableOfferModel.location_id,
+                        _SellableOfferModel.provider_account_id,
+                    ).where(
+                        _SellableOfferModel.provider_key == provider_key,
+                        _SellableOfferModel.billing_model == BILLING_MODEL_HOURLY,
+                    )
+                )
+            ).all()
+        owners: dict[tuple[str, str], str] = {}
+        for product_id, location_id, account_id in rows:
+            account = str(account_id or "").strip()
+            if account:
+                owners[(str(product_id), str(location_id))] = account
+        return owners
 
     async def retire_nonactive_accounts(
         self,

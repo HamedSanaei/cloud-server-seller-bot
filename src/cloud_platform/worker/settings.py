@@ -438,6 +438,26 @@ async def _close_telegram_notifiers(notifiers: tuple[Any, Any] | None) -> None:
 CATALOG_AUTO_SYNC_TIMEOUT_SECONDS = 600
 
 
+def _account_capacity_repository() -> Any | None:
+    """Durable provider-account capacity store for the hourly cloud sync.
+
+    Returns None (with a warning) when the DB layer cannot be imported, so a
+    wiring problem degrades to "capacity unknown" instead of stopping the
+    catalog sync entirely — capacity is an additional publication gate, never a
+    prerequisite for discovering inventory.
+    """
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+
+        return SqlAlchemyAccountCapacityRepository(SessionFactory)
+    except Exception:  # pragma: no cover - import guard
+        logger.warning("provider capacity store unavailable", exc_info=True)
+        return None
+
+
 def catalog_auto_sync_timeout() -> int:
     """Dedicated ``catalog_auto_sync`` cron timeout in seconds.
 
@@ -696,6 +716,10 @@ async def run_catalog_auto_sync_once() -> Any:
                                 accounts=dict(cloud_router.providers),
                                 account_priorities=cloud_router.priorities,
                                 account_states=cloud_router.account_states,
+                                # Durable capacity knowledge: an account whose
+                                # provider limit was definitively refused must
+                                # not be handed NEW orders by this sync run.
+                                capacity=_account_capacity_repository(),
                             )
                         )
                     )

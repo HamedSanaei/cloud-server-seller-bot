@@ -566,6 +566,9 @@ class Container:
         from cloud_platform.modules.provider_accounts.repository import (
             SqlAlchemyProviderAccountRepository,
         )
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
         from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 
         return HourlyCloudService(
@@ -581,6 +584,12 @@ class Container:
             audit_repo=_audit_repository(self.session_factory),
             cloud_providers=self.hourly_cloud_providers(),
             cloud_resolver=self.hourly_cloud_resolver(),
+            # Pre-checkout capacity gate: an offer pinned to an account whose
+            # provider instance limit was definitively refused is not sellable
+            # until the signal expires — the catalog stops publishing through
+            # it too, but this catches an offer published before the refusal.
+            capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
+            capacity_ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
             catalog_currency=get_settings().fx_catalog_pricing_currency,
             catalog_stale_limit_seconds=(get_settings().fx_frankfurter_catalog_max_stale_seconds),
         )

@@ -53,11 +53,17 @@ from cloud_platform.modules.pricing.service import ServerPriceSnapshotService
 from cloud_platform.modules.provider_accounts.domain import (
     ProviderAccountRepository,
 )
+from cloud_platform.modules.provider_capacity.domain import (
+    DEFAULT_LIMIT_TTL_SECONDS,
+    AccountCapacityRepository,
+    CapacityObservation,
+)
 from cloud_platform.modules.users.domain import User, UserStatus
 from cloud_platform.modules.wallet.domain import WalletRepository, WalletStatus
 from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.errors import (
     ProviderAuthError,
+    ProviderCapacityError,
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
@@ -414,6 +420,18 @@ class HourlyProviderUnavailableError(HourlyError):
     """A TRANSIENT provider problem blocked checkout (retry later)."""
 
 
+class HourlyAccountCapacityError(HourlyError):
+    """The pinned credential account cannot accept a NEW instance right now.
+
+    A provider capacity/account-limit refusal (Leaseweb ``PC-2031``) is NOT an
+    offer defect: the plan, location and image are all sellable and were
+    re-proven; the provider account has reached its instance limit. The
+    customer is told to retry shortly or choose another plan/location — never
+    that "this offer is unavailable" (which would be untrue and untraceable),
+    and never which internal credential account is involved.
+    """
+
+
 class HourlyCloudResolver:
     """Provider-neutral port for hourly cloud adapters (multi-account).
 
@@ -467,6 +485,12 @@ class HourlyCloudService:
         audit_repo: AuditRepository,
         cloud_providers: dict[str, Any] | None = None,
         cloud_resolver: HourlyCloudResolver | Any | None = None,
+        #: Durable per-credential-account capacity knowledge. Optional: a
+        #: deployment without it keeps working (capacity is then simply never
+        #: known), but a configured store is what keeps a NEW order off an
+        #: account whose provider limit was already definitively refused.
+        capacity_repo: AccountCapacityRepository | Any | None = None,
+        capacity_ttl_seconds: int = DEFAULT_LIMIT_TTL_SECONDS,
         #: Canonical storefront currency for foreign offers.  USD is the
         #: current deployment default; an explicit configured value is still
         #: validated at this application boundary.
@@ -486,6 +510,8 @@ class HourlyCloudService:
         # exact adapter that owns the observation. The plain dict stays as
         # the legacy fallback for single-credential deployments.
         self._cloud_resolver = cloud_resolver
+        self._capacity = capacity_repo
+        self._capacity_ttl_seconds = capacity_ttl_seconds
         target_currency = (catalog_currency or "").strip().upper()
         if target_currency not in SUPPORTED_CURRENCIES:
             raise ValueError("catalog_currency must be an audited currency code")
@@ -519,6 +545,84 @@ class HourlyCloudService:
         if adapter is None:
             raise HourlyNotAvailableError(f"no hourly adapter for {provider_key!r}")
         return adapter
+
+    # -- provider account capacity -----------------------------------------
+
+    async def _account_capacity(
+        self, provider_key: str, credential_account_id: str | None
+    ) -> Any | None:
+        """Best-effort capacity read for one pinned account.
+
+        A capacity-store failure must never block checkout: an unreadable
+        store means "capacity unknown", not "account limited". The catalog is
+        what keeps a limited account out of new-order publication; this guard
+        is the second line of defence for an offer that was published before
+        the refusal was learned.
+        """
+        repo = self._capacity
+        account_id = str(credential_account_id or "").strip()
+        if repo is None or not account_id:
+            return None
+        try:
+            return await repo.get(provider_key, account_id)
+        except Exception:
+            logger.warning(
+                "hourly capacity lookup failed for %s/%s; proceeding without capacity knowledge",
+                provider_key,
+                account_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _record_account_capacity_limit(
+        self,
+        *,
+        provider_key: str,
+        credential_account_id: str | None,
+        location_id: str | None,
+        product_id: str | None,
+        error: ProviderCapacityError,
+    ) -> None:
+        """Remember a definitive account-capacity refusal (never fatal).
+
+        The ADMIN log carries the full safe evidence (provider, credential
+        account id, provider error code, correlation id, affected
+        region/type). The customer sees only the dedicated capacity message.
+        Recording is best-effort: the provider failure itself is what fails
+        the operation, and losing the signal must not change that outcome.
+        """
+        account_id = str(credential_account_id or "").strip()
+        error_code = str(getattr(error, "error_code", None) or "").strip() or None
+        correlation_id = str(getattr(error, "correlation_id", None) or "").strip() or None
+        logger.warning(
+            "hourly provider account at capacity: provider=%s account=%s code=%s "
+            "correlationId=%s region=%s type=%s",
+            provider_key,
+            account_id or "-",
+            error_code or "-",
+            correlation_id or "-",
+            location_id or "-",
+            product_id or "-",
+        )
+        repo = self._capacity
+        if repo is None or not account_id:
+            return
+        try:
+            await repo.record_limit_reached(
+                provider_key=provider_key,
+                credential_account_id=account_id,
+                observation=CapacityObservation(
+                    error_code=error_code,
+                    correlation_id=correlation_id,
+                    location_id=location_id,
+                    product_id=product_id,
+                ),
+                ttl_seconds=self._capacity_ttl_seconds,
+            )
+        except Exception:
+            logger.exception(
+                "failed to record provider capacity limit for %s/%s", provider_key, account_id
+            )
 
     async def _repair_hourly_bundle(
         self,
@@ -899,6 +1003,21 @@ class HourlyCloudService:
 
         account = await self._accounts.get_or_create_active(user.id, offer.provider_key)
         pinned_account = str(offer.provider_account_id or "").strip() or None
+        # PRE-CHECKOUT capacity gate. If the account pinned to this offer has
+        # already definitively refused a new instance (and the signal has not
+        # expired), no new order may be accepted against it: the provider would
+        # reject it again. The catalog stops publishing through that account, so
+        # this only catches an offer that was published before the signal was
+        # learned. It never re-routes to another account — the accepted
+        # contract is pinned to this one — and it answers about the ACCOUNT, so
+        # it is evaluated before anything else about the account is resolved.
+        capacity = await self._account_capacity(offer.provider_key, pinned_account)
+        if capacity is not None and not capacity.accepts_new_orders():
+            raise HourlyAccountCapacityError(
+                "the provider account pinned to this offer has reached its "
+                f"instance limit ({capacity.error_code or 'limit reached'}); "
+                "it cannot accept new instances until the limit clears"
+            )
         try:
             adapter = self._adapter_for(offer.provider_key, pinned_account)
         except HourlyNotAvailableError as exc:
@@ -1308,6 +1427,25 @@ class HourlyCloudService:
                 image_label=image.label,
                 os_family=image.os_family,
                 idempotency_key=IdempotencyKey(claimed.operation_key),
+            )
+        except ProviderCapacityError as exc:
+            # The provider account has no capacity for a NEW instance. This is
+            # a DEFINITIVE pre-acceptance refusal (no resource was created), so
+            # the operation ends FAILED with its safe evidence preserved, and
+            # the account is remembered as limited for NEW orders. The
+            # contract's pinned account is never swapped and the POST is never
+            # replayed — recovery is a brand-new checkout.
+            await self._record_account_capacity_limit(
+                provider_key=server.provider_key,
+                credential_account_id=pinned_account,
+                location_id=snapshot.offer.location_id,
+                product_id=snapshot.offer.plan_id,
+                error=exc,
+            )
+            return await self._fail_operation(
+                claimed,
+                server,
+                f"provider account has no capacity for new instances: {exc}",
             )
         except ProviderOutcomeUnknown as exc:
             claimed.mark_outcome_unknown(str(exc))

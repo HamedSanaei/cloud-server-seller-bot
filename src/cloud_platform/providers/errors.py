@@ -16,6 +16,23 @@ class ProviderConflict(ProviderError):
     pass
 
 
+class ProviderCapacityError(ProviderError):
+    """The provider ACCOUNT has no capacity for a NEW billable resource.
+
+    Provider-neutral on purpose: application code must be able to tell "this
+    credential account reached its provider limit" (Leaseweb ``PC-2031`` /
+    "Customer limit reached") apart from "this offer/image is unavailable"
+    without importing any provider adapter.
+
+    It is a fact about the ACCOUNT, so the correct responses are a dedicated
+    customer message, a durable per-account capacity signal, and NO automatic
+    retry — least of all through another credential account, which would break
+    the accepted contract's pinned account and its exactly-once guarantees.
+    """
+
+    retryable = False
+
+
 class ProviderUnavailable(ProviderError):
     pass
 

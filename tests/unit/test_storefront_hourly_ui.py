@@ -282,6 +282,67 @@ class TestHourlyBuyScreens:
         assert text == Translator().t("store.cloud_retry_later")
         assert text != Translator().t("offers.unavailable")
 
+    async def test_a_capacity_refusal_shows_the_dedicated_provider_message(self) -> None:
+        """PC-2031 is not "this offer is unavailable": the account is full.
+
+        The customer must be told what happened and what to do, and must never
+        see an internal credential account id, provider code or correlation id.
+        """
+        from cloud_platform.modules.hourly.service import HourlyAccountCapacityError
+
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+
+        class _AtCapacity:
+            async def create_instance(self, **kwargs: Any) -> Any:
+                raise HourlyAccountCapacityError(
+                    "the provider account pinned to this offer has reached its "
+                    "instance limit (PC-2031); account sales-org-north"
+                )
+
+        bot._hourly = _AtCapacity()
+        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        text = screen.text.strip()
+        assert text == Translator().t("store.cloud_account_capacity")
+        assert text != Translator().t("offers.unavailable")
+        assert "PC-2031" not in text
+        assert "sales-org-north" not in text
+        # Actionable Persian text: capacity full + retry/choose another plan.
+        assert "ظرفیت" in text
+        assert "دوباره تلاش" in text
+
+    async def test_an_inconclusive_image_read_is_reported_as_temporary(self) -> None:
+        """A transient image-catalog failure is not "the OS is gone"."""
+        from cloud_platform.modules.checkout.service import OsTemporarilyUnavailableError
+
+        offers = FakeOffersRepo([_offer()])
+        bot, view = self._ui_with(offers, [_image()])
+
+        async def _unreadable(offer_id: Any) -> Any:
+            raise OsTemporarilyUnavailableError("image catalog temporarily unreadable")
+
+        view.cloud_images_screen = _unreadable  # type: ignore[method-assign]
+        screen = await _press(bot, bot._callback("store", "cloud_images", _ref(offers)))
+        text = screen.text.strip()
+        assert text == Translator().t("offers.os_temporarily_unavailable")
+        assert text != Translator().t("store.cloud_no_images")
+
+    async def test_a_stale_image_selection_after_a_transient_failure_retries(self) -> None:
+        """The hourly create path must not claim "OS unavailable" on a wobble."""
+        from cloud_platform.modules.checkout.service import OsTemporarilyUnavailableError
+
+        offers = FakeOffersRepo([_offer()])
+        bot, view = self._ui_with(offers, [_image()])
+
+        async def _unreadable(offer: Any, index: int) -> Any:
+            raise OsTemporarilyUnavailableError("image catalog temporarily unreadable")
+
+        view.cloud_image_by_index = _unreadable  # type: ignore[method-assign]
+        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        text = screen.text.strip()
+        assert text == Translator().t("offers.os_temporarily_unavailable")
+        assert text != Translator().t("offers.os_unavailable")
+
     async def test_buy_rejects_unexpected_error_to_error_screen(self) -> None:
         offers = FakeOffersRepo([_offer()])
         bot, _ = self._ui_with(offers, [_image()])

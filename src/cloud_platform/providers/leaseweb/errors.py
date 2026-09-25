@@ -36,6 +36,7 @@ import httpx
 
 from cloud_platform.providers.errors import (
     ProviderAuthError,
+    ProviderCapacityError,
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
@@ -45,9 +46,11 @@ from cloud_platform.providers.errors import (
 )
 
 __all__ = [
+    "CAPACITY_ERROR_CODES",
     "CORRELATION_HEADER",
     "LeasewebAmbiguousMutationError",
     "LeasewebAuthenticationError",
+    "LeasewebCapacityError",
     "LeasewebConflictError",
     "LeasewebError",
     "LeasewebErrorPayload",
@@ -59,6 +62,7 @@ __all__ = [
     "LeasewebTimeoutError",
     "LeasewebUnavailableError",
     "LeasewebValidationError",
+    "is_capacity_exhausted",
     "parse_error_payload",
     "redact_sensitive",
 ]
@@ -68,7 +72,42 @@ __all__ = [
 #: quote to Leaseweb support.
 CORRELATION_HEADER = "APIGW-CORRELATION-ID"
 
+#: Leaseweb error codes that mean "this credential account cannot accept a NEW
+#: billable instance right now". Observed live on ``POST /publicCloud/v1/instances``
+#: for the Frankfurt Sales Organization while it already ran two instances::
+#:
+#:     {"errorCode": "PC-2031", "errorMessage": "Customer limit reached"}
+#:
+#: It is a CAPACITY fact about the account, not a defect of the requested
+#: offer, and retrying the same account does not clear it.
+CAPACITY_ERROR_CODES: frozenset[str] = frozenset({"PC-2031"})
+
+#: Message fragments (case-insensitive) identifying the same condition when a
+#: response omits ``errorCode``. Deliberately narrow: a loose "limit" match
+#: would misclassify unrelated validation failures as capacity problems.
+_CAPACITY_MESSAGE_FRAGMENTS: tuple[str, ...] = (
+    "customer limit reached",
+    "customer limit has been reached",
+    "account limit reached",
+)
+
 _MAX_MESSAGE = 300
+
+
+def is_capacity_exhausted(error_code: str | None, message: str | None) -> bool:
+    """Whether a provider failure is an ACCOUNT CAPACITY limit (PC-2031).
+
+    Safe for any input: an unknown/absent code falls back to the documented
+    message text, and anything unrecognized is NOT a capacity condition.
+    """
+    code = (error_code or "").strip().upper()
+    if code and code in CAPACITY_ERROR_CODES:
+        return True
+    text = (message or "").strip().casefold()
+    if not text:
+        return False
+    return any(fragment in text for fragment in _CAPACITY_MESSAGE_FRAGMENTS)
+
 
 #: Patterns that must never survive into an exception message, a log record
 #: or a test snapshot. Provider error payloads may echo request bodies (for
@@ -350,6 +389,32 @@ class LeasewebValidationError(LeasewebError):
     """400/422: the request was rejected as invalid. Permanent."""
 
 
+class LeasewebCapacityError(LeasewebValidationError, ProviderCapacityError):
+    """The credential account has no capacity for NEW instances (PC-2031).
+
+    A distinct condition with a distinct operator response: the request was
+    well-formed and the offer is sellable, but this Sales Organization already
+    holds its maximum number of instances (``errorCode=PC-2031``,
+    ``errorMessage="Customer limit reached"``).
+
+    It is NOT an offer/image problem, so a customer must never be told "this
+    offer is unavailable", and it is NOT transient in the retry sense, so the
+    platform never re-sends the same POST (least of all through another
+    credential account: the accepted contract is pinned to one account).
+
+    The platform records it as a durable per-account capacity signal with a
+    TTL, which keeps the storefront from publishing NEW orders through an
+    account that has just refused one — while leaving every existing resource
+    resolvable through the account it was created with.
+    """
+
+    retryable = False
+
+    @property
+    def capacity_exhausted(self) -> bool:
+        return True
+
+
 class LeasewebResponseError(LeasewebError):
     """A successful response did not match the documented schema.
 
@@ -434,6 +499,13 @@ def error_for_response(
         return LeasewebRateLimitError(payload.summary, payload=payload, endpoint=endpoint)
     if status >= 500:
         return LeasewebServerError(payload.summary, payload=payload, endpoint=endpoint)
+    # Capacity/account-limit failures arrive as HTTP 400 with a dedicated
+    # provider code. They are classified BEFORE the generic status table so
+    # the platform can act on the account, not on the request shape.
+    if status in (400, 409, 422) and is_capacity_exhausted(
+        payload.error_code, payload.error_message or payload.user_message
+    ):
+        return LeasewebCapacityError(payload.summary, payload=payload, endpoint=endpoint)
     fallback = LeasewebValidationError if status < 500 else LeasewebServerError
     cls = _STATUS_TO_ERROR.get(status, fallback)
     return cls(payload.summary, payload=payload, endpoint=endpoint)

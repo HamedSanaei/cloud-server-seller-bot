@@ -24,7 +24,12 @@ from typing import Any
 from cloud_platform.modules.catalog.domain import LocationRecord
 from cloud_platform.modules.offers.domain import OfferSpecUpdate, TechnicalSpec
 from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
-from cloud_platform.providers.errors import ProviderAuthError, ProviderError
+from cloud_platform.providers.errors import (
+    ProviderAuthError,
+    ProviderError,
+    ProviderRateLimited,
+    ProviderUnavailable,
+)
 from cloud_platform.providers.leaseweb.cloud import (
     PROVIDER_KEY,
     CloudInstanceType,
@@ -61,6 +66,119 @@ class CloudSyncResult:
     verified_accounts: frozenset[tuple[str, str, str]] = frozenset()
     persistence_failures: tuple[str, ...] = ()
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerChoice:
+    """The account a (type, region) observation is published under.
+
+    ``published`` is the decision the storefront sees: an offer may only be
+    advertised as sellable when its OWNER proved, read-only, that it can serve
+    the exact pair (region + instance type + usable images) AND the account is
+    known to accept new orders.
+    """
+
+    account_id: str
+    images_state: str
+    item: CloudInstanceType
+    published: bool
+    reason: str | None = None
+
+
+#: Image-read outcomes an account can report for one (type, region) pair.
+#: ``ok``    - the provider listed usable images for THIS credential;
+#: ``empty`` - the read succeeded but listed nothing usable (definitive);
+#: ``rejected`` - the provider refused the read for this credential/region
+#:                (definitive: this account does not serve the pair);
+#: ``unknown``  - the read failed inconclusively (timeout/5xx/rate limit).
+IMAGE_STATE_OK = "ok"
+IMAGE_STATE_EMPTY = "empty"
+IMAGE_STATE_REJECTED = "rejected"
+IMAGE_STATE_UNKNOWN = "unknown"
+
+#: Outcomes that must never be published: the provider answered definitively
+#: that this credential cannot install anything here.
+_UNPUBLISHABLE_IMAGE_STATES = frozenset({IMAGE_STATE_EMPTY, IMAGE_STATE_REJECTED})
+
+
+def select_hourly_owner(
+    ranked: list[tuple[str, str, CloudInstanceType]],
+    *,
+    current_owner_id: str | None,
+    limit_reached: frozenset[str],
+) -> OwnerChoice:
+    """Choose the publishing account for one (type, region) pair, deterministically.
+
+    ``ranked`` is in account order (``(priority, id)``) and each entry carries
+    the account's image-read outcome (see :data:`IMAGE_STATE_OK`).
+
+    Policy, in order:
+
+    1. the CURRENT owner publishes when it proved the pair and may take new
+       orders (no churn: a sync run is not a reason to move ownership);
+    2. otherwise the first account that PROVED the pair read-only and can take
+       new orders publishes it — this is how an offer legitimately moves to a
+       healthy credential whose eligibility changed;
+    3. otherwise the current owner keeps the row, publishing only while it is
+       neither capacity-limited nor definitively unable to serve the pair;
+       an INCONCLUSIVE image read therefore never costs a proven owner its
+       offer, and never hands one to an account that never proved anything;
+    4. otherwise the first account that is neither limited nor definitively
+       unable publishes (an inconclusive probe on a sole supplier keeps the
+       inventory visible rather than flapping it off the storefront);
+    5. otherwise the pair stays known but UNPUBLISHED (nothing is retired).
+
+    A capacity-limited account is never selected for a NEW order; it can still
+    own the row it already owns, so provenance and reconciliation are untouched.
+    """
+    owner_entry = next((entry for entry in ranked if entry[0] == current_owner_id), None)
+
+    def proven(entry: tuple[str, str, CloudInstanceType]) -> bool:
+        return entry[0] not in limit_reached and entry[1] == IMAGE_STATE_OK
+
+    if owner_entry is not None and proven(owner_entry):
+        account_id, images_state, item = owner_entry
+        return OwnerChoice(account_id, images_state, item, published=True)
+
+    alternative = next((entry for entry in ranked if proven(entry)), None)
+    if alternative is not None:
+        account_id, images_state, item = alternative
+        return OwnerChoice(account_id, images_state, item, published=True)
+
+    if owner_entry is not None:
+        account_id, images_state, item = owner_entry
+        limited = account_id in limit_reached
+        published = not limited and images_state not in _UNPUBLISHABLE_IMAGE_STATES
+        if limited:
+            reason = "capacity-limit"
+        elif images_state == IMAGE_STATE_EMPTY:
+            reason = "no-usable-images"
+        elif images_state == IMAGE_STATE_REJECTED:
+            reason = "account-cannot-serve"
+        else:
+            reason = None
+        return OwnerChoice(account_id, images_state, item, published=published, reason=reason)
+
+    candidate = next(
+        (
+            entry
+            for entry in ranked
+            if entry[0] not in limit_reached and entry[1] not in _UNPUBLISHABLE_IMAGE_STATES
+        ),
+        None,
+    )
+    if candidate is not None:
+        account_id, images_state, item = candidate
+        return OwnerChoice(account_id, images_state, item, published=True)
+
+    account_id, images_state, item = ranked[0]
+    if account_id in limit_reached:
+        reason = "capacity-limit"
+    elif images_state == IMAGE_STATE_EMPTY:
+        reason = "no-usable-images"
+    else:
+        reason = "account-cannot-serve"
+    return OwnerChoice(account_id, images_state, item, published=False, reason=reason)
 
 
 def _technical_spec(item: CloudInstanceType) -> dict[str, object]:
@@ -112,6 +230,7 @@ class LeasewebHourlyCloudSyncer:
         accounts: dict[str, LeasewebHourlyCloudProvider] | None = None,
         account_priorities: dict[str, int] | None = None,
         account_states: dict[str, CredentialAccountState] | None = None,
+        capacity: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         if accounts:
@@ -122,6 +241,10 @@ class LeasewebHourlyCloudSyncer:
             raise ValueError("either provider= or accounts= must be supplied")
         self._priorities = dict(account_priorities or {})
         self._states = dict(account_states or {})
+        #: Durable per-account capacity knowledge (optional). An account whose
+        #: provider limit was definitively refused must not be handed NEW
+        #: orders — see :func:`select_hourly_owner`.
+        self._capacity = capacity
         #: Back-compat accessor for single-account call sites.
         self._provider = provider or next(iter(self._accounts.values()))
 
@@ -157,6 +280,55 @@ class LeasewebHourlyCloudSyncer:
             return legacy
         raise KeyError(account_id)
 
+    async def _current_owners(self, offers_repo: Any) -> dict[tuple[str, str], str]:
+        """Which credential account currently publishes each (type, region).
+
+        Ownership stability is a correctness rule, not a preference: an
+        inconclusive image probe must not move a region to an account that has
+        never proved it, and an accepted order's fingerprint keeps pointing at
+        the account it was pinned to. An unreadable owner map degrades to "no
+        current owner known", which makes the sync conservative (it publishes
+        only PROVEN pairs) instead of silently re-routing anything.
+        """
+        reader = getattr(offers_repo, "hourly_account_owners", None)
+        if not callable(reader):
+            return {}
+        try:
+            return dict(await reader(PROVIDER_KEY))
+        except Exception as exc:
+            logger.warning(
+                "leaseweb hourly sync could not read current owners: %s",
+                type(exc).__name__,
+            )
+            return {}
+
+    async def _limit_reached_accounts(self, warnings: list[str]) -> frozenset[str]:
+        """Accounts that must not be given NEW orders (durable capacity signal).
+
+        A store failure is reported and treated as "no account is known to be
+        limited": capacity knowledge is an ADDITIONAL gate, never a reason to
+        blind the whole hourly catalog.
+        """
+        # ``getattr`` mirrors the legacy ``__new__`` construction path used by
+        # older single-account call sites/tests: an absent store simply means
+        # "no account is known to be limited".
+        store = getattr(self, "_capacity", None)
+        reader = getattr(store, "limit_reached_accounts", None)
+        if not callable(reader):
+            return frozenset()
+        try:
+            accounts = await reader(PROVIDER_KEY)
+        except Exception as exc:
+            warnings.append(f"capacity state unreadable ({type(exc).__name__})")
+            return frozenset()
+        excluded = frozenset(str(account) for account in accounts or ())
+        if excluded:
+            warnings.append(
+                "accounts without capacity for new instances (not published): "
+                + ", ".join(sorted(excluded))
+            )
+        return excluded
+
     async def sync_all(self) -> CloudSyncResult:
         """Regions per account, then per-region instance types, then reconcile.
 
@@ -183,6 +355,12 @@ class LeasewebHourlyCloudSyncer:
         seen_locations: set[str] = set()
         account_failed = False
         written = 0
+        # Which account currently PUBLISHES each (type, region) pair, and which
+        # accounts are known to be out of capacity for NEW instances. Both are
+        # needed to keep ownership stable and to never route a new order
+        # through a credential the provider just refused.
+        owners = await self._current_owners(offers_repo)
+        limit_reached = await self._limit_reached_accounts(warnings)
         # (type, region) -> [(account, images-state, item)] in account order.
         # images-state: "ok" (>=1 usable image), "empty" (read ok, none),
         # "unknown" (read failed; never penalized).
@@ -249,15 +427,43 @@ class LeasewebHourlyCloudSyncer:
                 # owners).
                 try:
                     images = await provider.probe_region_images(region.id)
-                    images_state = "ok" if images else "empty"
-                except Exception as exc:
+                    images_state = IMAGE_STATE_OK if images else IMAGE_STATE_EMPTY
+                except (ProviderUnavailable, ProviderRateLimited) as exc:
+                    # INCONCLUSIVE: a timeout, a 5xx or a throttle says nothing
+                    # about whether this credential serves the pair, so it must
+                    # never cost the current owner its offer.
                     logger.warning(
                         "leaseweb cloud images of account %s region %s inconclusive: %s",
                         account_id,
                         region.id,
                         type(exc).__name__,
                     )
-                    images_state = "unknown"
+                    images_state = IMAGE_STATE_UNKNOWN
+                except ProviderError as exc:
+                    # DEFINITIVE provider answer (validation/forbidden/not
+                    # found/conflict): this credential does not serve images for
+                    # the region. Never "unknown" — an account that cannot prove
+                    # a pair must not be handed it (production moved a region
+                    # to a credential that could not serve it exactly this way).
+                    logger.warning(
+                        "leaseweb cloud images of account %s region %s rejected: %s",
+                        account_id,
+                        region.id,
+                        type(exc).__name__,
+                    )
+                    images_state = IMAGE_STATE_REJECTED
+                except Exception as exc:
+                    # NOT a provider answer: an adapter/internal error (e.g. an
+                    # adapter that does not implement the strict probe). That
+                    # proves nothing about the credential, so it is treated as
+                    # inconclusive rather than as "this account cannot serve".
+                    logger.warning(
+                        "leaseweb cloud images of account %s region %s inconclusive: %s",
+                        account_id,
+                        region.id,
+                        type(exc).__name__,
+                    )
+                    images_state = IMAGE_STATE_UNKNOWN
                 for item in types:
                     candidates.setdefault((item.id, region.id), []).append(
                         (account_id, images_state, item)
@@ -267,23 +473,33 @@ class LeasewebHourlyCloudSyncer:
         for pair in sorted(candidates):
             type_id, region_id = pair
             ranked = candidates[pair]
-            winner: tuple[str, str, CloudInstanceType] | None = None
-            for account_id, images_state, item in ranked:
-                if images_state == "ok":
-                    winner = (account_id, images_state, item)
-                    break
-            if winner is None:
-                for account_id, images_state, item in ranked:
-                    if images_state == "unknown":
-                        winner = (account_id, images_state, item)
-                        break
-            if winner is None:
-                # Definitive: every supplying account lists zero usable
-                # images. The pair stays known but unavailable — never
-                # advertised as fully sellable, never retired either.
-                winner = ranked[0]
-            account_id, images_state, item = winner
-            image_ready = images_state != "empty"
+            choice = select_hourly_owner(
+                ranked,
+                current_owner_id=owners.get(pair),
+                limit_reached=limit_reached,
+            )
+            account_id, images_state, item = (
+                choice.account_id,
+                choice.images_state,
+                choice.item,
+            )
+            # A pair is sellable only when its owner PROVED it read-only and
+            # the account can still take new orders. Capacity exhaustion is a
+            # distinct, time-bounded case: the offer stays stored (and its
+            # existing resources untouched) but is never advertised for NEW
+            # orders through an account that just refused one.
+            image_ready = images_state not in _UNPUBLISHABLE_IMAGE_STATES
+            publishable = choice.published
+            if choice.reason == "no-usable-images":
+                warnings.append(
+                    f"{region_id}: no account lists usable images for "
+                    f"{type_id}; offer kept unavailable (nothing retired)"
+                )
+            elif choice.reason is not None:
+                warnings.append(
+                    f"{region_id}: {type_id} not published through account "
+                    f"{account_id} ({choice.reason})"
+                )
             billing_parameters: dict[str, object] = {
                 "contract_type": "HOURLY",
                 "monthly_estimate_source": "hourly_rate",
@@ -308,7 +524,7 @@ class LeasewebHourlyCloudSyncer:
                 billing_parameters=billing_parameters,
                 technical_metadata=_technical_spec(item),
                 billing_model="hourly",
-                provider_available=image_ready,
+                provider_available=publishable,
                 provider_account_id=account_id,
             )
             counted = 0
@@ -333,14 +549,9 @@ class LeasewebHourlyCloudSyncer:
                 # (account, product, location) triple was observed. Pair-only
                 # sets would retire every scoped row the sync just wrote.
                 available.add((account_id, item.id, region_id))
-                if image_ready:
+                if image_ready and publishable:
                     verified.add(pair)
                     verified_owner.add((account_id, item.id, region_id))
-                else:
-                    warnings.append(
-                        f"{region_id}: no account lists usable images for "
-                        f"{type_id}; offer kept unavailable (nothing retired)"
-                    )
                 counted += 1
                 written += 1
             previous = per_region.get(region_id)

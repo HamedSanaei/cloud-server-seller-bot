@@ -66,11 +66,13 @@ from cloud_platform.modules.checkout.service import (
     OfferCatalogViewService,
     OfferConfirmView,
     OfferUnavailableError,
+    OsTemporarilyUnavailableError,
     OsUnavailableError,
     UserNotActiveError,
 )
 from cloud_platform.modules.compute.domain import ServerLifecycleState, ServerRepository
 from cloud_platform.modules.hourly.service import (
+    HourlyAccountCapacityError,
     HourlyNotAvailableError,
     HourlyProviderUnavailableError,
     HourlyRequestFailedError,
@@ -843,6 +845,8 @@ class MonthlyBotUi:
             )
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        except OsTemporarilyUnavailableError:
+            return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError:
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
         rows = [
@@ -1033,6 +1037,10 @@ class MonthlyBotUi:
             offer, options, back_callback, cancel_callback = await self._view.cloud_images_screen(
                 offer_id
             )
+        except OsTemporarilyUnavailableError:
+            # Inconclusive provider read: the plan keeps its images and the
+            # customer is told to try again, never that the OS is gone.
+            return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError:
             # The plan is sellable; the provider exposes no usable image for
             # it right now. Say exactly that instead of "unavailable".
@@ -1103,9 +1111,21 @@ class MonthlyBotUi:
             # both wrong and misleading: the same stale button would loop.
             logger.warning("hourly create rejected (previous request failed): %s", exc)
             return BotScreen(self._t.t("store.cloud_previous_failed"), self._menu_only())
+        except HourlyAccountCapacityError as exc:
+            # The provider ACCOUNT has no room for a new instance. The offer is
+            # fine, so never say "this offer is unavailable"; tell the customer
+            # what actually happened and what to do. No internal account id,
+            # error code or correlation id reaches the customer.
+            logger.warning("hourly create rejected (account at capacity): %s", exc)
+            return BotScreen(self._t.t("store.cloud_account_capacity"), self._menu_only())
         except HourlyProviderUnavailableError as exc:
             logger.warning("hourly create rejected (provider unreachable): %s", exc)
             return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
+        except OsTemporarilyUnavailableError as exc:
+            # An inconclusive image read is a provider wobble, not a plan that
+            # lost its operating systems.
+            logger.warning("hourly create rejected (image catalog unreadable): %s", exc)
+            return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError as exc:
             logger.warning("hourly create rejected (os unavailable): %s", exc)
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
@@ -1144,6 +1164,8 @@ class MonthlyBotUi:
             )
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        except OsTemporarilyUnavailableError:
+            return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError:
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
         hourly = self._t.t(
@@ -1580,6 +1602,8 @@ class MonthlyBotUi:
             )
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        except OsTemporarilyUnavailableError:
+            return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError:
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
         rows = [
@@ -1614,6 +1638,8 @@ class MonthlyBotUi:
             )
         except OfferUnavailableError:
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
+        except OsTemporarilyUnavailableError:
+            return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError:
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
         lines = [
@@ -1687,6 +1713,8 @@ class MonthlyBotUi:
             )
         except UserNotActiveError:
             return BotScreen(self._t.t("user.frozen"), self._menu_only())
+        except OsTemporarilyUnavailableError:
+            return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except (OfferUnavailableError, OsUnavailableError):
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
         except CheckoutError as exc:

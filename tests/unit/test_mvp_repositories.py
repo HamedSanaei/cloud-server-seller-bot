@@ -247,9 +247,15 @@ class TestSellableOfferRepository:
     ) -> None:
         """Production: 36 offers carried migration 0037's legacy `default` pin.
 
-        Current account-scoping: a scoped observation for a different account
-        does not mutate the existing differently-pinned row; it creates its
-        own account-scoped row. The original `default` pin is left untouched.
+        A scoped observation for a DIFFERENT account re-pins that single row in
+        place. The offer identity is ``(provider_key, product_id, location_id)``
+        — enforced by ``uq_sellable_offers_provider_product_location`` — so a
+        second row for the same triple cannot exist: attempting one raised an
+        IntegrityError and failed the entire sync source in production
+        (``ok=False`` while 50 offers stayed unwritten). Re-pinning is also what
+        lets publication follow a credential-account ELIGIBILITY change (the
+        previous owner drained, removed, or hit its provider instance limit)
+        without touching any accepted order's own pinned account.
         """
         row = _offer_row(provider_account_id="default", provider_cost_currency="GBP")
         db.execute.return_value = _result(row)
@@ -270,12 +276,11 @@ class TestSellableOfferRepository:
                 provider_available=True,
             ),
         )
-        # The pre-existing differently-pinned row is not overwritten.
-        assert row.provider_account_id == "default"
-        # A separate account-scoped row is created for the supplying account.
-        created = db.add.call_args.args[0]
-        assert created.provider_account_id == "sales-org-uk"
-        assert created.provider_cost_currency == "GBP"
+        # The single row is re-pinned to the account that supplied the
+        # observation — never duplicated (the unique identity forbids it).
+        assert row.provider_account_id == "sales-org-uk"
+        assert row.provider_cost_currency == "GBP"
+        db.add.assert_not_called()
 
     async def test_a_caller_without_account_knowledge_cannot_erase_provenance(
         self, db: AsyncMock

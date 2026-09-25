@@ -77,6 +77,7 @@ def _offer(
     billing_model: str = BILLING_MODEL_HOURLY,
     offer_id: UUID | None = None,
     technical_metadata: dict[str, object] | None = None,
+    provider_account_id: str | None = None,
 ) -> SellableOffer:
     return SellableOffer(
         id=offer_id or uuid4(),
@@ -107,6 +108,9 @@ def _offer(
         ),
         provider_available=True,
         enabled=True,
+        # The credential account the catalog published this offer under
+        # (LEASEWEB-MULTIACCOUNT): pinned into the immutable checkout contract.
+        provider_account_id=provider_account_id,
         created_at=datetime.now(UTC),
     )
 
@@ -145,6 +149,7 @@ async def _usd_offer(
     name: str = "Mini",
     offer_id: UUID | None = None,
     technical_metadata: dict[str, object] | None = None,
+    provider_account_id: str | None = None,
 ) -> SellableOffer:
     """Production-shaped hourly offer: EUR provider cost + USD selling price.
 
@@ -163,6 +168,7 @@ async def _usd_offer(
         billing_model=BILLING_MODEL_HOURLY,
         offer_id=offer_id,
         technical_metadata=technical_metadata,
+        provider_account_id=provider_account_id,
     )
     base = replace(
         base,

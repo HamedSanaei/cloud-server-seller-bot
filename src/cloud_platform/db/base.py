@@ -659,6 +659,61 @@ class ProviderRoute(Base):
     )
 
 
+class ProviderAccountCapacity(Base):
+    """Durable NEW-ORDER capacity state of one credential account.
+
+    A credential account can be authenticated and still refuse a new instance
+    because the provider account reached its customer/instance limit
+    (Leaseweb ``PC-2031`` / "Customer limit reached"). Leaseweb publishes no
+    quota endpoint, so the platform can only LEARN that fact from a definitive
+    refusal — this row is where it is remembered so bot, API and worker agree.
+
+    One row per ``(provider_key, credential_account_id)``: capacity is an
+    ACCOUNT fact, not a location fact. Nothing here is credential material.
+    The row never gates management/reconciliation of existing resources; it
+    only keeps NEW orders off an account whose limit is currently reached, and
+    ``expires_at`` returns the account to normal publication after the TTL.
+
+    Attributes:
+        provider_key: Logical provider (e.g. "leaseweb")
+        credential_account_id: Stable non-secret account handle
+        state: healthy | limit_reached
+        error_code: Provider error code of the last refusal (e.g. "PC-2031")
+        correlation_id: Provider routing id (safe to quote to support)
+        location_id: Location of the refused create, when known
+        product_id: Instance type of the refused create, when known
+        observations: How many definitive refusals were recorded
+        observed_at: When the current state was last observed
+        expires_at: When a limit_reached state stops applying (NULL = healthy)
+    """
+
+    __tablename__ = "provider_account_capacity"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_key",
+            "credential_account_id",
+            name="uq_provider_account_capacity_account",
+        ),
+        Index("ix_provider_account_capacity_provider_state", "provider_key", "state"),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_key = Column(String(32), nullable=False)
+    credential_account_id = Column(String(64), nullable=False)
+    state = Column(String(32), nullable=False, server_default="healthy")
+    error_code = Column(String(64), nullable=True)
+    correlation_id = Column(String(64), nullable=True)
+    location_id = Column(String(64), nullable=True)
+    product_id = Column(String(128), nullable=True)
+    observations = Column(Integer, nullable=False, server_default="0")
+    observed_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+    updated_at = Column(
+        DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
+    )
+
+
 class RenewalRecord(Base):
     """Renewal state of one prepaid monthly server (LEASEWEB-MVP).
 

@@ -80,6 +80,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "offers.no_offers": "فعلاً پلنی برای فروش در این لوکیشن موجود نیست.",
         "offers.no_locations": "فعلاً هیچ لوکیشنی برای فروش فعال نیست.",
         "offers.os_unavailable": "سیستم‌عامل انتخابی در دسترس نیست.",
+        "offers.os_temporarily_unavailable": "دریافت فهرست سیستم‌عامل‌ها در حال حاضر ممکن نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",  # noqa: E501, RUF001
         "offers.products_unavailable": "دریافت اطلاعات پلن ممکن نیست؛ کمی بعد دوباره تلاش کنید.",
         "servers.title": "🖥 سرورهای من:",
         "servers.empty": "هنوز سروری ندارید. از «خرید سرور» شروع کنید.",
@@ -353,6 +354,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.cloud_selected_price": "💵 {price}",
         "store.cloud_no_images": "در حال حاضر سیستم‌عامل قابل نصب برای این پلن در دسترس نیست.",
         "store.cloud_previous_failed": "درخواست قبلی ساخت سرور ناموفق شده است.\nلطفاً یک سفارش جدید ایجاد کنید.",  # noqa: E501, RUF001
+        "store.cloud_account_capacity": "ظرفیت ساخت سرور جدید در حساب ارائه‌دهنده تکمیل شده است.\nلطفاً کمی بعد دوباره تلاش کنید یا پلن/موقعیت دیگری را انتخاب کنید.",  # noqa: E501, RUF001
         "store.cloud_retry_later": "ارتباط با تأمین‌کننده سرویس در حال حاضر برقرار نیست.\nلطفاً چند دقیقه دیگر دوباره تلاش کنید.",  # noqa: E501, RUF001
         "store.cloud_confirm_title": "\u2601\ufe0f \u062a\u0627\u06cc\u06cc\u062f \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc",  # noqa: E501
         "store.cloud_confirm_provider": "\u0627\u0631\u0627\u0626\u0647\u200c\u062f\u0647\u0646\u062f\u0647: {provider}",  # noqa: E501
@@ -476,6 +478,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "offers.no_offers": "No plans are for sale at this location yet.",
         "offers.no_locations": "No locations are enabled for sale yet.",
         "offers.os_unavailable": "The selected operating system is not available.",
+        "offers.os_temporarily_unavailable": "The operating-system list cannot be retrieved right now; please try again shortly.",  # noqa: E501
         "offers.products_unavailable": "Plan information is currently unavailable; please try again shortly.",  # noqa: E501
         "servers.title": "🖥 My servers:",
         "servers.empty": "You have no servers yet. Start with Buy a server.",
@@ -747,6 +750,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.cloud_selected_price": "💵 {price}",
         "store.cloud_no_images": "No installable operating system is available for this plan right now.",  # noqa: E501
         "store.cloud_previous_failed": "The previous server request failed.\nPlease create a new order.",  # noqa: E501
+        "store.cloud_account_capacity": "The provider's capacity for new servers is currently full.\nPlease try again shortly or choose another plan/location.",  # noqa: E501
         "store.cloud_retry_later": "The provider is currently unreachable.\nPlease try again in a few minutes.",  # noqa: E501
         "store.cloud_confirm_title": "\u2601\ufe0f Confirm hourly server creation",
         "store.cloud_confirm_provider": "Provider: {provider}",

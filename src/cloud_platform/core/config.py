@@ -229,6 +229,7 @@ _PROVIDER_FIELDS: Mapping[str, Mapping[str, str]] = {
         "order_os_only_free": "leaseweb_order_os_only_free",
         "contract_term": "leaseweb_contract_term",
         "billing_cycle": "leaseweb_billing_cycle",
+        "cloud_account_limit_ttl_seconds": "leaseweb_cloud_account_limit_ttl_seconds",
     },
     "hetzner": {
         "api_token": "hetzner_api_token",
@@ -638,6 +639,14 @@ class Settings(BaseSettings):
     # provider-order row at checkout, before any provider call).
     leaseweb_contract_term: str = "1_MONTH"
     leaseweb_billing_cycle: str = "1_MONTH"
+    # Hourly cloud: how long ONE definitive provider account-capacity refusal
+    # (Leaseweb ``PC-2031`` "Customer limit reached") keeps that credential out
+    # of NEW-order publication. The provider publishes no quota endpoint, so
+    # capacity can only be learned from a refusal; a bounded window means a
+    # single refusal can never disable an account permanently, and the ordinary
+    # catalog sync re-probes automatically once it expires. Existing servers,
+    # orders and reconciliation are never affected. Minimum 60 seconds.
+    leaseweb_cloud_account_limit_ttl_seconds: int = Field(default=3600, ge=60)
     # Telegram admin alert chat for renewals/attention items (0 = unset).
     telegram_admin_chat_id: int = 0
     # Optional support contact shown on the support screen (e.g. @handle).

@@ -118,6 +118,46 @@ A `400` now also preserves `errorDetails` in the safe one-line summary
 (field + reason, redacted and bounded), because `errorCode`/`errorMessage`
 alone are not actionable.
 
+### Account capacity (`PC-2031`, "Customer limit reached")
+
+Incident 2026-09-25 (production): a later create was accepted by the schema and
+definitively refused with `400 {errorCode: "PC-2031", errorMessage: "Customer
+limit reached"}` on the `sales-org-north` credential. That is a fact about the
+ACCOUNT, not about the offer — the same plan/image/region may be perfectly
+sellable through another credential.
+
+- **No quota endpoint exists.** The official Public Cloud API schema has no
+  quota/limit path (checked against `leaseweb/api-definitions`
+  `publicCloud/paths`), so capacity cannot be read: it can only be LEARNED from
+  a definitive refusal and remembered.
+- `PC-2031` is classified as `LeasewebCapacityError`
+  (`LeasewebValidationError` **and** the provider-neutral
+  `ProviderCapacityError`): permanent for that POST (never auto-retried),
+  still carrying error code + sanitized message + correlation id for admins.
+- The refusal is persisted per `(provider_key, credential_account_id)` in
+  `provider_account_capacity`, written as an atomic `INSERT ... ON CONFLICT DO
+  UPDATE` so concurrent observations of one refusal end as ONE row with N
+  observations. It gates NEW orders only: management/reconciliation of
+  existing resources always resolves the account pinned on the resource.
+- **Never a cross-account replay.** The accepted contract is pinned to one
+  credential; swapping credentials after confirmation would break both the
+  immutable fingerprint and exactly-once. A capacity signal therefore acts
+  BEFORE checkout (catalog publication + a pre-checkout gate) so a *new*
+  checkout can legitimately be pinned to a healthy account, and arrives with
+  the offer's own fingerprint.
+- Publication is provable or absent: an account is only handed a pair it
+  PROVED read-only (region list + type list + image read). An inconclusive read
+  (timeout/5xx/throttle) is never a verdict — it keeps the current owner and
+  retires nothing; only a definitive "this credential cannot serve the pair"
+  routes the pair away, and a limited account keeps its row unpublished instead
+  of moving the offer.
+- The signal EXPIRES (the Leaseweb provider setting
+  `cloud_account_limit_ttl_seconds`, default 3600s, minimum 60) and
+  an operator can clear or re-probe it; one refusal never disables an account
+  permanently. `leaseweb cloud accounts doctor` prints the safe view (state,
+  capacity state, proven regions, visible instances, last code/correlation id —
+  never key material).
+
 ## 3. Status vocabulary
 
 `RUNNING` is confirmed by the documented launch response. The adapter maps

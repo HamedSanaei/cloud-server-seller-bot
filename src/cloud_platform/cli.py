@@ -2156,8 +2156,30 @@ async def leaseweb_cloud_doctor() -> int:
     accounts = list(cloud_router.accounts)
     print(f"leaseweb cloud doctor (read-only, {len(accounts)} credential account(s))")
     print(f"credential accounts examined: {', '.join(a.account_id for a in accounts) or '-'}")
+    # Durable NEW-ORDER capacity state: a credential can be fully
+    # authenticated, able to list regions and types, and still be unable to
+    # accept a new instance because its provider limit was reached
+    # (Leaseweb PC-2031). That is reported here so an operator never has to
+    # infer it from a customer-side failure.
+    capacity_records: dict[str, Any] = {}
+    capacity_states = _cloud_capacity_repository()
+    if capacity_states is None:
+        print("capacity state: unreadable (store unavailable)")
+    else:
+        try:
+            for record in await capacity_states.list_for_provider("leaseweb"):
+                capacity_records[record.credential_account_id] = record
+        except Exception as exc:
+            print(f"capacity state: unreadable ({type(exc).__name__})")
     ok_any = False
     for account in accounts:
+        record = capacity_records.get(account.account_id)
+        if record is not None and record.is_limit_reached():
+            print(
+                f"  account {account.account_id}: capacity LIMIT-REACHED "
+                f"({record.error_code or 'provider limit'}) — no NEW orders are "
+                "published through it"
+            )
         try:
             capability = await cloud_router.probe_account(account.account_id)
         except Exception as exc:
@@ -2281,6 +2303,174 @@ async def leaseweb_cloud_doctor() -> int:
         print("result: provider serves Cloud but nothing is sellable yet")
         return 1
     print("result: hourly Cloud buyable (Cloud family appears in Telegram)")
+    return 0
+
+
+def _cloud_capacity_repository() -> Any | None:
+    """Open the durable per-account capacity store (None when unavailable).
+
+    Diagnostics must never fail because the DB layer is unreachable: capacity
+    is reported as UNKNOWN in that case instead of crashing the command.
+    """
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+
+        return SqlAlchemyAccountCapacityRepository(SessionFactory)
+    except Exception:
+        return None
+
+
+async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = None) -> int:
+    """Read-only per-account hourly-Cloud capacity / eligibility diagnostics.
+
+    Answers, per credential account and without ever printing a secret:
+
+    - the stable account id, configured state (ACTIVE/DRAINING/DISABLED) and
+      selection priority;
+    - this process's authentication verdict;
+    - how many Cloud regions the account demonstrably serves, and how many
+      instances it currently holds there;
+    - its NEW-ORDER capacity state: ``healthy`` / ``limit-reached``, the
+      provider error code of the last refusal (e.g. ``PC-2031``), its
+      correlation id, and when the signal stops applying.
+
+    ``clear --account <id>`` marks one account eligible for new orders again
+    (the recorded refusal evidence is kept for diagnostics) — this is how an
+    operator re-probes after freeing provider capacity. Nothing here places,
+    retries or cancels a provider order, and no existing resource is touched.
+    """
+    from cloud_platform.providers.leaseweb.cloud_accounts import (
+        build_cloud_account_router,
+    )
+
+    settings = get_settings()
+    try:
+        router = build_cloud_account_router(settings)
+    except Exception as exc:
+        print(f"error: cloud account router unavailable ({type(exc).__name__})")
+        return 1
+    if router is None:
+        print("error: leaseweb hourly cloud has no credential configured")
+        return 1
+
+    accounts = list(router.accounts)
+    capacity_repo = _cloud_capacity_repository()
+    if capacity_repo is None:
+        print("[WARN] capacity store unavailable; capacity reported as UNKNOWN")
+
+    if action == "clear":
+        target = str(account or "").strip()
+        if not target:
+            print("error: clear requires --account <credential account id>")
+            print(f"configured accounts: {', '.join(a.account_id for a in accounts) or '-'}")
+            return 2
+        if target not in {a.account_id for a in accounts}:
+            print(f"error: account {target!r} is not configured")
+            return 2
+        if capacity_repo is None:
+            print("error: capacity store unavailable; nothing was cleared")
+            return 1
+        try:
+            record = await capacity_repo.record_healthy("leaseweb", target)
+        except Exception as exc:
+            print(f"error: could not clear capacity state ({type(exc).__name__})")
+            return 1
+        print(
+            f"account {target}: capacity state {record.state.value} "
+            f"(previous refusals recorded: {record.observations}); "
+            "it is eligible for NEW orders again"
+        )
+        return 0
+
+    records: dict[str, Any] = {}
+    if capacity_repo is not None:
+        try:
+            for record in await capacity_repo.list_for_provider("leaseweb"):
+                records[record.credential_account_id] = record
+        except Exception as exc:
+            print(f"[WARN] capacity state unreadable ({type(exc).__name__})")
+
+    print(f"leaseweb cloud accounts ({len(accounts)} configured)")
+    limit_reached: list[str] = []
+    for definition in accounts:
+        account_id = definition.account_id
+        print()
+        print(
+            f"account {account_id}: state={definition.state.value} "
+            f"priority={definition.priority} enabled={'yes' if definition.enabled else 'no'}"
+        )
+
+        region_count = None
+        instances = 0
+        auth = "not probed (disabled)"
+        if definition.enabled:
+            try:
+                capability = await router.probe_account(account_id)
+            except Exception as exc:
+                print(f"  cloud regions: unreadable ({type(exc).__name__})")
+                capability = None
+            if capability is None:
+                auth = "unknown"
+            elif capability.error_class == "AuthenticationError":
+                auth = "REJECTED (AuthenticationError)"
+            elif capability.accessible:
+                auth = "ok"
+            elif capability.error_class:
+                auth = f"inconclusive ({capability.error_class})"
+            else:
+                # Authenticated, but this Sales Organization serves no Cloud.
+                auth = "ok (no Cloud entitlement)"
+            if capability is not None and capability.accessible:
+                region_count = len(capability.regions)
+                provider = router.client_for(account_id)
+                for region_id, _types in sorted(capability.regions):
+                    try:
+                        instances += len(await provider.list_instances(region_id))
+                    except Exception:
+                        # A region this credential cannot census is not an
+                        # error: it is simply not counted.
+                        continue
+        print(f"  authentication: {auth}")
+        print(
+            "  cloud regions proven accessible: "
+            + (str(region_count) if region_count is not None else "unknown")
+        )
+        print(f"  instances currently held: {instances}")
+
+        record = records.get(account_id)
+        if record is None:
+            print("  capacity: healthy (never observed)")
+            continue
+        if record.is_limit_reached():
+            reference = record.observed_at.isoformat() if record.observed_at else "-"
+            expires = record.expires_at.isoformat() if record.expires_at else "-"
+            print(
+                f"  capacity: LIMIT-REACHED ({record.error_code or 'provider limit'}) "
+                "- no NEW orders are published through this account"
+            )
+            print(f"    last refusal: {reference}; applies until {expires}")
+            print(f"    correlationId: {record.correlation_id or '-'}")
+            print(f"    affected: {record.location_id or '-'} / {record.product_id or '-'}")
+            limit_reached.append(account_id)
+        else:
+            print(
+                f"  capacity: healthy (refusals recorded: {record.observations}"
+                + ("; signal expired" if record.state.value == "limit_reached" else "")
+                + ")"
+            )
+
+    print()
+    if limit_reached:
+        print("result: NEW hourly orders are NOT published through: " + ", ".join(limit_reached))
+        print(
+            "action: free capacity on the provider account (or wait for the "
+            "configured TTL), then run 'leaseweb cloud accounts clear --account <id>'"
+        )
+        return 1
+    print("result: every configured account may receive NEW hourly orders")
     return 0
 
 
@@ -3476,6 +3666,22 @@ def _parser() -> argparse.ArgumentParser:
     lsw_cloud = lsw_sub.add_parser("cloud", help="hourly cloud operations")
     lsw_cloud_sub = lsw_cloud.add_subparsers(dest="leaseweb_cloud", required=True)
     lsw_cloud_sub.add_parser("doctor", help="read-only regions/types/images per region")
+    lsw_cloud_accounts = lsw_cloud_sub.add_parser(
+        "accounts",
+        help="read-only per-account capacity state (doctor | clear)",
+    )
+    lsw_cloud_accounts.add_argument(
+        "action",
+        nargs="?",
+        choices=["doctor", "clear"],
+        default="doctor",
+        help="doctor reports; clear marks one account eligible again (keeps evidence)",
+    )
+    lsw_cloud_accounts.add_argument(
+        "--account",
+        default=None,
+        help="credential account id (required by 'clear')",
+    )
     lsw_cloud_catalog = lsw_cloud_sub.add_parser(
         "catalog", help="read-only normalized hourly catalog"
     )
@@ -3692,6 +3898,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.subcommand == "cloud":
             if args.leaseweb_cloud == "doctor":
                 return await leaseweb_cloud_doctor()
+            if args.leaseweb_cloud == "accounts":
+                return await leaseweb_cloud_accounts(args.action, args.account)
             if args.leaseweb_cloud == "catalog":
                 return await leaseweb_cloud_catalog(args.region)
             if args.leaseweb_cloud == "create-preview":

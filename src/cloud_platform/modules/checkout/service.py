@@ -88,6 +88,7 @@ from cloud_platform.providers.errors import (
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
+    ProviderUnavailable,
 )
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.routing import UnknownCredentialAccountError, provider_for
@@ -121,7 +122,24 @@ class OfferUnavailableError(CheckoutError):
 
 
 class OsUnavailableError(CheckoutError):
-    pass
+    """The plan has NO installable operating system (a definitive answer).
+
+    Used when the provider conclusively lists no usable image for the pinned
+    plan, or answers that this credential cannot serve the region at all. It is
+    NOT used for a provider read that simply failed: a transient failure is
+    :class:`OsTemporarilyUnavailableError`, and the plan stays sellable in the
+    storefront either way.
+    """
+
+
+class OsTemporarilyUnavailableError(CheckoutError):
+    """The image catalog could not be READ right now (transient).
+
+    A timeout, a 5xx or a rate limit is inconclusive about the plan: reporting
+    it as "no operating system" would misstate a provider wobble as permanent
+    unavailability and would tell the customer to stop trying. The customer is
+    told to retry instead, and nothing about the offer changes.
+    """
 
 
 class NoWalletError(CheckoutError):
@@ -1998,10 +2016,19 @@ class OfferCatalogViewService:
         )
         try:
             images = self._selectable_images(offer, await provider.list_images(offer.location_id))
+        except ProviderUnavailable as exc:
+            # TRANSIENT: the provider could not answer. The plan is still
+            # sellable and its images are unknown, not absent — never report
+            # this as "OS unavailable", and never remove the image from the
+            # storefront on one inconclusive read.
+            raise OsTemporarilyUnavailableError(
+                f"image catalog temporarily unreadable for {offer.ref}: {type(exc).__name__}"
+            ) from exc
         except Exception as exc:
-            # Not "this offer is unavailable": the plan is sellable and only
-            # the IMAGE catalog is unreadable right now, which is the OS
-            # question the customer is actually answering.
+            # DEFINITIVE: the provider refused this credential/region or listed
+            # nothing usable. Not "this offer is unavailable" — the plan is
+            # sellable and the OS question the customer is answering has a
+            # real, conclusive answer.
             raise OsUnavailableError(f"images currently unavailable for {offer.ref}") from exc
         if not images:
             # Same distinction, empty catalog instead of a failed read.
@@ -2037,6 +2064,10 @@ class OfferCatalogViewService:
         )
         try:
             images = self._selectable_images(offer, await provider.list_images(offer.location_id))
+        except ProviderUnavailable as exc:
+            raise OsTemporarilyUnavailableError(
+                f"image catalog temporarily unreadable for {offer.ref}: {type(exc).__name__}"
+            ) from exc
         except Exception as exc:
             raise OsUnavailableError(f"images currently unavailable for {offer.ref}") from exc
         if index < 0 or index >= len(images):
