@@ -382,6 +382,98 @@ Do not repeatedly run expensive commands after every small edit. Expensive check
 - Destructive provider operations require explicit application-layer authorization and an idempotency key.
 - Do not implement "temporary" shortcuts that allow negative wallet races, double provisioning or deletion without reconciliation.
 
+## Production Server Access
+
+The production environment of this product runs on the server/service
+identified as:
+
+- Production service: `Leaseweb (DE rep for fin)`
+
+When an issue is production-only (runtime behavior, logs, container/service
+state, deployed revision, connectivity) and the local repository cannot
+establish the facts, connect DIRECTLY to that server with OpenSSH. Production
+access is a normal diagnostic capability, not a last resort: a bug report that
+depends on production runtime state must not be answered from source-code
+assumptions alone.
+
+### SSH usage
+
+- Prefer the existing OpenSSH configuration under the current user's `~/.ssh/`
+  directory, and resolve the host entry for `Leaseweb (DE rep for fin)` from it.
+- NEVER guess or invent an IP address, hostname, username, password, port or
+  private-key path. If the host does not resolve from the configuration, stop
+  and ask instead of guessing.
+- Never print, expose, copy or commit private SSH keys, passwords, tokens or
+  other secrets.
+- Use non-interactive SSH commands where practical:
+  `ssh <configured-host> "<diagnostic-command>"`.
+- On this Windows development machine, if a normal OpenSSH invocation does not
+  work from the Desktop Commander shell, the configured SSH entrypoint is
+  `C:\Users\Hamed\.ssh\ssh-dc.cmd` (a thin wrapper that runs the
+  Git-for-Windows `ssh.exe` against the same `~/.ssh` configuration).
+- This repository is PUBLIC: host addresses, credentials and server-specific
+  secrets must never be written into tracked files, tests, logs or issue text.
+
+### What production access may be used for
+
+Read-only inspection is expected, proactively, whenever it materially helps:
+
+- reading application/service logs;
+- Docker/compose container status, logs and health;
+- systemd unit status and `journalctl` entries;
+- inspecting runtime configuration WITHOUT exposing secret values;
+- checking the deployed commit/version (the running platform image tag);
+- checking application health and storefront readiness
+  (`docker compose ... exec -T api python -m cloud_platform.cli ...`);
+- verifying database/network/service connectivity;
+- confirming whether a reported issue exists only in production;
+- validating the result of an already-authorized deployment.
+
+The deployed stack is `deploy/production/docker-compose.yml` (compose project
+`cloud-platform-production`) at the server path the deploy pipeline uses
+(`PROD_DEPLOY_PATH`; see `docs/operations/PRODUCTION_DEPLOY.md`). The server owns
+`deploy.env` and `configuration.toml`: inspect their KEYS if needed, but never
+print, copy or commit their values.
+
+### Production safety rules
+
+Production access is diagnostic/read-only by default. Without an explicit
+instruction from the user, DO NOT:
+
+- modify production files or configuration;
+- edit environment variables or secrets;
+- modify database records or schema;
+- restart or redeploy services merely as an experiment;
+- delete logs, files, containers, volumes or data;
+- run migrations;
+- install or remove packages;
+- run destructive Docker/system/database commands;
+- change firewall, network or SSH settings;
+- run `git reset`, `checkout`, `pull` or otherwise modify the production
+  working tree;
+- start a second stack, database, Redis or Telegram bot poller on that host:
+  exactly one bot polls the shared token, and services are replaced only by the
+  `staging` fast lane or an explicit `deploy-production` dispatch.
+
+If a production change is necessary, determine the root cause first and make the
+source-controlled fix in the repository whenever appropriate. Mutate production
+only when the user's task clearly authorizes that change, and prefer a pipeline
+deploy over an ad-hoc edit on the server.
+
+### Investigation workflow
+
+For production-related failures, use this order when appropriate:
+
+1. Inspect the local code/configuration.
+2. Connect to `Leaseweb (DE rep for fin)` through the configured OpenSSH host.
+3. Inspect the relevant production logs/status/runtime state.
+4. Correlate the production evidence with the source code.
+5. Identify the actual root cause.
+6. Implement the durable fix in source control.
+7. Run the smallest relevant local tests first.
+8. Deploy or modify production only when the task authorizes it.
+9. Verify the resulting production behavior through SSH/logs if useful.
+
 ## Commit & contribution policy
 
 - Agents must NEVER create commits, tags or releases, and must never push to a remote repository, unless explicitly requested by the repository owner.
