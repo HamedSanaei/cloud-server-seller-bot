@@ -538,6 +538,36 @@ class CloudInstance:
     account_id: str | None = None
 
 
+#: Page size for the unfiltered account instance census read.
+INVENTORY_PAGE_SIZE = 100
+
+#: Hard cap on census pages: a live API must never drive an unbounded loop.
+INVENTORY_MAX_PAGES = 50
+
+
+@dataclass(frozen=True, slots=True)
+class CloudInstancesRead:
+    """One UNFILTERED ``/instances`` read: the account's own instance census.
+
+    Leaseweb Public Cloud credentials are REGION-SCOPED: the ``region`` query
+    parameter is validated against the regions THIS credential is entitled to,
+    so a region-filtered read is rejected for every other region the global
+    catalog lists. The unfiltered read is therefore the only census that is
+    both complete and entitlement-agnostic — and every returned instance
+    carries its own ``region``, so geography stays a provider fact.
+
+    ``complete`` is False when the documented ``_metadata`` envelope reports
+    more instances than were read. A truncated list is a LOWER bound, and a
+    lower bound published as a census would look exactly like "instances were
+    freed".
+    """
+
+    instances: tuple[CloudInstance, ...]
+    raw_items: int
+    total_count: int | None = None
+    complete: bool = True
+
+
 def _memory_gb(item: dict[str, Any], resources: dict[str, Any]) -> int:
     for key in ("memoryGb", "memoryMB", "memoryMb", "memory"):
         raw = item.get(key, resources.get(key))
@@ -1195,8 +1225,69 @@ class LeasewebHourlyCloudProvider:
             )
         return HourlyCheckoutFacts(instance_type=match, root_disk=live)
 
+    async def read_all_instances(self) -> CloudInstancesRead:
+        """``GET /publicCloud/v1/instances`` WITHOUT a region filter (census).
+
+        The account-scoped census: complete, entitlement-agnostic and strictly
+        read-only. A region-filtered walk cannot be exhaustive here, because
+        the credential is entitled to one region while the global catalog
+        lists many (see :class:`CloudInstancesRead`).
+
+        Pagination follows the documented ``_metadata`` envelope
+        (``totalCount`` / ``limit`` / ``offset``). A read that cannot be
+        exhausted is reported ``complete=False`` instead of being silently
+        truncated, so callers fail closed rather than act on a lower bound.
+        """
+        instances: list[CloudInstance] = []
+        raw_items = 0
+        total_count: int | None = None
+        offset = 0
+        complete = False
+        for _page in range(INVENTORY_MAX_PAGES):
+            payload = await self._get(
+                "/publicCloud/v1/instances",
+                {"limit": INVENTORY_PAGE_SIZE, "offset": offset},
+            )
+            items = [
+                item
+                for item in self._items(payload, "instances", "data", "items")
+                if isinstance(item, dict)
+            ]
+            envelope = payload.get("_metadata") if isinstance(payload, dict) else None
+            raw_total = envelope.get("totalCount") if isinstance(envelope, dict) else None
+            if isinstance(raw_total, int) and not isinstance(raw_total, bool):
+                total_count = max(int(raw_total), 0)
+            if not items:
+                complete = True
+                break
+            raw_items += len(items)
+            instances.extend(
+                parsed for item in items if (parsed := _parse_instance(item)) is not None
+            )
+            offset += len(items)
+            if total_count is not None:
+                if raw_items >= total_count:
+                    complete = True
+                    break
+                continue
+            if len(items) < INVENTORY_PAGE_SIZE:
+                # No envelope to consult: a short page ends the list.
+                complete = True
+                break
+        return CloudInstancesRead(
+            instances=tuple(instances),
+            raw_items=raw_items,
+            total_count=total_count,
+            complete=complete,
+        )
+
     async def list_instances(self, region: str) -> list[CloudInstance]:
-        """``GET /publicCloud/v1/instances?region=`` (reconciliation reads)."""
+        """``GET /publicCloud/v1/instances?region=`` (reconciliation reads).
+
+        Region-filtered on purpose: callers pass the region the credential is
+        entitled to (an offer's pinned region), which is the one filter the
+        provider accepts. Use :meth:`read_all_instances` for a census.
+        """
         payload = await self._get(
             "/publicCloud/v1/instances", {"region": region, "limit": 100, "offset": 0}
         )

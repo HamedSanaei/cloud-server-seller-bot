@@ -5,22 +5,34 @@ credential account currently holds, and which ones. That is the baseline the
 refusal was learned against, and a later LOWER count is local evidence that
 capacity may have been freed.
 
-This adapter answers that question with read-only calls only —
-``list_regions`` (to learn where to look) and ``list_instances`` per region.
-It NEVER calls a create, a delete, a power action or any other mutating
-endpoint, and it never treats ``list_regions`` / ``list_instanceTypes`` /
-``list_images`` as capacity evidence: those prove authentication and catalog
-access, not create quota.
+This adapter answers that question with ONE strictly read-only call —
+``GET /publicCloud/v1/instances`` WITHOUT a region filter (see
+:class:`CloudInstancesRead`). It NEVER calls a create, a delete, a power action
+or any other mutating endpoint.
+
+Two provider facts shape the read:
+
+* Leaseweb Public Cloud credentials are REGION-SCOPED. The ``region`` query
+  parameter is validated against the regions the credential is entitled to, so
+  a region-filtered read raises the provider's validation error for every other
+  region the global catalog lists: a per-region walk can never be exhaustive,
+  while the account-scoped unfiltered read is the entire census.
+* ``list_regions`` / ``list_instanceTypes`` / ``list_images`` are NEVER treated
+  as capacity evidence: they prove authentication and catalog access, not
+  create quota.
 
 Fail-closed rules:
 
-* an account whose regions cannot be listed yields ``None`` (unknown census);
-* a census that could not read EVERY region yields ``None`` as well: a partial
-  count is a LOWER bound, and publishing it could look like "instances were
-  freed" when a region was merely unavailable. An inconclusive census must
-  never open a recovery window;
-* a disabled credential account is skipped entirely (it receives no orders,
-  so it needs no recovery).
+* a census that could not be read at all yields ``None``;
+* a census that could not be EXHAUSTED yields ``None`` as well: a partial count
+  is a LOWER bound, and publishing it could look like "instances were freed"
+  when a page was merely missing. An inconclusive census must never open a
+  recovery window;
+* a raw entry the parser cannot read is schema drift, not an absent instance:
+  the raw count and the parsed count must agree, because the ids hash is what
+  makes two censuses comparable;
+* a disabled credential account is skipped entirely (it receives no orders, so
+  it needs no recovery).
 """
 
 from __future__ import annotations
@@ -57,41 +69,35 @@ class LeasewebCloudInventorySource:
     async def _census(self, account_id: str) -> AccountInventory | None:
         try:
             provider = self._router.client_for(account_id)
-            regions = await provider.list_regions()
+            read = await provider.read_all_instances()
         except Exception as exc:
             logger.warning(
-                "capacity inventory: regions unreadable for account %s (%s)",
+                "capacity inventory: instances unreadable for account %s (%s)",
                 account_id,
                 type(exc).__name__,
             )
             return None
-        instance_ids: list[str] = []
-        unreadable: list[str] = []
-        for region in regions:
-            region_id = str(getattr(region, "id", "") or "")
-            if not region_id:
-                continue
-            try:
-                instances = await provider.list_instances(region_id)
-            except Exception as exc:
-                # Partial reads are NOT evidence: a lower count could mean
-                # "freed" when it actually means "region unavailable".
-                logger.warning(
-                    "capacity inventory: region %s unreadable for account %s (%s)",
-                    region_id,
-                    account_id,
-                    type(exc).__name__,
-                )
-                unreadable.append(region_id)
-                continue
-            for instance in instances:
-                instance_id = str(getattr(instance, "id", "") or "").strip()
-                if instance_id:
-                    instance_ids.append(instance_id)
-        if unreadable:
+        if not read.complete:
+            # Deliberately NOT "the instances I could see": a truncated list is
+            # a lower bound, and a lower bound is indistinguishable from
+            # "instances were freed". Unknown is the only honest answer.
+            logger.warning(
+                "capacity inventory: census incomplete for account %s (%d of %s read)",
+                account_id,
+                read.raw_items,
+                "unknown" if read.total_count is None else read.total_count,
+            )
             return None
+        if read.raw_items != len(read.instances):
+            logger.warning(
+                "capacity inventory: %d unreadable entry/entries for account %s",
+                read.raw_items - len(read.instances),
+                account_id,
+            )
+            return None
+        regions = {str(instance.region).strip() for instance in read.instances if instance.region}
         return AccountInventory(
-            instance_count=len(instance_ids),
-            ids_hash=inventory_ids_hash(instance_ids),
+            instance_count=len(read.instances),
+            ids_hash=inventory_ids_hash(instance.id for instance in read.instances),
             regions_read=len(regions),
         )

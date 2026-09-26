@@ -101,7 +101,11 @@ class AccountInventory:
 
     instance_count: int
     ids_hash: str
+    #: Regions the account currently holds instances in (0 when it holds none).
     regions_read: int = 0
+    #: Regions a census could not read. Always empty for an account-scoped
+    #: census (one unfiltered read); kept so a source that does read per
+    #: region can still report a partial read as unknown-but-attributable.
     unreadable_regions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
