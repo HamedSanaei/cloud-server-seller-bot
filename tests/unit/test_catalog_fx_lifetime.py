@@ -525,7 +525,20 @@ class TestCoordinatorPublication:
             provider_report.fx_observations[0].remaining_lifetime_at_sync_start_seconds
             >= HORIZON_SECONDS
         )
-        assert not any("storefront blackout" in warning for warning in provider_report.warnings)
+        prevented = [
+            warning
+            for warning in provider_report.warnings
+            if warning.startswith("storefront blackout prevented")
+        ]
+        assert len(prevented) == 1
+        assert "reason=bounded_catalog_fx" in prevented[0]
+        assert "pair=GBP/USD" in prevented[0]
+        assert "previous_sellable=1" in prevented[0]
+        assert "resulting_sellable=1" in prevented[0]
+        assert not any(
+            warning.startswith("storefront blackout occurred")
+            for warning in provider_report.warnings
+        )
 
         metadata = repo.set_auto_price_if_current.await_args.kwargs["pricing_metadata"]
         assert metadata["fx_stale"] is True

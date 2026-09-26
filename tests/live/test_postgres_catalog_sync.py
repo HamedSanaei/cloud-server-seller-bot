@@ -671,7 +671,19 @@ class TestLiveStorefrontFxBoundary:
             provider_report = report.providers[0]
             assert provider_report.previous_sellable == 0
             assert provider_report.resulting_sellable == 1
-            assert not any("storefront blackout" in warning for warning in provider_report.warnings)
+            # The bounded last-known-good rate kept the market visible, and the
+            # run says so explicitly instead of leaving an unexplained
+            # fx_stale=true behind.
+            assert any(
+                warning.startswith("storefront blackout prevented")
+                and "reason=bounded_catalog_fx" in warning
+                and "pair=EUR/USD" in warning
+                for warning in provider_report.warnings
+            )
+            assert not any(
+                warning.startswith("storefront blackout occurred")
+                for warning in provider_report.warnings
+            )
             observations = {entry.pair: entry for entry in provider_report.fx_observations}
             assert observations["EUR/USD"].stale is True
             assert (

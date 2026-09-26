@@ -339,6 +339,18 @@ class CatalogAutoSyncCoordinator:
             )
             if blackout is not None:
                 warnings.append(blackout)
+            prevented = self._blackout_prevented_warning(
+                provider_key,
+                previous_sellable=previous_sellable,
+                resulting_sellable=resulting_sellable,
+                fx_observations=fx_observations,
+            )
+            if prevented is not None:
+                # Production keeps INFO out of the container log, so the one
+                # signal an operator must never miss ("this market is priced
+                # from the bounded last-known-good rate") is a warning, and it
+                # is persisted for the catalog doctor as well.
+                warnings.append(prevented)
         elif not report.ok:
             logger.warning(
                 "catalog auto-sync for %s: no pricing/publication (sync not usable)",
@@ -464,6 +476,33 @@ class CatalogAutoSyncCoordinator:
         return (
             f"storefront blackout occurred: reason={reason} provider={provider_key} "
             f"pair={pairs} previous_sellable={previous_sellable} "
+            f"resulting_sellable={resulting_sellable}"
+        )
+
+    @staticmethod
+    def _blackout_prevented_warning(
+        provider_key: str,
+        *,
+        previous_sellable: int,
+        resulting_sellable: int,
+        fx_observations: list[CatalogFxObservation],
+    ) -> str | None:
+        """One line when a market stayed visible on a bounded last-known-good rate.
+
+        Repricing from the bounded catalog stale window is the difference
+        between "we used the last good official rate" and "the storefront
+        emptied"; naming it explains ``fx_stale=true`` prices without reading
+        per-row metadata.
+        """
+        if resulting_sellable <= 0:
+            return None
+        stale_pairs = sorted({obs.pair for obs in fx_observations if obs.stale})
+        if not stale_pairs:
+            return None
+        return (
+            "storefront blackout prevented: reason=bounded_catalog_fx "
+            f"provider={provider_key} pair={','.join(stale_pairs)} "
+            f"previous_sellable={previous_sellable} "
             f"resulting_sellable={resulting_sellable}"
         )
 

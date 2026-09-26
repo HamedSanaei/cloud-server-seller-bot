@@ -141,11 +141,15 @@ whose own bounded provenance is still valid keeps its price and stays on sale
 while the failure is audited; only an unprovable price is cleared. One refused
 row never aborts the rest of the walk, so a single bad pair cannot leave a
 half-refreshed catalog. If a market
-does fall to zero, the run logs
+does fall to zero, the run logs and persists
 `storefront blackout occurred: reason=fx_provenance_expired|fx_pricing_failed|
-bounded_catalog_fx_exhausted pair=... previous_sellable=... resulting_sellable=...`
-and each run records per-pair `observed_at`/`expires_at`/`catalog_valid_until`
-and remaining lifetime at sync start and publish.
+bounded_catalog_fx_exhausted pair=... previous_sellable=... resulting_sellable=...`;
+a market that stayed visible while priced from the bounded rate is reported as
+`storefront blackout prevented: reason=bounded_catalog_fx ...` so `fx_stale=true`
+prices are never unexplained. Both are WARNING-level (production keeps INFO out
+of the container log) and appear in `catalog auto-sync doctor`. Each run also
+logs per-pair `observed_at`/`expires_at`/`catalog_valid_until` and remaining
+lifetime at sync start and publish.
 
 Transactional settlement is untouched: payments keep using
 `get_rate(allow_catalog_stale=False)` and never inherit the catalog horizon.
