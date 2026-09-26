@@ -46,13 +46,17 @@ from cloud_platform.providers.errors import (
     ProviderRateLimited,
     ProviderUnavailable,
 )
+from cloud_platform.providers.hetzner import hourly
 
 logger = logging.getLogger(__name__)
 
-#: Hetzner's identity and billing currency. Provider metadata, not prices —
-#: all price values are ingested from the API payload (M04-005).
 PROVIDER_KEY = "hetzner"
-CURRENCY = "EUR"
+
+#: Hetzner's identity and billing currency. Provider metadata, not prices —
+#: all price values are ingested from the API payload (M04-005). Defined with
+#: the hourly parser so there is ONE currency constant, re-exported here for
+#: the existing importers (``client``).
+CURRENCY = hourly.CURRENCY
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,9 +660,9 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
         update=OfferSpecUpdate(
             name=name,
             vcpu=int(item.get("cores") or 0),
-            ram_gb=_memory_gb(item.get("memory")),
+            ram_gb=hourly.memory_gb(item.get("memory")),
             disk_gb=int(item.get("disk") or 0),
-            traffic=_traffic_label(item.get("included_traffic")),
+            traffic=hourly.traffic_label(item.get("included_traffic")),
             provider_cost_minor=monthly,
             provider_cost_currency=CURRENCY,
             technical_metadata=TechnicalSpec(
@@ -742,36 +746,6 @@ def _normalize_country(value: Any) -> str | None:
     if len(code) != 2 or not code.isalpha():
         return None
     return code
-
-
-def _memory_gb(value: Any) -> int:
-    """Hetzner reports memory in GB as a decimal string ("4.0") -> integer GB."""
-    if value is None:
-        return 0
-    try:
-        return int(Decimal(str(value)).to_integral_value(rounding=ROUND_HALF_UP))
-    except (InvalidOperation, ValueError):
-        return 0
-
-
-def _traffic_label(value: Any) -> str | None:
-    """Included traffic (bytes, provider-reported) -> display label.
-
-    Rendered in binary terabytes, the unit the provider itself uses for
-    included traffic, from Decimal arithmetic only.
-    """
-    if value is None or isinstance(value, (bool, float)):
-        return None
-    try:
-        total = Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
-    if total <= 0:
-        return None
-    terabytes = total / (Decimal(2) ** 40)
-    if terabytes == terabytes.to_integral_value():
-        return f"{int(terabytes)} TB"
-    return f"{terabytes.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)} TB"
 
 
 def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:
