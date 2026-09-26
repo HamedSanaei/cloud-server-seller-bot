@@ -151,12 +151,52 @@ sellable through another credential.
   retires nothing; only a definitive "this credential cannot serve the pair"
   routes the pair away, and a limited account keeps its row unpublished instead
   of moving the offer.
-- The signal EXPIRES (the Leaseweb provider setting
-  `cloud_account_limit_ttl_seconds`, default 3600s, minimum 60) and
-  an operator can clear or re-probe it; one refusal never disables an account
-  permanently. `leaseweb cloud accounts doctor` prints the safe view (state,
-  capacity state, proven regions, visible instances, last code/correlation id —
-  never key material).
+- **Evidence state machine, never "time passed".** An account is always in
+  exactly one of three states:
+  - `limit_reached` — a definitive refusal inside its cooling window
+    (the Leaseweb provider setting `cloud_account_limit_ttl_seconds`, default
+    3600s, minimum 60);
+  - `unknown_after_limit` — that window elapsed with NO proof that provider
+    capacity came back. Time passing is not evidence (Leaseweb does not free a
+    Sales Organization's limit because an hour went by), so the account stays
+    out of NEW-order publication. Reads settle the stored row
+    (`limit_reached` -> `unknown_after_limit`), which is why no caller can ever
+    observe "the TTL expired, therefore eligible";
+  - `healthy` — no refusal on record, or one of exactly two positive proof
+    paths: an operator clear (`leaseweb cloud accounts clear --account <id>`,
+    run after provider instances were actually removed) or a future read-only
+    quota API whose semantics PROVE new-instance capacity. `list_regions` /
+    `list_instanceTypes` / `list_images` / `list_instances` are not proofs
+    (they prove authentication and catalog access only), and no billable create
+    is ever issued as a capacity probe.
+- **History is reconciled, exactly once.** A refusal that predates the capacity
+  feature survives only as a failed provider operation's text
+  (`operations.error`). `leaseweb cloud accounts reconcile [--dry-run]` — and
+  the worker's startup pass — turn those into the same durable knowledge
+  through the audited classifier (`is_capacity_exhausted`): an unrelated 400
+  (image, region, validation) is never reinterpreted as capacity, no operation
+  or server row is mutated, no provider call is made, and the provider
+  operation key is the idempotency anchor (one evidence row per operation,
+  ever). The 2026-09-25 incident's own operation
+  (`server-create:5e4bf88c-...`) is recovered through exactly this path.
+- **Publication reacts immediately.** The moment a refusal is durable, the
+  hourly service refreshes NEW-order publication for that account: pairs
+  another enabled account PROVES read-only are re-pinned to it through the same
+  observation write the periodic sync uses, and the remaining pairs are
+  unpublished (fail closed). The 15-minute catalog cycle stays the backstop;
+  the offer row, its pricing provenance and any existing server keep their
+  pinned account, and the refused POST is never re-sent.
+- **One image-read semantics.** `list_images` (the customer OS screen) may fall
+  back to the provider's GLOBAL image catalog when the region FILTER is
+  rejected, but the capability question — doctor, catalog sync, checkout
+  revalidation — is answered by one implementation
+  (`region_images_verdict`): a rejected region filter is `unserved` (the
+  global list is display-only), an empty region-scoped read is `empty`, and
+  only a region-scoped read that lists usable images is `proven`. Routing and a
+  billable create fail closed on anything but `proven`.
+- `leaseweb cloud accounts doctor` prints the safe view (account state,
+  capacity state and why, proven regions, visible instances, last
+  code/correlation id — never key material).
 
 ## 3. Status vocabulary
 

@@ -11,7 +11,8 @@ once, and these tests pin each of them:
 2. NOT hand the offer to an account that never proved the exact pair — an
    inconclusive OR definitively refused probe is not proof;
 3. keep the row (and its provenance) so existing resources and reconciliation
-   are untouched, and publish it again once the state expires.
+   are untouched, and publish it again only after a POSITIVE recovery signal —
+   an elapsed cooling window is not one.
 
 The fakes are the ones the multi-account suites already use, so the code under
 test is the real syncer and the real publication decision.
@@ -238,12 +239,32 @@ class TestCapacityExcludesNewOrders:
         assert update.provider_account_id == "solo"
         assert result.verified_accounts == frozenset({("solo", TYPE, REGION)})
 
-    async def test_an_expired_signal_republishes_without_operator_action(self) -> None:
-        """TTL expiry is the re-probe: the account is eligible again."""
+    async def test_an_elapsed_signal_keeps_the_pair_unpublished(self) -> None:
+        """An elapsed cooling window is NOT positive proof of recovery.
+
+        This is the exact production shape of 8fc2e573: the refusal (and the
+        provider limit) outlived the TTL, the account was treated as eligible
+        again, and the next customer order hit the same PC-2031.
+        """
         north = _pair_view(proves_images=True)
         result, offers, _ = await _run(
             {"sales-org-north": north},
             capacity=_CapacityStore({"sales-org-north": _limited("sales-org-north", expired=True)}),
+            owners={(TYPE, REGION): "sales-org-north"},
+        )
+        update = offers.upserts[0]["update"]
+        assert update.provider_available is False
+        assert result.verified_accounts == frozenset()
+        assert "capacity-limit" in " ".join(result.warnings)
+
+    async def test_an_operator_clear_republishes_the_pair(self) -> None:
+        """A proven recovery (operator clear) is the transition that restores
+        NEW-order publication, without waiting for the next full walk."""
+        north = _pair_view(proves_images=True)
+        cleared = _limited("sales-org-north", expired=True).recovered()
+        result, offers, _ = await _run(
+            {"sales-org-north": north},
+            capacity=_CapacityStore({"sales-org-north": cleared}),
             owners={(TYPE, REGION): "sales-org-north"},
         )
         assert offers.upserts[0]["update"].provider_available is True

@@ -554,6 +554,55 @@ class Container:
         provider = self.hourly_cloud_provider()
         return {"leaseweb": provider} if provider is not None else {}
 
+    def capacity_republisher(self) -> Any | None:
+        """Reacts to a NEW capacity refusal by refreshing future publication.
+
+        Built from the same Leaseweb cloud account router the hourly service
+        uses, so the alternate account is selected with the SAME read-only
+        proof the catalog sync demands. ``None`` when no Cloud router is
+        configured: the periodic catalog walk remains the only refresher.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is None:
+            return None
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+        from cloud_platform.providers.leaseweb.capacity_republish import (
+            LeasewebCapacityRepublisher,
+        )
+
+        return LeasewebCapacityRepublisher(
+            session_factory=self.session_factory,
+            router=router,
+            capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
+        )
+
+    def leaseweb_capacity_reconciliation(self) -> Any | None:
+        """Idempotent recovery of historical PC-2031 refusals (read-only).
+
+        ``None`` when no Leaseweb Cloud scope exists, so the worker startup can
+        simply skip it instead of inventing evidence.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is None and not get_settings().leaseweb_api_key:
+            return None
+        from cloud_platform.modules.provider_capacity.reconciliation import (
+            CapacityReconciliationService,
+        )
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+        from cloud_platform.providers.leaseweb.capacity_evidence import (
+            SqlAlchemyHistoricalCapacityEvidenceSource,
+        )
+
+        return CapacityReconciliationService(
+            capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
+            evidence_source=SqlAlchemyHistoricalCapacityEvidenceSource(self.session_factory),
+            ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
+        )
+
     def hourly_cloud_service(self) -> Any:
         """The hourly instance creation command (no provider calls, no charge)."""
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
@@ -590,6 +639,10 @@ class Container:
             # it too, but this catches an offer published before the refusal.
             capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
             capacity_ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
+            # The moment a refusal is recorded, future-order publication is
+            # refreshed so the storefront stops advertising the limited
+            # account instead of waiting for the next catalog walk.
+            capacity_republisher=self.capacity_republisher(),
             catalog_currency=get_settings().fx_catalog_pricing_currency,
             catalog_stale_limit_seconds=(get_settings().fx_frankfurter_catalog_max_stale_seconds),
         )

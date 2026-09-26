@@ -126,11 +126,15 @@ order_os_only_free = true
 contract_term = "1_MONTH"
 billing_cycle = "1_MONTH"
 # Hourly cloud: how long ONE definitive provider account-capacity refusal
-# (Leaseweb PC-2031 "Customer limit reached") keeps that credential out of
-# NEW-order publication. Leaseweb publishes no quota endpoint, so capacity is
-# learned from a refusal; the window is bounded so one refusal can never disable
-# an account permanently, and the catalog sync re-probes once it expires.
-# Existing servers, orders and reconciliation are never affected. Minimum 60.
+# (Leaseweb PC-2031 "Customer limit reached") is treated as FRESH evidence.
+# Leaseweb publishes no quota endpoint, so capacity is only learned from a
+# refusal. While the refusal is fresh the account is `limit_reached`; after the
+# window elapses it becomes `unknown_after_limit` and STILL takes no NEW orders
+# — expiry removes freshness, never the fact that recovery is unproven. Only
+# positive proof restores `healthy`: `leaseweb cloud accounts clear --account
+# <id>` after provider instances were actually freed (or a future read-only
+# quota API that proves new-instance capacity). Existing servers, orders and
+# reconciliation are never affected by this state. Minimum 60.
 cloud_account_limit_ttl_seconds = 3600
 
 # --- Multiple Leaseweb credential accounts (LEASEWEB-MULTIACCOUNT) ----------

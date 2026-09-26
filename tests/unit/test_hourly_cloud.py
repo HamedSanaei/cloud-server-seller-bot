@@ -42,6 +42,33 @@ def _provider(**overrides: Any) -> LeasewebHourlyCloudProvider:
     return provider
 
 
+def _documented_region_rejection() -> LeasewebValidationError:
+    """The DOCUMENTED 400 for a region this credential does not own.
+
+    Built through the audited parser (``errorDetails.region``, exactly the
+    envelope production sends), because that field is what the platform now
+    reads to decide whether the *filter* — or the request itself — was rejected.
+    """
+    import httpx
+
+    from cloud_platform.providers.leaseweb.errors import (
+        error_for_response,
+        parse_error_payload,
+    )
+
+    payload = parse_error_payload(
+        httpx.Response(
+            status_code=400,
+            json={
+                "errorCode": "400",
+                "errorMessage": "Validation Failed",
+                "errorDetails": {"region": ['The value "eu-west-3" is not valid region.']},
+            },
+        )
+    )
+    return error_for_response(payload, endpoint="/publicCloud/v1/images")
+
+
 def _regions_payload() -> dict[str, Any]:
     return {
         "regions": [
@@ -239,7 +266,7 @@ class TestImages:
         ) -> Any:
             calls.append({"method": method, "path": path, "params": dict(params or {})})
             if params:
-                raise LeasewebValidationError("errorCode=400; Validation Failed; HTTP 400")
+                raise _documented_region_rejection()
             return {
                 "images": [
                     {
@@ -286,6 +313,94 @@ class TestImages:
         with pytest.raises(LeasewebAuthenticationError):
             await provider.list_images("eu-west-3")
         assert provider._transport.request.await_count == 1
+
+    async def test_a_non_region_400_never_widens_the_image_read(self) -> None:
+        """A 400 about anything BUT the region filter must fail closed.
+
+        The earlier behaviour widened the read on ANY validation error, which
+        could hand a customer screen (and a checkout) the global catalog after
+        an unrelated rejection. Only the documented region detail counts.
+        """
+        import httpx
+
+        from cloud_platform.providers.leaseweb.errors import (
+            error_for_response,
+            parse_error_payload,
+        )
+
+        payload = parse_error_payload(
+            httpx.Response(
+                status_code=400,
+                json={
+                    "errorCode": "400",
+                    "errorMessage": "Validation Failed",
+                    "errorDetails": {"rootDiskSize": ["This value should be 5 or more."]},
+                },
+            )
+        )
+        rejection = error_for_response(payload, endpoint="/publicCloud/v1/images")
+        provider = _provider()
+        provider._transport.request = AsyncMock(side_effect=rejection)
+        with pytest.raises(LeasewebValidationError):
+            await provider.list_images("eu-west-3")
+        assert provider._transport.request.await_count == 1
+
+    async def test_one_verdict_for_doctor_sync_and_checkout(self) -> None:
+        """The doctor, the catalog sync and the checkout revalidation answer the
+        SAME question the same way.
+
+        A rejected region filter is UNSERVED: the global catalog is legitimate
+        for the customer OS screen and proves nothing about NEW-instance
+        capability, so routing and a billable create must refuse it.
+        """
+        from cloud_platform.providers.leaseweb.cloud import RegionImagesState
+
+        provider = _provider()
+        calls: list[str] = []
+
+        async def _request(
+            method: str, path: str, *, params: dict[str, Any] | None = None, **kw: Any
+        ) -> Any:
+            calls.append(path)
+            if params:
+                raise _documented_region_rejection()
+            return {
+                "images": [{"id": "UBUNTU_24_04", "displayName": "Ubuntu 24.04", "region": None}]
+            }
+
+        provider._transport.request = _request
+
+        verdict = await provider.region_images_verdict("eu-central-1")
+        assert verdict.state is RegionImagesState.UNSERVED
+        assert verdict.region_scoped is False
+        assert verdict.proven is False
+        assert [image.id for image in verdict.images] == ["UBUNTU_24_04"]
+        assert "proves display only" in verdict.safe_note()
+
+        # The customer OS screen may still show the global catalog...
+        assert [image.id for image in await provider.list_images("eu-central-1")] == [
+            "UBUNTU_24_04"
+        ]
+        # ...while routing (the sync's proof) and checkout (the create path)
+        # must fail closed instead of treating display data as capability.
+        with pytest.raises(LeasewebValidationError):
+            await provider.probe_region_images("eu-central-1")
+        with pytest.raises(LeasewebValidationError):
+            await provider.installable_images("eu-central-1")
+        # Every one of those reads went through the single implementation.
+        assert calls == ["/publicCloud/v1/images"] * 8
+
+    async def test_an_empty_scoped_read_is_a_verdict_not_a_proof(self) -> None:
+        """A readable region with no usable image is EMPTY, never PROVEN."""
+        from cloud_platform.providers.leaseweb.cloud import RegionImagesState
+
+        provider = _provider()
+        provider._transport.request = AsyncMock(return_value={"images": []})
+        verdict = await provider.region_images_verdict("eu-west-3")
+        assert verdict.state is RegionImagesState.EMPTY
+        assert verdict.region_scoped is True
+        assert verdict.proven is False
+        assert "listed no usable image" in verdict.safe_note()
 
 
 class TestInstanceIdentity:

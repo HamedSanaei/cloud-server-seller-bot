@@ -671,20 +671,23 @@ class ProviderAccountCapacity(Base):
     One row per ``(provider_key, credential_account_id)``: capacity is an
     ACCOUNT fact, not a location fact. Nothing here is credential material.
     The row never gates management/reconciliation of existing resources; it
-    only keeps NEW orders off an account whose limit is currently reached, and
-    ``expires_at`` returns the account to normal publication after the TTL.
+    only keeps NEW orders off an account whose limit is currently reached.
+    ``expires_at`` marks when the refusal stops being FRESH — an elapsed
+    window produces ``unknown_after_limit`` (recovery unproven), never
+    ``healthy``; only an operator clear or a verified positive provider signal
+    returns an account to normal publication.
 
     Attributes:
         provider_key: Logical provider (e.g. "leaseweb")
         credential_account_id: Stable non-secret account handle
-        state: healthy | limit_reached
+        state: healthy | limit_reached | unknown_after_limit
         error_code: Provider error code of the last refusal (e.g. "PC-2031")
         correlation_id: Provider routing id (safe to quote to support)
         location_id: Location of the refused create, when known
         product_id: Instance type of the refused create, when known
         observations: How many definitive refusals were recorded
         observed_at: When the current state was last observed
-        expires_at: When a limit_reached state stops applying (NULL = healthy)
+        expires_at: When the refusal stops being fresh (NULL = healthy)
     """
 
     __tablename__ = "provider_account_capacity"
@@ -712,6 +715,66 @@ class ProviderAccountCapacity(Base):
     updated_at = Column(
         DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
     )
+
+
+class ProviderAccountCapacityEvent(Base):
+    """Append-only evidence log behind a credential account's capacity row.
+
+    The capacity row answers "what do we believe right now?"; this table
+    answers "why, and exactly when, did we learn it?". Two things depend on
+    it:
+
+    * **Exactly-once reconciliation.** A historical provider-operation failure
+      that proves a refusal (Leaseweb ``PC-2031``) is backfilled with its
+      operation key as ``source_ref``; the partial unique index below makes a
+      repeated reconciliation a no-op instead of a second observation.
+    * **Operator audit.** Which refusals were seen live, which were recovered
+      from history, and when an operator cleared the account.
+
+    Nothing here is credential material: an error code, a correlation id and
+    the location/product of the refused create only.
+
+    Attributes:
+        provider_key: Logical provider (e.g. "leaseweb")
+        credential_account_id: Stable non-secret account handle
+        kind: refusal | backfill | cleared
+        state: Resulting capacity state of the transition
+        source_ref: Idempotency anchor (provider operation key), when known
+        observed_at / expires_at: The incident's own timeline
+    """
+
+    __tablename__ = "provider_account_capacity_events"
+    __table_args__ = (
+        Index(
+            "ix_provider_account_capacity_events_account",
+            "provider_key",
+            "credential_account_id",
+            "created_at",
+        ),
+        Index(
+            "uq_provider_account_capacity_events_source",
+            "provider_key",
+            "credential_account_id",
+            "kind",
+            "source_ref",
+            unique=True,
+            postgresql_where=sa.text("source_ref IS NOT NULL"),
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_key = Column(String(32), nullable=False)
+    credential_account_id = Column(String(64), nullable=False)
+    kind = Column(String(16), nullable=False)
+    state = Column(String(32), nullable=False)
+    error_code = Column(String(64), nullable=True)
+    correlation_id = Column(String(64), nullable=True)
+    location_id = Column(String(64), nullable=True)
+    product_id = Column(String(128), nullable=True)
+    source_ref = Column(String(128), nullable=True)
+    observed_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
 
 
 class RenewalRecord(Base):

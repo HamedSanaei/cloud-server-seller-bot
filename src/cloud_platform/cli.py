@@ -2190,18 +2190,22 @@ async def leaseweb_cloud_doctor() -> int:
             print(f"  account {account.account_id}: Public Cloud ACCESSIBLE")
             print(f"    regions: {len(capability.regions)}")
             for region_id, type_count in sorted(capability.regions):
-                # Image read status is per-region, from the OWNING account.
+                # One verdict per region, from the OWNING account, using the
+                # SAME evidence rule the catalog sync and checkout use: the
+                # global image catalog is display-only and must never be
+                # reported as "this account can serve the region".
                 try:
                     provider = cloud_router.client_for(account.account_id)
-                    images = await provider.list_images(region_id)
+                    verdict = await _region_image_verdict(provider, region_id)
                     print(
                         f"    region {region_id}: {type_count} instance type(s), "
-                        f"{len(images)} image(s) readable"
+                        f"image capability {verdict.state.value}: {verdict.safe_note()}"
                     )
                 except Exception as exc:
                     print(
                         f"    region {region_id}: {type_count} instance type(s), "
-                        f"images unreadable ({type(exc).__name__})"
+                        f"image capability inconclusive ({type(exc).__name__}): "
+                        "routing keeps the last proven state"
                     )
         else:
             reason = _cloud_unavailable_reason(capability)
@@ -2323,7 +2327,88 @@ def _cloud_capacity_repository() -> Any | None:
         return None
 
 
-async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = None) -> int:
+async def _region_image_verdict(provider: Any, region_id: str) -> Any:
+    """The capability verdict for one region, from the provider itself.
+
+    Uses the adapter's single region-image implementation when it exists so
+    the doctor cannot disagree with the catalog sync and checkout; legacy
+    adapters (tests/doubles) keep working through the plain image read.
+    """
+    reader = getattr(provider, "region_images_verdict", None)
+    if callable(reader):
+        return await reader(region_id)
+
+    class _LegacyVerdict:
+        def __init__(self, count: int) -> None:
+            from cloud_platform.providers.leaseweb.cloud import RegionImagesState
+
+            self.state = RegionImagesState.PROVEN if count else RegionImagesState.EMPTY
+            self._count = count
+
+        def safe_note(self) -> str:
+            return f"region-scoped read: {self._count} usable image(s)"
+
+    return _LegacyVerdict(len(await provider.list_images(region_id)))
+
+
+async def _leaseweb_cloud_accounts_reconcile(
+    capacity_repo: Any | None, *, dry_run: bool = False
+) -> int:
+    """Recover historical capacity refusals into the durable store.
+
+    Read-only against the provider (it never calls it at all): the evidence is
+    the platform's own failed create operations, and the classification is the
+    audited Leaseweb capacity classifier. Idempotent, so re-running is safe.
+    """
+    if capacity_repo is None:
+        print("error: capacity store unavailable; nothing was reconciled")
+        return 1
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.provider_capacity.reconciliation import (
+        CapacityReconciliationService,
+    )
+    from cloud_platform.providers.leaseweb.capacity_evidence import (
+        SqlAlchemyHistoricalCapacityEvidenceSource,
+    )
+
+    service = CapacityReconciliationService(
+        capacity_repo=capacity_repo,
+        evidence_source=SqlAlchemyHistoricalCapacityEvidenceSource(SessionFactory),
+        ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
+    )
+    if dry_run:
+        source = SqlAlchemyHistoricalCapacityEvidenceSource(SessionFactory)
+        try:
+            evidence = await source.failed_capacity_evidence("leaseweb")
+        except Exception as exc:
+            print(f"error: historical evidence unreadable ({type(exc).__name__})")
+            return 1
+        print(f"capacity reconcile (dry run): {len(evidence)} provable refusal(s)")
+        for item in evidence:
+            print(
+                f"  {item.source_ref}: account={item.credential_account_id} "
+                f"code={item.error_code or '-'} correlationId={item.correlation_id or '-'} "
+                f"observed_at={item.observed_at.isoformat() if item.observed_at else '-'}"
+            )
+        return 0
+    try:
+        report = await service.run("leaseweb")
+    except Exception as exc:
+        print(f"error: capacity reconciliation failed ({type(exc).__name__})")
+        return 1
+    print(f"capacity reconcile: {report.summary()}")
+    for account_id, state in report.applied:
+        print(f"  applied: account={account_id} state={state}")
+    for source_ref in report.already_recorded:
+        print(f"  already recorded: {source_ref}")
+    for source_ref in report.failed:
+        print(f"  failed: {source_ref}")
+    return 0
+
+
+async def leaseweb_cloud_accounts(
+    action: str = "doctor", account: str | None = None, dry_run: bool = False
+) -> int:
     """Read-only per-account hourly-Cloud capacity / eligibility diagnostics.
 
     Answers, per credential account and without ever printing a secret:
@@ -2339,8 +2424,15 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
 
     ``clear --account <id>`` marks one account eligible for new orders again
     (the recorded refusal evidence is kept for diagnostics) — this is how an
-    operator re-probes after freeing provider capacity. Nothing here places,
-    retries or cancels a provider order, and no existing resource is touched.
+    operator re-probes after freeing provider capacity. An ELAPSED cooling
+    window is reported as ``unknown-after-limit`` and is deliberately NOT
+    eligible, because time passing is not proof that provider capacity
+    returned.
+
+    ``reconcile [--dry-run]`` recovers refusals that were only ever recorded as
+    historical provider-operation failures (idempotent, no provider call, no
+    credential material). Nothing here places, retries or cancels a provider
+    order, and no existing resource is touched.
     """
     from cloud_platform.providers.leaseweb.cloud_accounts import (
         build_cloud_account_router,
@@ -2393,6 +2485,21 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
         except Exception as exc:
             print(f"[WARN] capacity state unreadable ({type(exc).__name__})")
 
+    if action == "reconcile":
+        return await _leaseweb_cloud_accounts_reconcile(capacity_repo, dry_run=dry_run)
+
+    history: dict[str, tuple[Any, ...]] = {}
+    if capacity_repo is not None:
+        try:
+            for account_id in {definition.account_id for definition in accounts} | set(records):
+                events = await capacity_repo.list_events(
+                    "leaseweb", credential_account_id=account_id, limit=5
+                )
+                if events:
+                    history[account_id] = tuple(events)
+        except Exception as exc:
+            print(f"[WARN] capacity history unreadable ({type(exc).__name__})")
+
     print(f"leaseweb cloud accounts ({len(accounts)} configured)")
     limit_reached: list[str] = []
     for definition in accounts:
@@ -2439,6 +2546,25 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
             + (str(region_count) if region_count is not None else "unknown")
         )
         print(f"  instances currently held: {instances}")
+        if capability is not None and capability.accessible:
+            # Per-region capability verdict: the SAME evidence rule the catalog
+            # sync and checkout use. A rejected region filter is reported as
+            # "unserved" with its reason instead of being hidden behind a global
+            # image count, so this view can never claim a capability the sync
+            # denies.
+            for region_id, _types in sorted(capability.regions):
+                try:
+                    verdict = await _region_image_verdict(provider, region_id)
+                except Exception as exc:
+                    print(
+                        f"  region {region_id}: image capability inconclusive "
+                        f"({type(exc).__name__}) - routing keeps the last proven state"
+                    )
+                    continue
+                print(
+                    f"  region {region_id}: image capability {verdict.state.value} "
+                    f"({verdict.safe_note()})"
+                )
 
         record = records.get(account_id)
         if record is None:
@@ -2447,27 +2573,39 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
         if record.is_limit_reached():
             reference = record.observed_at.isoformat() if record.observed_at else "-"
             expires = record.expires_at.isoformat() if record.expires_at else "-"
+            blocked = record.blocked_reason() or "limit-reached"
             print(
-                f"  capacity: LIMIT-REACHED ({record.error_code or 'provider limit'}) "
-                "- no NEW orders are published through this account"
+                f"  capacity: NOT ELIGIBLE for NEW orders ({blocked}, "
+                f"{record.error_code or 'provider limit'})"
             )
-            print(f"    last refusal: {reference}; applies until {expires}")
+            print(f"    refusal observed: {reference}; cooling window ended: {expires}")
             print(f"    correlationId: {record.correlation_id or '-'}")
             print(f"    affected: {record.location_id or '-'} / {record.product_id or '-'}")
+            if blocked == "unknown-after-limit":
+                # The whole point of the state: elapsed time is NOT recovery.
+                print(
+                    "    recovery unproven: the cooling window elapsed without any "
+                    "positive evidence that provider capacity returned"
+                )
             limit_reached.append(account_id)
         else:
+            print(f"  capacity: healthy (refusals recorded: {record.observations})")
+        for event in history.get(account_id, ()):
             print(
-                f"  capacity: healthy (refusals recorded: {record.observations}"
-                + ("; signal expired" if record.state.value == "limit_reached" else "")
-                + ")"
+                f"    evidence {event.kind.value}: "
+                f"{event.created_at.isoformat() if event.created_at else '-'} "
+                f"state={event.state.value} code={event.error_code or '-'} "
+                f"correlationId={event.correlation_id or '-'} "
+                f"source={event.source_ref or 'live'}"
             )
 
     print()
     if limit_reached:
         print("result: NEW hourly orders are NOT published through: " + ", ".join(limit_reached))
         print(
-            "action: free capacity on the provider account (or wait for the "
-            "configured TTL), then run 'leaseweb cloud accounts clear --account <id>'"
+            "action: free capacity on the provider account, then run "
+            "'leaseweb cloud accounts clear --account <id>' to record the proven "
+            "recovery; an elapsed cooling window alone does NOT restore eligibility"
         )
         return 1
     print("result: every configured account may receive NEW hourly orders")
@@ -2579,7 +2717,11 @@ async def leaseweb_cloud_create_preview(
     try:
         try:
             types = await provider.list_instance_types(region)
-            images = await provider.list_images(region)
+            # A create preview must use the SAME region-scoped image evidence a
+            # real create would: the global catalog is display-only and must
+            # never make an unserved region look installable.
+            images_reader = getattr(provider, "installable_images", None) or provider.list_images
+            images = await images_reader(region)
         except Exception as exc:
             print(f"error: provider catalog unreadable ({type(exc).__name__})")
             return 1
@@ -3689,14 +3831,22 @@ def _parser() -> argparse.ArgumentParser:
     lsw_cloud_accounts.add_argument(
         "action",
         nargs="?",
-        choices=["doctor", "clear"],
+        choices=["doctor", "clear", "reconcile"],
         default="doctor",
-        help="doctor reports; clear marks one account eligible again (keeps evidence)",
+        help=(
+            "doctor reports; clear records proven recovery; reconcile recovers "
+            "historical refusals from failed operations (idempotent)"
+        ),
     )
     lsw_cloud_accounts.add_argument(
         "--account",
         default=None,
         help="credential account id (required by 'clear')",
+    )
+    lsw_cloud_accounts.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="reconcile: print the provable historical refusals without applying them",
     )
     lsw_cloud_catalog = lsw_cloud_sub.add_parser(
         "catalog", help="read-only normalized hourly catalog"
@@ -3915,7 +4065,9 @@ async def _dispatch(args: argparse.Namespace) -> int:
             if args.leaseweb_cloud == "doctor":
                 return await leaseweb_cloud_doctor()
             if args.leaseweb_cloud == "accounts":
-                return await leaseweb_cloud_accounts(args.action, args.account)
+                return await leaseweb_cloud_accounts(
+                    args.action, args.account, dry_run=bool(getattr(args, "dry_run", False))
+                )
             if args.leaseweb_cloud == "catalog":
                 return await leaseweb_cloud_catalog(args.region)
             if args.leaseweb_cloud == "create-preview":

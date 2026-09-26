@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from enum import StrEnum
 from typing import Any
 
 from cloud_platform.core.idempotency import IdempotencyKey
@@ -45,6 +46,84 @@ logger = logging.getLogger(__name__)
 #: Provider key served by this adapter (same Leaseweb account universe as
 #: VPS ordering; the commercial product differs, not the provider).
 PROVIDER_KEY = "leaseweb"
+
+#: Why a region-scoped image read could not be used as a capability proof.
+REGION_FILTER_UNSUPPORTED = "region-filter-unsupported"
+
+
+class RegionImagesState(StrEnum):
+    """What one credential's image evidence for a region actually PROVES."""
+
+    PROVEN = "proven"
+    """The region-scoped read succeeded and listed usable images."""
+
+    EMPTY = "empty"
+    """The region-scoped read succeeded; the credential lists no image."""
+
+    UNSERVED = "unserved"
+    """The provider rejected the region FILTER for this credential.
+
+    Definitive for ROUTING (a Leaseweb Sales Organization lists and bills its
+    own locations) and display-only for the image list: the global catalog
+    says which standard images exist, not that this account may install them
+    in that region.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class RegionImageRead:
+    """One raw region image read plus whether it was region-scoped."""
+
+    region: str
+    images: tuple[CloudImage, ...]
+    region_scoped: bool
+    detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RegionImageVerdict:
+    """The capability verdict shared by doctor, sync and checkout."""
+
+    region: str
+    state: RegionImagesState
+    region_scoped: bool
+    images: tuple[CloudImage, ...] = ()
+    detail: str | None = None
+
+    @property
+    def proven(self) -> bool:
+        return self.state is RegionImagesState.PROVEN
+
+    def safe_note(self) -> str:
+        """A bounded, non-secret explanation for operators."""
+        if self.state is RegionImagesState.PROVEN:
+            return f"region-scoped read: {len(self.images)} usable image(s)"
+        if self.state is RegionImagesState.EMPTY:
+            return "region-scoped read succeeded but listed no usable image"
+        detail = self.detail or REGION_FILTER_UNSUPPORTED
+        return (
+            f"region filter rejected for this credential ({detail}); the global "
+            f"catalog lists {len(self.images)} image(s), which proves display only"
+        )
+
+
+def is_region_filter_rejection(exc: BaseException) -> bool:
+    """Whether a 400 provably rejected the ``?region=`` FILTER itself.
+
+    Only the documented shape counts: Leaseweb answers
+    ``400 Validation Failed`` with ``errorDetails.region`` for a region this
+    Sales Organization does not own. Anything else — an image, storage or
+    request-shape complaint — is NOT this condition and must fail closed.
+    """
+    payload = getattr(exc, "payload", None)
+    details = getattr(payload, "error_details", None)
+    if isinstance(details, dict):
+        for field_name in details:
+            if str(field_name).strip().casefold() == "region":
+                return True
+    text = str(exc or "").casefold()
+    return "not valid region" in text or "invalid region" in text
+
 
 #: Hourly contract marker sent on every instance create.
 CONTRACT_TYPE_HOURLY = "HOURLY"
@@ -899,48 +978,122 @@ class LeasewebHourlyCloudProvider:
         """``GET /publicCloud/v1/instanceTypes?region=`` (catalog membership)."""
         return list((await self.read_instance_types(region)).types)
 
-    async def list_images(self, region: str) -> list[CloudImage]:
-        """Live installable images for one region (the OS/image screen).
+    async def read_region_images(self, region: str) -> RegionImageRead:
+        """The ONE region-scoped image read (documented filter + fallback).
 
         The documented ``?region=`` filter is attempted first. The provider's
         image catalog is however GLOBAL — every entry states ``region: null``,
         and the filter currently accepts only the credential's own region id,
         rejecting any other sellable region with HTTP 400 "not valid region"
         (observed 2026-09-25 for eu-west-3, ap-northeast-1, us-east-1, ... while
-        ``/regions`` and ``/instanceTypes`` accept all ten). A rejected request
-        shape therefore falls back to the same endpoint's global read instead
-        of reporting a sellable plan as having no operating system; every other
-        failure (auth, forbidden, not found, rate limit, unavailable) still
-        propagates and fails closed.
+        ``/regions`` and ``/instanceTypes`` accept all ten). A rejection of the
+        FILTER is therefore reported as an unscoped read backed by the global
+        catalog — display data — instead of being reported as "no operating
+        system available"; every other failure (auth, forbidden, not found,
+        rate limit, unavailable, or a 400 about anything but the region filter)
+        still propagates and fails closed.
 
-        Ownership/routing decisions must NOT use this method: the fallback
-        makes every credential look capable for every region. Call
-        :meth:`probe_region_images` for that.
+        Every other image method is defined in terms of this one, so the
+        customer screen, the doctor, the catalog sync and checkout revalidation
+        can never disagree about what the same evidence means.
         """
         try:
             payload = await self._get("/publicCloud/v1/images", {"region": region})
         except LeasewebValidationError as exc:
+            if not is_region_filter_rejection(exc):
+                raise
             logger.warning(
                 "images: provider rejected the region filter for %r (%s); "
-                "reading the global image catalog",
+                "reading the global image catalog (display only)",
                 region,
                 type(exc).__name__,
             )
             payload = await self._get("/publicCloud/v1/images")
-        return self._images_from(payload)
+            return RegionImageRead(
+                region=region,
+                images=tuple(self._images_from(payload)),
+                region_scoped=False,
+                detail=REGION_FILTER_UNSUPPORTED,
+            )
+        return RegionImageRead(
+            region=region, images=tuple(self._images_from(payload)), region_scoped=True
+        )
+
+    async def region_images_verdict(self, region: str) -> RegionImageVerdict:
+        """What this credential's image evidence for a region actually PROVES.
+
+        ``proven``  - the region-scoped read succeeded and listed usable images
+                      (the only outcome that proves the account can install
+                      here);
+        ``empty``   - the region-scoped read succeeded and listed nothing;
+        ``unserved`` - the provider rejected the region filter for this
+                      credential: the global catalog is display-only and proves
+                      nothing about NEW-instance capability here.
+
+        An inconclusive read (timeout/5xx/throttle) RAISES instead of returning
+        a verdict: it proves nothing and must never be recorded as "cannot
+        serve".
+        """
+        read = await self.read_region_images(region)
+        if not read.region_scoped:
+            return RegionImageVerdict(
+                region=region,
+                state=RegionImagesState.UNSERVED,
+                region_scoped=False,
+                images=read.images,
+                detail=read.detail,
+            )
+        state = RegionImagesState.PROVEN if read.images else RegionImagesState.EMPTY
+        return RegionImageVerdict(
+            region=region, state=state, region_scoped=True, images=read.images
+        )
+
+    async def list_images(self, region: str) -> list[CloudImage]:
+        """Installable-looking images for one region (the OS/image screen).
+
+        Display path: the global catalog is a legitimate answer when the region
+        filter is unsupported. Ownership/routing decisions must NOT use this
+        method — use :meth:`region_images_verdict` (see the doctor, the catalog
+        sync and :meth:`installable_images`), which says what the evidence
+        actually proves.
+        """
+        return list((await self.read_region_images(region)).images)
+
+    async def installable_images(self, region: str) -> list[CloudImage]:
+        """Images a NEW instance may be created from on THIS credential.
+
+        Identical semantics to the catalog sync's routing proof: the
+        region-scoped read must be accepted for this credential. A global
+        catalog read never turns an unserved region into a sellable one, so a
+        checkout (or a worker create) can never proceed into a region this
+        credential does not own — it fails closed with the provider answer.
+        """
+        verdict = await self.region_images_verdict(region)
+        if verdict.state is RegionImagesState.UNSERVED:
+            raise LeasewebValidationError(
+                f"region {region!r}: this credential cannot serve the region "
+                f"({verdict.detail or REGION_FILTER_UNSUPPORTED}); the global image "
+                "catalog is display-only and proves nothing about new instances"
+            )
+        return list(verdict.images)
 
     async def probe_region_images(self, region: str) -> list[CloudImage]:
-        """Region-scoped image read: does THIS credential serve this region?
+        """Region-scoped image read for ROUTING: does this credential serve it?
 
-        Unlike :meth:`list_images` there is deliberately NO global fallback.
-        The provider rejects the region filter with HTTP 400 for every region
-        except the credential's own one, so the outcome is exactly the routing
-        fact the catalog sync needs (a Leaseweb Sales Organization lists and
-        bills its own locations). The documented request shape is sent
-        unchanged, and a rejection propagates.
+        Strict on purpose (no global fallback): the provider rejects the region
+        filter for every region except the credential's own one, so the outcome
+        is exactly the routing fact the catalog sync needs (a Leaseweb Sales
+        Organization lists and bills its own locations). A rejected filter
+        raises the provider's own validation error, which the sync records as
+        ``account-cannot-serve`` — the same verdict its doctor view reports.
         """
-        payload = await self._get("/publicCloud/v1/images", {"region": region})
-        return self._images_from(payload)
+        verdict = await self.region_images_verdict(region)
+        if verdict.state is RegionImagesState.UNSERVED:
+            raise LeasewebValidationError(
+                f"region {region!r}: this credential is not entitled to the "
+                f"region-scoped image read ({verdict.detail or REGION_FILTER_UNSUPPORTED})"
+            )
+        return list(verdict.images)
 
     def _images_from(self, payload: Any) -> list[CloudImage]:
         return [
@@ -1000,7 +1153,10 @@ class LeasewebHourlyCloudProvider:
                 raise ProviderError(
                     f"exact provider rate changed for {product_id!r} in {location_id!r}"
                 )
-        images = await self.list_images(location_id)
+        # The SAME evidence rule the catalog sync uses to publish this offer: a
+        # region this credential cannot serve fails closed here instead of
+        # sending a billable POST the provider is known to refuse.
+        images = await self.installable_images(location_id)
         image = next((item for item in images if item.id == image_id), None)
         if image is None:
             raise ProviderNotFound(f"image {image_id!r} is not offered in {location_id!r}")

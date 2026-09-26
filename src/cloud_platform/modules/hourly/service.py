@@ -56,6 +56,7 @@ from cloud_platform.modules.provider_accounts.domain import (
 from cloud_platform.modules.provider_capacity.domain import (
     DEFAULT_LIMIT_TTL_SECONDS,
     AccountCapacityRepository,
+    CapacityChangeRepublisher,
     CapacityObservation,
 )
 from cloud_platform.modules.users.domain import User, UserStatus
@@ -68,6 +69,7 @@ from cloud_platform.providers.errors import (
     ProviderError,
     ProviderNotFound,
     ProviderOutcomeUnknown,
+    ProviderRateLimited,
     ProviderUnavailable,
 )
 from cloud_platform.providers.routing import DEFAULT_CREDENTIAL_ACCOUNT
@@ -491,6 +493,12 @@ class HourlyCloudService:
         #: account whose provider limit was already definitively refused.
         capacity_repo: AccountCapacityRepository | Any | None = None,
         capacity_ttl_seconds: int = DEFAULT_LIMIT_TTL_SECONDS,
+        #: NEW-ORDER publication refresher invoked the moment a definitive
+        #: capacity refusal is recorded. Optional and best effort: it exists so
+        #: the storefront stops advertising the limited account immediately
+        #: instead of at the next periodic catalog walk. It never touches an
+        #: accepted contract and never re-sends the refused POST.
+        capacity_republisher: CapacityChangeRepublisher | Any | None = None,
         #: Canonical storefront currency for foreign offers.  USD is the
         #: current deployment default; an explicit configured value is still
         #: validated at this application boundary.
@@ -512,6 +520,7 @@ class HourlyCloudService:
         self._cloud_resolver = cloud_resolver
         self._capacity = capacity_repo
         self._capacity_ttl_seconds = capacity_ttl_seconds
+        self._capacity_republisher = capacity_republisher
         target_currency = (catalog_currency or "").strip().upper()
         if target_currency not in SUPPORTED_CURRENCIES:
             raise ValueError("catalog_currency must be an audited currency code")
@@ -607,6 +616,7 @@ class HourlyCloudService:
         repo = self._capacity
         if repo is None or not account_id:
             return
+        durable = False
         try:
             await repo.record_limit_reached(
                 provider_key=provider_key,
@@ -619,9 +629,47 @@ class HourlyCloudService:
                 ),
                 ttl_seconds=self._capacity_ttl_seconds,
             )
+            durable = True
         except Exception:
             logger.exception(
                 "failed to record provider capacity limit for %s/%s", provider_key, account_id
+            )
+        if durable:
+            await self._republish_after_capacity_refusal(
+                provider_key=provider_key, credential_account_id=account_id
+            )
+
+    async def _republish_after_capacity_refusal(
+        self, *, provider_key: str, credential_account_id: str
+    ) -> None:
+        """Refresh NEW-ORDER publication right after a capacity refusal lands.
+
+        Runs only after the durable capacity write, so the checkout gate is
+        already effective when the catalog catches up: a second customer
+        confirming in the same second is refused by the account gate even if
+        an offer is still published. Best effort — the periodic catalog sync is
+        the backstop, and a publication failure must never change the outcome
+        of the provider operation that produced the refusal.
+        """
+        republisher = self._capacity_republisher
+        if republisher is None:
+            return
+        try:
+            report = await republisher.after_capacity_refusal(
+                provider_key=provider_key,
+                credential_account_id=credential_account_id,
+            )
+        except Exception:
+            logger.exception(
+                "capacity publication refresh failed for %s/%s", provider_key, credential_account_id
+            )
+            return
+        summary = getattr(report, "summary", None)
+        if callable(summary):
+            logger.warning(
+                "capacity publication refreshed after refusal: provider=%s %s",
+                provider_key,
+                summary(),
             )
 
     async def _repair_hourly_bundle(
@@ -1013,10 +1061,14 @@ class HourlyCloudService:
         # it is evaluated before anything else about the account is resolved.
         capacity = await self._account_capacity(offer.provider_key, pinned_account)
         if capacity is not None and not capacity.accepts_new_orders():
+            # Two genuinely different situations, one customer answer: the
+            # provider limit is still inside its window, or the window elapsed
+            # without anyone proving capacity came back. Neither is "eligible".
+            blocked = capacity.blocked_reason() or "limit-reached"
             raise HourlyAccountCapacityError(
-                "the provider account pinned to this offer has reached its "
-                f"instance limit ({capacity.error_code or 'limit reached'}); "
-                "it cannot accept new instances until the limit clears"
+                "the provider account pinned to this offer cannot take new "
+                f"instances ({blocked}, {capacity.error_code or 'limit reached'}); "
+                "a new order is possible only after capacity recovery is proven"
             )
         try:
             adapter = self._adapter_for(offer.provider_key, pinned_account)
@@ -1390,9 +1442,22 @@ class HourlyCloudService:
             return await self._requeue_operation(
                 claimed, f"hourly offer revalidation unavailable: {exc}"
             )
+        # The SAME evidence rule the catalog sync used to publish this offer:
+        # an adapter that can prove region-scoped installability is asked for
+        # it, so a create can never be sent into a region its pinned account is
+        # not entitled to (the global image catalog is display-only).
+        images_reader = getattr(adapter, "installable_images", None) or getattr(
+            adapter, "list_images", None
+        )
+        if not callable(images_reader):
+            return await self._fail_operation(
+                claimed, server, "provider adapter lacks an image read"
+            )
         try:
-            images = await adapter.list_images(snapshot.offer.location_id)
-        except (ProviderAuthError, ProviderNotFound, ProviderConflict) as exc:
+            images = await images_reader(snapshot.offer.location_id)
+        except (ProviderUnavailable, ProviderRateLimited) as exc:
+            return await self._requeue_operation(claimed, f"images unavailable: {exc}")
+        except ProviderError as exc:
             return await self._fail_operation(claimed, server, f"images unavailable: {exc}")
         except Exception as exc:
             return await self._requeue_operation(claimed, f"images unavailable: {exc}")

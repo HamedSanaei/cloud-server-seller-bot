@@ -11,7 +11,8 @@ credential ACCOUNT was out of room. These tests pin what must happen then:
   correlation id + location/type), and losing that write changes nothing;
 * an accepted contract is never replayed, never re-routed to another credential,
   and its already-failed operation is never resurrected;
-* an expired signal no longer blocks anything;
+* an ELAPSED signal still blocks (expiry is not evidence of recovery); only
+  an operator clear / verified positive proof makes the account eligible again;
 * the immutable fingerprint keeps the account the catalog selected.
 """
 
@@ -25,6 +26,7 @@ from test_hourly_state_machine import (  # type: ignore[import-not-found]
     FakeCapacityRepo,
     FakeHourlyAdapter,
     FakeOffersRepo,
+    _Ambiguous,
     _create,
     _DictResolver,
     _requested_server,
@@ -95,7 +97,10 @@ class TestNewOrderGate:
         assert servers.servers == {}
         assert resolver.resolved == []
 
-    async def test_an_expired_signal_does_not_block_checkout(self) -> None:
+    async def test_an_elapsed_signal_still_blocks_checkout(self) -> None:
+        """Expiry is NOT recovery: an account whose cooling window elapsed
+        without proof must not accept a new order (the provider would refuse it
+        again, exactly as it refused 8fc2e573)."""
         capacity = FakeCapacityRepo({ACCOUNT: _limit_reached(expired=True)})
         offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
         resolver = _DictResolver({ACCOUNT: FakeHourlyAdapter()})
@@ -103,7 +108,22 @@ class TestNewOrderGate:
             offers, FakeHourlyAdapter(), capacity=capacity, resolver=resolver
         )
 
-        result = await _create(service, offers, idempotency_key="expired-key")
+        with pytest.raises(HourlyAccountCapacityError):
+            await _create(service, offers, idempotency_key="expired-key")
+        assert capacity.writes == []
+
+    async def test_an_operator_clear_restores_checkout(self) -> None:
+        """A proven recovery (operator clear / verified positive signal) is the
+        ONLY transition back to eligibility — and it needs no new refusal."""
+        record = _limit_reached(expired=True).recovered()
+        capacity = FakeCapacityRepo({ACCOUNT: record})
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        resolver = _DictResolver({ACCOUNT: FakeHourlyAdapter()})
+        service, _, _, _ = _service(
+            offers, FakeHourlyAdapter(), capacity=capacity, resolver=resolver
+        )
+
+        result = await _create(service, offers, idempotency_key="cleared-key")
         assert result.server.credential_account_id == ACCOUNT
 
     async def test_the_fingerprint_pins_the_account_the_catalog_selected(self) -> None:
@@ -131,6 +151,30 @@ class TestNewOrderGate:
 
         result = await _create(service, offers, idempotency_key="store-down")
         assert result.server is not None
+
+
+class _RecordingRepublisher:
+    """Records the post-refusal publication refresh, in order.
+
+    The durable capacity write must ALREADY have happened when this runs: a
+    second customer confirming in the same second is stopped by the account
+    gate, not by the (eventually consistent) catalog.
+    """
+
+    def __init__(self, capacity: Any = None, *, error: Exception | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._capacity = capacity
+        self._error = error
+
+    async def after_capacity_refusal(self, *, provider_key: str, credential_account_id: str) -> Any:
+        if self._capacity is not None:
+            assert credential_account_id in self._capacity.records, (
+                "the capacity write must land before the catalog refresh"
+            )
+        self.calls.append((provider_key, credential_account_id))
+        if self._error is not None:
+            raise self._error
+        return None
 
 
 class TestWorkerCapacityRefusal:
@@ -239,6 +283,78 @@ class TestWorkerCapacityRefusal:
         assert ops.ops[f"server-create:{server.id}"].status.value == "failed"
         assert servers.servers[server.id] is not None
 
+    async def test_the_refusal_refreshes_new_order_publication_immediately(self) -> None:
+        """The 15-minute catalog cycle is a backstop, not the reaction.
+
+        Production kept advertising sales-org-north for the rest of the cycle
+        after the 06:20:02 refusal, which is the window 8fc2e573 was accepted
+        in. The moment the refusal is durable, publication is refreshed for
+        that account — once, with the exact account that refused.
+        """
+        capacity = FakeCapacityRepo({})
+        republisher = _RecordingRepublisher(capacity)
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        service, _, _, _ = _service(
+            offers,
+            FakeHourlyAdapter(),
+            capacity=capacity,
+            capacity_republisher=republisher,
+            resolver=_DictResolver({ACCOUNT: cloud}),
+        )
+        server = await _requested_server(service, offers)
+        cloud.create_error = _pc2031_error()
+
+        assert await service.process_server(server.id) == "failed"
+        assert republisher.calls == [(PROVIDER, ACCOUNT)]
+
+    async def test_a_broken_republisher_never_changes_the_operation(self) -> None:
+        """Best effort by contract: the catalog refresh must never mask (or
+        alter) the provider operation that produced the refusal."""
+        capacity = FakeCapacityRepo({})
+        republisher = _RecordingRepublisher(error=RuntimeError("catalog sync down"))
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        service, servers, _, ops = _service(
+            offers,
+            FakeHourlyAdapter(),
+            capacity=capacity,
+            capacity_republisher=republisher,
+            resolver=_DictResolver({ACCOUNT: cloud}),
+        )
+        server = await _requested_server(service, offers)
+        cloud.create_error = _pc2031_error()
+
+        assert await service.process_server(server.id) == "failed"
+        assert ops.ops[f"server-create:{server.id}"].status.value == "failed"
+        assert "PC-2031" in (ops.ops[f"server-create:{server.id}"].error or "")
+        assert servers.servers[server.id] is not None
+        assert republisher.calls == [(PROVIDER, ACCOUNT)]
+
+    async def test_a_lost_capacity_write_triggers_no_publication_change(self) -> None:
+        """No durable evidence means no reason to unpublish anything: the
+        periodic sync stays the backstop for that (rare) failure."""
+
+        class _BrokenWrite(FakeCapacityRepo):
+            async def record_limit_reached(self, **kwargs: Any) -> Any:
+                raise RuntimeError("db write lost")
+
+        republisher = _RecordingRepublisher()
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        service, _, _, _ = _service(
+            offers,
+            FakeHourlyAdapter(),
+            capacity=_BrokenWrite({}),
+            capacity_republisher=republisher,
+            resolver=_DictResolver({ACCOUNT: cloud}),
+        )
+        server = await _requested_server(service, offers)
+        cloud.create_error = _pc2031_error()
+
+        assert await service.process_server(server.id) == "failed"
+        assert republisher.calls == []
+
     async def test_a_transient_provider_failure_is_still_requeued_not_failed(self) -> None:
         """Capacity is definitive; a timeout is not — the states stay distinct."""
         from cloud_platform.providers.errors import ProviderUnavailable
@@ -258,3 +374,66 @@ class TestWorkerCapacityRefusal:
         assert await service.process_server(server.id) == "requeued"
         assert capacity.writes == []
         assert ops.ops[f"server-create:{server.id}"].status.value != "failed"
+
+
+class TestExistingResourcesStayManageable:
+    """Capacity is scoped to NEW orders: nothing already owned is affected.
+
+    The incident's account must stop receiving NEW business and keep serving
+    everything it already owns — including an ambiguous create that still has
+    to be resolved through the account pinned on the resource.
+    """
+
+    async def test_a_limited_account_still_reconciles_what_it_owns(self) -> None:
+        from types import SimpleNamespace
+
+        from cloud_platform.modules.hourly.service import hourly_reference_name
+
+        capacity = FakeCapacityRepo({})
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        resolver = _DictResolver({ACCOUNT: cloud})
+        service, servers, _, ops = _service(
+            offers, FakeHourlyAdapter(), capacity=capacity, resolver=resolver
+        )
+        server = await _requested_server(service, offers)
+        cloud.create_error = _Ambiguous("connection lost after POST")
+        assert await service.process_server(server.id) == "outcome-unknown"
+        # The refusal lands AFTER the resource exists (production's shape: the
+        # existing server and its pinned account predate the limit).
+        capacity.records[ACCOUNT] = _limit_reached()
+        assert capacity.records[ACCOUNT].is_limit_reached() is True
+
+        # ...and the in-flight create it already owns is still resolved through
+        # that SAME pinned account (no cross-account replay, no abandon).
+        cloud.find_result = SimpleNamespace(
+            id="i-9",
+            state="RUNNING",
+            region="eu-west-3",
+            reference=hourly_reference_name(server.id),
+            instance_type="lsw.mini",
+            image_id="UBUNTU",
+        )
+        assert await service.reconcile_server(server.id) == "attached"
+        assert set(resolver.resolved) == {ACCOUNT}
+        assert servers.servers[server.id].provider_server_id == "i-9"
+        assert ops.ops[f"server-create:{server.id}"].status.value == "completed"
+
+    async def test_a_settled_signal_never_unresolves_the_pinned_account(self) -> None:
+        """Management resolves the credential pinned on the RESOURCE, not the
+        capacity state — a settled (unproven) account must stay reachable for
+        the servers it already owns."""
+        capacity = FakeCapacityRepo({ACCOUNT: _limit_reached(expired=True)})
+        cloud = FakeHourlyAdapter()
+        resolver = _DictResolver({ACCOUNT: cloud})
+        service, _, _, _ = _service(
+            FakeOffersRepo([]), FakeHourlyAdapter(), capacity=capacity, resolver=resolver
+        )
+
+        settled = capacity.records[ACCOUNT].settled()
+        assert settled.state is AccountCapacityState.UNKNOWN_AFTER_LIMIT
+        assert settled.blocked_reason() == "unknown-after-limit"
+        # The management path resolves the pinned account directly (the same
+        # call `reconcile_server` makes) with no capacity consultation at all.
+        assert service._adapter_for(PROVIDER, ACCOUNT) is cloud
+        assert resolver.resolved == [ACCOUNT]

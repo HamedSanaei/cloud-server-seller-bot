@@ -257,6 +257,7 @@ def _service(
     snapshots: FakeSnapshots | None = None,
     ops: FakeOpsRepo | None = None,
     capacity: Any | None = None,
+    capacity_republisher: Any | None = None,
     resolver: Any | None = None,
     capacity_ttl_seconds: int = 3600,
 ) -> tuple[HourlyCloudService, FakeServerRepo, FakeSnapshots, FakeOpsRepo]:
@@ -274,6 +275,7 @@ def _service(
         cloud_providers={PROVIDER: cloud},
         capacity_repo=capacity,
         capacity_ttl_seconds=capacity_ttl_seconds,
+        capacity_republisher=capacity_republisher,
         cloud_resolver=resolver,
     )
     return service, servers, snapshots, ops

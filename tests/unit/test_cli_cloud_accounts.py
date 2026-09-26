@@ -57,6 +57,22 @@ class _Provider:
     async def list_instances(self, region: str) -> list[Any]:
         return list(self._instances.get(region, []))
 
+    async def region_images_verdict(self, region: str) -> Any:
+        """The one verdict the doctor, the sync and checkout share."""
+        from cloud_platform.providers.leaseweb.cloud import (
+            RegionImagesState,
+            RegionImageVerdict,
+        )
+
+        if region == "eu-west-2":
+            return RegionImageVerdict(
+                region=region,
+                state=RegionImagesState.UNSERVED,
+                region_scoped=False,
+                detail="region-filter-unsupported",
+            )
+        return RegionImageVerdict(region=region, state=RegionImagesState.PROVEN, region_scoped=True)
+
 
 class _Router:
     def __init__(self) -> None:
@@ -86,6 +102,11 @@ class _CapacityRepo:
             observations=1,
             observed_at=datetime.now(UTC),
         )
+
+    async def list_events(
+        self, provider_key: str, *, credential_account_id: str | None = None, limit: int = 20
+    ) -> list[Any]:
+        return []
 
 
 def _limit_reached() -> AccountCapacity:
@@ -135,11 +156,47 @@ class TestCloudAccountsDoctor:
         patched["repo"] = _CapacityRepo([_limit_reached()])
         assert await leaseweb_cloud_accounts("doctor") == 1
         out = capsys.readouterr().out
-        assert "capacity: LIMIT-REACHED (PC-2031)" in out
-        assert "no NEW orders are published through this account" in out
+        assert "capacity: NOT ELIGIBLE for NEW orders (limit-reached, PC-2031)" in out
         assert "correlationId: 07376219-7bcd-43d9-a5ea-4128fa57345a" in out
         assert "affected: eu-central-1 / lsw.m4.large" in out
         assert "leaseweb cloud accounts clear --account" in out
+
+    async def test_an_elapsed_window_is_reported_as_unproven_not_healthy(
+        self, patched: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The TTL elapsing must never read as "eligible again"."""
+        observed = datetime.now(UTC) - timedelta(hours=3)
+        expired = _limit_reached()
+        expired = AccountCapacity(
+            provider_key=expired.provider_key,
+            credential_account_id=expired.credential_account_id,
+            state=AccountCapacityState.LIMIT_REACHED,
+            error_code="PC-2031",
+            correlation_id=expired.correlation_id,
+            location_id=expired.location_id,
+            product_id=expired.product_id,
+            observations=1,
+            observed_at=observed,
+            expires_at=observed + timedelta(hours=1),
+        )
+        patched["repo"] = _CapacityRepo([expired])
+        assert await leaseweb_cloud_accounts("doctor") == 1
+        out = capsys.readouterr().out
+        assert "NOT ELIGIBLE for NEW orders (unknown-after-limit, PC-2031)" in out
+        assert "recovery unproven" in out
+        assert "capacity: healthy" not in out
+
+    async def test_the_region_image_verdict_explains_the_global_fallback(
+        self, patched: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Doctor, sync and checkout must agree about what the same evidence
+        proves: the global image catalog is display-only."""
+        assert await leaseweb_cloud_accounts("doctor") == 0
+        out = capsys.readouterr().out
+        assert "region eu-central-1: image capability proven" in out
+        assert "region eu-west-2: image capability unserved" in out
+        assert "region filter rejected for this credential" in out
+        assert "proves display only" in out
 
     async def test_the_report_never_prints_a_secret(
         self,
@@ -160,6 +217,47 @@ class TestCloudAccountsDoctor:
         assert await leaseweb_cloud_accounts("doctor") == 0
         out = capsys.readouterr().out
         assert "capacity store unavailable; capacity reported as UNKNOWN" in out
+
+
+class TestCloudAccountsReconcile:
+    async def test_reconcile_without_a_store_fails_closed(
+        self, patched: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        patched["repo"] = None
+        assert await leaseweb_cloud_accounts("reconcile") == 1
+        assert "capacity store unavailable" in capsys.readouterr().out
+
+    async def test_a_dry_run_lists_historical_evidence_without_applying_it(
+        self, patched: Any, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cloud_platform.modules.provider_capacity.domain import HistoricalCapacityEvidence
+        from cloud_platform.providers.leaseweb.capacity_evidence import (
+            SqlAlchemyHistoricalCapacityEvidenceSource,
+        )
+
+        evidence = (
+            HistoricalCapacityEvidence(
+                provider_key="leaseweb",
+                credential_account_id=ACCOUNT,
+                source_ref="server-create:5e4bf88c-cabe-4ab1-9eb4-cf448e046382",
+                error_code="PC-2031",
+                correlation_id="07376219-7bcd-43d9-a5ea-4128fa57345a",
+                observed_at=datetime.now(UTC) - timedelta(days=1),
+            ),
+        )
+
+        async def fake_failed(self: Any, provider_key: str, *, limit: int = 200) -> Any:
+            return evidence
+
+        monkeypatch.setattr(
+            SqlAlchemyHistoricalCapacityEvidenceSource, "failed_capacity_evidence", fake_failed
+        )
+        patched["repo"] = _CapacityRepo()
+        assert await leaseweb_cloud_accounts("reconcile", dry_run=True) == 0
+        out = capsys.readouterr().out
+        assert "capacity reconcile (dry run): 1 provable refusal(s)" in out
+        assert "server-create:5e4bf88c" in out
+        assert patched["repo"].records == []
 
 
 class TestCloudAccountsClear:

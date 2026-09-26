@@ -179,7 +179,11 @@ class TestAccountCapacityState:
         assert second.correlation_id == "cid-1"
         assert second.location_id == "eu-central-1"
 
-    def test_the_state_expires_on_its_own(self) -> None:
+    def test_an_elapsed_window_settles_to_unknown_not_healthy(self) -> None:
+        """Time passing removes FRESHNESS, never the fact that recovery is
+        unproven. An expired refusal must NOT make the account eligible again:
+        Leaseweb does not free a Sales Organization's customer limit because an
+        hour went by."""
         now = datetime(2026, 9, 25, 12, tzinfo=UTC)
         record = AccountCapacity(
             provider_key="leaseweb", credential_account_id="north", observations=0
@@ -190,10 +194,54 @@ class TestAccountCapacityState:
         )
         assert record.is_limit_reached(now=now + timedelta(seconds=59)) is True
         assert record.expired(now=now + timedelta(seconds=60)) is True
-        # Expired means eligible again: one refusal can never disable an
-        # account permanently.
-        assert record.accepts_new_orders(now=now + timedelta(seconds=60)) is True
-        assert record.is_limit_reached(now=now + timedelta(seconds=60)) is False
+        settled = record.settled(now=now + timedelta(seconds=60))
+        assert settled.state is AccountCapacityState.UNKNOWN_AFTER_LIMIT
+        assert settled.blocked_reason(now=now + timedelta(seconds=60)) == "unknown-after-limit"
+        # Still not eligible, on the record or after settling.
+        assert record.accepts_new_orders(now=now + timedelta(seconds=60)) is False
+        assert record.is_limit_reached(now=now + timedelta(seconds=60)) is True
+        assert settled.accepts_new_orders(now=now + timedelta(seconds=600)) is False
+        # The evidence (and its own timeline) survives the settlement.
+        assert settled.error_code == "PC-2031"
+        assert settled.expires_at == record.expires_at
+
+    def test_only_positive_proof_restores_eligibility(self) -> None:
+        """An operator clear (or a verified positive signal) is the ONE path
+        back to HEALTHY, and it keeps the refusal history for diagnostics."""
+        now = datetime(2026, 9, 25, 12, tzinfo=UTC)
+        record = (
+            AccountCapacity(provider_key="leaseweb", credential_account_id="north", observations=0)
+            .with_limit_reached(
+                observation=CapacityObservation(error_code="PC-2031"),
+                ttl_seconds=60,
+                now=now,
+            )
+            .settled(now=now + timedelta(seconds=600))
+        )
+        assert record.state is AccountCapacityState.UNKNOWN_AFTER_LIMIT
+        recovered = record.recovered(now=now + timedelta(seconds=600))
+        assert recovered.state is AccountCapacityState.HEALTHY
+        assert recovered.accepts_new_orders(now=now + timedelta(seconds=600)) is True
+        assert recovered.blocked_reason() is None
+        assert recovered.error_code == "PC-2031"  # evidence kept, eligibility changed
+
+    def test_a_fresh_refusal_after_settlement_refreshes_the_window(self) -> None:
+        now = datetime(2026, 9, 25, 12, tzinfo=UTC)
+        record = (
+            AccountCapacity(provider_key="leaseweb", credential_account_id="north", observations=1)
+            .with_limit_reached(
+                observation=CapacityObservation(error_code="PC-2031"), ttl_seconds=60, now=now
+            )
+            .settled(now=now + timedelta(seconds=600))
+            .with_limit_reached(
+                observation=CapacityObservation(correlation_id="cid-2"),
+                ttl_seconds=60,
+                now=now + timedelta(seconds=900),
+            )
+        )
+        assert record.state is AccountCapacityState.LIMIT_REACHED
+        assert record.observations == 3
+        assert record.expires_at == now + timedelta(seconds=960)
 
     def test_a_naive_datetime_is_read_as_utc(self) -> None:
         # The DB may hand back a naive timestamp; a wrong tz interpretation
@@ -238,3 +286,180 @@ class TestAccountCapacityState:
             AccountCapacity(provider_key="leaseweb", credential_account_id="  ")
         with pytest.raises(ValueError):
             CapacityObservation(error_code="   ")
+
+
+#: The sanitized ``operations.error`` text production stored for the incident
+#: (server 5e4bf88c, operation ``server-create:5e4bf88c-...``).
+PC2031_OPERATION_TEXT = (
+    "provider account has no capacity for new instances: errorCode=PC-2031; Customer limit "
+    "reached; correlationId=07376219-7bcd-43d9-a5ea-4128fa57345a; HTTP 400"
+)
+#: An unrelated provider 400: a region the credential does not serve.
+VALIDATION_OPERATION_TEXT = (
+    "hourly offer revalidation failed: errorCode=400; Validation Failed; region: "
+    'The value "eu-west-9" is not valid region; HTTP 400'
+)
+
+
+def _evidence(
+    source_ref: str = "server-create:5e4bf88c-cabe-4ab1-9eb4-cf448e046382",
+    *,
+    account: str = "sales-org-north",
+    error_code: str | None = "PC-2031",
+    observed_at: datetime | None = None,
+) -> Any:
+    from cloud_platform.modules.provider_capacity.domain import HistoricalCapacityEvidence
+
+    return HistoricalCapacityEvidence(
+        provider_key="leaseweb",
+        credential_account_id=account,
+        source_ref=source_ref,
+        error_code=error_code,
+        correlation_id="07376219-7bcd-43d9-a5ea-4128fa57345a",
+        observed_at=observed_at,
+    )
+
+
+class _FakeCapacityRepo:
+    """Durable-store double: applied source refs are remembered (idempotent)."""
+
+    def __init__(self, *, fail_on: set[str] | None = None) -> None:
+        self.seen: list[str] = []
+        self.applied: set[str] = set()
+        self._fail_on = set(fail_on or set())
+
+    async def record_historical_evidence(
+        self, evidence: Any, *, ttl_seconds: int = DEFAULT_LIMIT_TTL_SECONDS, now: Any = None
+    ) -> Any:
+        self.seen.append(evidence.source_ref)
+        if evidence.source_ref in self._fail_on:
+            raise RuntimeError("write failed")
+        if evidence.source_ref in self.applied:
+            return None
+        self.applied.add(evidence.source_ref)
+        return AccountCapacity(
+            provider_key=evidence.provider_key,
+            credential_account_id=evidence.credential_account_id,
+            state=AccountCapacityState.UNKNOWN_AFTER_LIMIT,
+            error_code=evidence.error_code,
+            observations=1,
+        )
+
+
+class _FakeEvidenceSource:
+    def __init__(self, items: tuple[Any, ...] = (), *, error: Exception | None = None) -> None:
+        self.items = items
+        self.error = error
+        self.asked: list[tuple[str, int]] = []
+
+    async def failed_capacity_evidence(self, provider_key: str, *, limit: int = 200) -> Any:
+        self.asked.append((provider_key, limit))
+        if self.error is not None:
+            raise self.error
+        return self.items
+
+
+class TestHistoricalReconciliation:
+    """Recovering a refusal the platform never recorded per ACCOUNT.
+
+    The incident's create failed BEFORE the capacity feature existed, so the
+    store was empty and the next customer order went to an account already at
+    its provider limit. The reconciliation closes that gap once, without
+    touching the operation and without a provider call.
+    """
+
+    def _service(self, repo: Any, source: Any, *, ttl_seconds: int = 3600) -> Any:
+        from cloud_platform.modules.provider_capacity.reconciliation import (
+            CapacityReconciliationService,
+        )
+
+        return CapacityReconciliationService(
+            capacity_repo=repo, evidence_source=source, ttl_seconds=ttl_seconds
+        )
+
+    async def test_an_incident_is_applied_once_and_a_replay_appends_nothing(self) -> None:
+        repo = _FakeCapacityRepo()
+        source = _FakeEvidenceSource((_evidence(),))
+        service = self._service(repo, source)
+
+        first = await service.run("leaseweb")
+        assert first.evidence_found == 1
+        assert first.applied == (("sales-org-north", "unknown_after_limit"),)
+        assert first.summary() == "provider=leaseweb evidence=1 applied=1 already=0 failed=0"
+        # The operation key is the idempotency anchor: a restart, a second
+        # worker or an operator retry applies nothing new.
+        second = await service.run("leaseweb")
+        assert second.applied == ()
+        assert second.already_recorded == (_evidence().source_ref,)
+        assert repo.seen == [_evidence().source_ref, _evidence().source_ref]
+        assert source.asked == [("leaseweb", 200), ("leaseweb", 200)]
+
+    async def test_a_failing_evidence_source_is_a_report_not_an_exception(self) -> None:
+        """Startup must never crash because history could not be read."""
+        repo = _FakeCapacityRepo()
+        service = self._service(repo, _FakeEvidenceSource(error=RuntimeError("db down")))
+
+        report = await service.run("leaseweb")
+        assert report.errors == ("evidence source: RuntimeError",)
+        assert report.applied == ()
+        assert repo.seen == []
+
+    async def test_one_failing_item_never_aborts_the_others(self) -> None:
+        first, second = _evidence("op-1"), _evidence("op-2", account="sales-org-uk")
+        repo = _FakeCapacityRepo(fail_on={"op-1"})
+        service = self._service(repo, _FakeEvidenceSource((first, second)))
+
+        report = await service.run("leaseweb")
+        assert report.failed == ("op-1",)
+        assert report.applied == (("sales-org-uk", "unknown_after_limit"),)
+        assert report.applied_count == 1
+
+    async def test_the_read_limit_must_be_positive(self) -> None:
+        service = self._service(_FakeCapacityRepo(), _FakeEvidenceSource())
+        with pytest.raises(ValueError):
+            await service.run("leaseweb", limit=0)
+
+    def test_only_a_proven_capacity_refusal_becomes_evidence(self) -> None:
+        """The DECISION is the audited classifier, not a text heuristic: a
+        generic provider 400 (region/image/validation) is never recovered as
+        capacity, and the capacity text is recovered with its code."""
+        from cloud_platform.providers.leaseweb.capacity_evidence import parse_capacity_evidence
+
+        proven = parse_capacity_evidence(
+            PC2031_OPERATION_TEXT,
+            provider_key="leaseweb",
+            credential_account_id="sales-org-north",
+            source_ref="server-create:5e4bf88c",
+        )
+        assert proven is not None
+        assert proven.error_code == "PC-2031"
+        assert proven.correlation_id == "07376219-7bcd-43d9-a5ea-4128fa57345a"
+        assert proven.source_ref == "server-create:5e4bf88c"
+        # What reaches the durable store is the safe subset only: an error
+        # code and a routing id — never the operation text, a credential or a
+        # request body.
+        observation = proven.as_observation()
+        assert (observation.error_code, observation.correlation_id) == (
+            "PC-2031",
+            "07376219-7bcd-43d9-a5ea-4128fa57345a",
+        )
+        assert (observation.location_id, observation.product_id) == (None, None)
+
+        assert (
+            parse_capacity_evidence(
+                VALIDATION_OPERATION_TEXT,
+                provider_key="leaseweb",
+                credential_account_id="sales-org-north",
+                source_ref="server-create:5e4bf88c",
+            )
+            is None
+        )
+        assert (
+            parse_capacity_evidence(
+                None,
+                provider_key="leaseweb",
+                credential_account_id="sales-org-north",
+                source_ref="server-create:5e4bf88c",
+            )
+            is None
+        )

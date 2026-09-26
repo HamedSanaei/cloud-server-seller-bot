@@ -24,6 +24,46 @@ async def startup(ctx: dict[str, object]) -> None:
         otlp_endpoint=settings.otel_exporter_endpoint,
         sample_ratio=settings.otel_sample_ratio,
     )
+    # Durable capacity knowledge must exist BEFORE the first checkout after a
+    # deployment: an account that refused a create before the capacity feature
+    # existed is otherwise considered eligible and is handed the next order.
+    # Idempotent (one evidence row per provider operation) and read-only.
+    await reconcile_capacity_evidence_once()
+
+
+async def reconcile_capacity_evidence_once() -> None:
+    """Recover historical capacity refusals exactly once per process.
+
+    Best effort by design: a reconciliation failure must never stop the
+    worker from starting (the CLI command exists for an explicit operator
+    run), and the routine is idempotent, so a crash-retry is harmless.
+    """
+    global _CAPACITY_EVIDENCE_RECONCILED
+    if _CAPACITY_EVIDENCE_RECONCILED:
+        return
+    _CAPACITY_EVIDENCE_RECONCILED = True
+    async with metrics.job("reconcile_capacity_evidence"):
+        from cloud_platform.core.container import create_container
+
+        container = None
+        try:
+            container = create_container()
+            reconciler = container.leaseweb_capacity_reconciliation()
+            if reconciler is None:
+                logger.info("capacity reconciliation skipped: no leaseweb cloud scope")
+                return
+            report = await reconciler.run("leaseweb")
+            logger.info("capacity reconciliation: %s", report.summary())
+        except Exception:
+            logger.exception("capacity reconciliation failed; worker continues")
+        finally:
+            if container is not None:
+                await container.close()
+
+
+#: One reconciliation per worker process (arq may call ``startup`` again after
+#: a restart in the same process); the routine itself is also idempotent.
+_CAPACITY_EVIDENCE_RECONCILED = False
 
 
 async def shutdown(ctx: dict[str, object]) -> None:
