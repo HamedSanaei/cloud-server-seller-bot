@@ -233,6 +233,23 @@ _PROVIDER_FIELDS: Mapping[str, Mapping[str, str]] = {
         "contract_term": "leaseweb_contract_term",
         "billing_cycle": "leaseweb_billing_cycle",
         "cloud_account_limit_ttl_seconds": "leaseweb_cloud_account_limit_ttl_seconds",
+        # Automatic capacity recovery (LEASEWEB-MULTIACCOUNT). The backoff
+        # schedule is a real list of integers; it is passed through (never
+        # comma-joined) and validated at the boundary.
+        "cloud_capacity_recovery_enabled": "leaseweb_cloud_capacity_recovery_enabled",
+        "cloud_capacity_recovery_interval_seconds": (
+            "leaseweb_cloud_capacity_recovery_interval_seconds"
+        ),
+        "cloud_capacity_recovery_backoff_seconds": (
+            "leaseweb_cloud_capacity_recovery_backoff_seconds"
+        ),
+        "cloud_capacity_canary_lease_seconds": ("leaseweb_cloud_capacity_canary_lease_seconds"),
+        "cloud_capacity_outage_reminder_delay_seconds": (
+            "leaseweb_cloud_capacity_outage_reminder_delay_seconds"
+        ),
+        "cloud_capacity_outage_reminder_interval_seconds": (
+            "leaseweb_cloud_capacity_outage_reminder_interval_seconds"
+        ),
     },
     "hetzner": {
         "api_token": "hetzner_api_token",
@@ -650,6 +667,28 @@ class Settings(BaseSettings):
     # catalog sync re-probes automatically once it expires. Existing servers,
     # orders and reconciliation are never affected. Minimum 60 seconds.
     leaseweb_cloud_account_limit_ttl_seconds: int = Field(default=3600, ge=60)
+    # --- Automatic capacity recovery (LEASEWEB-MULTIACCOUNT) ----------------
+    # PC-2031 no longer needs the operator to remember an override clear. A
+    # read-only controller inspects the account's instance inventory (and the
+    # local delete events), then lets EXACTLY ONE real customer order act as a
+    # canary; its provider verdict is what restores eligibility. No synthetic
+    # or billable probe server is ever created.
+    leaseweb_cloud_capacity_recovery_enabled: bool = True
+    #: Cron cadence (minutes) of the read-only recovery controller.
+    leaseweb_cloud_capacity_recovery_interval_seconds: int = Field(default=180, ge=60)
+    #: Exponential backoff between canary attempts, in seconds. 15m, 30m, 1h,
+    #: 2h and then every 6h by default; the LAST value is the permanent cap.
+    leaseweb_cloud_capacity_recovery_backoff_seconds: list[int] = Field(
+        default_factory=lambda: [900, 1800, 3600, 7200, 21600]
+    )
+    #: How long ONE in-flight canary order holds the durable single-attempt
+    #: lease before it expires on its own (a crashed worker never deadlocks
+    #: recovery).
+    leaseweb_cloud_capacity_canary_lease_seconds: int = Field(default=900, ge=60)
+    #: Operator reminder cadence while an account stays blocked: first card
+    #: after the delay, then every interval (deduplicated by the outbox).
+    leaseweb_cloud_capacity_outage_reminder_delay_seconds: int = Field(default=1800, ge=60)
+    leaseweb_cloud_capacity_outage_reminder_interval_seconds: int = Field(default=21600, ge=60)
     # Telegram admin alert chat for renewals/attention items (0 = unset).
     telegram_admin_chat_id: int = 0
     # Optional support contact shown on the support screen (e.g. @handle).

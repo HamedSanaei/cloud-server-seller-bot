@@ -2333,6 +2333,12 @@ class DeleteOperationExecutor:
         wallet_repo: WalletRepository,
         audit_repo: AuditRepository,
         waiter: ActionWaiter | None = None,
+        #: Optional durable capacity store (LEASEWEB-MULTIACCOUNT). A successful
+        #: provider deletion is LOCAL evidence that capacity may have been
+        #: freed on that credential account, so the automatic recovery window
+        #: is brought forward immediately. Best effort and never fatal: a
+        #: missing/failing store must not affect the deletion itself.
+        capacity_recovery: Any | None = None,
     ) -> None:
         self._ops = operation_repo
         self._servers = server_repo
@@ -2343,6 +2349,7 @@ class DeleteOperationExecutor:
         self._wallets = wallet_repo
         self._audit = AuditTrail(audit_repo)
         self._waiter = waiter or ActionWaiter()
+        self._capacity_recovery = capacity_recovery
 
     async def execute(
         self,
@@ -2368,6 +2375,31 @@ class DeleteOperationExecutor:
             },
         ):
             return await self._execute_in_span(operation, actor_type=actor_type, actor_id=actor_id)
+
+    async def _bring_forward_capacity_recovery(self, server: Any) -> None:
+        """Best-effort: a deleted instance may have freed provider capacity."""
+        repo = self._capacity_recovery
+        account = str(getattr(server, "credential_account_id", "") or "").strip()
+        provider_key = str(getattr(server, "provider_key", "") or "").strip()
+        if repo is None or not account or not provider_key:
+            return
+        if not getattr(server, "provider_server_id", None):
+            # Nothing was ever created on this account: no inventory changed.
+            return
+        try:
+            changed = await repo.bring_forward_recovery(provider_key, account)
+        except Exception:
+            logger.warning(
+                "capacity recovery could not be brought forward after a delete",
+                exc_info=True,
+            )
+            return
+        if changed:
+            logger.warning(
+                "capacity recovery brought forward after delete: provider=%s account=%s",
+                provider_key,
+                account,
+            )
 
     async def _execute_in_span(
         self,
@@ -2482,6 +2514,11 @@ class DeleteOperationExecutor:
             }
         )
         await self._ops.save(operation)
+        # CAPACITY RECOVERY SIGNAL: an app-owned instance just disappeared from
+        # its credential account, which may have freed the provider limit that
+        # blocked NEW orders. Bring that account's next recovery window forward
+        # (a local, read-only fact — never a provider call).
+        await self._bring_forward_capacity_recovery(server)
         await self._audit.record_mutation(
             actor_type=actor_type,
             actor_id=actor_id,

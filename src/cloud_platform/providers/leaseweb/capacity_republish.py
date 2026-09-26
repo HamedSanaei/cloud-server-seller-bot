@@ -223,6 +223,94 @@ class LeasewebCapacityRepublisher:
         logger.warning("leaseweb capacity publication refreshed: %s", report.summary())
         return report
 
+    async def after_capacity_recovery(
+        self, *, provider_key: str, credential_account_id: str
+    ) -> CapacityRepublishReport:
+        """Re-prove and republish the pairs of a RECOVERED account.
+
+        Called the moment a real canary order proved the account's capacity
+        returned. The periodic catalog walk would get there anyway, but this
+        makes the storefront available immediately — and it does so only with
+        the SAME read-only pair proof the periodic sync demands, so a recovered
+        account never publishes a pair it cannot actually serve. Every pair the
+        account cannot prove stays unpublished (fail closed).
+        """
+        account = str(credential_account_id or "").strip()
+        report = CapacityRepublishReport(provider_key=provider_key, credential_account_id=account)
+        if provider_key != PROVIDER_KEY or not account:
+            return report
+        definition = next(
+            (item for item in self._router.accounts if item.account_id == account), None
+        )
+        if definition is None or not definition.enabled:
+            return report
+        offers_repo = SqlAlchemySellableOfferRepository(self._session_factory)
+        try:
+            owners = await offers_repo.hourly_account_owners(PROVIDER_KEY)
+        except Exception as exc:
+            logger.warning(
+                "capacity recovery republication could not read current owners (%s)",
+                type(exc).__name__,
+            )
+            return report
+        pairs = sorted(pair for pair, owner in owners.items() if owner == account)
+        if not pairs:
+            return report
+        errors: list[str] = []
+        republished: list[tuple[str, str, str]] = []
+        unproven: list[tuple[str, str, str]] = []
+        regions_by_account: dict[str, frozenset[str]] = {}
+        for product_id, location_id in pairs:
+            probed = await self._prove_pair(
+                account,
+                product_id=product_id,
+                location_id=location_id,
+                regions_by_account=regions_by_account,
+                errors=errors,
+            )
+            if probed is None:
+                unproven.append((product_id, location_id, "recovery-unproven"))
+                continue
+            _account_id, images_state, item = probed
+            if images_state != IMAGE_STATE_OK:
+                unproven.append((product_id, location_id, "images-unproven"))
+                continue
+            try:
+                await offers_repo.upsert_from_provider(
+                    provider_key=PROVIDER_KEY,
+                    product_id=product_id,
+                    location_id=location_id,
+                    update=offer_spec_from_item(
+                        item,
+                        location_id,
+                        publishable=True,
+                        account_id=account,
+                    ),
+                    provider_account_id=account,
+                )
+            except Exception as exc:
+                errors.append(f"republish {product_id}/{location_id}: {type(exc).__name__}")
+                unproven.append((product_id, location_id, "persistence-failed"))
+                continue
+            republished.append((product_id, location_id, account))
+            logger.warning(
+                "leaseweb capacity: republished %s/%s through recovered account %s",
+                product_id,
+                location_id,
+                account,
+            )
+        report = CapacityRepublishReport(
+            provider_key=provider_key,
+            credential_account_id=account,
+            pairs_considered=len(pairs),
+            rerouted=tuple(republished),
+            unpublished=0,
+            unproven=tuple(unproven),
+            errors=tuple(errors),
+        )
+        logger.warning("leaseweb capacity recovery publication refreshed: %s", report.summary())
+        return report
+
     async def _limited_accounts(self, refused: str) -> frozenset[str]:
         """Every account known to be out of capacity for NEW orders."""
         if self._capacity is None:

@@ -211,11 +211,14 @@ class TestWorkerLifecycleAndNotifiers:
         by_name = {
             getattr(job, "coroutine", getattr(job, "func", None)).__name__: job for job in jobs
         }
-        assert len(by_name) == 14
+        assert len(by_name) == 15
         assert by_name["process_leaseweb_orders"].minute == set(range(0, 60, 2))
         assert by_name["reconcile_leaseweb_orders"].minute == set(range(0, 60, 3))
         # Catalog auto-sync runs at the configured interval (15 min default).
         assert by_name["catalog_auto_sync"].minute == set(range(0, 60, 15))
+        # Automatic capacity recovery is read-only and runs at its own cadence
+        # (3 minutes by default), independent of the catalog walk.
+        assert by_name["reconcile_cloud_capacity"].minute == set(range(0, 60, 3))
         # Hourly cloud submission uses the order-worker cadence.
         assert by_name["process_cloud_creates"].minute == set(range(0, 60, 2))
         assert by_name["reconcile_cloud_creates"].minute == set(range(0, 60, 3))
@@ -238,7 +241,7 @@ class TestWorkerLifecycleAndNotifiers:
             assert getattr(job, "run_at_startup", False) is True
 
     def test_worker_settings_cron_jobs_match(self) -> None:
-        assert len(ws.WorkerSettings.cron_jobs) == 14
+        assert len(ws.WorkerSettings.cron_jobs) == 15
         assert ws.WorkerSettings.on_startup is ws.startup
         assert ws.WorkerSettings.on_shutdown is ws.shutdown
 

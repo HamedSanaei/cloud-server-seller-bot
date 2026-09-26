@@ -190,6 +190,12 @@ class FakeCapacityRepo:
     def __init__(self, records: dict[str, Any] | None = None) -> None:
         self.records: dict[str, Any] = dict(records or {})
         self.writes: list[dict[str, Any]] = []
+        #: Recovery-canary bookkeeping (automatic recovery): attempts leased,
+        #: refusals recorded and recoveries proven.
+        self.canary_attempts: list[str] = []
+        self.canary_refusals: list[dict[str, Any]] = []
+        self.recovered: list[str] = []
+        self.released: list[str] = []
 
     async def get(self, provider_key: str, credential_account_id: str) -> Any:
         return self.records.get(credential_account_id)
@@ -236,6 +242,92 @@ class FakeCapacityRepo:
         )
         return updated
 
+    # -- automatic canary recovery -----------------------------------------
+
+    async def begin_canary_attempt(
+        self,
+        *,
+        provider_key: str,
+        credential_account_id: str,
+        ref: str,
+        lease_seconds: int,
+        now: Any = None,
+    ) -> Any:
+        from cloud_platform.modules.provider_capacity.domain import (
+            AccountCapacityState,
+        )
+
+        current = self.records.get(credential_account_id)
+        if current is None or current.state is not AccountCapacityState.RECOVERY_CANDIDATE:
+            return None
+        if current.canary_lease_held(now=now):
+            return None
+        updated = current.with_canary_attempt(ref=ref, lease_seconds=lease_seconds, now=now)
+        self.records[credential_account_id] = updated
+        self.canary_attempts.append(ref)
+        return updated
+
+    async def release_canary_lease(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        ref: str | None = None,
+        now: Any = None,
+    ) -> bool:
+        current = self.records.get(credential_account_id)
+        if current is None or current.canary_lease_ref is None:
+            return False
+        if ref is not None and current.canary_lease_ref != ref:
+            return False
+        self.records[credential_account_id] = current.with_canary_lease_released()
+        self.released.append(credential_account_id)
+        return True
+
+    async def record_canary_refusal(
+        self,
+        *,
+        provider_key: str,
+        credential_account_id: str,
+        ref: str,
+        observation: Any,
+        delay_seconds: int,
+        ttl_seconds: int = 3600,
+        now: Any = None,
+    ) -> Any:
+        current = self.records.get(credential_account_id)
+        if current is None or current.canary_lease_ref != ref:
+            return None
+        updated = current.with_canary_attempt_refused(
+            observation=observation, delay_seconds=delay_seconds, now=now
+        )
+        self.records[credential_account_id] = updated
+        self.canary_refusals.append(
+            {
+                "account": credential_account_id,
+                "ref": ref,
+                "delay_seconds": delay_seconds,
+                "error_code": observation.error_code,
+            }
+        )
+        return updated
+
+    async def record_recovery_proven(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        ref: str,
+        now: Any = None,
+    ) -> Any:
+        current = self.records.get(credential_account_id)
+        if current is None or current.canary_lease_ref != ref:
+            return None
+        updated = current.with_recovery_proven(now=now)
+        self.records[credential_account_id] = updated
+        self.recovered.append(credential_account_id)
+        return updated
+
 
 class _DictResolver:
     """Account-aware adapter resolution without any provider-specific branching."""
@@ -260,6 +352,8 @@ def _service(
     capacity_republisher: Any | None = None,
     resolver: Any | None = None,
     capacity_ttl_seconds: int = 3600,
+    canary_lease_seconds: int = 900,
+    canary_backoff_seconds: tuple[int, ...] = (900, 1800, 3600, 7200, 21600),
 ) -> tuple[HourlyCloudService, FakeServerRepo, FakeSnapshots, FakeOpsRepo]:
     servers = servers or FakeServerRepo()
     snapshots = snapshots or FakeSnapshots()
@@ -276,6 +370,8 @@ def _service(
         capacity_repo=capacity,
         capacity_ttl_seconds=capacity_ttl_seconds,
         capacity_republisher=capacity_republisher,
+        canary_lease_seconds=canary_lease_seconds,
+        canary_backoff_seconds=canary_backoff_seconds,
         cloud_resolver=resolver,
     )
     return service, servers, snapshots, ops

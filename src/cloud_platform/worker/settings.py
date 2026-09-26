@@ -88,6 +88,76 @@ async def reconcile_capacity_evidence_once() -> None:
 _CAPACITY_EVIDENCE_RECONCILED = False
 
 
+def capacity_recovery_minutes() -> set[int]:
+    """Cron minute set for the read-only capacity recovery controller.
+
+    Mirrors :func:`catalog_auto_sync_minutes`: only hour-dividing intervals are
+    expressible as an arq minute set; anything else falls back to the default 3
+    minutes so the controller keeps running instead of silently disappearing.
+    """
+    try:
+        interval = int(get_settings().leaseweb_cloud_capacity_recovery_interval_seconds)
+    except Exception:
+        interval = 180
+    if interval < 60 or 3600 % interval != 0:
+        logger.warning(
+            "capacity recovery interval %ss is not an hour-dividing minute cadence; "
+            "using 3 minutes",
+            interval,
+        )
+        interval = 180
+    return set(range(0, 60, interval // 60))
+
+
+async def reconcile_cloud_capacity(ctx: dict[str, object]) -> None:
+    """Read-only AUTOMATIC capacity recovery (LEASEWEB-MULTIACCOUNT).
+
+    PC-2031 used to require the operator to remember ``leaseweb cloud accounts
+    clear``. This scheduled pass removes that dependency: it reads each
+    credential account's instance inventory (read-only), keeps the baseline the
+    refusal was learned against, brings the next window forward when an
+    instance disappeared, opens the scheduled canary window, and emits the
+    deduplicated operator cards. It NEVER creates, deletes, powers or probes
+    anything: the canary is a real customer order, serialized by the durable
+    PostgreSQL lease in the checkout path.
+
+    Idempotent and safe to overlap with an operator CLI run: every write is
+    guarded ("earliest schedule wins") and the operator cards dedupe through
+    the durable outbox ``event_key``.
+    """
+    del ctx
+    async with metrics.job("reconcile_cloud_capacity"):
+        from cloud_platform.core.container import create_container
+
+        container = None
+        try:
+            container = create_container()
+            await container.initialize()
+            service = container.cloud_capacity_recovery_service()
+            if service is None:
+                logger.info("capacity recovery skipped: no leaseweb cloud scope")
+                return
+            report = await service.run("leaseweb")
+            logger.info("capacity recovery: %s", report.summary())
+            for outcome in report.outcomes:
+                logger.info(
+                    "capacity recovery account=%s state=%s attempts=%d baseline=%s "
+                    "count=%s window=%s notes=%s",
+                    outcome.credential_account_id,
+                    outcome.state,
+                    outcome.recovery_attempts,
+                    outcome.baseline_count,
+                    outcome.inventory_count,
+                    "open" if outcome.window_opened else "-",
+                    ",".join(outcome.notes) or "-",
+                )
+        except Exception:
+            logger.exception("capacity recovery pass failed; worker continues")
+        finally:
+            if container is not None:
+                await container.close()
+
+
 async def shutdown(ctx: dict[str, object]) -> None:
     ctx.clear()
 
@@ -393,6 +463,9 @@ async def _process_deletes_impl(ctx: dict[str, object], owned_resources: list[An
             hold_service=hold_service,
             wallet_repo=wallet_repo,
             audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+            # A successful provider deletion is local evidence that capacity may
+            # have been freed: bring that account's recovery window forward.
+            capacity_recovery=_account_capacity_repository(),
         )
         worker = DeleteWorker(
             operation_repo=SqlAlchemyOperationRepository(SessionFactory),
@@ -1192,6 +1265,11 @@ def _cron_jobs() -> list[Any]:
             run_at_startup=True,
             timeout=catalog_timeout,
         ),
+        cron(
+            reconcile_cloud_capacity,
+            minute=capacity_recovery_minutes(),
+            run_at_startup=True,
+        ),
         cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
         cron(reconcile_provider_resources, minute=every_three_minutes, run_at_startup=True),
@@ -1220,6 +1298,7 @@ class WorkerSettings:
         reconcile_payments,
         sync_leaseweb_offers,
         catalog_auto_sync,
+        reconcile_cloud_capacity,
         process_cloud_creates,
         reconcile_cloud_creates,
         process_leaseweb_orders,
@@ -1248,6 +1327,7 @@ PROVISIONING_FUNCTIONS: list[Any] = [
     process_deletes,
     reconcile_deletes,
     catalog_auto_sync,
+    reconcile_cloud_capacity,
     process_cloud_creates,
     reconcile_cloud_creates,
     process_leaseweb_orders,
@@ -1278,6 +1358,11 @@ def _role_cron_jobs(role: str) -> list[Any]:
                 minute=catalog_auto_sync_minutes(),
                 run_at_startup=True,
                 timeout=catalog_auto_sync_timeout(),
+            ),
+            cron(
+                reconcile_cloud_capacity,
+                minute=capacity_recovery_minutes(),
+                run_at_startup=True,
             ),
             cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
             cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),

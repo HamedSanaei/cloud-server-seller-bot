@@ -688,6 +688,16 @@ class ProviderAccountCapacity(Base):
         observations: How many definitive refusals were recorded
         observed_at: When the current state was last observed
         expires_at: When the refusal stops being fresh (NULL = healthy)
+        baseline_instance_count: Instances held when the refusal was learned
+        baseline_instance_ids_hash: Stable hash of those instance ids
+        baseline_observed_at: When that baseline census was taken
+        recovery_attempts: Canary attempts actually exercised (reset on proof)
+        last_recovery_attempt_at: When the last canary attempt started
+        next_recovery_attempt_at: When the next attempt window may open
+        canary_lease_ref: Durable single-canary lease owner (operation key)
+        canary_lease_expires_at: When an in-flight canary lease expires
+        outage_notified_at: When the outage card was enqueued
+        last_reminder_at: When the last outage reminder was enqueued
     """
 
     __tablename__ = "provider_account_capacity"
@@ -711,6 +721,19 @@ class ProviderAccountCapacity(Base):
     observations = Column(Integer, nullable=False, server_default="0")
     observed_at = Column(DateTime(timezone=True), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Automatic canary recovery (LEASEWEB-MULTIACCOUNT): read-only inventory
+    # baseline, exponential backoff schedule and the durable single-canary
+    # lease. NULL means "nothing scheduled/leased", never "eligible".
+    baseline_instance_count = Column(Integer, nullable=True)
+    baseline_instance_ids_hash = Column(String(64), nullable=True)
+    baseline_observed_at = Column(DateTime(timezone=True), nullable=True)
+    recovery_attempts = Column(Integer, nullable=False, server_default="0")
+    last_recovery_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    next_recovery_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    canary_lease_ref = Column(String(128), nullable=True)
+    canary_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    outage_notified_at = Column(DateTime(timezone=True), nullable=True)
+    last_reminder_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(
         DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")

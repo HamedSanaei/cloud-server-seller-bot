@@ -603,6 +603,86 @@ class Container:
             ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
         )
 
+    def capacity_recovery_backoff(self) -> tuple[int, ...]:
+        """The configured canary backoff schedule (validated, with fallback).
+
+        A malformed schedule must never take a process down: the documented
+        default applies and the misconfiguration is logged loudly.
+        """
+        from cloud_platform.modules.provider_capacity.domain import (
+            DEFAULT_RECOVERY_BACKOFF_SECONDS,
+            validate_recovery_backoff,
+        )
+
+        try:
+            return validate_recovery_backoff(
+                tuple(get_settings().leaseweb_cloud_capacity_recovery_backoff_seconds)
+            )
+        except ValueError:
+            logger.warning(
+                "leaseweb_cloud_capacity_recovery_backoff_seconds is invalid; "
+                "using the default %s-second schedule",
+                DEFAULT_RECOVERY_BACKOFF_SECONDS,
+                exc_info=True,
+            )
+            return DEFAULT_RECOVERY_BACKOFF_SECONDS
+
+    def cloud_capacity_recovery_service(self) -> Any | None:
+        """Read-only automatic capacity recovery controller (LEASEWEB-MULTIACCOUNT).
+
+        ``None`` when no Cloud router is configured: a deployment without
+        Leaseweb Cloud credentials has nothing to recover, and the controller
+        is never invented out of thin air.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is None:
+            return None
+        settings = get_settings()
+        from cloud_platform.modules.provider_capacity.recovery import (
+            CloudCapacityRecoveryService,
+        )
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+        from cloud_platform.providers.leaseweb.capacity_inventory import (
+            LeasewebCloudInventorySource,
+        )
+
+        return CloudCapacityRecoveryService(
+            capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
+            inventory_source=LeasewebCloudInventorySource(router=router),
+            event_sink=self.business_event_sink(),
+            sellable_offers_source=self.sellable_cloud_offer_count,
+            backoff_seconds=self.capacity_recovery_backoff(),
+            reminder_delay_seconds=(settings.leaseweb_cloud_capacity_outage_reminder_delay_seconds),
+            reminder_interval_seconds=(
+                settings.leaseweb_cloud_capacity_outage_reminder_interval_seconds
+            ),
+            ttl_seconds=settings.leaseweb_cloud_account_limit_ttl_seconds,
+            enabled=settings.leaseweb_cloud_capacity_recovery_enabled,
+        )
+
+    async def sellable_cloud_offer_count(self) -> int:
+        """Read-only count of Cloud offers a customer can actually buy today.
+
+        Uses the SAME sellability rule as the storefront (canonical currency +
+        valid provenance + publication state), so the readiness metric can
+        never claim an offer the customer cannot check out.
+        """
+        from cloud_platform.modules.offers.domain import is_sellable_in_currency
+
+        settings = get_settings()
+        currency = str(settings.fx_catalog_pricing_currency).strip().upper()
+        rows = await self.sellable_offer_repository().list_all()
+        count = 0
+        for row in rows:
+            if str(getattr(row, "billing_model", "") or "") != "hourly":
+                continue
+            if not is_sellable_in_currency(row, currency):
+                continue
+            count += 1
+        return count
+
     def hourly_cloud_service(self) -> Any:
         """The hourly instance creation command (no provider calls, no charge)."""
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
@@ -643,6 +723,11 @@ class Container:
             # refreshed so the storefront stops advertising the limited
             # account instead of waiting for the next catalog walk.
             capacity_republisher=self.capacity_republisher(),
+            # AUTOMATIC RECOVERY: one real order per account may act as the
+            # canary once the read-only controller opens a window. The lease
+            # serializes it; the backoff spaces the attempts out.
+            canary_lease_seconds=(get_settings().leaseweb_cloud_capacity_canary_lease_seconds),
+            canary_backoff_seconds=self.capacity_recovery_backoff(),
             catalog_currency=get_settings().fx_catalog_pricing_currency,
             catalog_stale_limit_seconds=(get_settings().fx_frankfurter_catalog_max_stale_seconds),
             # Operator business feed: the hourly lifecycle cards ride the SAME

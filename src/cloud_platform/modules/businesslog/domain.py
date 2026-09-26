@@ -86,6 +86,15 @@ class BusinessEventType(StrEnum):
     SERVICE_OPERATOR_ATTENTION_REQUIRED = "service.operator_attention_required"
     SERVICE_AUTO_RENEW_ENABLED = "service.auto_renew_enabled"
     SERVICE_AUTO_RENEW_DISABLED = "service.auto_renew_disabled"
+    # Provider credential-account capacity (LEASEWEB-MULTIACCOUNT). These
+    # describe the STOREFRONT's ability to accept new orders through one or
+    # more credential accounts; they are deduplicated by the durable outbox
+    # (one card per outage, reminders on a fixed cadence, one card per
+    # proven recovery).
+    PROVIDER_CAPACITY_LIMIT_REACHED = "provider.capacity_limit_reached"
+    PROVIDER_CAPACITY_STOREFRONT_UNAVAILABLE = "provider.capacity_storefront_unavailable"
+    PROVIDER_CAPACITY_RECOVERY_REMINDER = "provider.capacity_recovery_reminder"
+    PROVIDER_CAPACITY_RECOVERED = "provider.capacity_recovered"
 
     @property
     def log_flag(self) -> str:
@@ -129,6 +138,12 @@ _FLAGS: Mapping[BusinessEventType, str] = {
     BusinessEventType.SERVICE_OPERATOR_ATTENTION_REQUIRED: "log_server_management",
     BusinessEventType.SERVICE_AUTO_RENEW_ENABLED: "log_server_management",
     BusinessEventType.SERVICE_AUTO_RENEW_DISABLED: "log_server_management",
+    # Capacity outages are order-fulfilment failures: the operator who wants
+    # order-failure cards wants these too.
+    BusinessEventType.PROVIDER_CAPACITY_LIMIT_REACHED: "log_order_failures",
+    BusinessEventType.PROVIDER_CAPACITY_STOREFRONT_UNAVAILABLE: "log_order_failures",
+    BusinessEventType.PROVIDER_CAPACITY_RECOVERY_REMINDER: "log_order_failures",
+    BusinessEventType.PROVIDER_CAPACITY_RECOVERED: "log_order_failures",
 }
 
 #: Persian-first titles for the channel cards.
@@ -165,6 +180,18 @@ _TITLES: Mapping[BusinessEventType, str] = {
     BusinessEventType.SERVICE_OPERATOR_ATTENTION_REQUIRED: "🔔 سرویس نیازمند بررسی مدیر",
     BusinessEventType.SERVICE_AUTO_RENEW_ENABLED: "🔄 فعال‌سازی تمدید خودکار",
     BusinessEventType.SERVICE_AUTO_RENEW_DISABLED: "🔕 غیرفعال‌سازی تمدید خودکار",
+    BusinessEventType.PROVIDER_CAPACITY_LIMIT_REACHED: (
+        "🚧 ظرفیت حساب ارائه‌دهنده تکمیل شد (سفارش جدید متوقف شد)"
+    ),
+    BusinessEventType.PROVIDER_CAPACITY_STOREFRONT_UNAVAILABLE: (
+        "⛔ فروشگاه ابری موقتاً بسته شد (هیچ حساب ظرفیت‌داری باقی نمانده)"
+    ),
+    BusinessEventType.PROVIDER_CAPACITY_RECOVERY_REMINDER: (
+        "⏰ یادآوری: بازیابی ظرفیت هنوز اثبات نشده"
+    ),
+    BusinessEventType.PROVIDER_CAPACITY_RECOVERED: (
+        "✅ ظرفیت حساب ارائه‌دهنده بازیابی شد (سفارش واقعی پذیرفته شد)"
+    ),
 }
 
 #: Field labels for the rendered card (Persian-first, English hints).
@@ -215,6 +242,15 @@ _LABELS: Mapping[str, str] = {
     "grace_until": "مهلت پرداخت",
     "days_left": "روز باقی‌مانده",
     "auto_renew": "تمدید خودکار",
+    "accounts_blocked": "حساب‌های مسدود",
+    "accounts_total": "تعداد کل حساب‌ها",  # noqa: RUF001
+    "sellable_offers": "عرضه‌های قابل فروش",
+    "baseline_instances": "نمونه‌های پایه",
+    "instances": "نمونه‌های فعلی",
+    "attempts": "تلاش‌های بازیابی",
+    "next_attempt": "تلاش بعدی",
+    "storefront": "فروشگاه",
+    "action": "اقدام",
 }
 
 #: Order the fields are rendered in (stable, operator-friendly).
@@ -260,6 +296,14 @@ _FIELD_ORDER: tuple[str, ...] = (
     "image",
     "snapshot",
     "renewal_at",
+    "attempts",
+    "next_attempt",
+    "baseline_instances",
+    "instances",
+    "accounts_blocked",
+    "accounts_total",
+    "sellable_offers",
+    "storefront",
     "stage",
     "category",
     "reason",

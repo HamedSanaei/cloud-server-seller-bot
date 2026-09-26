@@ -131,11 +131,34 @@ billing_cycle = "1_MONTH"
 # refusal. While the refusal is fresh the account is `limit_reached`; after the
 # window elapses it becomes `unknown_after_limit` and STILL takes no NEW orders
 # — expiry removes freshness, never the fact that recovery is unproven. Only
-# positive proof restores `healthy`: `leaseweb cloud accounts clear --account
-# <id>` after provider instances were actually freed (or a future read-only
-# quota API that proves new-instance capacity). Existing servers, orders and
-# reconciliation are never affected by this state. Minimum 60.
+# positive proof restores `healthy`: a real order the provider ACCEPTED during
+# an automatic canary window, or the manual emergency override
+# (`leaseweb cloud accounts override-clear --account <id>`) after provider
+# instances were actually freed. Existing servers, orders and reconciliation
+# are never affected by this state. Minimum 60.
 cloud_account_limit_ttl_seconds = 3600
+# --- Automatic capacity recovery (LEASEWEB-MULTIACCOUNT) -------------------
+# Normal recovery needs NO operator action. A read-only controller keeps each
+# account's instance baseline, brings the next attempt window forward when an
+# instance disappears (or an app-owned instance is deleted), and spends
+# EXACTLY ONE real customer order as a canary — serialized by a durable
+# PostgreSQL lease. A provider ACCEPTANCE proves recovery; another PC-2031
+# backs off exponentially. No synthetic/billable probe server is ever created.
+cloud_capacity_recovery_enabled = true
+# Controller cadence in seconds (hour-dividing minute sets only; anything else
+# falls back to 3 minutes).
+cloud_capacity_recovery_interval_seconds = 180
+# Exponential backoff between canary attempts, in seconds. The LAST value is
+# the permanent cap. Defaults: 15m, 30m, 1h, 2h, then every 6h.
+cloud_capacity_recovery_backoff_seconds = [900, 1800, 3600, 7200, 21600]
+# How long ONE in-flight canary order holds the durable lease before it expires
+# on its own. Minimum 60.
+cloud_capacity_canary_lease_seconds = 900
+# Operator reminder cadence while an account stays blocked: the first card
+# `delay` seconds after the refusal, then every `interval` seconds. Cards are
+# deduplicated by the durable outbox, so a controller re-run never re-sends.
+cloud_capacity_outage_reminder_delay_seconds = 1800
+cloud_capacity_outage_reminder_interval_seconds = 21600
 
 # --- Multiple Leaseweb credential accounts (LEASEWEB-MULTIACCOUNT) ----------
 # A Leaseweb API key / Sales Organization only sees a narrow set of locations,

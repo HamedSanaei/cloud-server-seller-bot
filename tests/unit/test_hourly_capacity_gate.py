@@ -26,6 +26,7 @@ from test_hourly_state_machine import (  # type: ignore[import-not-found]
     FakeCapacityRepo,
     FakeHourlyAdapter,
     FakeOffersRepo,
+    _accepted_response,
     _Ambiguous,
     _create,
     _DictResolver,
@@ -39,6 +40,7 @@ from cloud_platform.modules.provider_capacity.domain import (
     AccountCapacity,
     AccountCapacityState,
 )
+from cloud_platform.providers.errors import ProviderError, ProviderUnavailable
 
 PROVIDER = "leaseweb"
 ACCOUNT = "sales-org-north"
@@ -163,6 +165,7 @@ class _RecordingRepublisher:
 
     def __init__(self, capacity: Any = None, *, error: Exception | None = None) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.recovery_calls: list[tuple[str, str]] = []
         self._capacity = capacity
         self._error = error
 
@@ -174,6 +177,15 @@ class _RecordingRepublisher:
         self.calls.append((provider_key, credential_account_id))
         if self._error is not None:
             raise self._error
+        return None
+
+    async def after_capacity_recovery(
+        self, *, provider_key: str, credential_account_id: str
+    ) -> Any:
+        if self._capacity is not None:
+            state = self._capacity.records[credential_account_id].state.value
+            assert state == "healthy", "recovery publication must follow the proof"
+        self.recovery_calls.append((provider_key, credential_account_id))
         return None
 
 
@@ -437,3 +449,135 @@ class TestExistingResourcesStayManageable:
         # call `reconcile_server` makes) with no capacity consultation at all.
         assert service._adapter_for(PROVIDER, ACCOUNT) is cloud
         assert resolver.resolved == [ACCOUNT]
+
+
+def _candidate() -> AccountCapacity:
+    """The automatic recovery window: ONE real order may prove capacity."""
+    return _limit_reached().with_recovery_window_open()
+
+
+class TestRecoveryCanary:
+    """The FIRST REAL CUSTOMER ORDER is the recovery canary (no synthetic
+    billable probe exists). Its provider verdict — not time — decides."""
+
+    async def test_an_accepted_canary_proves_recovery_and_republishes(self) -> None:
+        capacity = FakeCapacityRepo({ACCOUNT: _candidate()})
+        republisher = _RecordingRepublisher(capacity)
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        service, servers, _, ops = _service(
+            offers,
+            FakeHourlyAdapter(),
+            capacity=capacity,
+            capacity_republisher=republisher,
+            resolver=_DictResolver({ACCOUNT: cloud}),
+        )
+        server = await _requested_server(service, offers)
+        cloud.create_result = _accepted_response(server)
+
+        assert await service.process_server(server.id) == "provisioned"
+
+        # Exactly one provider POST, and it held the single canary lease first.
+        assert cloud.posts == 1
+        assert capacity.canary_attempts == [f"server-create:{server.id}"]
+        assert capacity.recovered == [ACCOUNT]
+        assert capacity.records[ACCOUNT].state is AccountCapacityState.HEALTHY
+        assert capacity.records[ACCOUNT].canary_lease_ref is None
+        # Publication through the recovered account is refreshed immediately.
+        assert republisher.recovery_calls == [(PROVIDER, ACCOUNT)]
+        # The proven acceptance is durable and charged normally (never a
+        # synthetic/free probe).
+        assert servers.servers[server.id].provider_server_id == "lsw-created"
+        assert ops.ops[f"server-create:{server.id}"].status.value == "completed"
+
+    async def test_a_refused_canary_backs_off_without_a_provider_resource(self) -> None:
+        capacity = FakeCapacityRepo({ACCOUNT: _candidate()})
+        republisher = _RecordingRepublisher(capacity)
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        service, servers, _, ops = _service(
+            offers,
+            FakeHourlyAdapter(),
+            capacity=capacity,
+            capacity_republisher=republisher,
+            resolver=_DictResolver({ACCOUNT: cloud}),
+        )
+        server = await _requested_server(service, offers)
+        cloud.create_error = _pc2031_error()
+
+        assert await service.process_server(server.id) == "failed"
+
+        record = capacity.records[ACCOUNT]
+        assert record.state is AccountCapacityState.LIMIT_REACHED
+        assert record.recovery_attempts == 1
+        assert record.canary_lease_ref is None
+        assert record.next_recovery_attempt_at is not None
+        assert capacity.canary_refusals == [
+            {
+                "account": ACCOUNT,
+                "ref": f"server-create:{server.id}",
+                "delay_seconds": 900,  # the FIRST backoff step (attempts=0)
+                "error_code": "PC-2031",
+            }
+        ]
+        # No provider resource was attached and the operation is terminal:
+        # a refused canary is never replayed blindly.
+        assert servers.servers[server.id].provider_server_id is None
+        assert servers.servers[server.id].state.value == "error"
+        assert ops.ops[f"server-create:{server.id}"].status.value == "failed"
+        # The account stops being published again, immediately.
+        assert republisher.calls == [(PROVIDER, ACCOUNT)]
+        assert await service.process_server(server.id) == "skipped"
+        assert len(capacity.canary_refusals) == 1
+
+    async def test_a_second_order_never_becomes_a_second_canary(self) -> None:
+        """The durable lease serializes the window: while one attempt is in
+        flight, another customer fails fast with the capacity answer and NO
+        provider POST (no blind retry)."""
+        capacity = FakeCapacityRepo({ACCOUNT: _candidate()})
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        service, servers, _, ops = _service(
+            offers,
+            FakeHourlyAdapter(),
+            capacity=capacity,
+            resolver=_DictResolver({ACCOUNT: cloud}),
+        )
+        first = await _requested_server(service, offers, idempotency_key="canary-1")
+        second = await _requested_server(service, offers, idempotency_key="canary-2")
+        cloud.create_result = _accepted_response(first)
+        # The first attempt is left IN FLIGHT (a transient provider problem
+        # requeues it) and therefore KEEPS the lease.
+        cloud.create_error = ProviderUnavailable("provider timeout")
+        assert await service.process_server(first.id) == "requeued"
+        assert capacity.records[ACCOUNT].canary_lease_held() is True
+
+        cloud.create_error = None
+        assert await service.process_server(second.id) == "failed"
+        assert cloud.posts == 1
+        assert capacity.canary_attempts == [f"server-create:{first.id}"]
+        assert servers.servers[second.id].provider_server_id is None
+        assert ops.ops[f"server-create:{second.id}"].status.value == "failed"
+
+    async def test_a_non_capacity_canary_failure_releases_the_lease(self) -> None:
+        """An unrelated provider rejection proves nothing about capacity, so
+        the window is not held hostage by it."""
+        capacity = FakeCapacityRepo({ACCOUNT: _candidate()})
+        offers = FakeOffersRepo([await _usd_offer(provider_account_id=ACCOUNT)])
+        cloud = FakeHourlyAdapter()
+        service, _, _, _ = _service(
+            offers,
+            FakeHourlyAdapter(),
+            capacity=capacity,
+            resolver=_DictResolver({ACCOUNT: cloud}),
+        )
+        server = await _requested_server(service, offers)
+        cloud.create_error = ProviderError("unrelated rejection")
+
+        assert await service.process_server(server.id) == "failed"
+
+        record = capacity.records[ACCOUNT]
+        assert record.state is AccountCapacityState.RECOVERY_CANDIDATE
+        assert record.canary_lease_ref is None
+        assert capacity.canary_refusals == []
+        assert capacity.released == [ACCOUNT]

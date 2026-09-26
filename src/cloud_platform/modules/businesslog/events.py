@@ -26,6 +26,10 @@ from cloud_platform.modules.businesslog.domain import (
 
 __all__ = [
     "admin_adjustment_event",
+    "capacity_outage_event",
+    "capacity_recovered_event",
+    "capacity_recovery_reminder_event",
+    "capacity_storefront_outage_event",
     "provider_accepted_event",
     "purchase_failed_event",
     "purchase_requested_event",
@@ -67,6 +71,148 @@ def _user_fields(user: Any, user_id: UUID | str | None = None) -> dict[str, Any]
     if user_id is not None and "user_id" not in fields:
         fields["user_id"] = _text(user_id)
     return fields
+
+
+# -- provider credential-account capacity (LEASEWEB-MULTIACCOUNT) ----------
+
+
+def _moment_epoch(moment: datetime | None) -> str:
+    """A stable dedupe token for one incident: its own timestamp, not "now"."""
+    return str(int((moment or datetime.now(UTC)).timestamp()))
+
+
+def capacity_outage_event(
+    *,
+    provider_key: str,
+    credential_account: str,
+    error_code: str | None = None,
+    correlation_id: str | None = None,
+    location_id: str | None = None,
+    product_id: str | None = None,
+    observations: int | None = None,
+    attempts: int | None = None,
+    next_attempt_at: datetime | None = None,
+    blocked_reason: str | None = None,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """A definitive capacity refusal stopped NEW orders through one account.
+
+    Keyed by the refusal's OWN instant, so the same outage can never produce a
+    second card while a NEW refusal (a new window) produces exactly one.
+    """
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=f"provider.capacity.outage:{credential_account}:{_moment_epoch(moment)}",
+        event_type=BusinessEventType.PROVIDER_CAPACITY_LIMIT_REACHED,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            credential_account=credential_account,
+            error_code=error_code,
+            correlation_id=correlation_id,
+            location=location_id,
+            product_id=product_id,
+            category="provider_capacity",
+            reason=blocked_reason,
+            attempts=attempts,
+            next_attempt=(next_attempt_at.isoformat() if next_attempt_at is not None else None),
+            action="automatic canary recovery is scheduled; no operator action is required",
+            **_counts(observations=observations),
+        ),
+        created_at=moment,
+    )
+
+
+def capacity_storefront_outage_event(
+    *,
+    provider_key: str,
+    blocked_accounts: tuple[str, ...],
+    total_accounts: int,
+    sellable_offers: int,
+    outage_since: datetime | None = None,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """HIGH-impact: EVERY configured capacity account is blocked.
+
+    Deduplicated per outage window (the earliest blocked observation is the
+    key), so the operator gets one card when the Cloud storefront becomes
+    unavailable rather than one per controller run.
+    """
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=(
+            f"provider.capacity.storefront:{provider_key}:{_moment_epoch(outage_since or moment)}"
+        ),
+        event_type=BusinessEventType.PROVIDER_CAPACITY_STOREFRONT_UNAVAILABLE,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            category="provider_capacity",
+            storefront="unavailable",
+            accounts_blocked=len(blocked_accounts),
+            accounts_total=total_accounts,
+            sellable_offers=sellable_offers,
+            credential_account=blocked_accounts[0] if blocked_accounts else None,
+            reason="all capacity accounts are blocked and no Cloud offer is sellable",
+            action="automatic recovery keeps probing; a manual override is the emergency path",
+        ),
+        created_at=moment,
+    )
+
+
+def capacity_recovery_reminder_event(
+    *,
+    provider_key: str,
+    credential_account: str,
+    attempts: int,
+    next_attempt_at: datetime | None = None,
+    blocked_reason: str | None = None,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """Periodic reminder while an account stays blocked (30 min, then 6 h)."""
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=(f"provider.capacity.reminder:{credential_account}:{_moment_epoch(moment)}"),
+        event_type=BusinessEventType.PROVIDER_CAPACITY_RECOVERY_REMINDER,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            credential_account=credential_account,
+            category="provider_capacity",
+            attempts=attempts,
+            next_attempt=(next_attempt_at.isoformat() if next_attempt_at is not None else None),
+            reason=blocked_reason,
+            action="the automatic canary is scheduled; no operator action is required",
+        ),
+        created_at=moment,
+    )
+
+
+def capacity_recovered_event(
+    *,
+    provider_key: str,
+    credential_account: str,
+    attempts: int = 0,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """A real customer order was ACCEPTED: provider capacity is proven again."""
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=f"provider.capacity.recovered:{credential_account}:{_moment_epoch(moment)}",
+        event_type=BusinessEventType.PROVIDER_CAPACITY_RECOVERED,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            credential_account=credential_account,
+            category="provider_capacity",
+            attempts=attempts,
+        ),
+        created_at=moment,
+    )
+
+
+def _counts(**values: int | None) -> dict[str, int]:
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def purchase_requested_event(

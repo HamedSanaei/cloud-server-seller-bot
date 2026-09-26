@@ -748,6 +748,224 @@ class TestHistoricalReconciliation:
         assert stored.accepts_new_orders() is True
 
 
+class TestAutomaticRecoveryPersistence:
+    """Canary recovery durability: the lease, the backoff and the proof.
+
+    These are PostgreSQL-only contracts by construction: the single-canary
+    serialization is ONE conditional UPDATE (only a real database decides who
+    wins the row), the baseline comparison is a row-locked read-modify-write,
+    and the recovery evidence must outrank an older historical refusal after a
+    restart.
+    """
+
+    async def _blocked(self, repo: SqlAlchemyAccountCapacityRepository) -> None:
+        await repo.record_limit_reached(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            observation=CapacityObservation(
+                error_code="PC-2031", correlation_id="07376219-7bcd-43d9-a5ea-4128fa57345a"
+            ),
+            ttl_seconds=3600,
+        )
+
+    async def _open_window(
+        self, repo: SqlAlchemyAccountCapacityRepository, *, now: datetime
+    ) -> AccountCapacity:
+        await repo.schedule_recovery(PROVIDER, ACCOUNT, delay_seconds=60, now=now)
+        opened = await repo.open_recovery_window(PROVIDER, ACCOUNT, now=now + timedelta(seconds=61))
+        assert opened is not None and opened.state is AccountCapacityState.RECOVERY_CANDIDATE
+        return opened
+
+    async def test_only_one_canary_lease_can_win_and_it_expires(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        await self._open_window(capacity_repo, now=now)
+
+        results = await asyncio.gather(
+            *[
+                capacity_repo.begin_canary_attempt(
+                    provider_key=PROVIDER,
+                    credential_account_id=ACCOUNT,
+                    ref=f"server-create:{index}",
+                    lease_seconds=900,
+                    now=now,
+                )
+                for index in range(3)
+            ],
+            return_exceptions=True,
+        )
+        winners = [result for result in results if not isinstance(result, Exception)]
+        assert len([result for result in winners if result is not None]) == 1
+        held = await capacity_repo.get(PROVIDER, ACCOUNT)
+        assert held is not None and held.canary_lease_held(now=now) is True
+        assert held.canary_lease_ref in {f"server-create:{index}" for index in range(3)}
+
+        # While the lease is held, another order cannot become the canary…
+        assert (
+            await capacity_repo.begin_canary_attempt(
+                provider_key=PROVIDER,
+                credential_account_id=ACCOUNT,
+                ref="server-create:late",
+                lease_seconds=900,
+                now=now + timedelta(seconds=1),
+            )
+            is None
+        )
+        # …and once it EXPIRES (a crashed worker), the window is usable again.
+        after = now + timedelta(hours=1)
+        retry = await capacity_repo.begin_canary_attempt(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            ref="server-create:late",
+            lease_seconds=900,
+            now=after,
+        )
+        assert retry is not None and retry.canary_lease_ref == "server-create:late"
+
+    async def test_a_refused_canary_backs_off_exactly_once(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        await self._open_window(capacity_repo, now=now)
+        ref = "server-create:canary-refused"
+        assert (
+            await capacity_repo.begin_canary_attempt(
+                provider_key=PROVIDER,
+                credential_account_id=ACCOUNT,
+                ref=ref,
+                lease_seconds=900,
+                now=now,
+            )
+            is not None
+        )
+        refused = await capacity_repo.record_canary_refusal(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            ref=ref,
+            observation=CapacityObservation(error_code="PC-2031", correlation_id="canary-cid"),
+            delay_seconds=1800,
+            ttl_seconds=3600,
+            now=now + timedelta(minutes=1),
+        )
+        assert refused is not None
+        assert refused.state is AccountCapacityState.LIMIT_REACHED
+        assert refused.recovery_attempts == 1
+        assert refused.canary_lease_ref is None
+        assert refused.next_recovery_attempt_at is not None
+        assert refused.next_recovery_attempt_at.replace(tzinfo=UTC) >= now + timedelta(minutes=30)
+        assert await capacity_repo.limit_reached_accounts(PROVIDER, now=now) == frozenset({ACCOUNT})
+        # Replaying the same attempt is a NO-OP: no second attempt, no second
+        # piece of evidence.
+        replay = await capacity_repo.record_canary_refusal(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            ref=ref,
+            observation=CapacityObservation(error_code="PC-2031"),
+            delay_seconds=1800,
+            now=now + timedelta(minutes=2),
+        )
+        assert replay is None
+        stored = await capacity_repo.get(PROVIDER, ACCOUNT)
+        assert stored is not None and stored.recovery_attempts == 1
+        kinds = [event.kind for event in await capacity_repo.list_events(PROVIDER)]
+        assert kinds.count(CapacityEventKind.RECOVERY_ATTEMPT) == 1
+        assert kinds.count(CapacityEventKind.REFUSAL) == 2  # the original + the canary
+
+    async def test_an_accepted_canary_proves_recovery_and_outranks_history(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        repo = capacity_environment.repo
+        now = datetime.now(UTC)
+        await self._blocked(repo)
+        await self._open_window(repo, now=now)
+        ref = "server-create:canary-accepted"
+        assert (
+            await repo.begin_canary_attempt(
+                provider_key=PROVIDER,
+                credential_account_id=ACCOUNT,
+                ref=ref,
+                lease_seconds=900,
+                now=now,
+            )
+            is not None
+        )
+        proven = await repo.record_recovery_proven(PROVIDER, ACCOUNT, ref=ref, now=now)
+        assert proven is not None and proven.state is AccountCapacityState.HEALTHY
+        assert proven.recovery_attempts == 0
+        assert proven.next_recovery_attempt_at is None
+        assert proven.outage_notified_at is None
+        assert await repo.limit_reached_accounts(PROVIDER) == frozenset()
+        # A restart reads the SAME proof, and the canary acceptance (a genuine
+        # positive signal) outranks an OLDER historical refusal.
+        restarted = SqlAlchemyAccountCapacityRepository(capacity_environment.factory)
+        assert (await restarted.get(PROVIDER, ACCOUNT)).state is AccountCapacityState.HEALTHY
+        history = HistoricalCapacityEvidence(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            source_ref=f"server-create:{HISTORICAL_SERVER}",
+            error_code="PC-2031",
+            observed_at=now - timedelta(days=1),
+        )
+        await restarted.record_historical_evidence(history, ttl_seconds=3600)
+        assert await restarted.limit_reached_accounts(PROVIDER) == frozenset()
+
+    async def test_the_inventory_baseline_brings_the_window_forward(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        baseline = await capacity_repo.record_inventory_census(
+            PROVIDER,
+            ACCOUNT,
+            instance_count=3,
+            ids_hash="hash-three",
+            now=now,
+        )
+        assert baseline is not None and baseline.baseline_instance_count == 3
+        # A LOWER count is local evidence that capacity may have been freed: the
+        # next window is brought forward to NOW and opens in the same pass.
+        census = await capacity_repo.record_inventory_census(
+            PROVIDER,
+            ACCOUNT,
+            instance_count=2,
+            ids_hash="hash-two",
+            now=now + timedelta(minutes=5),
+        )
+        assert census is not None
+        assert census.next_recovery_attempt_at is not None
+        opened = await capacity_repo.open_recovery_window(
+            PROVIDER, ACCOUNT, now=now + timedelta(minutes=5)
+        )
+        assert opened is not None and opened.state is AccountCapacityState.RECOVERY_CANDIDATE
+        # A candidate is published again for its single canary, but it is NOT
+        # "healthy": nothing has been proven yet.
+        assert opened.accepts_new_orders() is True
+        assert opened.accepts_canary() is True
+        assert await capacity_repo.limit_reached_accounts(PROVIDER) == frozenset()
+
+    async def test_a_local_delete_brings_recovery_forward(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        assert await capacity_repo.bring_forward_recovery(PROVIDER, ACCOUNT, now=now) is True
+        record = await capacity_repo.get(PROVIDER, ACCOUNT)
+        assert record is not None and record.next_recovery_attempt_at is not None
+        # Earliest wins: a second delete never pushes a live schedule LATER.
+        assert (
+            await capacity_repo.bring_forward_recovery(
+                PROVIDER, ACCOUNT, now=now + timedelta(hours=1)
+            )
+            is False
+        )
+        # A healthy account has nothing to bring forward.
+        await capacity_repo.record_healthy(PROVIDER, ACCOUNT)
+        assert await capacity_repo.bring_forward_recovery(PROVIDER, ACCOUNT, now=now) is False
+
+
 def test_the_scratch_database_never_touches_the_configured_one() -> None:
     """Documentation guard: the module only ever writes to its scratch DB."""
     assert SCRATCH_DB not in DB_URL or not DB_URL

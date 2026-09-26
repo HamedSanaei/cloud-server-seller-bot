@@ -30,6 +30,7 @@ from cloud_platform.modules.businesslog.domain import (
     emit_safe,
 )
 from cloud_platform.modules.businesslog.events import (
+    capacity_recovered_event,
     provider_accepted_event,
     purchase_failed_event,
     purchase_requested_event,
@@ -64,9 +65,16 @@ from cloud_platform.modules.provider_accounts.domain import (
 )
 from cloud_platform.modules.provider_capacity.domain import (
     DEFAULT_LIMIT_TTL_SECONDS,
+    DEFAULT_RECOVERY_BACKOFF_SECONDS,
+    MIN_RECOVERY_DELAY_SECONDS,
     AccountCapacityRepository,
+    AccountCapacityState,
     CapacityChangeRepublisher,
     CapacityObservation,
+    validate_recovery_backoff,
+)
+from cloud_platform.modules.provider_capacity.domain import (
+    recovery_backoff_seconds as recovery_delay_for_attempts,
 )
 from cloud_platform.modules.users.domain import User, UserStatus
 from cloud_platform.modules.wallet.domain import WalletRepository, WalletStatus
@@ -514,6 +522,21 @@ def hourly_reference_name(server_id: UUID) -> str:
     return f"srv-{server_id}"
 
 
+@dataclass(frozen=True, slots=True)
+class CanaryClaim:
+    """Whether ONE real order may act as the capacity-recovery canary.
+
+    ``required`` is True only when the pinned account is in
+    ``recovery_candidate``: the platform has decided to spend one real order
+    proving that provider capacity returned. ``leased`` is True when THIS
+    operation owns that single attempt.
+    """
+
+    required: bool = False
+    leased: bool = False
+    ref: str | None = None
+
+
 class HourlyCloudService:
     """The hourly creation command handler (no provider calls, no charge)."""
 
@@ -541,6 +564,12 @@ class HourlyCloudService:
         #: instead of at the next periodic catalog walk. It never touches an
         #: accepted contract and never re-sends the refused POST.
         capacity_republisher: CapacityChangeRepublisher | Any | None = None,
+        #: Durable single-canary lease for a recovery candidate: how long ONE
+        #: real order may hold the attempt before the lease expires on its own.
+        canary_lease_seconds: int = 900,
+        #: Exponential backoff between canary attempts (config-owned; the last
+        #: value is the permanent cap). No synthetic/billable probe exists.
+        canary_backoff_seconds: tuple[int, ...] = DEFAULT_RECOVERY_BACKOFF_SECONDS,
         #: Canonical storefront currency for foreign offers.  USD is the
         #: current deployment default; an explicit configured value is still
         #: validated at this application boundary.
@@ -572,6 +601,12 @@ class HourlyCloudService:
         self._capacity = capacity_repo
         self._capacity_ttl_seconds = capacity_ttl_seconds
         self._capacity_republisher = capacity_republisher
+        if isinstance(canary_lease_seconds, bool) or not isinstance(canary_lease_seconds, int):
+            raise ValueError("canary_lease_seconds must be an integer")
+        if canary_lease_seconds < MIN_RECOVERY_DELAY_SECONDS:
+            raise ValueError(f"canary_lease_seconds must be >= {MIN_RECOVERY_DELAY_SECONDS}")
+        self._canary_lease_seconds = canary_lease_seconds
+        self._canary_backoff_seconds = validate_recovery_backoff(canary_backoff_seconds)
         target_currency = (catalog_currency or "").strip().upper()
         if target_currency not in SUPPORTED_CURRENCIES:
             raise ValueError("catalog_currency must be an audited currency code")
@@ -636,6 +671,135 @@ class HourlyCloudService:
             )
             return None
 
+    async def _claim_canary_attempt(
+        self,
+        *,
+        provider_key: str,
+        credential_account_id: str | None,
+        operation_key: str,
+    ) -> CanaryClaim:
+        """Acquire the DURABLE single-canary lease for one recovery attempt.
+
+        Only a ``recovery_candidate`` account can be claimed, and only one
+        operation at a time can hold the lease (one conditional UPDATE). When a
+        lease is REQUIRED but could not be acquired — another canary is in
+        flight, or the capacity store is unreadable — the caller must fail the
+        operation with the standard capacity answer: no provider POST, no
+        charge. Failing closed here is what keeps "one canary" true.
+        """
+        repo = self._capacity
+        account = str(credential_account_id or "").strip()
+        if repo is None or not account:
+            return CanaryClaim()
+        try:
+            record = await repo.get(provider_key, account)
+        except Exception:
+            logger.warning(
+                "canary capacity read failed for %s/%s; the account is not "
+                "treated as recoverable in this attempt",
+                provider_key,
+                account,
+                exc_info=True,
+            )
+            return CanaryClaim()
+        if record is None or record.state is not AccountCapacityState.RECOVERY_CANDIDATE:
+            return CanaryClaim()
+        try:
+            leased = await repo.begin_canary_attempt(
+                provider_key=provider_key,
+                credential_account_id=account,
+                ref=operation_key,
+                lease_seconds=self._canary_lease_seconds,
+            )
+        except Exception:
+            logger.exception(
+                "failed to acquire the capacity recovery canary lease for %s/%s",
+                provider_key,
+                account,
+            )
+            return CanaryClaim(required=True)
+        if leased is None:
+            return CanaryClaim(required=True)
+        logger.warning(
+            "capacity recovery canary leased: provider=%s account=%s ref=%s",
+            provider_key,
+            account,
+            operation_key,
+        )
+        return CanaryClaim(required=True, leased=True, ref=operation_key)
+
+    async def _recover_after_canary(
+        self, *, provider_key: str, credential_account_id: str | None, ref: str | None
+    ) -> None:
+        """A canary order was ACCEPTED: record the proven recovery + republish.
+
+        Best effort by design: this runs after the provider acceptance is
+        durably persisted, so a failure here must never change the outcome of
+        an already-accepted contract. The periodic catalog sync remains the
+        backstop for publication.
+        """
+        repo = self._capacity
+        account = str(credential_account_id or "").strip()
+        if repo is None or not account or not ref:
+            return
+        try:
+            proven = await repo.record_recovery_proven(provider_key, account, ref=ref)
+        except Exception:
+            logger.exception(
+                "failed to record the proven capacity recovery for %s/%s", provider_key, account
+            )
+            return
+        if proven is None:
+            return
+        logger.warning(
+            "capacity recovery proven by a real order: provider=%s account=%s ref=%s",
+            provider_key,
+            account,
+            ref,
+        )
+        await emit_safe(
+            self._events,
+            capacity_recovered_event(
+                provider_key=provider_key,
+                credential_account=account,
+                attempts=int(getattr(proven, "recovery_attempts", 0) or 0),
+            ),
+        )
+        republisher = self._capacity_republisher
+        refresh = getattr(republisher, "after_capacity_recovery", None)
+        if not callable(refresh):
+            return
+        try:
+            await refresh(provider_key=provider_key, credential_account_id=account)
+        except Exception:
+            logger.exception(
+                "capacity recovery publication refresh failed for %s/%s", provider_key, account
+            )
+
+    async def _release_canary_lease(
+        self,
+        *,
+        provider_key: str,
+        credential_account_id: str | None,
+        ref: str | None,
+        reason: str,
+    ) -> None:
+        """Release THIS attempt's canary lease (never another attempt's)."""
+        repo = self._capacity
+        account = str(credential_account_id or "").strip()
+        if repo is None or not account or not ref:
+            return
+        try:
+            await repo.release_canary_lease(provider_key, account, ref=ref)
+        except Exception:
+            logger.warning(
+                "could not release the canary lease for %s/%s (%s)",
+                provider_key,
+                account,
+                reason,
+                exc_info=True,
+            )
+
     async def _record_account_capacity_limit(
         self,
         *,
@@ -644,6 +808,7 @@ class HourlyCloudService:
         location_id: str | None,
         product_id: str | None,
         error: ProviderCapacityError,
+        canary_ref: str | None = None,
     ) -> None:
         """Remember a definitive account-capacity refusal (never fatal).
 
@@ -669,20 +834,43 @@ class HourlyCloudService:
         repo = self._capacity
         if repo is None or not account_id:
             return
+        observation = CapacityObservation(
+            error_code=error_code,
+            correlation_id=correlation_id,
+            location_id=location_id,
+            product_id=product_id,
+        )
         durable = False
         try:
-            await repo.record_limit_reached(
-                provider_key=provider_key,
-                credential_account_id=account_id,
-                observation=CapacityObservation(
-                    error_code=error_code,
-                    correlation_id=correlation_id,
-                    location_id=location_id,
-                    product_id=product_id,
-                ),
-                ttl_seconds=self._capacity_ttl_seconds,
-            )
-            durable = True
+            recorded = None
+            if canary_ref:
+                # A REAL recovery attempt was refused again: count it and back
+                # off exponentially instead of treating it as a first refusal.
+                attempts = 0
+                try:
+                    current = await repo.get(provider_key, account_id)
+                    attempts = int(getattr(current, "recovery_attempts", 0) or 0) if current else 0
+                except Exception:
+                    attempts = 0
+                recorded = await repo.record_canary_refusal(
+                    provider_key=provider_key,
+                    credential_account_id=account_id,
+                    ref=canary_ref,
+                    observation=observation,
+                    delay_seconds=recovery_delay_for_attempts(
+                        attempts, self._canary_backoff_seconds
+                    ),
+                    ttl_seconds=self._capacity_ttl_seconds,
+                )
+                durable = recorded is not None
+            if recorded is None:
+                await repo.record_limit_reached(
+                    provider_key=provider_key,
+                    credential_account_id=account_id,
+                    observation=observation,
+                    ttl_seconds=self._capacity_ttl_seconds,
+                )
+                durable = True
         except Exception:
             logger.exception(
                 "failed to record provider capacity limit for %s/%s", provider_key, account_id
@@ -1177,6 +1365,14 @@ class HourlyCloudService:
         """
         operation.mark_outcome_unknown(reason)
         await self._ops.save(operation)
+        # A canary whose outcome is UNKNOWN proves nothing: release its lease so
+        # the next scheduled window can attempt again, but never claim recovery.
+        await self._release_canary_lease(
+            provider_key=server.provider_key,
+            credential_account_id=getattr(server, "credential_account_id", None),
+            ref=getattr(operation, "operation_key", None),
+            reason="outcome-unknown",
+        )
         logger.warning("hourly create %s outcome unknown: %s", server.id, reason)
         code, correlation = self._provider_evidence(failure)
         await self._emit_purchase_failed(
@@ -1790,6 +1986,24 @@ class HourlyCloudService:
                 stage="images",
             )
         reference = hourly_reference_name(server.id)
+        # CAPACITY RECOVERY CANARY: when the pinned account is a recovery
+        # candidate, THIS order may become the single real attempt that proves
+        # provider capacity returned. The durable lease makes it exclusive; a
+        # candidate whose lease is already held fails here with the standard
+        # capacity answer and never reaches the provider (no POST, no charge).
+        canary = await self._claim_canary_attempt(
+            provider_key=server.provider_key,
+            credential_account_id=pinned_account,
+            operation_key=claimed.operation_key,
+        )
+        if canary.required and not canary.leased:
+            return await self._fail_operation(
+                claimed,
+                server,
+                "capacity recovery attempt already in flight for this account",
+                category=FAILURE_PROVIDER_CAPACITY,
+                stage="capacity_canary",
+            )
         try:
             created = await adapter.create_instance(
                 instance_type=snapshot.offer.plan_id,
@@ -1815,6 +2029,7 @@ class HourlyCloudService:
                 location_id=snapshot.offer.location_id,
                 product_id=snapshot.offer.plan_id,
                 error=exc,
+                canary_ref=canary.ref,
             )
             return await self._fail_operation(
                 claimed,
@@ -1836,6 +2051,14 @@ class HourlyCloudService:
             await self._ops.save(claimed)
             return "requeued"
         except ProviderError as exc:
+            # A non-capacity refusal is NOT a canary verdict: release the lease
+            # so the recovery window is not held by an unrelated failure.
+            await self._release_canary_lease(
+                provider_key=server.provider_key,
+                credential_account_id=pinned_account,
+                ref=canary.ref,
+                reason=type(exc).__name__,
+            )
             return await self._fail_operation(
                 claimed,
                 server,
@@ -1922,6 +2145,15 @@ class HourlyCloudService:
             metadata={"provider_server_id": created_id},
         )
         logger.info("hourly server %s -> provider %s", server.id, created_id)
+        # CAPACITY RECOVERY CANARY: the provider ACCEPTED this create, which is
+        # exactly the proof PC-2031 refuses to give. Recovery is PROVEN (not
+        # assumed): the account becomes eligible again and publication through
+        # it is refreshed immediately instead of at the next catalog walk.
+        await self._recover_after_canary(
+            provider_key=server.provider_key,
+            credential_account_id=pinned_account,
+            ref=canary.ref,
+        )
         # OPERATOR CARD: only now is the acceptance DURABLE (provider resource
         # id persisted, REQUESTED -> PROVISIONING saved, operation completed,
         # audit written). Emitting any earlier would let the channel claim an

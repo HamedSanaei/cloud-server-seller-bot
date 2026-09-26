@@ -134,6 +134,12 @@ def patched(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(cloud_accounts, "build_cloud_account_router", lambda settings: router)
     holder: dict[str, Any] = {"repo": _CapacityRepo()}
     monkeypatch.setattr("cloud_platform.cli._cloud_capacity_repository", lambda: holder["repo"])
+
+    async def _sellable() -> int:
+        return holder["sellable"]
+
+    holder["sellable"] = 12
+    monkeypatch.setattr("cloud_platform.cli._cloud_sellable_offer_count", _sellable)
     return holder
 
 
@@ -159,7 +165,24 @@ class TestCloudAccountsDoctor:
         assert "capacity: NOT ELIGIBLE for NEW orders (limit-reached, PC-2031)" in out
         assert "correlationId: 07376219-7bcd-43d9-a5ea-4128fa57345a" in out
         assert "affected: eu-central-1 / lsw.m4.large" in out
-        assert "leaseweb cloud accounts clear --account" in out
+        # Normal recovery is automatic; the manual clear is only the override.
+        assert "NO operator action is required" in out
+        assert "override-clear --account" in out
+        assert "emergency override only" in out
+
+    async def test_storefront_capacity_metrics_are_reported(
+        self, patched: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The doctor exposes the same six metrics the readiness gate prints."""
+        patched["repo"] = _CapacityRepo([_limit_reached()])
+        assert await leaseweb_cloud_accounts("doctor") == 1
+        out = capsys.readouterr().out
+        assert "cloud_sellable_offers: 12" in out
+        assert "capacity_blocked_accounts: 1" in out
+        assert "capacity_unknown_accounts: 0" in out
+        assert "recovery_candidate_accounts: 0" in out
+        assert "cloud_storefront_available: True" in out
+        assert "cloud_storefront_outage_seconds:" in out
 
     async def test_an_elapsed_window_is_reported_as_unproven_not_healthy(
         self, patched: Any, capsys: pytest.CaptureFixture[str]

@@ -30,10 +30,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,6 +44,7 @@ from cloud_platform.db.base import (
 )
 from cloud_platform.modules.provider_capacity.domain import (
     DEFAULT_LIMIT_TTL_SECONDS,
+    MIN_RECOVERY_DELAY_SECONDS,
     AccountCapacity,
     AccountCapacityState,
     CapacityEvent,
@@ -61,8 +63,13 @@ _CONSTRAINT = "uq_provider_account_capacity_account"
 #: reconciliation idempotent (one evidence row per provider operation).
 _EVENT_INDEX_ELEMENTS = ("provider_key", "credential_account_id", "kind", "source_ref")
 
-#: Evidence kinds that prove an operator/positive-proof decision was made.
-_CLEARED_KINDS = (CapacityEventKind.CLEARED.value,)
+#: Evidence kinds that prove a positive decision (recovery PROVEN, either by
+#: an operator override or by a real accepted canary order). Newer positive
+#: evidence outranks an older historical refusal during reconciliation.
+_CLEARED_KINDS = (
+    CapacityEventKind.CLEARED.value,
+    CapacityEventKind.RECOVERED.value,
+)
 
 
 def _attr(row: Any, name: str) -> Any:
@@ -93,6 +100,16 @@ def _capacity_from_row(row: Any) -> AccountCapacity:
         observations=int(_attr(row, "observations") or 0),
         observed_at=_attr(row, "observed_at"),
         expires_at=_attr(row, "expires_at"),
+        baseline_instance_count=_attr(row, "baseline_instance_count"),
+        baseline_instance_ids_hash=_attr(row, "baseline_instance_ids_hash"),
+        baseline_observed_at=_attr(row, "baseline_observed_at"),
+        recovery_attempts=int(_attr(row, "recovery_attempts") or 0),
+        last_recovery_attempt_at=_attr(row, "last_recovery_attempt_at"),
+        next_recovery_attempt_at=_attr(row, "next_recovery_attempt_at"),
+        canary_lease_expires_at=_attr(row, "canary_lease_expires_at"),
+        canary_lease_ref=_attr(row, "canary_lease_ref"),
+        outage_notified_at=_attr(row, "outage_notified_at"),
+        last_reminder_at=_attr(row, "last_reminder_at"),
     ).settled()
 
 
@@ -228,6 +245,11 @@ class SqlAlchemyAccountCapacityRepository:
         # refusal recorded, so each carried-forward column coalesces onto the
         # row the conflict found.
         excluded = insertion.excluded
+        # A refusal that arrives while the account was HEALTHY starts a NEW
+        # outage: the previous baseline, recovery counter and notification
+        # bookkeeping belong to the previous incident and are reset. A refusal
+        # on an already-blocked account keeps that context.
+        fresh_outage = model.state == AccountCapacityState.HEALTHY.value
         statement = insertion.on_conflict_do_update(
             constraint=_CONSTRAINT,
             set_={
@@ -239,6 +261,25 @@ class SqlAlchemyAccountCapacityRepository:
                 "observations": model.observations + 1,
                 "observed_at": observed_at,
                 "expires_at": expires_at,
+                "baseline_instance_count": case(
+                    (fresh_outage, None), else_=model.baseline_instance_count
+                ),
+                "baseline_instance_ids_hash": case(
+                    (fresh_outage, None), else_=model.baseline_instance_ids_hash
+                ),
+                "baseline_observed_at": case(
+                    (fresh_outage, None), else_=model.baseline_observed_at
+                ),
+                "recovery_attempts": case((fresh_outage, 0), else_=model.recovery_attempts),
+                "canary_lease_ref": case((fresh_outage, None), else_=model.canary_lease_ref),
+                "canary_lease_expires_at": case(
+                    (fresh_outage, None), else_=model.canary_lease_expires_at
+                ),
+                "outage_notified_at": case((fresh_outage, None), else_=model.outage_notified_at),
+                "last_reminder_at": case((fresh_outage, None), else_=model.last_reminder_at),
+                "next_recovery_attempt_at": case(
+                    (fresh_outage, None), else_=model.next_recovery_attempt_at
+                ),
             },
         ).returning(model)
         async with self._session_factory() as session:
@@ -401,6 +442,490 @@ class SqlAlchemyAccountCapacityRepository:
             await session.commit()
         return _capacity_from_row(row)
 
+    # -- automatic canary recovery -----------------------------------------
+
+    async def record_inventory_census(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        instance_count: int,
+        ids_hash: str,
+        now: datetime | None = None,
+    ) -> AccountCapacity | None:
+        """Read-only inventory evidence for one blocked account.
+
+        The FIRST census after a refusal becomes the baseline (what the account
+        held when the limit was learned). A LATER census below that baseline
+        means an instance was freed: the next recovery window is brought
+        forward to ``now`` so the canary can be spent immediately instead of
+        waiting for the backoff.
+        """
+        if isinstance(instance_count, bool) or not isinstance(instance_count, int):
+            raise ValueError("instance_count must be an integer")
+        if instance_count < 0:
+            raise ValueError("instance_count must be >= 0")
+        if not str(ids_hash or "").strip():
+            raise ValueError("ids_hash must not be empty")
+        reference = _aware(now)
+        model = _ProviderAccountCapacityModel
+        async with self._session_factory() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(model)
+                        .where(
+                            model.provider_key == provider_key,
+                            model.credential_account_id == credential_account_id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                await session.rollback()
+                return None
+            record = _capacity_from_row(row)
+            if not record.is_limit_reached(now=reference):
+                await session.rollback()
+                return record
+            updated = record
+            if record.baseline_instance_count is None:
+                updated = record.with_baseline(
+                    instance_count=instance_count, ids_hash=str(ids_hash), now=reference
+                )
+            elif instance_count < record.baseline_instance_count:
+                # An instance was freed: the scheduled backoff is no longer the
+                # best estimate of when capacity may exist. Open the window now.
+                updated = replace(record, next_recovery_attempt_at=reference)
+            target: Any = row
+            target.baseline_instance_count = updated.baseline_instance_count
+            target.baseline_instance_ids_hash = updated.baseline_instance_ids_hash
+            target.baseline_observed_at = updated.baseline_observed_at
+            target.next_recovery_attempt_at = updated.next_recovery_attempt_at
+            await session.commit()
+        return updated.settled(now=reference)
+
+    async def bring_forward_recovery(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """An app-owned instance was removed: evaluate the account immediately.
+
+        The delete saga calls this with a LOCAL fact (no provider call). The
+        next controller pass then sees the inventory decrease and opens the
+        canary window without waiting out the backoff. Only a blocked account
+        with a later/absent schedule is changed; a healthy account, an open
+        window or an in-flight canary is left alone.
+        """
+        reference = _aware(now)
+        model = _ProviderAccountCapacityModel
+        statement = (
+            update(model)
+            .where(
+                model.provider_key == provider_key,
+                model.credential_account_id == credential_account_id,
+                model.state.in_(
+                    (
+                        AccountCapacityState.LIMIT_REACHED.value,
+                        AccountCapacityState.UNKNOWN_AFTER_LIMIT.value,
+                    )
+                ),
+                or_(
+                    model.next_recovery_attempt_at.is_(None),
+                    model.next_recovery_attempt_at > reference,
+                ),
+            )
+            .values(next_recovery_attempt_at=reference)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(statement)
+            await session.commit()
+        return bool(result.rowcount)
+
+    async def schedule_recovery(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        delay_seconds: int,
+        now: datetime | None = None,
+    ) -> AccountCapacity | None:
+        """Schedule the next canary window for a blocked account.
+
+        A no-op when the account is eligible, already scheduled, or has an
+        attempt in flight: the earliest existing schedule always wins, so two
+        workers can never fight over the delay.
+        """
+        if isinstance(delay_seconds, bool) or not isinstance(delay_seconds, int):
+            raise ValueError("delay_seconds must be an integer")
+        if delay_seconds < MIN_RECOVERY_DELAY_SECONDS:
+            raise ValueError(f"delay_seconds must be >= {MIN_RECOVERY_DELAY_SECONDS}")
+        reference = _aware(now)
+        model = _ProviderAccountCapacityModel
+        async with self._session_factory() as session:
+            row = (
+                (
+                    await session.execute(
+                        select(model)
+                        .where(
+                            model.provider_key == provider_key,
+                            model.credential_account_id == credential_account_id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if row is None:
+                await session.rollback()
+                return None
+            record = _capacity_from_row(row)
+            if (
+                not record.is_limit_reached(now=reference)
+                or record.next_recovery_attempt_at is not None
+                or record.canary_lease_held(now=reference)
+            ):
+                await session.rollback()
+                return record
+            scheduled = record.with_recovery_scheduled(delay_seconds=delay_seconds, now=reference)
+            target: Any = row
+            target.next_recovery_attempt_at = scheduled.next_recovery_attempt_at
+            await session.commit()
+        return scheduled.settled(now=reference)
+
+    async def open_recovery_window(
+        self, provider_key: str, credential_account_id: str, *, now: datetime | None = None
+    ) -> AccountCapacity | None:
+        """Open the canary window when the schedule is due (single winner).
+
+        ``None`` when the account is eligible, still cooling, has no schedule
+        or a canary already in flight — the window is never opened by accident.
+        """
+        reference = _aware(now)
+        model = _ProviderAccountCapacityModel
+        statement = (
+            update(model)
+            .where(
+                model.provider_key == provider_key,
+                model.credential_account_id == credential_account_id,
+                model.state.in_(
+                    (
+                        AccountCapacityState.LIMIT_REACHED.value,
+                        AccountCapacityState.UNKNOWN_AFTER_LIMIT.value,
+                    )
+                ),
+                model.next_recovery_attempt_at.isnot(None),
+                model.next_recovery_attempt_at <= reference,
+                or_(
+                    model.canary_lease_expires_at.is_(None),
+                    model.canary_lease_expires_at <= reference,
+                ),
+            )
+            .values(
+                state=AccountCapacityState.RECOVERY_CANDIDATE.value,
+                next_recovery_attempt_at=None,
+                canary_lease_ref=None,
+                canary_lease_expires_at=None,
+            )
+            .returning(model)
+        )
+        async with self._session_factory() as session:
+            row = (await session.execute(statement)).scalars().first()
+            if row is None:
+                await session.rollback()
+                return None
+            await session.commit()
+        return _capacity_from_row(row)
+
+    async def begin_canary_attempt(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        ref: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> AccountCapacity | None:
+        """Acquire the DURABLE single-canary lease for one real order.
+
+        One conditional UPDATE is the whole serialization: exactly one caller
+        can move a free lease to its own reference, so two customer orders can
+        never both become the canary. The evidence row is appended in the same
+        transaction, keyed by the attempt reference, so a replayed attempt
+        never records twice.
+        """
+        if not str(ref or "").strip():
+            raise ValueError("ref must not be empty")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int):
+            raise ValueError("lease_seconds must be an integer")
+        if lease_seconds < MIN_RECOVERY_DELAY_SECONDS:
+            raise ValueError(f"lease_seconds must be >= {MIN_RECOVERY_DELAY_SECONDS}")
+        reference = _aware(now)
+        expires_at = reference + timedelta(seconds=lease_seconds)
+        model = _ProviderAccountCapacityModel
+        statement = (
+            update(model)
+            .where(
+                model.provider_key == provider_key,
+                model.credential_account_id == credential_account_id,
+                model.state == AccountCapacityState.RECOVERY_CANDIDATE.value,
+                or_(
+                    model.canary_lease_expires_at.is_(None),
+                    model.canary_lease_expires_at <= reference,
+                ),
+            )
+            .values(
+                canary_lease_ref=str(ref),
+                canary_lease_expires_at=expires_at,
+                last_recovery_attempt_at=reference,
+            )
+            .returning(model)
+        )
+        async with self._session_factory() as session:
+            row = (await session.execute(statement)).scalars().first()
+            if row is None:
+                await session.rollback()
+                return None
+            await session.execute(
+                pg_insert(_ProviderAccountCapacityEventModel)
+                .values(
+                    **_event_values(
+                        provider_key=provider_key,
+                        credential_account_id=credential_account_id,
+                        kind=CapacityEventKind.RECOVERY_ATTEMPT,
+                        state=AccountCapacityState.RECOVERY_CANDIDATE,
+                        observation=CapacityObservation(),
+                        source_ref=f"canary:{ref}",
+                        observed_at=reference,
+                    )
+                )
+                .on_conflict_do_nothing(
+                    index_elements=list(_EVENT_INDEX_ELEMENTS),
+                    index_where=_ProviderAccountCapacityEventModel.source_ref.isnot(None),
+                )
+            )
+            await session.commit()
+        return _capacity_from_row(row)
+
+    async def release_canary_lease(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        ref: str | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Release a lease (the matching attempt when ``ref`` is supplied)."""
+        reference = _aware(now)
+        model = _ProviderAccountCapacityModel
+        statement = update(model).where(
+            model.provider_key == provider_key,
+            model.credential_account_id == credential_account_id,
+            model.canary_lease_ref.isnot(None),
+            model.canary_lease_expires_at.isnot(None),
+            model.canary_lease_expires_at > reference,
+        )
+        if ref is not None:
+            statement = statement.where(model.canary_lease_ref == str(ref))
+        statement = statement.values(canary_lease_ref=None, canary_lease_expires_at=None)
+        async with self._session_factory() as session:
+            result = await session.execute(statement)
+            await session.commit()
+        return bool(result.rowcount)
+
+    async def record_canary_refusal(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        ref: str,
+        observation: CapacityObservation,
+        delay_seconds: int,
+        ttl_seconds: int = DEFAULT_LIMIT_TTL_SECONDS,
+        now: datetime | None = None,
+    ) -> AccountCapacity | None:
+        """A canary was refused again: back off, stay unpublished.
+
+        Guarded by the lease reference, so replaying the same attempt is a
+        no-op (``None``) instead of a second attempt count and a second log
+        line. The canonical refusal evidence is refreshed in the same
+        transaction.
+        """
+        if not str(ref or "").strip():
+            raise ValueError("ref must not be empty")
+        ttl = validate_limit_ttl(ttl_seconds)
+        if isinstance(delay_seconds, bool) or not isinstance(delay_seconds, int):
+            raise ValueError("delay_seconds must be an integer")
+        if delay_seconds < MIN_RECOVERY_DELAY_SECONDS:
+            raise ValueError(f"delay_seconds must be >= {MIN_RECOVERY_DELAY_SECONDS}")
+        reference = _aware(now)
+        expires_at = reference + timedelta(seconds=ttl)
+        model = _ProviderAccountCapacityModel
+        statement = (
+            update(model)
+            .where(
+                model.provider_key == provider_key,
+                model.credential_account_id == credential_account_id,
+                model.state == AccountCapacityState.RECOVERY_CANDIDATE.value,
+                model.canary_lease_ref == str(ref),
+            )
+            .values(
+                state=AccountCapacityState.LIMIT_REACHED.value,
+                error_code=func.coalesce(observation.error_code, model.error_code),
+                correlation_id=func.coalesce(observation.correlation_id, model.correlation_id),
+                location_id=func.coalesce(observation.location_id, model.location_id),
+                product_id=func.coalesce(observation.product_id, model.product_id),
+                observations=model.observations + 1,
+                observed_at=reference,
+                expires_at=expires_at,
+                recovery_attempts=model.recovery_attempts + 1,
+                last_recovery_attempt_at=reference,
+                next_recovery_attempt_at=reference + timedelta(seconds=delay_seconds),
+                canary_lease_ref=None,
+                canary_lease_expires_at=None,
+            )
+            .returning(model)
+        )
+        async with self._session_factory() as session:
+            row = (await session.execute(statement)).scalars().first()
+            if row is None:
+                await session.rollback()
+                return None
+            await session.execute(
+                pg_insert(_ProviderAccountCapacityEventModel)
+                .values(
+                    **_event_values(
+                        provider_key=provider_key,
+                        credential_account_id=credential_account_id,
+                        kind=CapacityEventKind.REFUSAL,
+                        state=AccountCapacityState.LIMIT_REACHED,
+                        observation=observation,
+                        source_ref=f"canary:{ref}",
+                        observed_at=reference,
+                        expires_at=expires_at,
+                    )
+                )
+                .on_conflict_do_nothing(
+                    index_elements=list(_EVENT_INDEX_ELEMENTS),
+                    index_where=_ProviderAccountCapacityEventModel.source_ref.isnot(None),
+                )
+            )
+            await session.commit()
+        return _capacity_from_row(row)
+
+    async def record_recovery_proven(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        ref: str,
+        now: datetime | None = None,
+    ) -> AccountCapacity | None:
+        """A canary order was ACCEPTED: eligibility is proven, not guessed."""
+        if not str(ref or "").strip():
+            raise ValueError("ref must not be empty")
+        reference = _aware(now)
+        model = _ProviderAccountCapacityModel
+        statement = (
+            update(model)
+            .where(
+                model.provider_key == provider_key,
+                model.credential_account_id == credential_account_id,
+                model.canary_lease_ref == str(ref),
+            )
+            .values(
+                state=AccountCapacityState.HEALTHY.value,
+                expires_at=None,
+                observed_at=reference,
+                recovery_attempts=0,
+                next_recovery_attempt_at=None,
+                canary_lease_ref=None,
+                canary_lease_expires_at=None,
+                outage_notified_at=None,
+                last_reminder_at=None,
+            )
+            .returning(model)
+        )
+        async with self._session_factory() as session:
+            row = (await session.execute(statement)).scalars().first()
+            if row is None:
+                await session.rollback()
+                return await self.get(provider_key, credential_account_id)
+            await session.execute(
+                pg_insert(_ProviderAccountCapacityEventModel)
+                .values(
+                    **_event_values(
+                        provider_key=provider_key,
+                        credential_account_id=credential_account_id,
+                        kind=CapacityEventKind.RECOVERED,
+                        state=AccountCapacityState.HEALTHY,
+                        observation=CapacityObservation(),
+                        source_ref=f"canary:{ref}",
+                        observed_at=reference,
+                    )
+                )
+                .on_conflict_do_nothing(
+                    index_elements=list(_EVENT_INDEX_ELEMENTS),
+                    index_where=_ProviderAccountCapacityEventModel.source_ref.isnot(None),
+                )
+            )
+            await session.commit()
+        return _capacity_from_row(row)
+
+    async def mark_outage_notified(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Remember that this outage's operator card was enqueued."""
+        reference = _aware(now)
+        model = _ProviderAccountCapacityModel
+        statement = (
+            update(model)
+            .where(
+                model.provider_key == provider_key,
+                model.credential_account_id == credential_account_id,
+                model.outage_notified_at.is_(None),
+            )
+            .values(outage_notified_at=reference)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(statement)
+            await session.commit()
+        return bool(result.rowcount)
+
+    async def mark_reminder_sent(
+        self,
+        provider_key: str,
+        credential_account_id: str,
+        *,
+        sent_at: datetime | None = None,
+    ) -> bool:
+        """Remember the reminder instant (the outbox key is the real dedupe)."""
+        reference = _aware(sent_at)
+        model = _ProviderAccountCapacityModel
+        statement = (
+            update(model)
+            .where(
+                model.provider_key == provider_key,
+                model.credential_account_id == credential_account_id,
+            )
+            .values(last_reminder_at=reference)
+        )
+        async with self._session_factory() as session:
+            result = await session.execute(statement)
+            await session.commit()
+        return bool(result.rowcount)
+
     async def record_healthy(
         self,
         provider_key: str,
@@ -435,6 +960,15 @@ class SqlAlchemyAccountCapacityRepository:
                     "state": AccountCapacityState.HEALTHY.value,
                     "expires_at": None,
                     "observed_at": observed_at,
+                    # The operator override is an explicit reset of the
+                    # automated recovery state: attempts, schedule, lease and
+                    # outage bookkeeping all start from a clean slate.
+                    "recovery_attempts": 0,
+                    "next_recovery_attempt_at": None,
+                    "canary_lease_ref": None,
+                    "canary_lease_expires_at": None,
+                    "outage_notified_at": None,
+                    "last_reminder_at": None,
                 },
             )
             .returning(model)

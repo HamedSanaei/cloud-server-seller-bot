@@ -152,7 +152,7 @@ sellable through another credential.
   routes the pair away, and a limited account keeps its row unpublished instead
   of moving the offer.
 - **Evidence state machine, never "time passed".** An account is always in
-  exactly one of three states:
+  exactly one of four states:
   - `limit_reached` — a definitive refusal inside its cooling window
     (the Leaseweb provider setting `cloud_account_limit_ttl_seconds`, default
     3600s, minimum 60);
@@ -162,13 +162,34 @@ sellable through another credential.
     out of NEW-order publication. Reads settle the stored row
     (`limit_reached` -> `unknown_after_limit`), which is why no caller can ever
     observe "the TTL expired, therefore eligible";
-  - `healthy` — no refusal on record, or one of exactly two positive proof
-    paths: an operator clear (`leaseweb cloud accounts clear --account <id>`,
-    run after provider instances were actually removed) or a future read-only
-    quota API whose semantics PROVE new-instance capacity. `list_regions` /
-    `list_instanceTypes` / `list_images` / `list_instances` are not proofs
-    (they prove authentication and catalog access only), and no billable create
-    is ever issued as a capacity probe.
+  - `recovery_candidate` — a bounded attempt window is OPEN: inventory exercise
+    freed an instance (or the scheduled backoff elapsed), so exactly ONE real
+    customer order may act as the canary. The window is serialized by a
+    durable PostgreSQL lease (`canary_lease_ref` / `canary_lease_expires_at`,
+    one conditional `UPDATE`), so two orders can never both be the canary; an
+    accepted order proves recovery, another `PC-2031` returns the account to
+    `limit_reached` with an exponential backoff;
+  - `healthy` — no refusal on record, or a POSITIVE proof: an accepted canary
+    order, an operator override
+    (`leaseweb cloud accounts override-clear --account <id>`, after provider
+    instances were actually removed), or a read-only quota API whose semantics
+    PROVE new-instance capacity. **Leaseweb publishes no such quota endpoint**
+    (audited against the official Public Cloud API schema: only regions,
+    instance types, images, instances and contracts exist), so automated
+    recovery relies on the instance inventory and the canary verdict.
+    `list_regions` / `list_instanceTypes` / `list_images` are not proofs (they
+    prove authentication and catalog access only), `list_instances` is only a
+    recovery SIGNAL (the baseline), and no synthetic billable create is ever
+    issued as a capacity probe.
+- **Recovery is automatic; the manual clear is the override.** A read-only
+  worker pass (every 3 minutes by default, plus at startup) keeps each blocked
+  account's instance baseline, schedules the next attempt with the configured
+  exponential backoff (15 m / 30 m / 1 h / 2 h, capped at 6 h), brings it
+  forward the moment the inventory drops below the baseline (or an app-owned
+  instance of that account is deleted), opens the canary window, and emits the
+  deduplicated operator cards: outage, storefront-unavailable (every capacity
+  account blocked), 30-minute-then-6-hour reminders, and one recovery card per
+  proven recovery. No operator memory is required for normal recovery.
 - **History is reconciled, exactly once.** A refusal that predates the capacity
   feature survives only as a failed provider operation's text
   (`operations.error`). `leaseweb cloud accounts reconcile [--dry-run]` — and
@@ -185,7 +206,10 @@ sellable through another credential.
   observation write the periodic sync uses, and the remaining pairs are
   unpublished (fail closed). The 15-minute catalog cycle stays the backstop;
   the offer row, its pricing provenance and any existing server keep their
-  pinned account, and the refused POST is never re-sent.
+  pinned account, and the refused POST is never re-sent. The inverse works too:
+  the moment a canary order is ACCEPTED, the recovered account's own pairs are
+  re-proved read-only and republished immediately (a pair it cannot prove stays
+  unpublished).
 - **One image-read semantics.** `list_images` (the customer OS screen) may fall
   back to the provider's GLOBAL image catalog when the region FILTER is
   rejected, but the capability question — doctor, catalog sync, checkout
@@ -196,7 +220,14 @@ sellable through another credential.
   billable create fail closed on anything but `proven`.
 - `leaseweb cloud accounts doctor` prints the safe view (account state,
   capacity state and why, proven regions, visible instances, last
-  code/correlation id — never key material).
+  code/correlation id, the automated recovery state, and the storefront
+  capacity metrics — never key material). `offers readiness` and
+  `business-log doctor` print the same
+  `cloud_sellable_offers` / `capacity_blocked_accounts` /
+  `capacity_unknown_accounts` / `recovery_candidate_accounts` /
+  `cloud_storefront_available` / `cloud_storefront_outage_seconds` metrics, and
+  the API health endpoint stays technically healthy: a capacity outage is a
+  storefront/commercial state, not a platform outage.
 
 ## 3. Status vocabulary
 

@@ -2310,6 +2310,50 @@ async def leaseweb_cloud_doctor() -> int:
     return 0
 
 
+async def _cloud_sellable_offer_count() -> int:
+    """Read-only count of hourly Cloud offers a customer can buy right now.
+
+    Uses the SAME sellability rule as the storefront (canonical currency +
+    valid provenance + publication state), so a metric can never claim an
+    offer the customer cannot check out. Returns 0 when the price book cannot
+    be read: metrics are informational and must never crash a diagnostic.
+    """
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.offers.domain import is_sellable_in_currency
+        from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
+
+        currency = str(get_settings().fx_catalog_pricing_currency).strip().upper()
+        rows = await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+        return sum(
+            1
+            for row in rows
+            if str(getattr(row, "billing_model", "") or "") == "hourly"
+            and is_sellable_in_currency(row, currency)
+        )
+    except Exception:
+        return 0
+
+
+async def _capacity_storefront_metrics(
+    capacity_repo: Any | None, *, sellable_offers: int
+) -> dict[str, Any]:
+    """Read-only capacity/storefront metrics shared by the doctor and readiness.
+
+    Returns an empty map when the capacity rows are unavailable: metrics are
+    informational and must never turn a diagnostic command into a crash.
+    """
+    if capacity_repo is None:
+        return {}
+    try:
+        from cloud_platform.modules.provider_capacity.status import capacity_status
+
+        records = await capacity_repo.list_for_provider("leaseweb")
+        return dict(capacity_status("leaseweb", records, sellable_offers=sellable_offers).metrics())
+    except Exception:
+        return {}
+
+
 def _cloud_capacity_repository() -> Any | None:
     """Open the durable per-account capacity store (None when unavailable).
 
@@ -2422,12 +2466,21 @@ async def leaseweb_cloud_accounts(
       provider error code of the last refusal (e.g. ``PC-2031``), its
       correlation id, and when the signal stops applying.
 
-    ``clear --account <id>`` marks one account eligible for new orders again
-    (the recorded refusal evidence is kept for diagnostics) — this is how an
-    operator re-probes after freeing provider capacity. An ELAPSED cooling
-    window is reported as ``unknown-after-limit`` and is deliberately NOT
-    eligible, because time passing is not proof that provider capacity
-    returned.
+    NORMAL recovery is automatic and needs no operator action: a read-only
+    controller keeps the account's instance baseline, brings the next attempt
+    window forward when an instance is freed (or a local delete happens), and
+    spends exactly ONE real customer order as a canary, serialized by a durable
+    PostgreSQL lease. An accepted order proves recovery; another ``PC-2031``
+    backs off exponentially. This command shows that state (attempts, next
+    window, baseline, in-flight canary).
+
+    ``clear --account <id>`` / ``override-clear --account <id>`` is the
+    EMERGENCY OVERRIDE only: it marks one account eligible again immediately
+    (the recorded refusal evidence is kept for diagnostics) when the operator
+    has already freed provider capacity and does not want to wait for the next
+    canary window. An ELAPSED cooling window is reported as
+    ``unknown-after-limit`` and is deliberately NOT eligible, because time
+    passing is not proof that provider capacity returned.
 
     ``reconcile [--dry-run]`` recovers refusals that were only ever recorded as
     historical provider-operation failures (idempotent, no provider call, no
@@ -2453,7 +2506,7 @@ async def leaseweb_cloud_accounts(
     if capacity_repo is None:
         print("[WARN] capacity store unavailable; capacity reported as UNKNOWN")
 
-    if action == "clear":
+    if action in ("clear", "override-clear"):
         target = str(account or "").strip()
         if not target:
             print("error: clear requires --account <credential account id>")
@@ -2474,6 +2527,11 @@ async def leaseweb_cloud_accounts(
             f"account {target}: capacity state {record.state.value} "
             f"(previous refusals recorded: {record.observations}); "
             "it is eligible for NEW orders again"
+        )
+        print(
+            "note: this is the MANUAL EMERGENCY OVERRIDE. Normal recovery is "
+            "automatic (instance baseline + one canary order + backoff) and "
+            "needs no operator action."
         )
         return 0
 
@@ -2570,7 +2628,12 @@ async def leaseweb_cloud_accounts(
         if record is None:
             print("  capacity: healthy (never observed)")
             continue
-        if record.is_limit_reached():
+        if record.state.value == "recovery_candidate":
+            print(
+                "  capacity: RECOVERY CANDIDATE - one real order may prove "
+                "recovery now (single canary, durable lease)"
+            )
+        elif record.is_limit_reached():
             reference = record.observed_at.isoformat() if record.observed_at else "-"
             expires = record.expires_at.isoformat() if record.expires_at else "-"
             blocked = record.blocked_reason() or "limit-reached"
@@ -2590,6 +2653,38 @@ async def leaseweb_cloud_accounts(
             limit_reached.append(account_id)
         else:
             print(f"  capacity: healthy (refusals recorded: {record.observations})")
+        if record.error_code or record.recovery_attempts:
+            print(f"  recovery attempts so far: {record.recovery_attempts}")
+        if record.baseline_instance_count is not None:
+            print(
+                "  recovery baseline: "
+                f"{record.baseline_instance_count} instance(s) observed "
+                f"{record.baseline_observed_at.isoformat() if record.baseline_observed_at else '-'}"
+            )
+        if record.next_recovery_attempt_at is not None:
+            print(
+                f"  next automatic recovery window: {record.next_recovery_attempt_at.isoformat()}"
+            )
+        if record.canary_lease_held():
+            lease_ends = (
+                record.canary_lease_expires_at.isoformat()
+                if record.canary_lease_expires_at is not None
+                else "-"
+            )
+            print(
+                "  canary order in flight (ref "
+                f"{record.canary_lease_ref or '-'}, lease ends {lease_ends})"
+            )
+        if record.outage_notified_at is not None:
+            print(
+                "  operator feed: outage card sent "
+                f"{record.outage_notified_at.isoformat()}"
+                + (
+                    f"; last reminder {record.last_reminder_at.isoformat()}"
+                    if record.last_reminder_at is not None
+                    else ""
+                )
+            )
         for event in history.get(account_id, ()):
             print(
                 f"    evidence {event.kind.value}: "
@@ -2599,13 +2694,27 @@ async def leaseweb_cloud_accounts(
                 f"source={event.source_ref or 'live'}"
             )
 
+    metric_values = await _capacity_storefront_metrics(
+        capacity_repo, sellable_offers=await _cloud_sellable_offer_count()
+    )
+    if metric_values:
+        print()
+        print("storefront capacity metrics (leaseweb):")
+        for name, value in metric_values.items():
+            print(f"  {name}: {value}")
+
     print()
     if limit_reached:
         print("result: NEW hourly orders are NOT published through: " + ", ".join(limit_reached))
         print(
-            "action: free capacity on the provider account, then run "
-            "'leaseweb cloud accounts clear --account <id>' to record the proven "
-            "recovery; an elapsed cooling window alone does NOT restore eligibility"
+            "action: NO operator action is required — automatic canary recovery "
+            "keeps probing (instance inventory/base deletion + exponential "
+            "backoff) and restores publication once a real order is accepted."
+        )
+        print(
+            "  emergency override only: 'leaseweb cloud accounts "
+            "override-clear --account <id>' after you already freed provider "
+            "capacity; an elapsed cooling window alone does NOT restore eligibility"
         )
         return 1
     print("result: every configured account may receive NEW hourly orders")
@@ -3338,11 +3447,14 @@ async def offers_readiness() -> int:
     stored: dict[str, int] = {}
     sellable: dict[str, int] = {}
     operator_disabled: dict[str, int] = {}
+    cloud_sellable = 0
     for row in rows:
         key = str(row.provider_key)
         stored[key] = stored.get(key, 0) + 1
         if is_sellable_in_currency(row, catalog_currency):
             sellable[key] = sellable.get(key, 0) + 1
+            if str(getattr(row, "billing_model", "") or "") == "hourly":
+                cloud_sellable += 1
         if getattr(row, "operator_disabled", False):
             operator_disabled[key] = operator_disabled.get(key, 0) + 1
 
@@ -3413,6 +3525,17 @@ async def offers_readiness() -> int:
             f"{provider_key}: {total} stored offer(s) but ZERO sellable in "
             f"{catalog_currency} (none has a canonical currency plus valid FX provenance)"
         )
+
+    # CAPACITY/STOREFRONT METRICS (LEASEWEB-MULTIACCOUNT): a provider can have
+    # sellable rows yet be temporarily closed because every credential account
+    # is out of capacity. These counters make that state explicit; they are
+    # informational — the gate above still owns pass/fail.
+    for name, value in (
+        await _capacity_storefront_metrics(
+            _cloud_capacity_repository(), sellable_offers=cloud_sellable
+        )
+    ).items():
+        print(f"[INFO] {name}: {value}")
 
     for line in lines:
         print(line)
@@ -3869,6 +3992,16 @@ async def business_log_doctor() -> DoctorResult:
         # signature of a dispatcher that is not running (or cannot reach
         # Telegram) — worth calling out explicitly.
         report("Dispatcher delivering", False, "pending events exist but none was ever sent")
+    # Capacity/storefront context is INFORMATIONAL here: an empty Cloud
+    # storefront must never make the LOGGER doctor fail (the capacity doctor
+    # owns that verdict), but the operator reading this report wants to know
+    # whether an outage is what the feed is about to report.
+    for name, value in (
+        await _capacity_storefront_metrics(
+            _cloud_capacity_repository(), sellable_offers=await _cloud_sellable_offer_count()
+        )
+    ).items():
+        lines.append(f"      {name}: {value}")
     return DoctorResult(ok=ok, lines=lines)
 
 
@@ -3921,22 +4054,23 @@ def _parser() -> argparse.ArgumentParser:
     lsw_cloud_sub.add_parser("doctor", help="read-only regions/types/images per region")
     lsw_cloud_accounts = lsw_cloud_sub.add_parser(
         "accounts",
-        help="read-only per-account capacity state (doctor | clear)",
+        help="read-only per-account capacity state (doctor | override-clear | reconcile)",
     )
     lsw_cloud_accounts.add_argument(
         "action",
         nargs="?",
-        choices=["doctor", "clear", "reconcile"],
+        choices=["doctor", "clear", "override-clear", "reconcile"],
         default="doctor",
         help=(
-            "doctor reports; clear records proven recovery; reconcile recovers "
-            "historical refusals from failed operations (idempotent)"
+            "doctor reports the automatic recovery state; clear/override-clear "
+            "is the MANUAL EMERGENCY override; reconcile recovers historical "
+            "refusals from failed operations (idempotent)"
         ),
     )
     lsw_cloud_accounts.add_argument(
         "--account",
         default=None,
-        help="credential account id (required by 'clear')",
+        help="credential account id (required by 'clear'/'override-clear')",
     )
     lsw_cloud_accounts.add_argument(
         "--dry-run",

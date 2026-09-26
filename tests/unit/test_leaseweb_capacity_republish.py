@@ -415,6 +415,94 @@ def _limited(account_id: str = LIMITED) -> Any:
     )
 
 
+async def _republish_recovery(
+    clients: dict[str, _CloudProviderFake],
+    *,
+    owners: dict[tuple[str, str], str] | None = None,
+    enabled: dict[str, bool] | None = None,
+    fail_upsert: bool = False,
+) -> tuple[Any, _RepublishOffersRepo, _Router]:
+    """Run the REAL recovery republication with patched repositories."""
+    import cloud_platform.providers.leaseweb.capacity_republish as mod
+    from cloud_platform.providers.leaseweb.capacity_republish import (
+        LeasewebCapacityRepublisher,
+    )
+
+    offers = _RepublishOffersRepo(
+        owners if owners is not None else {(TYPE, REGION): LIMITED},
+        fail_upsert=fail_upsert,
+    )
+    router = _Router(clients, enabled=enabled)
+    republisher = LeasewebCapacityRepublisher(
+        session_factory=lambda: None,  # type: ignore[arg-type]
+        router=router,  # type: ignore[arg-type]
+    )
+    with patch.object(mod, "SqlAlchemySellableOfferRepository", lambda _sf: offers):
+        report = await republisher.after_capacity_recovery(
+            provider_key=PROVIDER, credential_account_id=LIMITED
+        )
+    return report, offers, router
+
+
+class TestRecoveryRepublication:
+    """A PROVEN recovery must reopen the storefront at once — but only for the
+    pairs the recovered account can still prove read-only."""
+
+    async def test_the_proven_pairs_of_a_recovered_account_are_republished(self) -> None:
+        report, offers, router = await _republish_recovery({LIMITED: _proves()})
+
+        assert report.pairs_considered == 1
+        assert report.rerouted == ((TYPE, REGION, LIMITED),)
+        assert report.unproven == ()
+        assert report.errors == ()
+        assert len(offers.upserts) == 1
+        written = offers.upserts[0]
+        assert written["provider_account_id"] == LIMITED
+        update = written["update"]
+        assert update.provider_available is True
+        assert update.provider_account_id == LIMITED
+        assert update.billing_model == "hourly"
+        assert (update.provider_cost_minor, update.provider_cost_currency) == (2, "EUR")
+        # Read-only: only the proving account was consulted, and nothing was
+        # unpublished (the refusal already did that).
+        assert router.looked_up == [LIMITED]
+        assert offers.mark_calls == []
+
+    async def test_a_pair_the_recovered_account_cannot_prove_stays_closed(self) -> None:
+        report, offers, _ = await _republish_recovery({LIMITED: _cannot_serve()})
+
+        assert report.rerouted == ()
+        assert report.unproven == ((TYPE, REGION, "images-unproven"),)
+        assert offers.upserts == []
+
+    async def test_only_the_recovered_accounts_own_pairs_are_touched(self) -> None:
+        report, offers, router = await _republish_recovery(
+            {LIMITED: _proves(), ALTERNATE: _proves()},
+            owners={(TYPE, REGION): LIMITED, ("lsw.mini", REGION): ALTERNATE},
+        )
+
+        assert report.rerouted == ((TYPE, REGION, LIMITED),)
+        assert [row["provider_account_id"] for row in offers.upserts] == [LIMITED]
+        assert ALTERNATE not in router.looked_up
+
+    async def test_a_disabled_recovered_account_is_a_no_op(self) -> None:
+        report, offers, router = await _republish_recovery(
+            {LIMITED: _proves()}, enabled={LIMITED: False}
+        )
+
+        assert report.pairs_considered == 0
+        assert report.rerouted == ()
+        assert offers.upserts == []
+        assert router.looked_up == []
+
+    async def test_a_failing_republish_is_reported_never_raised(self) -> None:
+        report, _offers, _ = await _republish_recovery({LIMITED: _proves()}, fail_upsert=True)
+
+        assert report.rerouted == ()
+        assert report.unproven == ((TYPE, REGION, "persistence-failed"),)
+        assert report.errors and report.errors[0].startswith("republish ")
+
+
 @pytest.mark.parametrize("account_id", [LIMITED, ""])
 def test_only_a_real_account_triggers_a_republish(account_id: str) -> None:
     """Shape guard: an empty account id is never a reason to touch the catalog."""
