@@ -36,7 +36,10 @@ from cloud_platform.db.timestamps import from_db_utc
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.billing.service import FinalChargeService, MissingSnapshotError
+from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.events import vps_provisioned_event
 from cloud_platform.modules.compute.domain import (
+    BILLING_MODEL_HOURLY,
     CloudServer,
     ServerLifecycleState,
     ServerRepository,
@@ -937,6 +940,22 @@ class CreateTimeoutReconciler:
             logger.exception("failed to release hold for server %s", server.id)
 
 
+def _fingerprint_text(fingerprint: Any, key: str) -> str | None:
+    """A safe text fact of an immutable contract fingerprint (never a secret).
+
+    Hourly cloud servers carry provider/plan/location in the pinned offer
+    fingerprint rather than on the row; the reconciler reads it read-only to
+    enrich the operator card.
+    """
+    if not isinstance(fingerprint, dict):
+        return None
+    value = fingerprint.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 class StateReconciliationOutcome(StrEnum):
     """Result of reconciling one server's state against the provider."""
 
@@ -974,10 +993,20 @@ class ServerStateReconciler:
         server_repo: ServerRepository,
         provider_registry: ProviderRegistry,
         audit_repo: AuditRepository,
+        #: Durable operator business-log sink (optional). This reconciler owns
+        #: the final PROVISIONING -> RUNNING transition of an hourly cloud
+        #: instance, so it is the only correct place to tell the operator that
+        #: the server was actually provisioned.
+        event_sink: BusinessEventSink | None = None,
+        #: Optional user lookup used only to enrich that card with the safe
+        #: identity (Telegram id / username).
+        user_repo: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._registry = provider_registry
         self._audit = AuditTrail(audit_repo)
+        self._events = event_sink
+        self._users = user_repo
 
     async def reconcile(self) -> dict[StateReconciliationOutcome, int]:
         """Reconcile all provider-backed servers; returns a count per outcome."""
@@ -1045,10 +1074,56 @@ class ServerStateReconciler:
                     "to": plan.target.value,
                 },
             )
+            if plan.target is ServerLifecycleState.RUNNING:
+                await self._emit_hourly_provisioned(server)
             return StateReconciliationOutcome.REPAIRED
 
         # StateAction.CONTAIN
         return await self._contain(server, f"state reconciliation: {plan.reason}")
+
+    async def _emit_hourly_provisioned(self, server: CloudServer) -> None:
+        """Emit the ONE ``vps_provisioned`` card for an hourly cloud server.
+
+        This reconciler owns the final PROVISIONING -> RUNNING transition, so
+        it is the only place that can honestly tell the operator a server was
+        provisioned (a successful POST is not proof of delivery). Scoped to
+        the hourly billing model: the monthly flow emits its own, richer card
+        from the provisioning worker during creation. The deterministic event
+        key means repeated passes — or a later pass reaching RUNNING through
+        another path — can never post the card twice.
+        """
+        if str(getattr(server, "billing_model", "")) != BILLING_MODEL_HOURLY:
+            return
+        user = None
+        if self._users is not None and server.user_id is not None:
+            try:
+                user = await self._users.get(server.user_id)
+            except Exception:
+                logger.warning(
+                    "business-log identity lookup failed for user %s",
+                    server.user_id,
+                    exc_info=True,
+                )
+        fingerprint = getattr(server, "offer_fingerprint", None)
+        await emit_safe(
+            self._events,
+            vps_provisioned_event(
+                user=user,
+                user_id=server.user_id,
+                server_id=server.id,
+                provider_key=server.provider_key,
+                provider_order_id=server.provider_server_id,
+                location_id=_fingerprint_text(fingerprint, "location_id"),
+                plan_name=_fingerprint_text(fingerprint, "product_id"),
+                state=server.state.value,
+                ipv4=getattr(server, "ipv4", None),
+                ipv6=getattr(server, "ipv6", None),
+                credential_account=getattr(server, "credential_account_id", None),
+                image_id=getattr(server, "image_id", None),
+                kind=BILLING_MODEL_HOURLY,
+                at=datetime.now(UTC),
+            ),
+        )
 
     async def _contain(self, server: CloudServer, reason: str) -> StateReconciliationOutcome:
         try:

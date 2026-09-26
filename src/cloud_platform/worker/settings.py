@@ -24,11 +24,33 @@ async def startup(ctx: dict[str, object]) -> None:
         otlp_endpoint=settings.otel_exporter_endpoint,
         sample_ratio=settings.otel_sample_ratio,
     )
+    _log_business_logger_state(settings)
     # Durable capacity knowledge must exist BEFORE the first checkout after a
     # deployment: an account that refused a create before the capacity feature
     # existed is otherwise considered eligible and is handed the next order.
     # Idempotent (one evidence row per provider operation) and read-only.
     await reconcile_capacity_evidence_once()
+
+
+def _log_business_logger_state(settings: object) -> None:
+    """Log ONCE whether the operator business feed can actually deliver.
+
+    A misconfigured feed used to be silent: ``enabled=true`` without a chat
+    id reads as "logging works" while every event is dropped by the policy.
+    Reports presence only — never the chat id or the bot token.
+    """
+    enabled = bool(getattr(settings, "telegram_logger_enabled", False))
+    chat_id = int(getattr(settings, "telegram_logger_chat_id", 0) or 0)
+    if enabled and not chat_id:
+        logger.error(
+            "business logger is enabled but telegram.logger.chat_id is not "
+            "configured; the operator feed cannot deliver"
+        )
+        return
+    if enabled:
+        logger.info("business logger enabled; durable Telegram outbox active")
+        return
+    logger.info("business logger disabled; operator feed inactive")
 
 
 async def reconcile_capacity_evidence_once() -> None:
@@ -127,6 +149,12 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
                 server_repo=server_repo,
                 provider_registry=container.provider_registry,
                 audit_repo=audit_repo,
+                # The reconciler owns the final PROVISIONING -> RUNNING
+                # transition of an hourly cloud instance, so the operator's
+                # "vps provisioned" card is emitted from here, through the
+                # same durable outbox.
+                event_sink=container.business_event_sink(),
+                user_repo=container.user_repository(),
             ).reconcile()
             logger.info(
                 "provider resource reconciliation: create=%s state=%s",

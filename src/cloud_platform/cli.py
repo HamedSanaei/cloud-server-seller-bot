@@ -3777,6 +3777,101 @@ async def renewals_check() -> int:
 # ---------------------------------------------------------------------------
 
 
+def _age_text(moment: Any) -> str:
+    """Human age of a stored timestamp (naive DB values are read as UTC)."""
+    from datetime import UTC, datetime
+
+    if moment is None:
+        return "none"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    seconds = max(0, int((datetime.now(UTC) - moment).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+
+async def business_log_doctor() -> DoctorResult:
+    """Read-only: the operator Telegram feed's durable outbox state.
+
+    Reports whether the feed is configured and ACTIVE (enabled AND a chat id
+    present), the per-status counts of ``business_log_events``, the age of the
+    oldest undelivered event, the last successful delivery and the most
+    recent stored (already sanitized) delivery error. Never prints a chat id,
+    a bot token, a provider key or an event payload: a doctor run must be safe
+    to paste into an issue.
+    """
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.businesslog.domain import (
+        STATUS_ABANDONED,
+        STATUS_PENDING,
+        STATUS_RETRY,
+        STATUS_SENDING,
+        STATUS_SENT,
+        BusinessLogPolicy,
+    )
+    from cloud_platform.modules.businesslog.repository import (
+        SqlAlchemyBusinessLogRepository,
+    )
+
+    policy = BusinessLogPolicy.from_settings(get_settings())
+    lines: list[str] = []
+    ok = True
+
+    def report(name: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and passed
+        mark = "OK " if passed else "FAIL"
+        lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+
+    report("Logger enabled", policy.enabled, "[telegram.logger] enabled")
+    report(
+        "Chat configured",
+        bool(policy.chat_id),
+        "chat id present (value never printed)" if policy.chat_id else "chat id is missing",
+    )
+    if not policy.active:
+        report(
+            "Active policy",
+            False,
+            "enabled=false or no chat id: every business event is dropped",
+        )
+        return DoctorResult(ok=False, lines=lines)
+    report("Active policy", True, "durable outbox → Telegram dispatcher")
+    try:
+        snapshot = await SqlAlchemyBusinessLogRepository(SessionFactory).operator_snapshot()
+    except Exception as exc:
+        report("Outbox readable", False, f"{type(exc).__name__}: {exc}")
+        return DoctorResult(ok=False, lines=lines)
+    report("Outbox readable", True, "business_log_events")
+    counts = snapshot.counts
+    for status in (STATUS_PENDING, STATUS_SENDING, STATUS_RETRY, STATUS_SENT, STATUS_ABANDONED):
+        lines.append(f"      {status.lower():<9} {counts.get(status, 0)}")
+    outstanding_statuses = (STATUS_PENDING, STATUS_SENDING, STATUS_RETRY)
+    outstanding = sum(counts.get(status, 0) for status in outstanding_statuses)
+    lines.append(
+        "      oldest outstanding: "
+        + (_age_text(snapshot.oldest_outstanding_at) if outstanding else "none")
+    )
+    lines.append("      last sent: " + _age_text(snapshot.last_sent_at))
+    last_error = snapshot.last_error or "none"
+    lines.append(f"      last delivery error: {last_error[:300]}")
+    report(
+        "No abandoned events",
+        counts.get(STATUS_ABANDONED, 0) == 0,
+        f"{counts.get(STATUS_ABANDONED, 0)} event(s) were never delivered",
+    )
+    if counts.get(STATUS_PENDING, 0) and counts.get(STATUS_SENT, 0) == 0:
+        # A feed that has never delivered anything but has pending rows is the
+        # signature of a dispatcher that is not running (or cannot reach
+        # Telegram) — worth calling out explicitly.
+        report("Dispatcher delivering", False, "pending events exist but none was ever sent")
+    return DoctorResult(ok=ok, lines=lines)
+
+
 def _parser() -> argparse.ArgumentParser:
     from cloud_platform.modules.markets.domain import MARKET_ORDER
 
@@ -3962,6 +4057,12 @@ def _parser() -> argparse.ArgumentParser:
         "doctor", help="read-only: compare the real config with the canonical template"
     )
 
+    business_log = sub.add_parser("business-log", help="operator Telegram feed diagnostics")
+    business_log_sub = business_log.add_subparsers(dest="subcommand", required=True)
+    business_log_sub.add_parser(
+        "doctor", help="read-only: outbox status, oldest pending, last delivery error"
+    )
+
     users = sub.add_parser("users")
     users_sub = users.add_subparsers(dest="subcommand", required=True)
     find = users_sub.add_parser("find")
@@ -4135,6 +4236,13 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.subcommand == "doctor":
             return await config_doctor()
         print(f"unknown command config {args.subcommand}")  # pragma: no cover
+        return 2
+    if args.command == "business-log":
+        if args.subcommand == "doctor":
+            result = await business_log_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
+        print(f"unknown command business-log {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "catalog":
         if args.subcommand == "auto-sync" and args.subsubcommand == "doctor":

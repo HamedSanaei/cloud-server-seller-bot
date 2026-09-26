@@ -49,6 +49,22 @@ class BusinessLogRecord:
     last_error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class BusinessLogSnapshot:
+    """Read-only operator view of the durable outbox (never a secret).
+
+    Deliberately carries no payload: ``business-log doctor`` reports state
+    and the SANITIZED delivery error of the most recent failed attempt —
+    never an event body, a chat id or a bot token.
+    """
+
+    counts: dict[str, int]
+    oldest_outstanding_at: datetime | None = None
+    last_sent_at: datetime | None = None
+    last_error: str | None = None
+    last_error_at: datetime | None = None
+
+
 def _to_record(row: Any) -> BusinessLogRecord:
     return BusinessLogRecord(
         id=row.id,
@@ -183,3 +199,45 @@ class SqlAlchemyBusinessLogRepository:
                 await session.execute(select(_Model.status, func.count()).group_by(_Model.status))
             ).all()
             return {str(status): int(count) for status, count in rows}
+
+    async def operator_snapshot(self) -> BusinessLogSnapshot:
+        """Aggregated, read-only outbox state for ``business-log doctor``.
+
+        Counts per status, the age of the oldest undelivered event, the last
+        successful delivery and the most recent stored (already sanitized)
+        delivery error. No payload is ever read, so a doctor run cannot leak
+        an event body into a log or a terminal scrollback.
+        """
+        outstanding = (STATUS_PENDING, STATUS_SENDING, STATUS_RETRY)
+        async with self._session_factory() as session:
+            counts = {
+                str(status): int(count)
+                for status, count in (
+                    await session.execute(
+                        select(_Model.status, func.count()).group_by(_Model.status)
+                    )
+                ).all()
+            }
+            oldest = (
+                await session.execute(
+                    select(func.min(_Model.created_at)).where(_Model.status.in_(outstanding))
+                )
+            ).scalar_one_or_none()
+            last_sent = (
+                await session.execute(select(func.max(_Model.sent_at)))
+            ).scalar_one_or_none()
+            error_row = (
+                await session.execute(
+                    select(_Model.last_error, _Model.created_at)
+                    .where(_Model.last_error.is_not(None))
+                    .order_by(_Model.created_at.desc())
+                    .limit(1)
+                )
+            ).first()
+        return BusinessLogSnapshot(
+            counts=counts,
+            oldest_outstanding_at=oldest,
+            last_sent_at=last_sent,
+            last_error=str(error_row[0]) if error_row is not None else None,
+            last_error_at=error_row[1] if error_row is not None else None,
+        )

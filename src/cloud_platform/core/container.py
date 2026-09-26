@@ -645,6 +645,12 @@ class Container:
             capacity_republisher=self.capacity_republisher(),
             catalog_currency=get_settings().fx_catalog_pricing_currency,
             catalog_stale_limit_seconds=(get_settings().fx_frankfurter_catalog_max_stale_seconds),
+            # Operator business feed: the hourly lifecycle cards ride the SAME
+            # durable outbox as the monthly/payment flows (the worker owns
+            # Telegram delivery, never this service). Disabled configuration
+            # yields the null sink, so no financial path gains a dependency.
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:

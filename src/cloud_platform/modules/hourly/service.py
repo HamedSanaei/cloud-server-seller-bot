@@ -25,6 +25,15 @@ from uuid import UUID, uuid4
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.businesslog.domain import (
+    BusinessEventSink,
+    emit_safe,
+)
+from cloud_platform.modules.businesslog.events import (
+    provider_accepted_event,
+    purchase_failed_event,
+    purchase_requested_event,
+)
 from cloud_platform.modules.catalog.image_compatibility import image_compatible
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_HOURLY,
@@ -116,6 +125,22 @@ RECOVERABLE_HOURLY_PROVIDER_STATES = frozenset(
     }
 )
 
+#: Operator-facing hourly failure categories. Short, normalized, safe labels
+#: (never a raw provider response body) that drive both the business-log card
+#: title and the operator's triage of a failed/ambiguous hourly create.
+FAILURE_PROVIDER_CAPACITY = "provider_capacity"
+FAILURE_PROVIDER_REJECTED = "provider_rejected"
+FAILURE_PROVIDER_AUTH = "provider_auth"
+FAILURE_OFFER_REVALIDATION = "offer_revalidation_failed"
+FAILURE_IMAGE_UNAVAILABLE = "image_unavailable"
+FAILURE_INVALID_CONTRACT = "invalid_contract"
+FAILURE_INFRASTRUCTURE = "infrastructure_failure"
+FAILURE_OUTCOME_UNKNOWN = "outcome_unknown"
+FAILURE_RECOVERY_REQUIRED = "recovery_required"
+
+#: The business-log ``kind`` of every hourly-cloud lifecycle event.
+HOURLY_EVENT_KIND = "hourly"
+
 
 def _recovered_hourly_state_problem(value: Any) -> str | None:
     raw_state = getattr(value, "state", None) or getattr(value, "status", "")
@@ -187,6 +212,23 @@ def _offer_root_disk(offer: Any) -> tuple[int, str]:
             if isinstance(raw_types, (list, tuple)) and raw_types:
                 storage = raw_types[0]
     return _validated_root_disk_pair(getattr(offer, "disk_gb", None), storage)
+
+
+def _fingerprint_text(server: Any, key: str) -> str | None:
+    """A safe text fact of the immutable hourly contract fingerprint.
+
+    Worker/reconciler paths hold the ``CloudServer`` (plus the operation),
+    not the offer row: the pinned fingerprint is the one durable source of
+    the provider/plan/location facts the operator card needs.
+    """
+    fingerprint = getattr(server, "offer_fingerprint", None)
+    if not isinstance(fingerprint, dict):
+        return None
+    value = fingerprint.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _fingerprint_root_disk(fingerprint: Any) -> tuple[int, str] | None:
@@ -504,6 +546,15 @@ class HourlyCloudService:
         #: validated at this application boundary.
         catalog_currency: str = "USD",
         catalog_stale_limit_seconds: int | None = None,
+        #: Durable operator business-log sink (the SAME outbox the monthly /
+        #: payment flows use). Optional and never inline: Telegram delivery is
+        #: the worker's job, so a broken feed can never affect a purchase, a
+        #: provider POST, an operation or a charge.
+        event_sink: BusinessEventSink | None = None,
+        #: User lookup used ONLY to enrich an operator card with the safe
+        #: identity (Telegram id / username). Optional: without it the card
+        #: still carries the platform user id of the server.
+        user_repo: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -526,6 +577,8 @@ class HourlyCloudService:
             raise ValueError("catalog_currency must be an audited currency code")
         self._catalog_currency: str = target_currency
         self._catalog_stale_limit_seconds = catalog_stale_limit_seconds
+        self._events = event_sink
+        self._users = user_repo
 
     def _adapter_for(self, provider_key: str, credential_account_id: str | None) -> Any:
         """Exact cloud adapter for a pinned credential account (fail closed).
@@ -948,6 +1001,195 @@ class HourlyCloudService:
                 )
             await asyncio.sleep(0.01)
 
+    # -- operator business-log feed ----------------------------------------
+    #
+    # Hourly Cloud is an operator-visible lifecycle: the SAME durable outbox
+    # the monthly/payment flows use (never a direct Telegram call) carries
+    # "requested", "provider accepted", "vps provisioned" plus every
+    # definitive failure and every ambiguous outcome. Each emission is keyed
+    # by the durable local identity, so a repeated worker pass, a reconciler
+    # sweep or a replayed confirmation can never duplicate a card, and
+    # ``emit_safe`` guarantees a broken feed can never fail a purchase, a
+    # provider POST, an operation transition or a charge.
+
+    async def _event_identity(self, user_id: UUID | None, user: Any = None) -> Any:
+        """Best-effort safe user identity for an operator card (never raises).
+
+        Worker/reconciler paths hold only ``server.user_id``; when a user
+        repository is wired the safe identity (Telegram id / username) is
+        loaded for the card. A lookup failure degrades to the plain id
+        instead of affecting the lifecycle operation.
+        """
+        if user is not None:
+            return user
+        if user_id is None or self._users is None:
+            return None
+        try:
+            return await self._users.get(user_id)
+        except Exception:
+            logger.warning(
+                "hourly business-log identity lookup failed for user %s",
+                user_id,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _provider_evidence(error: BaseException | None) -> tuple[str | None, str | None]:
+        """Safe ``(error_code, correlation_id)`` evidence of a provider failure.
+
+        Only the two documented envelope facts are read — never a response
+        body — and a provider exception that carries neither simply omits
+        them from the card.
+        """
+        if error is None:
+            return None, None
+        code = str(getattr(error, "error_code", None) or "").strip() or None
+        correlation = str(getattr(error, "correlation_id", None) or "").strip() or None
+        return code, correlation
+
+    async def _emit_purchase_requested(
+        self, *, user: User, server: CloudServer, offer: Any, operation_key: str
+    ) -> None:
+        """One card once the complete durable hourly intent exists."""
+        await emit_safe(
+            self._events,
+            purchase_requested_event(
+                user=user,
+                user_id=user.id,
+                server_id=server.id,
+                provider_key=offer.provider_key,
+                location_id=offer.location_id,
+                plan_name=str(getattr(offer, "name", "") or offer.product_id),
+                product_id=offer.product_id,
+                os_name=getattr(server, "os", None),
+                image_id=getattr(server, "image_id", None),
+                selling_price_minor=offer.selling_price_minor,
+                currency=offer.selling_currency,
+                provider_cost_minor=offer.provider_cost_minor,
+                provider_cost_currency=offer.provider_cost_currency,
+                credential_account=getattr(server, "credential_account_id", None),
+                operation_key=operation_key,
+                kind=HOURLY_EVENT_KIND,
+                at=datetime.now(UTC),
+            ),
+        )
+
+    async def _emit_provider_accepted(
+        self,
+        *,
+        server: CloudServer,
+        provider_server_id: str,
+        operation_key: str | None = None,
+        product_id: str | None = None,
+        location_id: str | None = None,
+        plan_name: str | None = None,
+        provider_cost_minor: int | None = None,
+        currency: str | None = None,
+        state: str | None = None,
+    ) -> None:
+        """One card once the provider identity is DURABLY attached.
+
+        The deterministic ``purchase.provider_accepted:<server_id>`` key makes
+        the fresh POST and both read-only recovery paths converge on exactly
+        one card per server.
+        """
+        pinned_product = product_id or _fingerprint_text(server, "product_id")
+        await emit_safe(
+            self._events,
+            provider_accepted_event(
+                user=await self._event_identity(server.user_id),
+                user_id=server.user_id,
+                server_id=server.id,
+                provider_key=server.provider_key,
+                provider_order_id=provider_server_id,
+                product_id=pinned_product,
+                location_id=location_id or _fingerprint_text(server, "location_id"),
+                plan_name=plan_name or pinned_product,
+                provider_cost_minor=provider_cost_minor,
+                currency=currency,
+                operation_key=operation_key,
+                credential_account=getattr(server, "credential_account_id", None),
+                image_id=getattr(server, "image_id", None),
+                state=state,
+                kind=HOURLY_EVENT_KIND,
+                at=datetime.now(UTC),
+            ),
+        )
+
+    async def _emit_purchase_failed(
+        self,
+        server: CloudServer,
+        *,
+        category: str,
+        reason: str,
+        stage: str,
+        operation_key: str | None = None,
+        error_code: str | None = None,
+        correlation_id: str | None = None,
+        provider_order_id: str | None = None,
+    ) -> None:
+        """One failure/ambiguity card (best effort, never raises).
+
+        ``category`` is a normalized label; the raw provider body is never a
+        parameter, and the payload still passes through the shared sanitizer.
+        """
+        pinned_product = _fingerprint_text(server, "product_id")
+        await emit_safe(
+            self._events,
+            purchase_failed_event(
+                user=await self._event_identity(server.user_id),
+                user_id=server.user_id,
+                server_id=server.id,
+                provider_key=server.provider_key,
+                provider_order_id=provider_order_id or server.provider_server_id,
+                operation_key=operation_key,
+                category=category,
+                reason=reason,
+                stage=stage,
+                location_id=_fingerprint_text(server, "location_id"),
+                plan_name=pinned_product,
+                product_id=pinned_product,
+                image_id=getattr(server, "image_id", None),
+                error_code=error_code,
+                correlation_id=correlation_id,
+                credential_account=getattr(server, "credential_account_id", None),
+                kind=HOURLY_EVENT_KIND,
+                at=datetime.now(UTC),
+            ),
+        )
+
+    async def _mark_outcome_unknown(
+        self,
+        operation: Any,
+        server: CloudServer,
+        reason: str,
+        *,
+        stage: str = "provider_create",
+        failure: BaseException | None = None,
+    ) -> str:
+        """Persist OUTCOME_UNKNOWN and emit ONE "needs review" card.
+
+        Used for every FIRST transition into the ambiguous state. The
+        deterministic ``purchase.failed:<id>:outcome_unknown`` key keeps a
+        per-minute reconciler from re-posting the same warning, and the card
+        explicitly tells the operator not to blind-retry the create.
+        """
+        operation.mark_outcome_unknown(reason)
+        await self._ops.save(operation)
+        logger.warning("hourly create %s outcome unknown: %s", server.id, reason)
+        code, correlation = self._provider_evidence(failure)
+        await self._emit_purchase_failed(
+            server,
+            category=FAILURE_OUTCOME_UNKNOWN,
+            reason=reason,
+            stage=stage,
+            operation_key=getattr(operation, "operation_key", None),
+            error_code=code,
+            correlation_id=correlation,
+        )
+        return "outcome-unknown"
+
     async def create_instance(
         self,
         *,
@@ -1279,6 +1521,16 @@ class HourlyCloudService:
             offer.selling_currency,
             image_label,
         )
+        # OPERATOR CARD: emitted only now, when the complete durable intent
+        # exists (server row + immutable snapshot + server-create operation +
+        # audit mutation). An idempotency replay returns through
+        # ``_replay_hourly_server`` and therefore never emits a second card.
+        await self._emit_purchase_requested(
+            user=user,
+            server=created,
+            offer=offer,
+            operation_key=f"server-create:{created.id}",
+        )
         return HourlyCreateResult(server=created, replayed=False)
 
     async def cloud_image_by_index(self, offer: Any, index: int) -> Any:
@@ -1385,11 +1637,19 @@ class HourlyCloudService:
         try:
             snapshot = await self._snapshots.require_snapshot(server.id)
         except Exception as exc:
-            return await self._fail_operation(claimed, server, f"no price snapshot: {exc}")
+            return await self._fail_operation(
+                claimed,
+                server,
+                f"no price snapshot: {exc}",
+                category=FAILURE_INFRASTRUCTURE,
+                stage="snapshot",
+            )
         try:
             _validate_hourly_contract(server, snapshot)
         except HourlyError as exc:
-            return await self._fail_operation(claimed, server, str(exc))
+            return await self._fail_operation(
+                claimed, server, str(exc), category=FAILURE_INVALID_CONTRACT, stage="validation"
+            )
         # The launch root disk is a REQUIRED provider create input, so it must
         # come from the accepted contract. A legacy (pre-root-disk) contract
         # cannot supply it and is failed with an actionable reason instead of
@@ -1397,12 +1657,16 @@ class HourlyCloudService:
         try:
             pinned_root_disk = _fingerprint_root_disk(server.offer_fingerprint)
         except HourlyError as exc:
-            return await self._fail_operation(claimed, server, str(exc))
+            return await self._fail_operation(
+                claimed, server, str(exc), category=FAILURE_INVALID_CONTRACT, stage="validation"
+            )
         if pinned_root_disk is None:
             return await self._fail_operation(
                 claimed,
                 server,
                 "hourly request predates the pinned launch root disk; a new order is required",
+                category=FAILURE_INVALID_CONTRACT,
+                stage="validation",
             )
         # The exact credential account pinned at creation owns the POST —
         # never an arbitrary configured key.
@@ -1410,11 +1674,21 @@ class HourlyCloudService:
         try:
             adapter = self._adapter_for(server.provider_key, pinned_account)
         except HourlyNotAvailableError as exc:
-            return await self._fail_operation(claimed, server, str(exc))
+            return await self._fail_operation(
+                claimed,
+                server,
+                str(exc),
+                category=FAILURE_INFRASTRUCTURE,
+                stage="adapter",
+            )
         image_id = getattr(server, "image_id", None)
         if not image_id:
             return await self._fail_operation(
-                claimed, server, "hourly request has no immutable provider image id"
+                claimed,
+                server,
+                "hourly request has no immutable provider image id",
+                category=FAILURE_INVALID_CONTRACT,
+                stage="validation",
             )
         validator = getattr(adapter, "validate_hourly_offer_for_checkout", None)
         if not callable(validator):
@@ -1422,6 +1696,8 @@ class HourlyCloudService:
                 claimed,
                 server,
                 "provider adapter lacks hourly checkout revalidation capability",
+                category=FAILURE_INFRASTRUCTURE,
+                stage="adapter",
             )
         try:
             await validator(
@@ -1434,9 +1710,23 @@ class HourlyCloudService:
                 root_disk_size_gb=pinned_root_disk[0],
                 root_disk_storage_type=pinned_root_disk[1],
             )
-        except (ProviderAuthError, ProviderNotFound, ProviderConflict) as exc:
+        except ProviderAuthError as exc:
             return await self._fail_operation(
-                claimed, server, f"hourly offer revalidation failed: {exc}"
+                claimed,
+                server,
+                f"hourly offer revalidation failed: {exc}",
+                category=FAILURE_PROVIDER_AUTH,
+                stage="offer_revalidation",
+                failure=exc,
+            )
+        except (ProviderNotFound, ProviderConflict) as exc:
+            return await self._fail_operation(
+                claimed,
+                server,
+                f"hourly offer revalidation failed: {exc}",
+                category=FAILURE_OFFER_REVALIDATION,
+                stage="offer_revalidation",
+                failure=exc,
             )
         except Exception as exc:
             return await self._requeue_operation(
@@ -1451,20 +1741,35 @@ class HourlyCloudService:
         )
         if not callable(images_reader):
             return await self._fail_operation(
-                claimed, server, "provider adapter lacks an image read"
+                claimed,
+                server,
+                "provider adapter lacks an image read",
+                category=FAILURE_INFRASTRUCTURE,
+                stage="adapter",
             )
         try:
             images = await images_reader(snapshot.offer.location_id)
         except (ProviderUnavailable, ProviderRateLimited) as exc:
             return await self._requeue_operation(claimed, f"images unavailable: {exc}")
         except ProviderError as exc:
-            return await self._fail_operation(claimed, server, f"images unavailable: {exc}")
+            return await self._fail_operation(
+                claimed,
+                server,
+                f"images unavailable: {exc}",
+                category=FAILURE_IMAGE_UNAVAILABLE,
+                stage="images",
+                failure=exc,
+            )
         except Exception as exc:
             return await self._requeue_operation(claimed, f"images unavailable: {exc}")
         image = next((img for img in images if img.id == image_id), None)
         if image is None:
             return await self._fail_operation(
-                claimed, server, f"image id {image_id!r} no longer offered at pinned location"
+                claimed,
+                server,
+                f"image id {image_id!r} no longer offered at pinned location",
+                category=FAILURE_IMAGE_UNAVAILABLE,
+                stage="images",
             )
         offer_metadata = getattr(snapshot, "pricing_metadata", {}) or {}
         offer_architecture = getattr(snapshot.offer, "architecture", None) or (
@@ -1478,7 +1783,11 @@ class HourlyCloudService:
             account_id=pinned_account,
         ):
             return await self._fail_operation(
-                claimed, server, "pinned image is not compatible with the pinned offer"
+                claimed,
+                server,
+                "pinned image is not compatible with the pinned offer",
+                category=FAILURE_IMAGE_UNAVAILABLE,
+                stage="images",
             )
         reference = hourly_reference_name(server.id)
         try:
@@ -1511,12 +1820,14 @@ class HourlyCloudService:
                 claimed,
                 server,
                 f"provider account has no capacity for new instances: {exc}",
+                category=FAILURE_PROVIDER_CAPACITY,
+                stage="provider_create",
+                failure=exc,
             )
         except ProviderOutcomeUnknown as exc:
-            claimed.mark_outcome_unknown(str(exc))
-            await self._ops.save(claimed)
-            logger.warning("hourly create %s ambiguous: %s", server.id, exc)
-            return "outcome-unknown"
+            return await self._mark_outcome_unknown(
+                claimed, server, str(exc), stage="provider_create", failure=exc
+            )
         except ProviderUnavailable as exc:
             # The adapter contract proves this failure occurred before the
             # provider accepted the create. Requeue the same operation key;
@@ -1525,29 +1836,36 @@ class HourlyCloudService:
             await self._ops.save(claimed)
             return "requeued"
         except ProviderError as exc:
-            return await self._fail_operation(claimed, server, str(exc))
+            return await self._fail_operation(
+                claimed,
+                server,
+                str(exc),
+                category=FAILURE_PROVIDER_REJECTED,
+                stage="provider_create",
+                failure=exc,
+            )
         created_id = getattr(created, "id", None)
         if not isinstance(created_id, str) or not created_id.strip():
             # A provider response without a durable resource identity cannot
             # prove what was created. Never retry the POST blindly.
-            claimed.mark_outcome_unknown("hourly provider response has no resource id")
-            await self._ops.save(claimed)
-            return "outcome-unknown"
+            return await self._mark_outcome_unknown(
+                claimed, server, "hourly provider response has no resource id"
+            )
         raw_provider_status = getattr(created, "status", None) or getattr(created, "state", "")
         provider_status = str(getattr(raw_provider_status, "value", raw_provider_status) or "")
         provider_status = provider_status.strip().lower()
         if provider_status in REJECTED_HOURLY_PROVIDER_STATES:
-            claimed.mark_outcome_unknown(
-                f"hourly provider rejected the create with status {provider_status!r}"
+            return await self._mark_outcome_unknown(
+                claimed,
+                server,
+                f"hourly provider rejected the create with status {provider_status!r}",
             )
-            await self._ops.save(claimed)
-            return "outcome-unknown"
         if provider_status not in RECOVERABLE_HOURLY_PROVIDER_STATES:
-            claimed.mark_outcome_unknown(
-                f"hourly provider returned unrecognized state {provider_status!r}"
+            return await self._mark_outcome_unknown(
+                claimed,
+                server,
+                f"hourly provider returned unrecognized state {provider_status!r}",
             )
-            await self._ops.save(claimed)
-            return "outcome-unknown"
         response_mismatches: list[str] = []
         if not _response_identity_matches(
             created,
@@ -1573,11 +1891,11 @@ class HourlyCloudService:
                         response_mismatches.append(f"{name}={value!r}")
                         break
         if response_mismatches:
-            claimed.mark_outcome_unknown(
-                "hourly provider response identity mismatch: " + ", ".join(response_mismatches)
+            return await self._mark_outcome_unknown(
+                claimed,
+                server,
+                "hourly provider response identity mismatch: " + ", ".join(response_mismatches),
             )
-            await self._ops.save(claimed)
-            return "outcome-unknown"
         # Persist the provider correlation on the server before terminalizing
         # the operation. If this save fails/crashes, the operation remains
         # IN_FLIGHT and reconciliation can find the exact POST outcome; the
@@ -1604,6 +1922,21 @@ class HourlyCloudService:
             metadata={"provider_server_id": created_id},
         )
         logger.info("hourly server %s -> provider %s", server.id, created_id)
+        # OPERATOR CARD: only now is the acceptance DURABLE (provider resource
+        # id persisted, REQUESTED -> PROVISIONING saved, operation completed,
+        # audit written). Emitting any earlier would let the channel claim an
+        # acceptance the platform cannot prove.
+        await self._emit_provider_accepted(
+            server=server,
+            provider_server_id=created_id,
+            operation_key=claimed.operation_key,
+            product_id=snapshot.offer.plan_id,
+            location_id=snapshot.offer.location_id,
+            plan_name=snapshot.offer.plan_id,
+            provider_cost_minor=snapshot.offer.cost_minor,
+            currency=snapshot.offer.currency,
+            state=provider_status,
+        )
         return "provisioned"
 
     async def _reconcile_inflight(self, server: CloudServer, operation: Any) -> str:
@@ -1630,6 +1963,15 @@ class HourlyCloudService:
         if found is not None:
             found_id = getattr(found, "id", None)
             if not isinstance(found_id, str) or not found_id.strip():
+                # A reference match without a durable resource id cannot be
+                # attached: alert the operator instead of ever re-POSTing.
+                await self._emit_purchase_failed(
+                    server,
+                    category=FAILURE_OUTCOME_UNKNOWN,
+                    reason="hourly recovery found a resource without a durable id",
+                    stage="recovery",
+                    operation_key=getattr(operation, "operation_key", None),
+                )
                 return "outcome-unknown"
             if not _response_identity_matches(
                 found,
@@ -1639,18 +1981,20 @@ class HourlyCloudService:
                 account_id=getattr(server, "credential_account_id", None),
                 reference=hourly_reference_name(server.id),
             ):
-                operation.mark_outcome_unknown(
-                    "hourly recovery response identity does not match the pinned contract"
+                return await self._mark_outcome_unknown(
+                    operation,
+                    server,
+                    "hourly recovery response identity does not match the pinned contract",
+                    stage="recovery",
                 )
-                await self._ops.save(operation)
-                return "outcome-unknown"
             state_problem = _recovered_hourly_state_problem(found)
             if state_problem is not None:
-                operation.mark_outcome_unknown(
-                    f"hourly recovery rejected by provider state: {state_problem}"
+                return await self._mark_outcome_unknown(
+                    operation,
+                    server,
+                    f"hourly recovery rejected by provider state: {state_problem}",
+                    stage="recovery",
                 )
-                await self._ops.save(operation)
-                return "outcome-unknown"
             server.provider_server_id = found_id
             if server.state is ServerLifecycleState.REQUESTED:
                 server.transition_to(ServerLifecycleState.PROVISIONING)
@@ -1667,6 +2011,21 @@ class HourlyCloudService:
                 await self._ops.save(operation)
             except Exception:
                 logger.exception("failed to complete recovered hourly operation %s", operation.id)
+            # READ-ONLY RECOVERY: the deterministic provider reference proved
+            # the earlier POST landed and the identity is now durably attached.
+            # The same ``purchase.provider_accepted:<server_id>`` key as the
+            # fresh path keeps this exactly one card per server.
+            await self._emit_provider_accepted(
+                server=server,
+                provider_server_id=found_id,
+                operation_key=getattr(operation, "operation_key", None),
+                product_id=snapshot.offer.plan_id,
+                location_id=snapshot.offer.location_id,
+                plan_name=snapshot.offer.plan_id,
+                provider_cost_minor=snapshot.offer.cost_minor,
+                currency=snapshot.offer.currency,
+                state=str(getattr(found, "state", "") or "") or None,
+            )
             return "recovered"
         updated = getattr(operation, "updated_at", None)
         if updated is not None:
@@ -1675,10 +2034,12 @@ class HourlyCloudService:
             if datetime.now(UTC) - updated < timedelta(minutes=15):
                 return "still-inflight"
         try:
-            operation.mark_outcome_unknown(
-                "hourly create worker lease expired; provider outcome requires read-only review"
+            await self._mark_outcome_unknown(
+                operation,
+                server,
+                "hourly create worker lease expired; provider outcome requires read-only review",
+                stage="recovery",
             )
-            await self._ops.save(operation)
         except Exception:
             logger.exception("failed to quarantine stale hourly operation %s", operation.id)
         return "outcome-unknown"
@@ -1708,6 +2069,16 @@ class HourlyCloudService:
                 if server.state is ServerLifecycleState.REQUESTED:
                     server.transition_to(ServerLifecycleState.ERROR)
                 await self._servers.save(server)
+                # The provider may already have been POSTed for this intent;
+                # a malformed contract around a non-terminal operation is a
+                # human-recovery case, never an automatic retry.
+                await self._emit_purchase_failed(
+                    server,
+                    category=FAILURE_RECOVERY_REQUIRED,
+                    reason=f"invalid immutable hourly intent: {error}",
+                    stage="validation",
+                    operation_key=getattr(operation, "operation_key", None),
+                )
                 return "review"
             if operation.status is OperationStatus.PENDING:
                 claimed = await self._ops.claim(operation.id)
@@ -1720,11 +2091,36 @@ class HourlyCloudService:
             if server.state is ServerLifecycleState.REQUESTED:
                 server.transition_to(ServerLifecycleState.ERROR)
             await self._servers.save(server)
+            # The failure transition is durable: tell the operator once (the
+            # category-scoped key dedupes repeated quarantines).
+            await self._emit_purchase_failed(
+                server,
+                category=FAILURE_INVALID_CONTRACT,
+                reason=f"invalid immutable hourly intent: {error}",
+                stage="validation",
+                operation_key=f"server-create:{server.id}",
+            )
         except Exception:
             logger.exception("failed to quarantine malformed hourly intent %s", server.id)
         return f"invalid:{error}"
 
-    async def _fail_operation(self, claimed: Any, server: CloudServer, error: str) -> str:
+    async def _fail_operation(
+        self,
+        claimed: Any,
+        server: CloudServer,
+        error: str,
+        *,
+        category: str = FAILURE_INFRASTRUCTURE,
+        stage: str = "provider_create",
+        failure: BaseException | None = None,
+    ) -> str:
+        """Fail the operation, move the server to ERROR, alert the operator once.
+
+        The card is emitted only AFTER both durable writes (operation FAILED,
+        server ERROR): it can never describe a state the database does not
+        have. The category-scoped deterministic key means a re-processed
+        failure never posts twice.
+        """
         claimed.fail(error)
         await self._ops.save(claimed)
         try:
@@ -1733,6 +2129,16 @@ class HourlyCloudService:
         except Exception:
             logger.exception("failed to mark hourly server %s ERROR", server.id)
         logger.warning("hourly create %s failed: %s", server.id, error)
+        code, correlation = self._provider_evidence(failure)
+        await self._emit_purchase_failed(
+            server,
+            category=category,
+            reason=error,
+            stage=stage,
+            operation_key=getattr(claimed, "operation_key", None),
+            error_code=code,
+            correlation_id=correlation,
+        )
         return "failed"
 
     async def reconcile_server(self, server_id: UUID) -> str:
@@ -1762,6 +2168,14 @@ class HourlyCloudService:
                     }
                 )
                 await self._ops.save(operation)
+                # The durable attachment IS the acceptance; the deterministic
+                # key keeps the recovery card identical to the fresh one.
+                await self._emit_provider_accepted(
+                    server=server,
+                    provider_server_id=server.provider_server_id,
+                    operation_key=getattr(operation, "operation_key", None),
+                    state=str(getattr(getattr(server, "state", None), "value", "")) or None,
+                )
                 return "recovered"
             return "skipped"
         if operation is None or operation.status is not OperationStatus.OUTCOME_UNKNOWN:
@@ -1826,4 +2240,17 @@ class HourlyCloudService:
         )
         await self._ops.save(operation)
         logger.info("hourly reconcile %s attached provider %s", server.id, found_id)
+        # READ-ONLY RECOVERY CARD: same deterministic key as the fresh accept,
+        # so a server that was recovered here can never produce two cards.
+        await self._emit_provider_accepted(
+            server=server,
+            provider_server_id=found_id,
+            operation_key=getattr(operation, "operation_key", None),
+            product_id=snapshot.offer.plan_id,
+            location_id=snapshot.offer.location_id,
+            plan_name=snapshot.offer.plan_id,
+            provider_cost_minor=snapshot.offer.cost_minor,
+            currency=snapshot.offer.currency,
+            state=str(getattr(found, "state", "") or "") or None,
+        )
         return "attached"

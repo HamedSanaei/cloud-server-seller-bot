@@ -200,6 +200,10 @@ _LABELS: Mapping[str, str] = {
     "category": "دسته خطا",
     "reason": "دلیل",
     "gateway": "درگاه",
+    "credential_account": "حساب پروایدر",
+    "error_code": "کد خطا",
+    "correlation_id": "Correlation ID",
+    "stage": "مرحله",
     "payment_session_id": "شناسه پرداخت",
     "gateway_reference": "کد مرجع درگاه",
     "balance_after": "موجودی بعد از تراکنش",
@@ -219,6 +223,7 @@ _FIELD_ORDER: tuple[str, ...] = (
     "kind",
     "market",
     "provider",
+    "credential_account",
     "location",
     "plan",
     "product_id",
@@ -255,9 +260,39 @@ _FIELD_ORDER: tuple[str, ...] = (
     "image",
     "snapshot",
     "renewal_at",
+    "stage",
     "category",
     "reason",
+    "error_code",
+    "correlation_id",
 )
+
+#: Category-specific card titles. The generic event title cannot tell a
+#: definitive refusal apart from an ambiguous outcome, and the operator has
+#: to be able to triage from the FIRST line of the card.
+_CATEGORY_TITLES: Mapping[str, str] = {
+    "provider_capacity": "🚧 ظرفیت حساب پروایدر برای ساخت سرور جدید تکمیل است",
+    "provider_auth": "🔐 خطای احراز هویت با پروایدر",
+    "provider_rejected": "🚫 پروایدر ساخت سرور را نپذیرفت",
+    "offer_revalidation_failed": "📉 اعتبارسنجی مجدد آفر در پروایدر ناموفق بود",
+    "image_unavailable": "💿 ایمیج انتخابی در پروایدر در دسترس نیست",
+    "invalid_contract": "🧾 قرارداد ساعتی نامعتبر است (نیازمند بررسی)",
+    "outcome_unknown": "⚠️ نتیجه ساخت سرور نامشخص است و نیاز به بررسی دارد",
+    "recovery_required": "🛠 بازیابی سرور نیازمند اقدام دستی است",
+    "infrastructure_failure": "🧱 خطای زیرساخت در فرایند ساخت سرور",
+}
+
+#: Advisory lines for categories where an operator could otherwise take a
+#: harmful action (most importantly: blindly retrying an ambiguous create).
+_CATEGORY_NOTES: Mapping[str, str] = {
+    "outcome_unknown": (
+        "راهنما: از تلاش مجدد (retry) خودداری کنید؛ "
+        "نتیجه فقط با بررسی read-only پروایدر مشخص می‌شود."
+    ),
+    "provider_capacity": (
+        "راهنما: تا اثبات بازیابی ظرفیت، سفارش جدید برای این حساب پذیرفته نمی‌شود."
+    ),
+}
 
 
 class BusinessLogError(Exception):
@@ -369,9 +404,16 @@ def format_minor(minor: int | None, currency: str | None) -> str | None:
 
 
 def render_event(event_type: BusinessEventType, payload: Mapping[str, Any]) -> str:
-    """Render one event as the operator card sent to the channel."""
-    lines = [_TITLES.get(event_type, event_type.value)]
+    """Render one event as the operator card sent to the channel.
+
+    A known failure ``category`` selects a more precise title (and, for
+    genuinely ambiguous outcomes, an explicit "do not blind-retry" note):
+    the operator must be able to triage from the first line.
+    """
     remaining = dict(payload)
+    category = str(remaining.get("category") or "")
+    title = _CATEGORY_TITLES.get(category) or _TITLES.get(event_type, event_type.value)
+    lines = [title]
     for key in _FIELD_ORDER:
         if key not in remaining:
             continue
@@ -380,6 +422,9 @@ def render_event(event_type: BusinessEventType, payload: Mapping[str, Any]) -> s
         lines.append(f"{label}: {value}")
     for key in sorted(remaining):
         lines.append(f"{_LABELS.get(key, key)}: {remaining[key]}")
+    note = _CATEGORY_NOTES.get(category)
+    if note:
+        lines.append(note)
     return "\n".join(str(line) for line in lines)
 
 
@@ -558,10 +603,22 @@ class BusinessLogDispatcher:
         sent = retried = abandoned = 0
         for record in claimed:
             key = str(record.event_key)
+            event_type = str(getattr(record, "event_type", ""))
             attempts = int(getattr(record, "attempts", 1) or 1)
             if attempts > self._policy.max_attempts:
                 await self._repo.mark_abandoned(
                     key, error=f"exceeded {self._policy.max_attempts} delivery attempts"
+                )
+                # An abandoned row is a business event the operator never saw:
+                # it must be visible in the application log, not just in the
+                # table. No token or chat id is ever logged.
+                logger.error(
+                    "business log event ABANDONED: event_key=%s event_type=%s attempts=%s "
+                    "max_attempts=%s",
+                    key,
+                    event_type,
+                    attempts,
+                    self._policy.max_attempts,
                 )
                 abandoned += 1
                 continue
@@ -569,10 +626,24 @@ class BusinessLogDispatcher:
                 await self._channel.send(self.render(record))
             except Exception as exc:
                 delay = self._policy.backoff_base_seconds * (2 ** (attempts - 1))
+                next_attempt_at = moment + timedelta(seconds=delay)
+                safe_error = _safe_error(exc)
                 await self._repo.mark_retry(
                     key,
-                    error=_safe_error(exc),
-                    next_attempt_at=moment + timedelta(seconds=delay),
+                    error=safe_error,
+                    next_attempt_at=next_attempt_at,
+                )
+                # Safe delivery diagnostics only: never the bot token, the
+                # chat id or the raw Telegram response body.
+                logger.warning(
+                    "business log delivery failed: event_key=%s event_type=%s attempt=%s "
+                    "next_attempt_at=%s exception=%s error=%s",
+                    key,
+                    event_type,
+                    attempts,
+                    next_attempt_at.isoformat(),
+                    type(exc).__name__,
+                    safe_error,
                 )
                 retried += 1
                 continue
