@@ -178,9 +178,25 @@ sellable through another credential.
     instance types, images, instances and contracts exist), so automated
     recovery relies on the instance inventory and the canary verdict.
     `list_regions` / `list_instanceTypes` / `list_images` are not proofs (they
-    prove authentication and catalog access only), `list_instances` is only a
-    recovery SIGNAL (the baseline), and no synthetic billable create is ever
-    issued as a capacity probe.
+    prove authentication and catalog access only), the account's instance
+    census is only a recovery SIGNAL (the baseline), and no synthetic billable
+    create is ever issued as a capacity probe.
+- **The census is account-scoped, never a region walk.** A Sales Organization
+  credential is REGION-SCOPED: `GET /publicCloud/v1/instances?region=` validates
+  the filter against the regions THIS credential is entitled to — one region
+  per credential in practice (`sales-org-north` -> `eu-central-1`,
+  `sales-org-uk` -> `eu-west-2`, returned as
+  `region: Valid options are "<one-region>"`), irrespective of how many
+  instances it holds, so the entitlement set is NOT "regions I have instances
+  in". The filter is therefore rejected for every other region the GLOBAL
+  catalog lists, and a per-region walk reports every region unreadable while
+  the baseline can never be captured (`sales-org-uk` holds zero instances and
+  still reports `eu-west-2`). The census uses the UNFILTERED account-scoped
+  read instead, paging on the documented `_metadata.totalCount` envelope, and
+  fails closed (unknown) when the read cannot be exhausted or an entry does not
+  parse: a truncated list is a lower bound and would masquerade as "capacity was
+  freed". Each returned instance carries its own `region`, so geography stays a
+  provider fact and the census needs no per-region reads at all.
 - **Recovery is automatic; the manual clear is the override.** A read-only
   worker pass (every 3 minutes by default, plus at startup) keeps each blocked
   account's instance baseline, schedules the next attempt with the configured
