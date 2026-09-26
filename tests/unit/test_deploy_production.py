@@ -1,8 +1,9 @@
 """Tests for the production CD pipeline (GHCR build + SSH deploy).
 
-Acceptance: every push to `main` runs CI first; only a green CI run builds
-the exact tested commit into an immutable GHCR image and deploys that exact
-image with migrations-first ordering, health gates, single-bot enforcement
+Acceptance: `main` no longer deploys automatically while `staging` is the
+active development lane; a release is an explicit `workflow_dispatch` with a
+full SHA that is an ancestor of `main`, built into an immutable GHCR image and
+deployed with migrations-first ordering, health gates, single-bot enforcement
 and image rollback (never a database downgrade).
 
 These are static/functional tests only — no test here performs a real
@@ -86,34 +87,55 @@ class TestWorkflowTriggersAndGates:
     def test_workflow_file_is_valid_yaml(self) -> None:
         assert _workflow()["name"] == "deploy-production"
 
-    def test_deploys_on_ci_completion_and_manual_dispatch(self) -> None:
+    def test_main_never_deploys_automatically(self) -> None:
+        """While `staging` owns the bot, a green push to `main` deploys NOTHING.
+
+        Two lanes racing one Telegram bot token on one host is exactly what
+        serialization cannot fix, so the automatic `workflow_run` trigger is
+        gone. Restoring it is a deliberate change that must bring its own
+        server/bot first (see docs/operations/PRODUCTION_DEPLOY.md).
+        """
         on = _on(_workflow())
-        assert "workflow_run" in on
-        assert on["workflow_run"]["workflows"] == ["ci"]
-        assert on["workflow_run"]["types"] == ["completed"]
+        assert "workflow_run" not in on
+        assert "push" not in on
         assert "workflow_dispatch" in on
         assert "sha" in on["workflow_dispatch"]["inputs"]
+        assert on["workflow_dispatch"]["inputs"]["sha"]["required"] is True
 
     def test_deployments_are_serialized(self) -> None:
         concurrency = _workflow()["concurrency"]
         assert concurrency["group"] == "production-deploy"
         assert concurrency["cancel-in-progress"] is False
 
+    def test_deploy_job_joins_the_shared_host_group(self) -> None:
+        """A release deploy and a staging deploy must never mutate one host at once.
+
+        The workflow-level group above only serializes releases against each
+        other; the job-level group is shared with the staging lane, whose
+        deploy job joins `telegram-shared-host-deploy` too (asserted in
+        tests/unit/test_deploy_staging.py).
+        """
+        deploy = _workflow()["jobs"]["deploy"]
+        assert deploy["concurrency"]["group"] == "telegram-shared-host-deploy"
+        assert deploy["concurrency"]["cancel-in-progress"] is False
+
     def test_minimal_permissions(self) -> None:
         permissions = _workflow()["permissions"]
         assert permissions["contents"] == "read"
         assert permissions["packages"] == "write"
 
-    def test_build_job_gates_on_successful_push_to_main(self) -> None:
+    def test_build_job_is_manual_dispatch_only(self) -> None:
+        jobs = _workflow()["jobs"]
+        assert jobs["build"]["if"] == "github.event_name == 'workflow_dispatch'"
         text = WORKFLOW.read_text(encoding="utf-8")
-        assert "github.event.workflow_run.conclusion" in text
-        assert "github.event.workflow_run.event" in text
-        assert "github.event.workflow_run.head_branch" in text
-        assert '"main"' in text or "'main'" in text
+        # A green CI run is no longer a deployment trigger of any kind.
+        assert "github.event.workflow_run" not in text
 
-    def test_deploys_the_ci_tested_sha_not_a_moving_ref(self) -> None:
+    def test_deploys_the_dispatched_sha_not_a_moving_ref(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        assert "github.event.workflow_run.head_sha" in text
+        assert 'sha="${{ inputs.sha }}"' in text
+        # The release is still refused when it is not an ancestor of main.
+        assert "git merge-base --is-ancestor" in text
         # Both checkouts pin the exact SHA.
         assert text.count("ref: ${{") >= 2
 
@@ -1010,6 +1032,7 @@ def _release_harness(
     fail_normalize: bool = False,
     fail_storefront_readiness: bool = False,
     crash_loop: bool = False,
+    deploy_profile: str = "production",
     alembic_image_head: str = "0034 (head)",
     alembic_db_head: str = "0034 (head)",
     expected_head: str = "0034",
@@ -1075,6 +1098,7 @@ def _release_harness(
         f"EXPECTED_COMPOSE_SHA256='{'f' * 64 if bad_sha else candidate_sha}' "
         f"ENV_FILE='{env_file.as_posix()}' "
         f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='{expected_head}' "
+        f"DEPLOY_PROFILE='{deploy_profile}' "
         f"STABILIZE_SECONDS=1 HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
         f"source '{DEPLOY_SCRIPT.as_posix()}'; "
         "set +e; main; echo MAIN_RC=$?"
@@ -1313,6 +1337,74 @@ class TestReleaseComposeContract:
         assert (tmp_path / "configuration.toml").read_bytes() == config_before
 
 
+class TestDeployProfiles:
+    """`DEPLOY_PROFILE` selects the lane's WORK, never its safety.
+
+    Both lanes run this one engine. `staging` exists to make the loop fast, so
+    it skips exactly one expensive step - the one-shot provider catalog refresh
+    that the worker's scheduled coordinator already owns. Every other gate
+    (configuration preflight, migrations + head + physical schema, catalog
+    canonicalization, single bot, health, storefront readiness, rollback) is
+    identical, and `test_staging_profile_still_fails_on_a_broken_storefront`
+    proves it on the failure path.
+    """
+
+    def test_only_production_and_staging_are_accepted(self) -> None:
+        assert "DEPLOY_PROFILE must be 'production' or 'staging'" in _script()
+
+    def test_the_staging_branch_precedes_the_refresh_it_skips(self) -> None:
+        script = _script()
+        branch = script.index('[ "${DEPLOY_PROFILE}" = "staging" ]')
+        refresh = script.index("python -m cloud_platform.cli catalog auto-sync run")
+        assert branch < refresh
+
+    @needs_bash
+    def test_production_profile_runs_the_catalog_refresh(self, tmp_path: Path) -> None:
+        result, _, _, _, _, _ = _release_harness(tmp_path)
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=0" in result.stdout
+        assert "deploy profile      : production" in result.stdout
+        assert "refreshing provider catalog facts" in result.stdout
+        assert "catalog auto-sync run" in _stub_calls(tmp_path, "docker-calls.log")
+
+    @needs_bash
+    def test_staging_profile_skips_only_the_catalog_refresh(self, tmp_path: Path) -> None:
+        result, _, _, _, _, _ = _release_harness(tmp_path, deploy_profile="staging")
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=0" in result.stdout
+        assert "deploy profile      : staging" in result.stdout
+        assert "skipping the one-shot catalog refresh" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        assert "catalog auto-sync run" not in calls
+        # Every other release transition and gate still runs.
+        assert "run --rm --no-deps migrate" in calls
+        assert "normalize-selling-currency --execute" in calls
+        assert "storefront readiness: ok" in result.stdout
+        assert "DEPLOYMENT SUCCEEDED" in result.stdout
+
+    @needs_bash
+    def test_staging_profile_still_fails_on_a_broken_storefront(self, tmp_path: Path) -> None:
+        """The staging lane is faster, never blinder."""
+        result, deploy_dir, canonical, _, env_before, _config_before = _release_harness(
+            tmp_path, deploy_profile="staging", fail_storefront_readiness=True
+        )
+        assert result.returncode == 0, f"harness itself failed: {result.stderr}"
+        assert "MAIN_RC=1" in result.stdout
+        assert "storefront readiness failed" in result.stderr
+        assert "release compose promoted" not in result.stdout
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_unknown_profile_fails_before_any_mutation(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, deploy_profile="canary"
+        )
+        assert "DEPLOY_PROFILE must be" in result.stderr
+        _assert_no_mutation(tmp_path, result, deploy_dir, canonical, env_before, config_before)
+
+
 class TestStorefrontReadinessGate:
     """A green deploy must never leave the customer catalog EMPTY.
 
@@ -1454,7 +1546,7 @@ class TestReleaseComposeDelivery:
         # SSH key login, GHCR login, compose delivery, deploy: one trust path.
         assert text.count("StrictHostKeyChecking=yes") >= 3
 
-    def test_single_delivery_path_for_automatic_and_manual_deploys(self) -> None:
+    def test_single_delivery_path_for_every_deploy(self) -> None:
         steps = self._steps()
         delivery = [
             step for step in steps if step.get("name") == "Deliver release compose candidate"
