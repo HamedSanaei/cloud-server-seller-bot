@@ -237,6 +237,16 @@ interval_seconds = 900
 # outlive its own cadence (overlapping runs also serialize on the catalog
 # advisory lock).
 timeout_seconds = 600
+# Safety margin (seconds) on top of `interval_seconds + timeout_seconds`.
+#
+# Every NEW catalog price must stay provable until the next scheduled refresh
+# has completed, otherwise the storefront empties between two healthy syncs the
+# moment the reference rate behind its prices expires (the 2026-09-26 Leaseweb
+# blackout: a "fresh" GBP->USD quote with ~2 minutes of TTL left was published
+# for every offer, and the whole foreign market went invisible ~15 minutes
+# before the next sync repriced it). Never set this to 0 in production: it
+# absorbs scheduler jitter and a slower-than-usual provider walk.
+fx_safety_margin_seconds = 300
 
 [storefront.pricing.leaseweb]
 mode = "markup"

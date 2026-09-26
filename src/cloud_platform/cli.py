@@ -2681,7 +2681,7 @@ async def offers_price_book(
     from cloud_platform.core.container import Container, create_container
     from cloud_platform.db.session import SessionFactory
     from cloud_platform.modules.offers.domain import PricingPolicy
-    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer, resolve_catalog_rate
     from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 
     settings = get_settings()
@@ -2691,6 +2691,11 @@ async def offers_price_book(
         return 2
     catalog_stale_limit = int(getattr(settings, "fx_frankfurter_catalog_max_stale_seconds", 86400))
     catalog_quote_ttl = int(getattr(settings, "fx_frankfurter_quote_ttl_seconds", 3600))
+    # Manual pricing must obey the SAME publication horizon as the periodic
+    # catalog sync: a price that expires before the next refresh would empty the
+    # storefront even though the sync itself is healthy.
+    catalog_horizon = int(settings.catalog_fx_min_remaining_lifetime_seconds)
+    catalog_horizon_anchor = datetime.now(UTC)
     container = create_container()
     resolver = container.global_fx_resolver_or_none()
     repo = SqlAlchemySellableOfferRepository(
@@ -2718,14 +2723,17 @@ async def offers_price_book(
                 if pair in prefetched_rates:
                     continue
                 try:
-                    get_catalog_rate = getattr(resolver, "get_catalog_rate", None)
-                    if callable(get_catalog_rate):
-                        prefetched_rates[pair] = await get_catalog_rate(source, destination)
-                    else:
-                        prefetched_rates[pair] = await resolver.get_rate(
-                            source, destination, allow_catalog_stale=True
-                        )
-                except Exception:
+                    prefetched_rates[pair] = await resolve_catalog_rate(
+                        resolver,
+                        source,
+                        destination,
+                        min_remaining_lifetime_seconds=catalog_horizon,
+                    )
+                except Exception as exc:
+                    print(
+                        f"  WARN {source}->{destination}: reference rate unavailable "
+                        f"({type(exc).__name__})"
+                    )
                     continue
         for row in sorted(rows, key=lambda o: (o.location_id, o.product_id)):
             native_currency = (row.provider_cost_currency or "").strip().upper()
@@ -2735,6 +2743,8 @@ async def offers_price_book(
                 row_target,
                 identity_ttl_seconds=catalog_quote_ttl,
                 prefetched_rates=prefetched_rates,
+                min_catalog_fresh_lifetime_seconds=catalog_horizon,
+                catalog_horizon_anchor=catalog_horizon_anchor,
             )
             if row.selling_price_minor > 0:
                 continue
@@ -2882,7 +2892,7 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
         has_valid_pricing_provenance,
         requires_currency_normalization,
     )
-    from cloud_platform.modules.offers.pricing import CatalogOfferPricer
+    from cloud_platform.modules.offers.pricing import CatalogOfferPricer, resolve_catalog_rate
     from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 
     settings = get_settings()
@@ -2890,6 +2900,10 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
     configured_target = str(settings.fx_catalog_pricing_currency).strip().upper()
     catalog_stale_limit = int(getattr(settings, "fx_frankfurter_catalog_max_stale_seconds", 86400))
     catalog_quote_ttl = int(getattr(settings, "fx_frankfurter_quote_ttl_seconds", 3600))
+    # Normalizing storefront prices is catalog publication too: it must obey the
+    # same horizon as the periodic sync or the storefront would empty again.
+    catalog_horizon = int(settings.catalog_fx_min_remaining_lifetime_seconds)
+    catalog_horizon_anchor = datetime.now(UTC)
     if target != configured_target:
         print(
             f"refused: --target {target} differs from configured catalog currency "
@@ -2932,19 +2946,17 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                 if pair in prefetched_rates:
                     continue
                 try:
-                    get_rate = getattr(resolver, "get_rate", None)
-                    if callable(get_rate):
-                        prefetched_rates[pair] = await get_rate(
-                            source_currency, destination, allow_catalog_stale=True
-                        )
-                    else:
-                        get_catalog_rate = getattr(resolver, "get_catalog_rate", None)
-                        if not callable(get_catalog_rate):
-                            continue
-                        prefetched_rates[pair] = await get_catalog_rate(
-                            source_currency, destination
-                        )
-                except Exception:
+                    prefetched_rates[pair] = await resolve_catalog_rate(
+                        resolver,
+                        source_currency,
+                        destination,
+                        min_remaining_lifetime_seconds=catalog_horizon,
+                    )
+                except Exception as exc:
+                    print(
+                        f"  WARN {source_currency}->{destination}: reference rate "
+                        f"unavailable ({type(exc).__name__})"
+                    )
                     continue
         normalized = 0
         intentionally_skipped = 0
@@ -2973,6 +2985,8 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                         row_target,
                         identity_ttl_seconds=catalog_quote_ttl,
                         prefetched_rates=prefetched_rates,
+                        min_catalog_fresh_lifetime_seconds=catalog_horizon,
+                        catalog_horizon_anchor=catalog_horizon_anchor,
                     )
                     priced = await pricer.price_auto(row, policy)
                     priced_minor = priced.selling_price_minor
@@ -3028,6 +3042,8 @@ async def offers_normalize_selling_currency(dry_run: bool, target: str = "USD") 
                         target,
                         identity_ttl_seconds=catalog_quote_ttl,
                         prefetched_rates=prefetched_rates,
+                        min_catalog_fresh_lifetime_seconds=catalog_horizon,
+                        catalog_horizon_anchor=catalog_horizon_anchor,
                     )
                     priced = await pricer.price_manual(row)
                     priced_minor = priced.selling_price_minor

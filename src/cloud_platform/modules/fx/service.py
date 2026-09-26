@@ -954,6 +954,53 @@ class GlobalFiatFxResolver:
     def catalog_stale_limit(self) -> int:
         return self.config.catalog_max_stale_seconds or self.config.max_stale_seconds
 
+    def _catalog_valid_until(self, quote: FxReferenceQuote, *, stale: bool) -> datetime:
+        """Latest instant this observation may still back a catalog price.
+
+        A quote published as *fresh* is bounded by its own TTL. A quote used
+        through the bounded last-known-good policy is bounded by
+        ``observed_at`` plus the configured catalog stale limit. Both bounds are
+        explicit and finite, so no catalog price ever carries an open-ended
+        reference rate.
+        """
+        if stale:
+            return quote.observed_at + timedelta(seconds=self.catalog_stale_limit)
+        return quote.expires_at
+
+    def _fresh_covers_horizon(
+        self, quote: FxReferenceQuote, now: datetime, min_remaining_lifetime_seconds: int
+    ) -> bool:
+        """Whether this observation may back a FRESH price for the horizon.
+
+        ``min_remaining_lifetime_seconds`` is the catalog publication horizon:
+        a price written now must stay provable until the next scheduled catalog
+        refresh has completed. A quote that is technically still fresh but
+        carries less than that horizon left is not fresh enough to publish.
+        """
+        if now >= quote.expires_at:
+            return False
+        age = self._age_seconds(quote)
+        if age > Decimal(self.catalog_stale_limit):
+            return False
+        if age > Decimal(self.config.quote_ttl_seconds):
+            return False
+        remaining = self._catalog_valid_until(quote, stale=False) - now
+        return remaining >= timedelta(seconds=min_remaining_lifetime_seconds)
+
+    def _stale_covers_horizon(
+        self, quote: FxReferenceQuote, now: datetime, min_remaining_lifetime_seconds: int
+    ) -> bool:
+        """Whether the bounded last-known-good window covers the horizon.
+
+        The stale window is the operator-configured catalog stale limit, so a
+        quote close to the end of that window cannot be published either: the
+        resulting price would expire before the next refresh completed.
+        """
+        if self._age_seconds(quote) > Decimal(self.catalog_stale_limit):
+            return False
+        remaining = self._catalog_valid_until(quote, stale=True) - now
+        return remaining >= timedelta(seconds=min_remaining_lifetime_seconds)
+
     async def get_rate(
         self,
         base_currency: str,
@@ -964,10 +1011,33 @@ class GlobalFiatFxResolver:
         """Return an exact rate, allowing stale fallback only for catalog sync.
 
         Payment/charge callers must pass ``False`` so a bounded reference-rate
-        cache window can never become implicit settlement permission.
+        cache window can never become implicit settlement permission. Catalog
+        callers that publish prices should use :meth:`get_catalog_rate` with an
+        explicit publication horizon instead.
         """
+        return await self._resolve(
+            base_currency,
+            quote_currency,
+            allow_catalog_stale=allow_catalog_stale,
+            min_remaining_lifetime_seconds=0,
+        )
+
+    async def _resolve(
+        self,
+        base_currency: str,
+        quote_currency: str,
+        *,
+        allow_catalog_stale: bool,
+        min_remaining_lifetime_seconds: int,
+    ) -> ReferenceRateResolution:
         if not isinstance(allow_catalog_stale, bool):
             raise ValueError("allow_catalog_stale must be boolean")
+        if (
+            isinstance(min_remaining_lifetime_seconds, bool)
+            or not isinstance(min_remaining_lifetime_seconds, int)
+            or min_remaining_lifetime_seconds < 0
+        ):
+            raise ValueError("min_remaining_lifetime_seconds must be a non-negative integer")
         base = normalize_currency(base_currency)
         quote = normalize_currency(quote_currency)
         if base not in GLOBAL_FIAT_CURRENCIES or quote not in GLOBAL_FIAT_CURRENCIES:
@@ -986,18 +1056,15 @@ class GlobalFiatFxResolver:
         )
         cached = await self._safe_cache_get(key, base, quote)
         now = datetime.now(UTC)
-        if (
-            cached is not None
-            and now < cached.expires_at
-            and self._age_seconds(cached) <= Decimal(self.catalog_stale_limit)
-            and self._age_seconds(cached) <= Decimal(self.config.quote_ttl_seconds)
+        if cached is not None and self._fresh_covers_horizon(
+            cached, now, min_remaining_lifetime_seconds
         ):
             return ReferenceRateResolution(cached, stale=False)
         if (
             allow_catalog_stale
             and cached is not None
             and self._stale_fallback_until.get(key, datetime.min.replace(tzinfo=UTC)) > now
-            and self._age_seconds(cached) <= Decimal(self.catalog_stale_limit)
+            and self._stale_covers_horizon(cached, now, min_remaining_lifetime_seconds)
         ):
             return ReferenceRateResolution(cached, stale=True)
         if (
@@ -1011,18 +1078,15 @@ class GlobalFiatFxResolver:
         async with self._lock_for(key):
             cached = await self._safe_cache_get(key, base, quote)
             now = datetime.now(UTC)
-            if (
-                cached is not None
-                and now < cached.expires_at
-                and self._age_seconds(cached) <= Decimal(self.catalog_stale_limit)
-                and self._age_seconds(cached) <= Decimal(self.config.quote_ttl_seconds)
+            if cached is not None and self._fresh_covers_horizon(
+                cached, now, min_remaining_lifetime_seconds
             ):
                 return ReferenceRateResolution(cached, stale=False)
             if (
                 allow_catalog_stale
                 and cached is not None
                 and self._stale_fallback_until.get(key, datetime.min.replace(tzinfo=UTC)) > now
-                and self._age_seconds(cached) <= Decimal(self.catalog_stale_limit)
+                and self._stale_covers_horizon(cached, now, min_remaining_lifetime_seconds)
             ):
                 return ReferenceRateResolution(cached, stale=True)
             if (
@@ -1055,6 +1119,15 @@ class GlobalFiatFxResolver:
                     # into catalog stale fallback.
                     self._stale_fallback_until[key] = failure_now + timedelta(seconds=30)
                     if allow_catalog_stale:
+                        if not self._stale_covers_horizon(
+                            cached, failure_now, min_remaining_lifetime_seconds
+                        ):
+                            # The last observation is inside the stale limit but
+                            # too close to its end to outlive the next refresh.
+                            raise FxStaleError(
+                                "global reference rate stale fallback cannot cover "
+                                "the catalog publication horizon"
+                            ) from exc
                         logger.warning(
                             "global FX live fetch failed; using bounded stale reference rate",
                             extra={
@@ -1062,6 +1135,7 @@ class GlobalFiatFxResolver:
                                 "market": f"{base}/{quote}",
                                 "stale": True,
                                 "age_seconds": str(self._age_seconds(cached)),
+                                "min_remaining_lifetime_seconds": (min_remaining_lifetime_seconds),
                             },
                         )
                         return ReferenceRateResolution(cached, stale=True)
@@ -1081,7 +1155,9 @@ class GlobalFiatFxResolver:
             fresh_now = datetime.now(UTC)
             fresh_age = self._age_seconds(fresh)
             if fresh_now >= fresh.expires_at:
-                if allow_catalog_stale and fresh_age <= Decimal(self.catalog_stale_limit):
+                if allow_catalog_stale and self._stale_covers_horizon(
+                    fresh, fresh_now, min_remaining_lifetime_seconds
+                ):
                     await self._safe_cache_put(key, fresh)
                     self._stale_fallback_until.pop(key, None)
                     self._failure_memo_until.pop(key, None)
@@ -1090,22 +1166,61 @@ class GlobalFiatFxResolver:
             if fresh_age > Decimal(self.catalog_stale_limit):
                 raise FxStaleError("global reference rate exceeded the live freshness limit")
             if fresh_age > Decimal(self.config.quote_ttl_seconds):
-                if allow_catalog_stale and fresh_age <= Decimal(self.catalog_stale_limit):
+                if allow_catalog_stale and self._stale_covers_horizon(
+                    fresh, fresh_now, min_remaining_lifetime_seconds
+                ):
                     await self._safe_cache_put(key, fresh)
                     self._stale_fallback_until.pop(key, None)
                     self._failure_memo_until.pop(key, None)
                     return ReferenceRateResolution(fresh, stale=True)
                 raise FxStaleError("global reference rate exceeded the configured quote TTL")
+            if not self._fresh_covers_horizon(fresh, fresh_now, min_remaining_lifetime_seconds):
+                # A technically fresh quote may still be too short-lived for
+                # catalog publication (a short provider TTL, or a horizon
+                # larger than the configured quote TTL). It is usable only as
+                # the explicitly-audited bounded stale policy, never as "fresh".
+                if allow_catalog_stale and self._stale_covers_horizon(
+                    fresh, fresh_now, min_remaining_lifetime_seconds
+                ):
+                    await self._safe_cache_put(key, fresh)
+                    self._stale_fallback_until.pop(key, None)
+                    self._failure_memo_until.pop(key, None)
+                    return ReferenceRateResolution(fresh, stale=True)
+                raise FxStaleError(
+                    "global reference rate cannot cover the catalog publication horizon"
+                )
             await self._safe_cache_put(key, fresh)
             self._stale_fallback_until.pop(key, None)
             self._failure_memo_until.pop(key, None)
             return ReferenceRateResolution(fresh, stale=False)
 
     async def get_catalog_rate(
-        self, base_currency: str, quote_currency: str
+        self,
+        base_currency: str,
+        quote_currency: str,
+        *,
+        min_remaining_lifetime_seconds: int = 0,
     ) -> ReferenceRateResolution:
-        """Opt in to the bounded last-known-good catalog pricing policy."""
-        return await self.get_rate(base_currency, quote_currency, allow_catalog_stale=True)
+        """Reference rate for catalog pricing, with an explicit publication horizon.
+
+        ``min_remaining_lifetime_seconds`` is the minimum time the resulting
+        catalog price must stay provable AFTER this call, derived from the
+        catalog sync cadence so a freshly published price outlives the next
+        scheduled refresh. A cached quote that is technically still fresh but
+        cannot cover that horizon is never returned as fresh: the resolver tries
+        a live provider refresh first and only then uses the bounded, explicitly
+        audited stale-catalog policy. When neither covers the horizon it fails
+        closed instead of publishing a price that is about to expire.
+
+        Payment/charge callers keep using :meth:`get_rate` and never inherit
+        this catalog-only requirement.
+        """
+        return await self._resolve(
+            base_currency,
+            quote_currency,
+            allow_catalog_stale=True,
+            min_remaining_lifetime_seconds=min_remaining_lifetime_seconds,
+        )
 
     async def resolve(
         self,

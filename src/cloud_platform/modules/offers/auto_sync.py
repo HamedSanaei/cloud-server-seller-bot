@@ -30,13 +30,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from cloud_platform.modules.catalog.domain import CatalogSyncLock
-from cloud_platform.modules.fx.domain import FxUnavailableError
 from cloud_platform.modules.fx.service import ReferenceRateResolution
 from cloud_platform.modules.offers.domain import (
     PRICING_MODE_MARKUP,
@@ -51,7 +50,12 @@ from cloud_platform.modules.offers.domain import (
     required_selling_currency,
     requires_currency_normalization,
 )
-from cloud_platform.modules.offers.pricing import CatalogOfferPricer, ReferenceRateResolver
+from cloud_platform.modules.offers.pricing import (
+    CatalogOfferPricer,
+    PricedOffer,
+    ReferenceRateResolver,
+    resolve_catalog_rate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,50 @@ def _verified_offer_keys(
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogFxObservation:
+    """One reference-rate pair used by a catalog run, with its horizon facts.
+
+    Recorded for every run so an empty (or nearly empty) storefront can be
+    explained from logs alone: which pair, from which provider, whether it was
+    fresh or bounded-stale, how much lifetime it had left at sync start and
+    after pricing, and the exact instant its provenance stops being valid.
+    Aggregate counts only — never a secret, never a provider payload.
+    """
+
+    base_currency: str
+    target_currency: str
+    provider: str = ""
+    stale: bool = False
+    observed_at: datetime | None = None
+    expires_at: datetime | None = None
+    catalog_valid_until: datetime | None = None
+    remaining_lifetime_at_sync_start_seconds: int | None = None
+    remaining_lifetime_at_publish_seconds: int | None = None
+    error: str | None = None
+
+    @property
+    def pair(self) -> str:
+        return f"{self.base_currency}/{self.target_currency}"
+
+    def log_fields(self) -> dict[str, object]:
+        return {
+            "pair": self.pair,
+            "fx_provider": self.provider,
+            "fx_stale": self.stale,
+            "observed_at": self.observed_at.isoformat() if self.observed_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "catalog_valid_until": (
+                self.catalog_valid_until.isoformat() if self.catalog_valid_until else None
+            ),
+            "remaining_lifetime_at_sync_start_seconds": (
+                self.remaining_lifetime_at_sync_start_seconds
+            ),
+            "remaining_lifetime_at_publish_seconds": (self.remaining_lifetime_at_publish_seconds),
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderAutoSyncReport:
     """What one coordinator run did for one provider."""
 
@@ -84,6 +132,19 @@ class ProviderAutoSyncReport:
     retired: int = 0
     warnings: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    #: Customer-visible offers before and after this run's pricing/publication
+    #: phase. A market moving from >0 to 0 is the storefront-blackout signal.
+    previous_sellable: int = 0
+    resulting_sellable: int = 0
+    sync_started_at: datetime | None = None
+    sync_finished_at: datetime | None = None
+    fx_observations: tuple[CatalogFxObservation, ...] = ()
+
+    @property
+    def sync_duration_seconds(self) -> int | None:
+        if self.sync_started_at is None or self.sync_finished_at is None:
+            return None
+        return int((self.sync_finished_at - self.sync_started_at).total_seconds())
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +233,7 @@ class CatalogAutoSyncCoordinator:
         reference_rates: ReferenceRateResolver | None = None,
         catalog_currency: str = "USD",
         identity_ttl_seconds: int = 3600,
+        catalog_min_fresh_lifetime_seconds: int = 0,
     ) -> None:
         self._sources = list(sources)
         self._offers = offers
@@ -181,6 +243,17 @@ class CatalogAutoSyncCoordinator:
         self._reference_rates = reference_rates
         self._catalog_currency = str(catalog_currency or "USD").strip().upper()
         self._identity_ttl_seconds = identity_ttl_seconds
+        if (
+            isinstance(catalog_min_fresh_lifetime_seconds, bool)
+            or not isinstance(catalog_min_fresh_lifetime_seconds, int)
+            or catalog_min_fresh_lifetime_seconds < 0
+        ):
+            raise ValueError("catalog_min_fresh_lifetime_seconds must be a non-negative integer")
+        #: Minimum remaining reference-rate lifetime a NEW catalog price must
+        #: carry, derived from the sync cadence so a freshly written price
+        #: outlives the next scheduled refresh. Zero disables the requirement
+        #: (legacy/diagnostic use only) and logs a loud warning at run time.
+        self._catalog_min_fresh_lifetime_seconds = catalog_min_fresh_lifetime_seconds
 
     async def run(self) -> AutoSyncRunReport:
         """Execute one refresh pass, or skip it when the lock is held."""
@@ -199,6 +272,10 @@ class CatalogAutoSyncCoordinator:
         from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY
 
         provider_key = source.provider_key
+        # The publication horizon is measured from the RUN start: a provider walk
+        # that takes minutes must not shorten the validity of the prices it
+        # writes, and every row of this run must survive until the next one.
+        sync_started_at = datetime.now(UTC)
         try:
             report = await source.sync_catalog()
         except Exception as exc:  # pragma: no cover - sources report, not raise
@@ -214,16 +291,34 @@ class CatalogAutoSyncCoordinator:
         prices_updated = 0
         published = 0
         pricing_errors: list[str] = []
+        fx_observations: list[CatalogFxObservation] = []
+        previous_sellable = 0
+        resulting_sellable = 0
         if report.ok and not report.persistence_failures:
             if self._policy_for(provider_key, report.billing_model) is None:
                 warnings.append("no automatic pricing policy configured; costs refreshed only")
+            if self._catalog_min_fresh_lifetime_seconds <= 0:
+                logger.warning(
+                    "catalog auto-sync %s: no catalog FX freshness horizon configured; "
+                    "published prices may expire before the next refresh",
+                    provider_key,
+                )
+            try:
+                previous_sellable = await self._sellable_count(provider_key, report.billing_model)
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                warnings.append(f"previous sellable count unavailable: {type(exc).__name__}")
             # The pricing/publication phase must never abort the run: a
             # failure here used to skip the state write below entirely, so a
             # sync that repaired catalog data still showed "never" in the
             # doctor. Record the failure visibly and always persist state.
             try:
                 prices_updated = await self._auto_price(
-                    provider_key, report, warnings, pricing_errors
+                    provider_key,
+                    report,
+                    warnings,
+                    pricing_errors,
+                    catalog_horizon_anchor=sync_started_at,
+                    fx_observations=fx_observations,
                 )
                 published = await self._auto_publish(provider_key, report, warnings)
             except Exception as exc:
@@ -231,6 +326,19 @@ class CatalogAutoSyncCoordinator:
                 logger.warning("catalog auto-sync for %s: %s", provider_key, message)
                 warnings.append(message)
                 errors.append(message)
+            try:
+                resulting_sellable = await self._sellable_count(provider_key, report.billing_model)
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                warnings.append(f"resulting sellable count unavailable: {type(exc).__name__}")
+            blackout = self._blackout_warning(
+                provider_key,
+                previous_sellable=previous_sellable,
+                resulting_sellable=resulting_sellable,
+                fx_observations=fx_observations,
+                pricing_errors=pricing_errors,
+            )
+            if blackout is not None:
+                warnings.append(blackout)
         elif not report.ok:
             logger.warning(
                 "catalog auto-sync for %s: no pricing/publication (sync not usable)",
@@ -265,6 +373,11 @@ class CatalogAutoSyncCoordinator:
             retired=report.retired,
             warnings=tuple(warnings),
             errors=tuple(errors),
+            previous_sellable=previous_sellable,
+            resulting_sellable=resulting_sellable,
+            sync_started_at=sync_started_at,
+            sync_finished_at=datetime.now(UTC),
+            fx_observations=tuple(fx_observations),
         )
         try:
             await self._state.record_run(
@@ -283,7 +396,9 @@ class CatalogAutoSyncCoordinator:
             logger.warning("catalog auto-sync state write failed for %s: %s", state_key, exc)
         logger.info(
             "catalog auto-sync %s: ok=%s discovered=%d persisted=%d prices=%d "
-            "published=%d retired=%d warnings=%d errors=%d",
+            "published=%d retired=%d warnings=%d errors=%d sync_started_at=%s "
+            "sync_finished_at=%s sync_duration_seconds=%d previous_sellable=%d "
+            "resulting_sellable=%d",
             state_key,
             outcome.ok,
             outcome.discovered,
@@ -293,8 +408,64 @@ class CatalogAutoSyncCoordinator:
             outcome.retired,
             len(outcome.warnings),
             len(outcome.errors),
+            outcome.sync_started_at.isoformat() if outcome.sync_started_at else None,
+            outcome.sync_finished_at.isoformat() if outcome.sync_finished_at else None,
+            outcome.sync_duration_seconds or 0,
+            outcome.previous_sellable,
+            outcome.resulting_sellable,
         )
+        for observation in outcome.fx_observations:
+            logger.info(
+                "catalog auto-sync %s: fx pair=%s",
+                state_key,
+                observation.pair,
+                extra=observation.log_fields(),
+            )
         return outcome
+
+    async def _sellable_count(self, provider_key: str, billing_model: str) -> int:
+        """Customer-visible offers of one provider/product line right now.
+
+        Uses exactly the repository gate the storefront uses, so the count can
+        never disagree with what a customer would be shown.
+        """
+        rows = await self._offers.list_sellable(provider_key)
+        return sum(1 for row in rows if row.billing_model == billing_model)
+
+    @staticmethod
+    def _blackout_warning(
+        provider_key: str,
+        *,
+        previous_sellable: int,
+        resulting_sellable: int,
+        fx_observations: list[CatalogFxObservation],
+        pricing_errors: list[str],
+    ) -> str | None:
+        """One clear line when a market loses every customer-visible offer.
+
+        A provider that genuinely stopped offering anything is not reported as
+        an FX blackout; only a market that went dark while this run touched
+        reference rates (or failed to price rows) is, with the failing pair(s)
+        named so the cause is visible without reading the provider payloads.
+        """
+        if previous_sellable <= 0 or resulting_sellable > 0:
+            return None
+        failed_pairs = sorted({obs.pair for obs in fx_observations if obs.error})
+        reason = None
+        if failed_pairs:
+            reason = "fx_provenance_expired"
+        elif pricing_errors:
+            reason = "fx_pricing_failed"
+        elif any(obs.stale for obs in fx_observations):
+            reason = "bounded_catalog_fx_exhausted"
+        if reason is None:
+            return None
+        pairs = ",".join(failed_pairs) or "-"
+        return (
+            f"storefront blackout occurred: reason={reason} provider={provider_key} "
+            f"pair={pairs} previous_sellable={previous_sellable} "
+            f"resulting_sellable={resulting_sellable}"
+        )
 
     def _policy_for(self, provider_key: str, billing_model: str) -> PricingPolicy | None:
         # Family-specific policy first (``leaseweb.hourly``), then the
@@ -304,15 +475,26 @@ class CatalogAutoSyncCoordinator:
         )
 
     @staticmethod
-    def _pricing_failure_metadata(row: SellableOffer, reason: str) -> dict[str, object]:
+    def _pricing_failure_metadata(
+        row: SellableOffer, reason: str, *, preserved: bool = False
+    ) -> dict[str, object]:
+        """Audit one failed reprice without silently hiding a valid price.
+
+        When the row keeps a still-valid bounded price (``preserved``), that
+        price stays ON SALE: it is already proven by its own audited
+        provenance, and hiding it would turn one failed reference-rate read into
+        an empty storefront. Only a row whose price can no longer be proven is
+        unlisted, through the explicit ``fx_repricing_pending`` gate.
+        """
         metadata = dict(row.pricing_metadata or {})
-        metadata.update(
-            {
-                "fx_repricing_pending": True,
-                "fx_last_error": reason,
-                "fx_last_error_at": datetime.now(UTC).isoformat(),
-            }
-        )
+        recorded_at = datetime.now(UTC).isoformat()
+        metadata["fx_last_error"] = reason
+        metadata["fx_last_error_at"] = recorded_at
+        if preserved:
+            metadata.pop("fx_repricing_pending", None)
+            metadata["fx_reprice_deferred_at"] = recorded_at
+        else:
+            metadata["fx_repricing_pending"] = True
         return metadata
 
     async def _auto_price(
@@ -321,14 +503,23 @@ class CatalogAutoSyncCoordinator:
         report: CatalogSyncReport,
         warnings: list[str],
         pricing_errors: list[str] | None = None,
+        *,
+        catalog_horizon_anchor: datetime | None = None,
+        fx_observations: list[CatalogFxObservation] | None = None,
     ) -> int:
         """Reprice every verified auto-owned row from current cost and FX.
 
         Foreign native costs are resolved once per distinct currency pair (the
         shared resolver owns TTL/singleflight). Native provider cost columns are
         never written. Manual prices and operator-disabled rows are untouched.
+
+        The single pair resolution is acquired with the catalog publication
+        horizon, because every row of one run shares it: a resolution that
+        expires before the next scheduled refresh would take the whole market
+        off sale minutes after this run finished.
         """
         updated = 0
+        horizon_anchor = catalog_horizon_anchor or datetime.now(UTC)
         eligible: list[tuple[SellableOffer, PricingPolicy]] = []
         currencies: set[str] = set()
         for account_id, product_id, location_id in _verified_offer_keys(report):
@@ -370,28 +561,28 @@ class CatalogAutoSyncCoordinator:
         # than offers. Identity USD requires no source and never enters this set.
         rate_errors: dict[str, str] = {}
         prefetched_rates: dict[tuple[str, str], ReferenceRateResolution] = {}
-        if currencies and self._reference_rates is None:
-            for currency in sorted(currencies):
-                rate_errors[currency] = "FX unavailable"
-        else:
-            for currency in sorted(currencies):
-                try:
-                    assert self._reference_rates is not None
-                    get_rate = getattr(self._reference_rates, "get_rate", None)
-                    if callable(get_rate):
-                        resolution = await get_rate(
-                            currency,
-                            self._catalog_currency,
-                            allow_catalog_stale=True,
-                        )
-                    else:
-                        get_catalog_rate = getattr(self._reference_rates, "get_catalog_rate", None)
-                        if not callable(get_catalog_rate):
-                            raise FxUnavailableError("global catalog FX resolver is unavailable")
-                        resolution = await get_catalog_rate(currency, self._catalog_currency)
-                    prefetched_rates[(currency, self._catalog_currency)] = resolution
-                except Exception as exc:
-                    rate_errors[currency] = type(exc).__name__
+        observations: list[CatalogFxObservation] = []
+        for currency in sorted(currencies):
+            try:
+                resolution = await resolve_catalog_rate(
+                    self._reference_rates,
+                    currency,
+                    self._catalog_currency,
+                    min_remaining_lifetime_seconds=self._catalog_min_fresh_lifetime_seconds,
+                )
+                prefetched_rates[(currency, self._catalog_currency)] = resolution
+                observations.append(
+                    self._observe_fx_pair(currency, resolution, anchor=horizon_anchor)
+                )
+            except Exception as exc:
+                rate_errors[currency] = type(exc).__name__
+                observations.append(
+                    CatalogFxObservation(
+                        base_currency=currency,
+                        target_currency=self._catalog_currency,
+                        error=type(exc).__name__,
+                    )
+                )
 
         for row, policy in eligible:
             currency = _valid_currency(row.provider_cost_currency)
@@ -411,6 +602,8 @@ class CatalogAutoSyncCoordinator:
                     row_target,
                     prefetched_rates=prefetched_rates,
                     identity_ttl_seconds=self._identity_ttl_seconds,
+                    min_catalog_fresh_lifetime_seconds=(self._catalog_min_fresh_lifetime_seconds),
+                    catalog_horizon_anchor=horizon_anchor,
                 )
                 priced = await row_pricer.price_auto(row, policy)
                 priced.pricing_metadata.update(
@@ -419,6 +612,14 @@ class CatalogAutoSyncCoordinator:
                         "provider_cost_currency": currency,
                     }
                 )
+                if not self._valid_new_price(row, priced):
+                    await self._record_fx_failure(
+                        row,
+                        "computed catalog price lacks valid FX provenance; previous price kept",
+                        warnings,
+                        pricing_errors,
+                    )
+                    continue
             except Exception as exc:
                 reason = (
                     f"FX pricing failed for {currency}->{self._catalog_currency}: "
@@ -426,20 +627,97 @@ class CatalogAutoSyncCoordinator:
                 )
                 await self._record_fx_failure(row, reason, warnings, pricing_errors)
                 continue
-            result = await self._offers.set_auto_price_if_current(
-                row.id,
-                expected_cost_minor=row.provider_cost_minor,
-                expected_cost_currency=currency,
-                selling_price_minor=priced.selling_price_minor,
-                selling_currency=priced.selling_currency,
-                pricing_metadata=priced.pricing_metadata,
-                expected_provider_rate=_exact_provider_rate(row),
-            )
+            try:
+                result = await self._offers.set_auto_price_if_current(
+                    row.id,
+                    expected_cost_minor=row.provider_cost_minor,
+                    expected_cost_currency=currency,
+                    selling_price_minor=priced.selling_price_minor,
+                    selling_currency=priced.selling_currency,
+                    pricing_metadata=priced.pricing_metadata,
+                    expected_provider_rate=_exact_provider_rate(row),
+                )
+            except ValueError as exc:
+                # Never abort the whole walk for one row: a price the
+                # persistence layer refuses is recorded as a pricing failure so
+                # the remaining rows (and the previous valid prices) survive.
+                await self._record_fx_failure(
+                    row,
+                    f"automatic price rejected: {exc}",
+                    warnings,
+                    pricing_errors,
+                )
+                continue
             if result is None:
                 warnings.append(f"{row.ref}: manual/operator change won pricing race")
                 continue
             updated += 1
+        publish_now = datetime.now(UTC)
+        if fx_observations is not None:
+            fx_observations.extend(
+                replace(
+                    observation,
+                    remaining_lifetime_at_publish_seconds=(
+                        int((observation.catalog_valid_until - publish_now).total_seconds())
+                        if observation.catalog_valid_until is not None
+                        else None
+                    ),
+                )
+                for observation in observations
+            )
         return updated
+
+    def _observe_fx_pair(
+        self,
+        base_currency: str,
+        resolution: ReferenceRateResolution,
+        *,
+        anchor: datetime,
+    ) -> CatalogFxObservation:
+        """Record one acquired pair's freshness/staleness and validity bound."""
+        stale_limit = getattr(self._reference_rates, "catalog_stale_limit", None)
+        if resolution.stale:
+            valid_until = (
+                resolution.observed_at + timedelta(seconds=stale_limit)
+                if isinstance(stale_limit, int) and stale_limit > 0
+                else None
+            )
+        else:
+            valid_until = resolution.quote.expires_at
+        return CatalogFxObservation(
+            base_currency=base_currency,
+            target_currency=self._catalog_currency,
+            provider=resolution.source,
+            stale=resolution.stale,
+            observed_at=resolution.observed_at,
+            expires_at=resolution.quote.expires_at,
+            catalog_valid_until=valid_until,
+            remaining_lifetime_at_sync_start_seconds=(
+                int((valid_until - anchor).total_seconds()) if valid_until is not None else None
+            ),
+        )
+
+    def _valid_new_price(self, row: SellableOffer, priced: PricedOffer) -> bool:
+        """Whether a computed price proves itself BEFORE it replaces a live one.
+
+        Publication must not destroy visibility: an unprovable replacement is
+        recorded as an FX failure and the row keeps its previous, still-valid
+        price instead of blanking the market until the next run.
+        """
+        required_currency = required_selling_currency(row, self._catalog_currency)
+        if priced.selling_currency.strip().upper() != required_currency:
+            return False
+        candidate = replace(
+            row,
+            selling_price_minor=priced.selling_price_minor,
+            selling_currency=priced.selling_currency,
+            pricing_metadata=dict(priced.pricing_metadata),
+        )
+        return has_valid_pricing_provenance(
+            candidate,
+            required_currency,
+            catalog_stale_limit_seconds=getattr(self._reference_rates, "catalog_stale_limit", None),
+        )
 
     @staticmethod
     def _same_cost_snapshot(row: SellableOffer) -> bool:
@@ -474,10 +752,10 @@ class CatalogAutoSyncCoordinator:
         pricing_errors: list[str] | None = None,
     ) -> None:
         """Keep a valid canonical price, or leave a new/invalid offer unpriced."""
-        metadata = self._pricing_failure_metadata(row, reason)
         # Preserve only a price whose metadata proves the same native-cost
-        # snapshot. New/legacy rows are cleared but remain retained for a
-        # deterministic later reprice; they are never deleted.
+        # snapshot AND is still inside its own bounded provenance window. New or
+        # legacy rows are cleared but remain retained for a deterministic later
+        # reprice; they are never deleted.
         preserve = (
             row.selling_price_minor > 0
             and row.selling_currency.strip().upper()
@@ -491,6 +769,7 @@ class CatalogAutoSyncCoordinator:
                 ),
             )
         )
+        metadata = self._pricing_failure_metadata(row, reason, preserved=preserve)
         result = await self._offers.record_auto_pricing_failure_if_current(
             row.id,
             expected_cost_minor=row.provider_cost_minor,

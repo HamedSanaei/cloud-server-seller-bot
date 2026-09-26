@@ -655,6 +655,16 @@ async def run_catalog_auto_sync_once() -> Any:
             if not settings.storefront_catalog_sync_enabled:
                 logger.info("catalog auto-sync disabled by configuration; skipping")
                 return
+            # Derived, never hardcoded: interval + clamped timeout + margin. A
+            # price published by this run must stay provable until the next
+            # scheduled refresh has completed, or the storefront empties between
+            # two healthy syncs the moment its reference rate expires.
+            logger.info(
+                "catalog auto-sync starting: interval=%ds timeout=%ds fx_publication_horizon=%ds",
+                settings.storefront_catalog_sync_interval_seconds,
+                catalog_auto_sync_timeout(),
+                settings.catalog_fx_min_remaining_lifetime_seconds,
+            )
             sources: list[Any] = []
             if settings.providers_enabled.get("leaseweb", True):
                 from cloud_platform.providers.leaseweb.accounts import (
@@ -769,6 +779,9 @@ async def run_catalog_auto_sync_once() -> Any:
                 reference_rates=global_fx,
                 catalog_currency=settings.fx_catalog_pricing_currency,
                 identity_ttl_seconds=settings.fx_frankfurter_quote_ttl_seconds,
+                catalog_min_fresh_lifetime_seconds=(
+                    settings.catalog_fx_min_remaining_lifetime_seconds
+                ),
             )
             report = await coordinator.run()
             if not report.ran:

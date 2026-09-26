@@ -564,6 +564,163 @@ class TestLiveHourlySyncAcceptance:
             await provider.close()
 
 
+@requires_postgres
+class TestLiveStorefrontFxBoundary:
+    """Real PostgreSQL read path across the reference-rate validity boundary.
+
+    Pins the 2026-09-26 blackout with the REAL resolver, pricer, repository and
+    browse chain: a reference quote whose own TTL is about to run out must not
+    be published as a short-lived "fresh" price, and the foreign market must
+    stay visible on real rows while a bounded last-known-good rate is legal.
+    """
+
+    #: 900s cadence + 600s job budget + 300s margin (the incident defaults).
+    HORIZON_SECONDS = 900 + 600 + 300
+
+    async def test_foreign_market_survives_the_reference_quote_expiry(self, _clean_db: Any) -> None:
+        from datetime import UTC, datetime, timedelta
+        from decimal import Decimal
+
+        from cloud_platform.modules.checkout.service import OfferCatalogViewService
+        from cloud_platform.modules.fx.cache import build_fx_cache
+        from cloud_platform.modules.fx.domain import FxReferenceQuote, FxUnavailableError
+        from cloud_platform.modules.fx.ports import reference_rate_cache_key
+        from cloud_platform.modules.fx.service import (
+            GlobalFiatFxConfig,
+            GlobalFiatFxResolver,
+        )
+        from cloud_platform.modules.markets.domain import ProviderCatalog
+        from cloud_platform.modules.offers.auto_sync import (
+            CatalogAutoSyncCoordinator,
+            PricingPolicy,
+        )
+        from cloud_platform.providers.leaseweb.cloud import LeasewebHourlyCloudProvider
+        from cloud_platform.providers.leaseweb.cloud_auto_sync import (
+            LeasewebHourlyCloudSyncSource,
+        )
+        from cloud_platform.providers.leaseweb.cloud_sync import LeasewebHourlyCloudSyncer
+
+        session_factory = _clean_db
+        stale_limit = 86400
+        now = datetime.now(UTC)
+        observed = now - timedelta(seconds=3600)
+
+        class _FrankfurterOutage:
+            """Read-only provider double: every refresh attempt fails."""
+
+            source_name = "frankfurter"
+
+            async def get_reference_rate(self, base: str, quote: str) -> Any:
+                raise FxUnavailableError("frankfurter unavailable")
+
+            async def close(self) -> None:
+                return None
+
+        cache = build_fx_cache(backend="memory")
+        await cache.put(
+            reference_rate_cache_key("EUR", "USD", source="frankfurter"),
+            FxReferenceQuote(
+                base_currency="EUR",
+                quote_currency="USD",
+                rate=Decimal("1.17"),
+                source="frankfurter",
+                source_market="EUR/USD",
+                provider_date=observed.date(),
+                observed_at=observed,
+                # The incident shape: technically still fresh, seconds of TTL.
+                expires_at=now + timedelta(seconds=5),
+            ),
+        )
+        resolver = GlobalFiatFxResolver(
+            source=_FrankfurterOutage(),  # type: ignore[arg-type]
+            cache=cache,
+            config=GlobalFiatFxConfig(
+                quote_ttl_seconds=3600,
+                max_stale_seconds=345600,
+                catalog_max_stale_seconds=stale_limit,
+            ),
+        )
+        provider = LeasewebHourlyCloudProvider.__new__(LeasewebHourlyCloudProvider)
+        provider._transport = _StubCloudTransport()
+        offers_repo = SqlAlchemySellableOfferRepository(
+            session_factory,
+            catalog_currency="USD",
+            catalog_stale_limit_seconds=stale_limit,
+        )
+        try:
+            coordinator = CatalogAutoSyncCoordinator(
+                sources=[
+                    LeasewebHourlyCloudSyncSource(
+                        LeasewebHourlyCloudSyncer(session_factory, accounts={"north": provider})
+                    )
+                ],
+                offers=offers_repo,
+                state=SqlAlchemyCatalogSyncStateRepository(session_factory),
+                lock=PostgresAdvisoryCatalogSyncLock(session_factory),
+                pricing_policies={
+                    "leaseweb.hourly": PricingPolicy(
+                        mode="markup", markup_percent=25, auto_publish=True
+                    )
+                },
+                reference_rates=resolver,
+                catalog_currency="USD",
+                catalog_min_fresh_lifetime_seconds=self.HORIZON_SECONDS,
+            )
+            report = await coordinator.run()
+            assert report.ran is True
+            provider_report = report.providers[0]
+            assert provider_report.previous_sellable == 0
+            assert provider_report.resulting_sellable == 1
+            assert not any("storefront blackout" in warning for warning in provider_report.warnings)
+            observations = {entry.pair: entry for entry in provider_report.fx_observations}
+            assert observations["EUR/USD"].stale is True
+            assert (
+                observations["EUR/USD"].remaining_lifetime_at_sync_start_seconds
+                >= self.HORIZON_SECONDS
+            )
+
+            sellable = await offers_repo.list_sellable()
+            assert [row.product_id for row in sellable] == ["lsw.c3.large"]
+            stored = sellable[0]
+            assert stored.pricing_metadata["fx_stale"] is True
+            valid_until = datetime.fromisoformat(
+                str(stored.pricing_metadata["catalog_valid_until"])
+            )
+            # Bounded by the audited stale window, not by the 5-second TTL the
+            # quote itself had left: the price outlives the next refresh.
+            assert valid_until == observed + timedelta(seconds=stale_limit)
+            assert valid_until - datetime.now(UTC) >= timedelta(seconds=self.HORIZON_SECONDS)
+
+            service = OfferCatalogViewService(
+                offers_repo=offers_repo,
+                provider_registry=_FailingRegistry(),
+                wallet_repo=_FailingWallet(),
+                signing_key=SIGNING_KEY,
+                market_catalog=ProviderCatalog(
+                    markets={PROVIDER: "foreign"},
+                    display_names={PROVIDER: "Leaseweb"},
+                    enabled={},
+                    families={
+                        PROVIDER: {
+                            "vps": {
+                                "billing_model": BILLING_MODEL_MONTHLY,
+                                "display_name": "VPS",
+                            },
+                            "cloud": {
+                                "billing_model": "hourly",
+                                "display_name": "Cloud",
+                            },
+                        }
+                    },
+                ),
+                location_repo=SqlAlchemyLocationRepository(session_factory),
+            )
+            views, _back = await service.providers_screen("foreign")
+            assert [(view.provider_key, view.offer_count) for view in views] == [(PROVIDER, 1)]
+        finally:
+            await provider.close()
+
+
 class _FailingRegistry:
     def get(self, key: str) -> Any:
         raise KeyError(key)

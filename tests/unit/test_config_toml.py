@@ -385,6 +385,7 @@ class TestCommittedExample:
             ("storefront", "catalog_sync", "enabled"),
             ("storefront", "catalog_sync", "interval_seconds"),
             ("storefront", "catalog_sync", "timeout_seconds"),
+            ("storefront", "catalog_sync", "fx_safety_margin_seconds"),
             ("fx", "catalog_pricing_currency"),
             ("fx", "global_enabled"),
             ("fx", "global_fiat_provider"),

@@ -106,6 +106,50 @@ distinct currency pairs, not offer count. In-process singleflight and a
 versioned provider-family cache key prevent local stampedes. Redis is used in
 production.
 
+### Catalog publication horizon (never publish a price that dies first)
+
+A newly published catalog price must stay provable until the NEXT scheduled
+refresh has completed. Otherwise the storefront empties between two healthy
+syncs the moment its reference rate runs out — with every provider read fine.
+
+That is exactly what happened on 2026-09-26: a cached reference quote with ~2
+minutes of TTL left was still classified `fresh`, so one Leaseweb hourly run
+published every offer with `catalog_valid_until` two minutes away. The foreign
+market went invisible for ~12 minutes until the next sync repriced it, and only
+the generic "no valid FX provenance" readiness line hinted at why.
+
+The horizon is derived from configuration, never hardcoded:
+
+```text
+storefront.catalog_sync.interval_seconds
+  + min(storefront.catalog_sync.timeout_seconds, interval_seconds)
+  + storefront.catalog_sync.fx_safety_margin_seconds        (default 300)
+```
+
+`GlobalFiatFxResolver.get_catalog_rate(..., min_remaining_lifetime_seconds=...)`
+therefore never returns a technically-fresh-but-too-short quote as fresh. It
+refreshes live first and only then uses the bounded last-known-good policy,
+which is persisted explicitly as `fx_stale=true` with
+`catalog_valid_until = observed_at + catalog_max_stale_seconds` plus its
+`fx_stale_limit_seconds`. If neither can cover the horizon the call fails
+closed.
+
+`CatalogOfferPricer` enforces the same rule at write time, measured from ONE
+anchor per catalog run (a 2-3 minute provider walk must not shorten what it
+publishes), so a short-lived replacement is refused instead of written. A row
+whose own bounded provenance is still valid keeps its price and stays on sale
+while the failure is audited; only an unprovable price is cleared. One refused
+row never aborts the rest of the walk, so a single bad pair cannot leave a
+half-refreshed catalog. If a market
+does fall to zero, the run logs
+`storefront blackout occurred: reason=fx_provenance_expired|fx_pricing_failed|
+bounded_catalog_fx_exhausted pair=... previous_sellable=... resulting_sellable=...`
+and each run records per-pair `observed_at`/`expires_at`/`catalog_valid_until`
+and remaining lifetime at sync start and publish.
+
+Transactional settlement is untouched: payments keep using
+`get_rate(allow_catalog_stale=False)` and never inherit the catalog horizon.
+
 ## Identity and domestic routes
 
 * Identity conversions make no source call.
@@ -134,6 +178,13 @@ request_timeout_seconds = 5
 quote_ttl_seconds = 3600
 max_stale_seconds = 345600
 catalog_max_stale_seconds = 86400
+
+[storefront.catalog_sync]
+enabled = true
+interval_seconds = 900
+timeout_seconds = 600
+# Safety margin on interval + clamped timeout (the catalog publication horizon).
+fx_safety_margin_seconds = 300
 ```
 
 `fx.provider` remains accepted as a backward-compatible alias for the

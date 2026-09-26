@@ -200,6 +200,9 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
         "storefront_catalog_sync_interval_seconds"
     ),
     ("storefront", "catalog_sync", "timeout_seconds"): ("storefront_catalog_sync_timeout_seconds"),
+    ("storefront", "catalog_sync", "fx_safety_margin_seconds"): (
+        "storefront_catalog_fx_safety_margin_seconds"
+    ),
 }
 
 #: Contract keys that are deliberately NOT part of the canonical template:
@@ -689,11 +692,37 @@ class Settings(BaseSettings):
     #: the ONLY job granted the longer budget (see
     #: :func:`cloud_platform.worker.settings.catalog_auto_sync_timeout`).
     storefront_catalog_sync_timeout_seconds: int = Field(default=600, gt=0)
+    #: Safety margin (seconds) added to the catalog FX publication horizon. The
+    #: horizon is derived (interval + clamped timeout + this margin), never
+    #: hardcoded: a price published now must stay provable until the next
+    #: scheduled refresh has finished, otherwise the storefront empties between
+    #: two healthy syncs the moment its reference rate expires.
+    storefront_catalog_fx_safety_margin_seconds: int = Field(default=300, ge=0)
     # ``[storefront.pricing.<provider>]`` sections as parsed above, e.g.
     # ``{"leaseweb": {"mode": "markup", "markup_percent": 25,
     # "auto_publish": True}}``. Absent = no automatic pricing/publication
     # for that provider (sync still refreshes its costs).
     storefront_pricing: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @property
+    def catalog_fx_min_remaining_lifetime_seconds(self) -> int:
+        """Minimum remaining reference-rate lifetime a NEW catalog price carries.
+
+        Derived from the catalog cadence, never hardcoded: the next scheduled
+        refresh starts at most ``interval`` seconds from a run and may take up
+        to its clamped ``timeout`` to finish, plus a configured margin for
+        scheduler jitter. A price written with less lifetime than this expires
+        before the refresh that would have replaced it, which is exactly how the
+        2026-09-26 Leaseweb storefront blackout happened with every provider
+        read healthy.
+        """
+        interval = int(self.storefront_catalog_sync_interval_seconds)
+        # A catalog run must not outlive its own cadence (the same clamp the
+        # worker applies to the job timeout) and the margin is never negative.
+        timeout = min(int(self.storefront_catalog_sync_timeout_seconds), interval)
+        margin = max(int(self.storefront_catalog_fx_safety_margin_seconds), 0)
+        return interval + timeout + margin
+
     arvancloud_api_key: str = ""
     arvancloud_api_base_url: str = "https://napi.arvancloud.ir/ecc/v1"
     arvancloud_region: str = ""

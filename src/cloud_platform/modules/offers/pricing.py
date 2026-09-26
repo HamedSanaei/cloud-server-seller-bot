@@ -8,6 +8,7 @@ currency's audited minor unit.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -42,9 +43,65 @@ class ReferenceRateResolver(Protocol):
         allow_catalog_stale: bool = False,
     ) -> ReferenceRateResolution: ...
 
+    async def get_catalog_rate(
+        self,
+        base_currency: str,
+        quote_currency: str,
+        *,
+        min_remaining_lifetime_seconds: int = 0,
+    ) -> ReferenceRateResolution: ...
+
 
 class OfferPricingError(ValueError):
     """The provider observation cannot be priced without guessing."""
+
+
+def _accepts_catalog_horizon(candidate: object) -> bool:
+    """Whether a resolver callable implements the catalog publication horizon.
+
+    Legacy/diagnostic resolvers (and scripted doubles) keep their previous
+    contract; they simply cannot honour the horizon and are used as-is.
+    """
+    try:
+        parameters = inspect.signature(candidate).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):  # pragma: no cover - permissive callables
+        return True
+    if "min_remaining_lifetime_seconds" in parameters:
+        return True
+    return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
+async def resolve_catalog_rate(
+    rates: ReferenceRateResolver | None,
+    base_currency: str,
+    quote_currency: str,
+    *,
+    min_remaining_lifetime_seconds: int,
+) -> ReferenceRateResolution:
+    """Acquire one catalog reference rate with an explicit publication horizon.
+
+    Catalog publication is a different concern from transactional settlement:
+    the canonical path asks for a rate whose validity outlives the next
+    scheduled catalog refresh (``min_remaining_lifetime_seconds``), so a freshly
+    written price can never expire before the refresh that replaces it. The
+    bounded last-known-good policy stays available, but it is selected by the
+    resolver and always reported through ``stale``.
+    """
+    if rates is None:
+        raise FxUnavailableError(f"FX unavailable for {base_currency}->{quote_currency}")
+    get_catalog_rate = getattr(rates, "get_catalog_rate", None)
+    if callable(get_catalog_rate):
+        resolution: ReferenceRateResolution
+        if _accepts_catalog_horizon(get_catalog_rate):
+            resolution = await get_catalog_rate(
+                base_currency,
+                quote_currency,
+                min_remaining_lifetime_seconds=min_remaining_lifetime_seconds,
+            )
+        else:
+            resolution = await get_catalog_rate(base_currency, quote_currency)
+        return resolution
+    return await rates.get_rate(base_currency, quote_currency, allow_catalog_stale=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +121,8 @@ class CatalogOfferPricer:
         *,
         prefetched_rates: Mapping[tuple[str, str], ReferenceRateResolution] | None = None,
         identity_ttl_seconds: int = 3600,
+        min_catalog_fresh_lifetime_seconds: int = 0,
+        catalog_horizon_anchor: datetime | None = None,
     ) -> None:
         if (
             isinstance(identity_ttl_seconds, bool)
@@ -71,9 +130,25 @@ class CatalogOfferPricer:
             or identity_ttl_seconds <= 0
         ):
             raise ValueError("identity_ttl_seconds must be a positive integer")
+        if (
+            isinstance(min_catalog_fresh_lifetime_seconds, bool)
+            or not isinstance(min_catalog_fresh_lifetime_seconds, int)
+            or min_catalog_fresh_lifetime_seconds < 0
+        ):
+            raise ValueError("min_catalog_fresh_lifetime_seconds must be a non-negative integer")
         self._rates = reference_rates
         self._prefetched_rates = dict(prefetched_rates or {})
-        self._identity_ttl_seconds = identity_ttl_seconds
+        self._min_catalog_fresh_lifetime_seconds = min_catalog_fresh_lifetime_seconds
+        # The horizon is measured from ONE anchor per catalog run, not from the
+        # write instant: a provider walk that takes minutes must not shorten the
+        # validity of the first rows it writes. ``None`` anchors at construction
+        # time, so a directly-constructed pricer still enforces a real horizon.
+        self._catalog_horizon_anchor = catalog_horizon_anchor or datetime.now(UTC)
+        if self._catalog_horizon_anchor.tzinfo is None:
+            raise ValueError("catalog_horizon_anchor must be timezone-aware")
+        # Identity conversions carry no rate risk, but their validity is still a
+        # catalog publication fact: it must cover the same horizon.
+        self._identity_ttl_seconds = max(identity_ttl_seconds, min_catalog_fresh_lifetime_seconds)
         self._target = normalize_currency(target_currency)
         # Fail at composition time if the configured target has no audited
         # minor-unit exponent; unknown currencies are never assumed to be cents.
@@ -82,6 +157,10 @@ class CatalogOfferPricer:
     @property
     def target_currency(self) -> str:
         return self._target
+
+    @property
+    def min_catalog_fresh_lifetime_seconds(self) -> int:
+        return self._min_catalog_fresh_lifetime_seconds
 
     async def price_auto(self, offer: SellableOffer, policy: PricingPolicy) -> PricedOffer:
         """Native exact cost -> target FX -> markup -> final customer rounding."""
@@ -206,8 +285,11 @@ class CatalogOfferPricer:
         else:
             if self._rates is None:
                 raise FxUnavailableError(f"FX unavailable for {source_currency}->{target_currency}")
-            resolution = await self._rates.get_rate(
-                source_currency, target_currency, allow_catalog_stale=True
+            resolution = await resolve_catalog_rate(
+                self._rates,
+                source_currency,
+                target_currency,
+                min_remaining_lifetime_seconds=self._min_catalog_fresh_lifetime_seconds,
             )
         if (
             resolution.base_currency != source_currency
@@ -309,9 +391,27 @@ class CatalogOfferPricer:
             if not isinstance(stale_limit, int) or stale_limit <= 0:
                 raise OfferPricingError("stale catalog FX has no bounded validity limit")
             metadata["fx_stale_limit_seconds"] = stale_limit
-            metadata["catalog_valid_until"] = (
-                resolution.observed_at + timedelta(seconds=stale_limit)
-            ).isoformat()
+            valid_until = resolution.observed_at + timedelta(seconds=stale_limit)
         else:
-            metadata["catalog_valid_until"] = resolution.quote.expires_at.isoformat()
+            valid_until = resolution.quote.expires_at
+        # A published catalog price must stay provable until the next scheduled
+        # refresh has completed. Without this gate a "fresh" quote with minutes
+        # of TTL left is written for every offer of the run and the whole market
+        # silently disappears the moment that quote expires, even though the
+        # provider reads were perfectly healthy (2026-09-26 Leaseweb blackout).
+        # The check is measured from ONE anchor per run, and it is deliberately
+        # applied to both the fresh and the bounded stale path: a refresh that
+        # cannot be proven is refused here, never written as a shorter-lived one.
+        if self._min_catalog_fresh_lifetime_seconds > 0:
+            required_until = self._catalog_horizon_anchor + timedelta(
+                seconds=self._min_catalog_fresh_lifetime_seconds
+            )
+            if valid_until < required_until:
+                raise OfferPricingError(
+                    "catalog FX provenance cannot cover the next scheduled catalog refresh"
+                )
+            metadata["catalog_fresh_lifetime_required_seconds"] = (
+                self._min_catalog_fresh_lifetime_seconds
+            )
+        metadata["catalog_valid_until"] = valid_until.isoformat()
         return metadata
