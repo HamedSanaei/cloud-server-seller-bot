@@ -1,22 +1,32 @@
 """Hetzner Cloud hourly facts: normalized DTOs and the ONE price parser.
 
 Hetzner sells Cloud servers by the hour with a monthly cap. ``GET /server_types``
-reports, per (server type, location), an exact ``hourly.gross`` and an exact
-``monthly.gross``. Those are two different provider facts: the monthly value is
-the CAP, the hourly value is the RATE. The platform must never derive one from
-the other (``monthly / 720``) -- the provider's own hourly price is
-authoritative, and its sub-cent precision (``0.0063`` EUR) is real money.
+reports, per price entry, the provider's exact hourly and monthly prices. Those
+are two different facts: the monthly value is the CAP, the hourly value is the
+RATE. The platform must never derive one from the other (``monthly / 720``) --
+the provider's own hourly price is authoritative.
 
-Rounding policy: the exact provider decimal TEXT is preserved verbatim on the
-DTO (``*_rate_exact``), so margin audit keeps the true rate even where it has
-more precision than the platform's minor unit can express, while integer
-``*_minor`` fields are produced with the currency's audited exponent
-(``HALF_UP``) so downstream money math stays exact integer arithmetic.
+The payload shape is verified against the live API, not assumed. Each entry in
+``prices`` carries ``price_hourly.gross`` / ``price_monthly.gross`` (decimal
+STRINGS, serialized with trailing zeros) plus its own ``included_traffic``, and
+the server type separately enumerates ``locations`` with an ``available`` flag.
+Two consequences the code below depends on:
+
+* a price entry existing for a location does NOT mean the plan can be created
+  there -- ``locations[].available`` is the authoritative signal, so a priced but
+  unavailable pair is REJECTED rather than published as an unbuyable offer;
+* ``included_traffic`` lives on the price entry, not on the server type.
+
+Rounding policy: the exact provider decimal is preserved on the DTO
+(``*_rate_exact``, emitted canonically so the provider's trailing-zero noise
+does not become precision) while integer ``*_minor`` fields use the currency's
+audited exponent (``HALF_UP``) so downstream money math stays exact integer
+arithmetic.
 
 Everything here fails CLOSED. An entry whose location price cannot be PROVEN,
-whose hourly gross is missing/malformed/non-positive, or that the provider
-marks deprecated yields a REJECTION carrying a reason -- never a plan with a
-guessed price, and never another location's price.
+whose hourly gross is missing/malformed/non-positive, that is deprecated, or
+that the provider marks unavailable yields a REJECTION carrying a reason --
+never a plan with a guessed price, and never another location's price.
 """
 
 from __future__ import annotations
@@ -31,9 +41,13 @@ from cloud_platform.modules.fx.domain import SUPPORTED_CURRENCIES, currency_expo
 #: all price values are ingested from the API payload (M04-005).
 CURRENCY = "EUR"
 
+#: The provider's own price keys on each ``prices[]`` entry (verified live).
+HOURLY_PRICE_KEY = "price_hourly"
+MONTHLY_PRICE_KEY = "price_monthly"
+
 # Rejection reasons. Stable strings: they are surfaced verbatim in operator
-# diagnostics (``hetzner doctor`` / catalog auto-sync doctor), so an operator can
-# tell "the provider sent no price" apart from "we refused to guess one".
+# diagnostics, so an operator can tell "the provider sent no price" apart from
+# "we refused to guess one".
 REASON_NO_PRICES = "no-prices"
 REASON_NO_LOCATION_PRICE = "no-location-price"
 REASON_UNPROVEN_LOCATION = "unproven-location"
@@ -44,6 +58,7 @@ REASON_MISSING_MONTHLY = "missing-monthly"
 REASON_MALFORMED_MONTHLY = "malformed-monthly"
 REASON_NON_POSITIVE_MONTHLY = "non-positive-monthly"
 REASON_DEPRECATED = "deprecated"
+REASON_UNAVAILABLE_AT_LOCATION = "unavailable-at-location"
 REASON_MISSING_IDENTITY = "missing-identity"
 REASON_UNKNOWN_CURRENCY = "unknown-currency"
 
@@ -55,9 +70,9 @@ class HetznerHourlyPlan:
     ``hourly_cost_minor`` is the provider rate in integer minor units of the
     provider's own currency, converted with that currency's audited exponent
     (HALF_UP, the canonical DISPLAY rounding); ``hourly_rate_exact`` preserves
-    the provider's verbatim decimal rate (e.g. ``"0.0063"``) so sub-cent
-    precision is never silently lost -- downstream integer money math stays
-    exact while margin audit keeps the true rate.
+    the provider's decimal rate (e.g. ``"0.0088"``) so sub-cent precision is
+    never silently lost -- downstream integer money math stays exact while
+    margin audit keeps the true rate.
 
     ``monthly_cap_minor``/``monthly_rate_exact`` are the provider's monthly CAP
     (Hetzner stops charging at it). They are a COST fact for margin accounting
@@ -86,6 +101,7 @@ class HetznerHourlyPlan:
     architecture: str | None = None
     cpu_type: str | None = None
     storage_type: str | None = None
+    category: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,8 +118,9 @@ class HourlyPlansRead:
     """One ``/server_types`` read for ONE location.
 
     ``rejected`` is a pricing fact, not a schema failure: entries the provider
-    does not price at this location (or prices unusably) are reported with
-    their reason instead of being silently dropped or force-published.
+    does not price at this location, or prices unusably, or marks unavailable
+    are reported with their reason instead of being silently dropped or
+    force-published.
     """
 
     location_id: str
@@ -153,16 +170,24 @@ def minor_units(value: Decimal, currency: str = CURRENCY) -> int:
     return int((value * factor).to_integral_value(rounding=ROUND_HALF_UP))
 
 
-def _gross_decimal(raw: Any, key: str) -> tuple[Decimal | None, str]:
+def exact_text(value: Decimal) -> str:
+    """Canonical decimal text without the provider's trailing-zero noise.
+
+    Hetzner serializes prices as ``"0.0088000000000000"``. Those trailing zeros
+    are formatting, not precision, so the value is emitted canonically
+    (``"0.0088"``): the exact number is unchanged, only its spelling.
+    """
+    return format(value.normalize(), "f")
+
+
+def _gross_decimal(entry: dict[str, Any], key: str) -> tuple[Decimal | None, str]:
     """Exact ``gross`` decimal from one price entry, or a reason.
 
     A JSON ``float`` is rejected instead of parsed: the provider sends decimal
     STRINGS, so a float in this position means precision was already lost
     before the value reached us and it cannot be trusted as money.
     """
-    if not isinstance(raw, dict):
-        return None, "missing"
-    value = raw.get(key)
+    value = entry.get(key)
     if not isinstance(value, dict):
         return None, "missing"
     gross = value.get("gross")
@@ -211,6 +236,31 @@ def _location_price_entry(
     return None, REASON_NO_LOCATION_PRICE
 
 
+def _location_availability(item: dict[str, Any], location_id: str) -> bool | None:
+    """``locations[].available`` for this location, as the provider reports it.
+
+    The server type enumerates the locations it can be created in and flags each
+    one. A location listed as unavailable is authoritative -- a live example is
+    a plan that still carries a price entry for a location it cannot be created
+    in, so a priced pair is not by itself a sellable one.
+
+    Returns None only when the payload says nothing about availability at all
+    (no ``locations`` block), which is the one case the caller may treat as
+    unstated rather than unproven.
+    """
+    raw_locations = item.get("locations")
+    if not isinstance(raw_locations, list) or not raw_locations:
+        return None
+    for entry in raw_locations:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("name") or "").strip() == location_id:
+            return bool(entry.get("available", False))
+    # The provider enumerates availability: a location it did not list is not
+    # one this plan can be created in.
+    return False
+
+
 def _reject(plan_id: str, location_id: str, reason: str) -> HetznerHourlyRejection:
     return HetznerHourlyRejection(plan_id=plan_id, location_id=location_id, reason=reason)
 
@@ -229,17 +279,19 @@ def parse_hourly_plan(
         return _reject("", location_id, REASON_MISSING_IDENTITY)
     if CURRENCY not in SUPPORTED_CURRENCIES:
         return _reject(plan_id, location_id, REASON_UNKNOWN_CURRENCY)
-    if bool(item.get("deprecated", False)):
+    if bool(item.get("deprecated", False)) or item.get("deprecation"):
         return _reject(plan_id, location_id, REASON_DEPRECATED)
+    if _location_availability(item, location_id) is False:
+        return _reject(plan_id, location_id, REASON_UNAVAILABLE_AT_LOCATION)
 
     entry, reason = _location_price_entry(item, location_id)
     if entry is None:
         return _reject(plan_id, location_id, reason)
 
-    hourly, reason = _gross_decimal(entry, "hourly")
+    hourly, reason = _gross_decimal(entry, HOURLY_PRICE_KEY)
     if hourly is None:
         return _reject(plan_id, location_id, f"{reason}-hourly")
-    monthly, reason = _gross_decimal(entry, "monthly")
+    monthly, reason = _gross_decimal(entry, MONTHLY_PRICE_KEY)
     if monthly is None:
         return _reject(plan_id, location_id, f"{reason}-monthly")
 
@@ -247,24 +299,29 @@ def parse_hourly_plan(
     architecture = raw_architecture if raw_architecture.lower() != "unknown" else ""
     cpu_type = item.get("cpu_type")
     storage_type = item.get("storage_type")
+    category = item.get("category")
     raw_memory = item.get("memory")
+    raw_traffic = entry.get("included_traffic")
+    if raw_traffic is None:
+        raw_traffic = item.get("included_traffic")
     return HetznerHourlyPlan(
         plan_id=plan_id,
         server_type_id=str(item.get("id") or ""),
         location_id=location_id,
-        hourly_rate_exact=str(hourly),
+        hourly_rate_exact=exact_text(hourly),
         hourly_cost_minor=minor_units(hourly),
-        monthly_rate_exact=str(monthly),
+        monthly_rate_exact=exact_text(monthly),
         monthly_cap_minor=minor_units(monthly),
         currency=CURRENCY,
         vcpu=int(item.get("cores") or 0),
         ram_gb=memory_gb(raw_memory),
         memory_gb_exact=str(raw_memory) if raw_memory is not None else "",
         disk_gb=int(item.get("disk") or 0),
-        traffic=traffic_label(item.get("included_traffic")),
+        traffic=traffic_label(raw_traffic),
         architecture=architecture or None,
         cpu_type=str(cpu_type) if cpu_type else None,
         storage_type=str(storage_type) if storage_type else None,
+        category=str(category) if category else None,
     )
 
 
@@ -298,7 +355,7 @@ def parse_hourly_instance(
 
     Returning None is the safe answer: a response missing the reference or the
     location can never prove it is OUR server, and the create path treats an
-    unproven response as unverified rather than as success (§3).
+    unproven response as unverified rather than as success.
     """
     if not isinstance(payload, dict):
         return None
@@ -402,10 +459,13 @@ def traffic_label(value: Any) -> str | None:
 
 __all__ = [
     "CURRENCY",
+    "HOURLY_PRICE_KEY",
+    "MONTHLY_PRICE_KEY",
     "HetznerHourlyInstance",
     "HetznerHourlyPlan",
     "HetznerHourlyRejection",
     "HourlyPlansRead",
+    "exact_text",
     "memory_gb",
     "minor_units",
     "parse_hourly_instance",

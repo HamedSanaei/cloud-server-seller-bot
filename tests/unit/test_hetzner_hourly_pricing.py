@@ -23,20 +23,42 @@ def _price(
     declared: bool = True,
     hourly_net: object | None = None,
     monthly_net: object | None = None,
+    traffic: object = 21990232555520,
 ) -> dict[str, object]:
+    """One ``prices[]`` entry with the LIVE-VERIFIED key names.
+
+    The provider nests the prices under ``price_hourly``/``price_monthly`` and
+    carries ``included_traffic`` on the price entry itself.
+    """
     entry: dict[str, object] = {
-        "hourly": {
+        "price_hourly": {
             "net": hourly_net if hourly_net is not None else hourly_gross,
             "gross": hourly_gross,
         },
-        "monthly": {
+        "price_monthly": {
             "net": monthly_net if monthly_net is not None else monthly_gross,
             "gross": monthly_gross,
         },
+        "included_traffic": traffic,
+        "price_per_tb_traffic": {"net": "1.0000000000", "gross": "1.0000000000000000"},
     }
     if declared:
         entry["location"] = location
     return entry
+
+
+_LOCATION_IDS = {"fsn1": 1, "nbg1": 2, "hel1": 3, "ash": 4, "hil": 5, "sin": 6}
+
+
+def _listed(location: str, *, available: bool = True) -> dict[str, object]:
+    """One entry of the server type's own ``locations`` availability block."""
+    return {
+        "id": _LOCATION_IDS.get(location, 99),
+        "name": location,
+        "available": available,
+        "recommended": False,
+        "deprecation": None,
+    }
 
 
 def _server_type(**overrides: object) -> dict[str, object]:
@@ -46,13 +68,15 @@ def _server_type(**overrides: object) -> dict[str, object]:
         "name": "cx22",
         "description": "CX22",
         "cores": 2,
-        "memory": 4.0,
+        "memory": 4,
         "disk": 40,
         "deprecated": False,
+        "deprecation": None,
         "architecture": "x86",
         "cpu_type": "shared",
         "storage_type": "local",
-        "included_traffic": 21990232555520,
+        "category": "cost_optimized",
+        "locations": [_listed("fsn1"), _listed("nbg1"), _listed("hel1")],
         "prices": [
             _price("fsn1", "0.0075", "3.92"),
             _price("nbg1", "0.0078", "4.07"),
@@ -110,7 +134,7 @@ def test_each_location_keeps_its_own_provider_price() -> None:
 
 def test_missing_hourly_price_is_rejected_rather_than_derived() -> None:
     entry = _price("fsn1", "0.0075", "3.92")
-    del entry["hourly"]  # type: ignore[misc]
+    del entry["price_hourly"]
     rejection = _rejection(_server_type(prices=[entry]), "fsn1")
     # Rejection IS the proof no monthly/720 fallback ran: nothing was published.
     assert rejection.reason == hz.REASON_MISSING_HOURLY
@@ -118,15 +142,18 @@ def test_missing_hourly_price_is_rejected_rather_than_derived() -> None:
 
 
 def test_the_two_price_blocks_are_never_conflated() -> None:
-    """Rate comes from ``hourly`` and cap from ``monthly`` -- never swapped."""
+    """Rate comes from the hourly block and cap from the monthly one."""
     entry = _price("fsn1", "5.0", "3.92")
-    entry["hourly"], entry["monthly"] = entry["monthly"], entry["hourly"]
+    entry["price_hourly"], entry["price_monthly"] = (
+        entry["price_monthly"],
+        entry["price_hourly"],
+    )
     plan = _plan(_server_type(prices=[entry]), "fsn1")
     assert plan.hourly_rate_exact == "3.92"
     assert plan.hourly_cost_minor == 392
-    assert plan.monthly_rate_exact == "5.0"
+    assert plan.monthly_rate_exact == "5"
     assert plan.monthly_cap_minor == 500
-    rejection = _rejection(_server_type(prices=[{**entry, "monthly": {}}]), "fsn1")
+    rejection = _rejection(_server_type(prices=[{**entry, "price_monthly": {}}]), "fsn1")
     assert rejection.reason == hz.REASON_MISSING_MONTHLY
 
 
@@ -251,10 +278,11 @@ def test_a_non_dict_entry_is_reported_not_silently_dropped() -> None:
 
 
 def test_a_plan_carries_the_provider_hardware_and_traffic_facts() -> None:
-    plan = _plan(_server_type(), "fsn1")
+    plan = _plan(_server_type(memory="4.0"), "fsn1")
     assert (plan.vcpu, plan.ram_gb, plan.disk_gb) == (2, 4, 40)
     assert plan.memory_gb_exact == "4.0"
     assert plan.traffic == "20 TB"
+    assert plan.category == "cost_optimized"
     assert plan.architecture == "x86"
     assert (plan.cpu_type, plan.storage_type) == ("shared", "local")
     assert plan.server_type_id == "22"
@@ -275,11 +303,89 @@ def test_minor_units_uses_the_audited_currency_exponent() -> None:
 
 def test_fractional_memory_and_odd_traffic_render_from_decimal_only() -> None:
     plan = _plan(
-        _server_type(memory="7.5", included_traffic=1099511627776),
+        _server_type(
+            memory="7.5",
+            prices=[_price("fsn1", "0.0075", "3.92", traffic=1099511627776)],
+        ),
         "fsn1",
     )
     assert (plan.ram_gb, plan.memory_gb_exact) == (8, "7.5")
     assert plan.traffic == "1 TB"
+
+
+def test_traffic_comes_from_the_price_entry_not_the_server_type() -> None:
+    """The real payload carries ``included_traffic`` per location."""
+    item = _server_type()
+    assert "included_traffic" not in item
+    assert _plan(item, "fsn1").traffic == "20 TB"
+
+
+# ------------------------------------------------- live-verified payload rules
+
+
+def test_the_documented_price_keys_are_what_we_read() -> None:
+    """Regression guard: ``hourly.gross`` does not exist on the real API.
+
+    An entry shaped the old (assumed) way must be REJECTED, not parsed --
+    otherwise a flattened fixture would silently reintroduce a parser that
+    reads a key the provider never sends.
+    """
+    item = _server_type(
+        prices=[
+            {
+                "location": "fsn1",
+                "hourly": {"gross": "0.9"},
+                "monthly": {"gross": "9"},
+            }
+        ]
+    )
+    assert _rejection(item, "fsn1").reason == hz.REASON_MISSING_HOURLY
+
+
+def test_a_plan_priced_but_unavailable_at_the_location_is_rejected() -> None:
+    """A price entry is not a licence to sell: availability decides.
+
+    Live example (cx23): priced for hel1 and nbg1 while ``available: false``
+    there, so publishing on price alone would create unbuyable offers.
+    """
+    item = _server_type(locations=[_listed("fsn1", available=False)])
+    rejection = _rejection(item, "fsn1")
+    assert rejection.reason == hz.REASON_UNAVAILABLE_AT_LOCATION
+    assert rejection.plan_id == "cx22"
+
+
+def test_a_location_the_provider_does_not_list_is_unavailable() -> None:
+    item = _server_type(locations=[_listed("fsn1")])
+    assert _rejection(item, "nbg1").reason == hz.REASON_UNAVAILABLE_AT_LOCATION
+
+
+def test_availability_is_not_gated_when_the_payload_states_none() -> None:
+    item = _server_type()
+    item.pop("locations")
+    assert _plan(item, "fsn1").hourly_rate_exact == "0.0075"
+
+
+def test_an_empty_availability_block_states_nothing() -> None:
+    assert _plan(_server_type(locations=[]), "fsn1").hourly_rate_exact == "0.0075"
+
+
+def test_the_provider_trailing_zero_noise_is_canonicalised() -> None:
+    """Live prices arrive as ``"0.0088000000000000"``."""
+    plan = _plan(
+        _server_type(prices=[_price("fsn1", "0.0088000000000000", "5.4900000000000000")]),
+        "fsn1",
+    )
+    assert plan.hourly_rate_exact == "0.0088"
+    assert plan.monthly_rate_exact == "5.49"
+    # Canonical spelling, identical number -- no precision was rounded away.
+    assert Decimal(plan.hourly_rate_exact) == Decimal("0.0088000000000000")
+    assert plan.hourly_cost_minor == 1
+    assert plan.monthly_cap_minor == 549
+
+
+def test_a_deprecation_object_also_marks_the_plan_deprecated() -> None:
+    item = _server_type(deprecation={"unavailable_after": "2026-09-01T00:00:00+00:00"})
+    assert _rejection(item, "fsn1").reason == hz.REASON_DEPRECATED
 
 
 # ------------------------------------------------------------------ instances
