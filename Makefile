@@ -1,4 +1,4 @@
-.PHONY: sync lint format-check typecheck test check staging-check pre-commit api bot worker infra migrate
+.PHONY: sync lint format-check typecheck test check staging-check staging-test pre-commit api bot worker infra migrate
 
 # Sync dependencies including dev tools
 sync:
@@ -30,6 +30,12 @@ check: lint format-check typecheck test
 # release lane (`make check`, `verify_ci.py --push-ready`) keeps those.
 staging-check:
 	uv run python scripts/verify_ci.py --staging
+
+# The complete staging-lane validation in one command: ONLY the tests you name,
+# then the fast staging gate. No full suite, no coverage, no mypy, no Docker.
+# Usage: make staging-test TESTS="tests/unit/test_business_log.py tests/unit/test_hourly_state_machine.py"
+staging-test:
+	uv run python scripts/verify_ci.py --staging $(addprefix --test ,$(TESTS))
 
 # Run pre-commit hooks on all files
 pre-commit:

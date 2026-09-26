@@ -69,6 +69,11 @@ When asked to "continue the project" or "do the next tasks":
 
 ## Development lanes: `staging` (fast) and `main` (release-grade)
 
+> **Staging iteration speed is a product requirement.**
+> Never run release-grade local validation on a `staging` task unless the OWNER
+> explicitly asks for release/main validation. The `staging` rule in this file
+> overrides every generic gate wording that appears after it.
+
 Two lanes, two risk profiles. Choose the lane by what the change is FOR, never
 by convenience.
 
@@ -83,8 +88,8 @@ not run the full suite, does not compute coverage and does not run
 Normal feature development is therefore:
 
 1. implement the change;
-2. run the tests for the code actually touched (Level 1, or Level 2 when
-   shared components are involved);
+2. run the tests for the code actually touched (see the staging contract
+   below — targeted only, never the whole suite);
 3. run the staging gate locally: `make staging-check`;
 4. inspect `git status --short` and the diff;
 5. commit when the owner has asked for commits;
@@ -99,6 +104,59 @@ Staging-ready. Targeted validation passed. Full release suite was not executed.
 It MUST NOT describe that as `production-ready`, `fully validated`, or `ready
 to push`.
 
+### Staging-local validation contract (authoritative)
+
+If the target branch is `staging`, the required local validation is ONLY:
+
+1. the tests directly related to the changed behavior, and
+2. `make staging-check` — or, where `make` is unavailable (this Windows
+   workstation has no `make` on PATH), the exact equivalent
+   `uv run python scripts/verify_ci.py --staging`.
+
+One command covers the whole contract:
+`uv run python scripts/verify_ci.py --staging --test <exact test> [--test ...]`
+(`make staging-test TESTS="<exact test> ..."`).
+
+Nothing else is mandatory. In particular, a `staging` task MUST NOT
+automatically run:
+
+```text
+uv run python scripts/verify_ci.py --push-ready
+uv run pytest                       # the whole suite
+uv run pytest --cov=...             # coverage
+uv run mypy src
+uv run pre-commit run --all-files
+all of tests/live/*
+docker build / docker compose up|down
+tests/unit/test_deploy_production.py::TestEntrypointContract::test_built_image_executes_through_the_real_entrypoint
+```
+
+Those belong to `main`/release validation. This holds EVEN when the change
+touches migrations, database repositories, `core/container.py`, shared
+services, provider code or the business logger: validate the affected risk.
+
+| Changed risk | Staging validation (then `make staging-check`) |
+| --- | --- |
+| Migration | the affected migration/unit test + `scripts/check_migrations.py` |
+| PostgreSQL-specific behavior | ONLY the exact relevant real-PostgreSQL test(s) |
+| Bot/UI | the exact related bot tests |
+| Leaseweb/hourly behavior | the exact hourly/Leaseweb tests |
+| Business logger | the exact business-log tests + the affected hourly tests |
+| Shared service/DI | the affected module tests |
+
+Do NOT escalate a staging change into repository-wide Level-3 validation.
+
+### Local Docker policy (staging)
+
+Do not use Docker Desktop on the owner's machine to prepare a staging push:
+no image pulls, no local image builds, no compose up/down, no
+`test_built_image_executes_through_the_real_entrypoint`, no full
+`tests/live/*` run. The immutable application image is built by GitHub Actions
+after the push. If ONE regression genuinely depends on PostgreSQL driver
+semantics, run only that exact test against an already-running test database
+(or let a GitHub-hosted run prove it) instead of turning the workstation into a
+release runner.
+
 **`main` — the stable/release lane.** `ci` runs in full (static gates,
 pre-commit, full pytest with the coverage floor, migration/provider/artifact
 gates, live PostgreSQL contracts). `deploy-production` no longer deploys
@@ -106,14 +164,17 @@ automatically: a release is an explicit `workflow_dispatch` with a full SHA
 that is an ancestor of `main`. Automatic release delivery may only be restored
 together with a server/bot of its own (see `docs/operations/PRODUCTION_DEPLOY.md`).
 
-Full validation (and the coverage floor) stays mandatory for:
+Full validation (and the coverage floor) applies ONLY to `main`/release work:
 
 - release/merge preparation into `main`;
-- database migrations with broad risk;
+- a release build that includes database migrations with broad risk;
 - security/authentication changes where full validation is warranted;
 - payment settlement / critical financial changes;
 - shared architecture changes;
-- any explicit owner request.
+- any explicit owner request for a staging change.
+
+For a `staging` push NONE of these apply: the staging contract above is the
+whole requirement, regardless of which subsystem the change touches.
 
 ### Staging environment facts (do not violate)
 
@@ -140,27 +201,42 @@ Full validation (and the coverage floor) stays mandatory for:
 
 ## Quality gates
 
-Static gates run on every change; test scope is layered (see Testing policy).
-For a staging-bound change the static gate is `make staging-check` (`ruff
-check`, `ruff format --check`, compileall, import smoke); `mypy src` and
-`pre-commit` are required for release/`main`-bound work (and run in `ci` on
-every pull request).
+Which gates are mandatory depends ONLY on the lane the change targets.
 
-Before marking an implementation task done, run:
+**Target branch `staging` — the normal feature-development lane:**
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src
+uv run pytest <the exact tests related to the changed behavior>
+make staging-check          # ruff check, ruff format --check, compileall, import smoke
 ```
 
-Then run the tests required by the Testing policy. Do not claim a gate passed unless it was actually run.
+That is the COMPLETE required local validation. Nothing else is mandatory, no
+matter which subsystem the change touches (see the staging contract above).
+
+**Target branch `main` / a release:**
+
+```bash
+uv run python scripts/verify_ci.py --push-ready
+```
+
+which is the only mode that requires `mypy src`, `pre-commit run --all-files`,
+the full suite and the coverage floor.
+
+`mypy src` is a `main`/release gate: it is required for release-bound work and
+runs in `ci` on every pull request, but it is NOT a per-task requirement for
+staging iterations. Do not claim a gate passed unless it was actually run.
 
 ## Testing policy
 
-Do NOT automatically run the entire test suite after every change. Test scope is layered.
+Lane precedence comes FIRST: for a `staging` change the required tests are only
+the ones directly related to the changed behavior, followed by
+`make staging-check`. The layered levels below never escalate a staging push
+into repository-wide validation — they define how to pick the affected risk,
+and (for `main`) when the whole suite is warranted.
 
-### Level 1 — Required after every change
+Do NOT automatically run the entire test suite after every change.
+
+### Level 1 — Targeted tests (every change, both lanes)
 
 Run only the tests directly related to the modified code:
 
@@ -170,10 +246,18 @@ Run only the tests directly related to the modified code:
 | Leaseweb provider | `pytest tests/unit/test_leaseweb*.py` |
 | Payments | `pytest tests/unit/test_payment*.py` |
 | FX | `pytest tests/unit/test_fx*.py` |
+| Business logger | `pytest tests/unit/test_business_log.py` (+ the affected feature tests) |
+| Hourly cloud/Leaseweb | `pytest tests/unit/test_hourly_*.py tests/unit/test_leaseweb*.py` |
 
-### Level 2 — Related module validation
+Prefer naming the exact test ids over whole globs; a targeted run is evidence
+about the changed behavior only.
 
-Run when the change touches shared components: `core/config.py`, `core/container.py`, database models, shared services or dependency injection. Requires the affected module tests plus the related integration tests.
+### Level 2 — Related module validation (affected scope, still targeted)
+
+Run when the change touches shared components: `core/config.py`,
+`core/container.py`, database models, shared services or dependency injection.
+Requires the affected module tests plus the related integration tests — NOT the
+full suite, and NOT (for staging) `mypy` or coverage.
 
 ### Database integer contract
 
@@ -187,17 +271,19 @@ Run when the change touches shared components: `core/config.py`, `core/container
   to acquire its real PostgreSQL advisory lock; provider tests alone do not
   prove the periodic pipeline can start.
 
-### Level 3 — Full suite
+### Level 3 — Full suite (main/release ONLY)
 
-Run the full pytest suite ONLY when:
+Run the full pytest suite when PREPARING MAIN/RELEASE work:
 
 - preparing a merge into `main`
-- changing database migrations
-- changing shared architecture
-- modifying authentication/security
-- modifying payment settlement logic
-- modifying core infrastructure that affects many modules
-- explicitly requested by the owner
+- a release build or a release-blocking change: database migrations, shared
+  architecture, authentication/security, payment settlement, core
+  infrastructure that affects many modules
+- explicitly requested by the owner for a staging change
+
+A `staging` push NEVER inherits these conditions: a migration, a shared
+architecture change, an auth change or a payment change on `staging` is still
+validated with its affected targeted tests plus `make staging-check`.
 
 ## Coverage policy
 
@@ -209,8 +295,9 @@ Coverage threshold checks are required only for:
 - any task being declared ready to push to `main`
 
 Individual feature/fix tasks do not need to satisfy global coverage thresholds
-during iterative development, and a `staging` push never needs one: coverage
-belongs to pull requests targeting `main`, releases and `main`-bound work.
+during iterative development, and a `staging` push NEVER needs one — do not
+start a coverage run to prepare a staging push. Coverage belongs to pull
+requests targeting `main`, releases and `main`-bound work.
 
 For targeted tests:
 
@@ -230,6 +317,8 @@ repository-wide CI coverage gate MUST be executed locally. CI must not be the fi
 place where a push-ready change discovers the 88% coverage failure.
 
 ## Push-ready / main-bound validation
+
+If the target branch is `staging`, STOP — this section does not apply.
 
 Any task whose result is expected to be pushed directly to `main`, released,
 deployed, or handed to the owner as "ready to push" MUST reproduce the
@@ -312,8 +401,9 @@ git status --short
 AGAIN, because the validation itself may generate files. If validation
 changed tracked files unexpectedly, the task is NOT complete.
 
-## Tracked vs untracked pre-commit rule
+## Tracked vs untracked pre-commit rule (main/release)
 
+Applies to `main`/release work; `pre-commit` is not part of staging validation.
 `pre-commit run --all-files` primarily validates files known to Git. Newly
 created/untracked files must not be assumed covered by that statement.
 
@@ -339,10 +429,11 @@ copying the Unix pipeline blindly (e.g. pass the listed files explicitly to
 Do NOT require this expensive explicit scan after every small edit. Require it
 for push-ready/security-sensitive changes or when new files were created.
 
-## Pre-commit idempotency
+## Pre-commit idempotency (main/release)
 
-If a pre-commit hook modifies a file, the validation FAILED even if the hook
-repaired it. The agent must:
+Applies when pre-commit is actually run (`ci`, `--push-ready`, or an explicit
+owner request). If a pre-commit hook modifies a file, the validation FAILED
+even if the hook repaired it. The agent must:
 
 1. inspect the modification
 2. re-run relevant tests if needed
