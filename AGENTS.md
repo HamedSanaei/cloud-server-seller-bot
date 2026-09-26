@@ -67,9 +67,84 @@ When asked to "continue the project" or "do the next tasks":
   currency minor unit, preserve enough precision for correct accrual rather
   than silently rounding per-hour rates.
 
+## Development lanes: `staging` (fast) and `main` (release-grade)
+
+Two lanes, two risk profiles. Choose the lane by what the change is FOR, never
+by convenience.
+
+**`staging` — the active development/integration lane.** Every push to
+`staging` runs `.github/workflows/deploy-staging.yml`: fast checks (`ruff
+check`, `ruff format --check`, `compileall` over `src`, api/worker/bot import
+smoke) -> cached Docker build -> immediate deploy of the exact pushed SHA to
+the CURRENT server and the SAME Telegram bot. It does not wait for `ci`, does
+not run the full suite, does not compute coverage and does not run
+`pre-commit run --all-files`.
+
+Normal feature development is therefore:
+
+1. implement the change;
+2. run the tests for the code actually touched (Level 1, or Level 2 when
+   shared components are involved);
+3. run the staging gate locally: `make staging-check`;
+4. inspect `git status --short` and the diff;
+5. commit when the owner has asked for commits;
+6. push to `staging` and let the deploy expose the behavior in Telegram.
+
+An agent may report exactly:
+
+```text
+Staging-ready. Targeted validation passed. Full release suite was not executed.
+```
+
+It MUST NOT describe that as `production-ready`, `fully validated`, or `ready
+to push`.
+
+**`main` — the stable/release lane.** `ci` runs in full (static gates,
+pre-commit, full pytest with the coverage floor, migration/provider/artifact
+gates, live PostgreSQL contracts). `deploy-production` no longer deploys
+automatically: a release is an explicit `workflow_dispatch` with a full SHA
+that is an ancestor of `main`. Automatic release delivery may only be restored
+together with a server/bot of its own (see `docs/operations/PRODUCTION_DEPLOY.md`).
+
+Full validation (and the coverage floor) stays mandatory for:
+
+- release/merge preparation into `main`;
+- database migrations with broad risk;
+- security/authentication changes where full validation is warranted;
+- payment settlement / critical financial changes;
+- shared architecture changes;
+- any explicit owner request.
+
+### Staging environment facts (do not violate)
+
+- One server, one compose project (`cloud-platform-production`), one
+  server-owned `configuration.toml`/`deploy.env` and ONE Telegram bot token for
+  both lanes. There must never be two processes polling that token: compose
+  pins `bot` to `replicas: 1` and the deploy script refuses anything but
+  exactly one running bot container.
+- Do NOT create a second database, Redis, deploy path, bot, or duplicate
+  infrastructure secrets. `deploy/staging/docker-compose.yml` (M12-004)
+  describes a separate isolated stack and is NOT the staging lane.
+- Both lanes share the deploy engine `scripts/deploy-production.sh`.
+  `DEPLOY_PROFILE=staging` skips only the one-shot provider catalog refresh
+  (the worker's scheduled coordinator owns provider facts) and keeps every
+  other gate, including migrations, schema parity, single-bot, health and
+  storefront readiness. A failed staging deploy rolls back exactly like a
+  release deploy.
+- Staging deploys are `staging-deploy` with `cancel-in-progress: true`: the
+  newest push wins and superseded runs are cancelled. The manual release
+  deploy joins `telegram-shared-host-deploy`, so the two lanes never mutate
+  the host at the same time.
+- Never weaken the release lane to make staging faster, and never claim one
+  lane's evidence for the other.
+
 ## Quality gates
 
 Static gates run on every change; test scope is layered (see Testing policy).
+For a staging-bound change the static gate is `make staging-check` (`ruff
+check`, `ruff format --check`, compileall, import smoke); `mypy src` and
+`pre-commit` are required for release/`main`-bound work (and run in `ci` on
+every pull request).
 
 Before marking an implementation task done, run:
 
@@ -134,7 +209,8 @@ Coverage threshold checks are required only for:
 - any task being declared ready to push to `main`
 
 Individual feature/fix tasks do not need to satisfy global coverage thresholds
-during iterative development.
+during iterative development, and a `staging` push never needs one: coverage
+belongs to pull requests targeting `main`, releases and `main`-bound work.
 
 For targeted tests:
 
@@ -157,7 +233,9 @@ place where a push-ready change discovers the 88% coverage failure.
 
 Any task whose result is expected to be pushed directly to `main`, released,
 deployed, or handed to the owner as "ready to push" MUST reproduce the
-repository's real GitHub Actions gates locally before completion.
+repository's real GitHub Actions gates locally before completion. A push to
+`staging` is NOT such a task: it needs the targeted tests plus
+`make staging-check`, not this section.
 
 For such tasks the agent MUST run (or equivalently `uv run python scripts/verify_ci.py --push-ready`):
 
@@ -286,6 +364,10 @@ Tests executed:
 If the full suite was not executed, do not claim the project is fully validated. Use this wording:
 
 > Targeted validation completed. Full suite not executed because the change scope does not require it.
+
+For a staging-lane change that wording is:
+
+> Staging-ready. Targeted validation passed. Full release suite was not executed.
 
 Do not claim a coverage threshold passed unless the run that enforced it actually happened
 (see Coverage policy). Report targeted runs as correctness evidence, not as coverage evidence.

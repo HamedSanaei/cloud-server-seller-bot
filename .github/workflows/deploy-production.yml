@@ -1,28 +1,30 @@
 name: deploy-production
 
-# Continuous delivery: every green push to `main` is built into an immutable
-# image and deployed to production. Failed CI never deploys anything.
+# Release delivery (MANUAL while `staging` is the active development lane).
 #
-# Gate chain: push to main -> `ci` workflow (lint/types/secrets/tests/gates)
-# -> this workflow (only when that CI run concluded `success`) -> GHCR build
-# of the EXACT tested SHA -> compose candidate delivery from the exact
-# checkout (SHA-256 verified on the server) -> SSH deploy of that exact
-# image with that exact compose -> migrations -> api/worker/single-bot ->
-# health checks -> atomic compose promotion (rollback on failure).
+# `staging` deploys automatically on every push (deploy-staging.yml) to the
+# CURRENT server and the SAME Telegram bot, so `main` must NOT auto-deploy:
+# two lanes racing one Telegram token / host is exactly what serialization
+# cannot fix, and during this phase a green `main` has no release meaning.
+# Pushing to `main` therefore runs `ci` and nothing else.
 #
-# Manual redeploys use `workflow_dispatch` with an explicit full SHA. The
-# manual path builds/verifies/deploys/health-checks exactly like the
-# automatic one; there is no second, less-safe path.
+# An operator deploys explicitly with `workflow_dispatch` and a full 40-char
+# SHA (an ancestor of `main`): GHCR build of that EXACT SHA -> compose
+# candidate delivery from the exact checkout (SHA-256 verified on the server)
+# -> SSH deploy of that exact image with that exact compose -> migrations ->
+# api/worker/single-bot -> health checks -> atomic compose promotion
+# (rollback on failure).
+#
+# Restoring automatic release delivery later is a deliberate change: re-add
+# the `workflow_run` trigger for a green `push` to `main` AND give the release
+# lane a server/bot of its own first, because until then `main` and `staging`
+# would fight over the same single-consumer Telegram bot token.
 #
 # Concurrency: deployments are serialized (`production-deploy`,
-# cancel-in-progress: false). A newer green commit waits for the running
-# deploy to finish and then deploys afterwards — a deploy is never cancelled
-# halfway because a newer commit appeared.
+# cancel-in-progress: false). A newer dispatch waits for the running deploy to
+# finish and then deploys afterwards — a deploy is never cancelled halfway.
 
 on:
-  workflow_run:
-    workflows: [ci]
-    types: [completed]
   workflow_dispatch:
     inputs:
       sha:
@@ -46,13 +48,10 @@ jobs:
     name: Build immutable image
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Never deploy PR executions: only a successful PUSH run of `ci` on main,
-    # or an explicit manual dispatch with a pinned SHA.
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch == 'main')
+    # Manual dispatch only: while `staging` owns the development server and
+    # the single Telegram bot, NO push - not even a green push to `main` -
+    # deploys anything from this workflow.
+    if: github.event_name == 'workflow_dispatch'
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       image: ${{ steps.resolve.outputs.image }}
@@ -62,17 +61,9 @@ jobs:
         id: resolve
         run: |
           set -Eeuo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            sha="${{ inputs.sha }}"
-          else
-            [ "${{ github.event.workflow_run.conclusion }}" = "success" ] \
-              || { echo "CI did not succeed; refusing to deploy"; exit 1; }
-            [ "${{ github.event.workflow_run.event }}" = "push" ] \
-              || { echo "source was not a push; refusing to deploy"; exit 1; }
-            [ "${{ github.event.workflow_run.head_branch }}" = "main" ] \
-              || { echo "source was not main; refusing to deploy"; exit 1; }
-            sha="${{ github.event.workflow_run.head_sha }}"
-          fi
+          # Manual dispatch only: the operator hands over an immutable SHA,
+          # and the ancestor-of-main check below refuses anything unreleased.
+          sha="${{ inputs.sha }}"
           if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "deployment SHA must be a full 40-char hex commit, got '${sha}'"
             exit 1
@@ -89,8 +80,7 @@ jobs:
           ref: ${{ steps.resolve.outputs.sha }}
           fetch-depth: 0
 
-      - name: Refuse SHAs outside main (manual path only)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Refuse SHAs outside main
         run: |
           set -Eeuo pipefail
           git merge-base --is-ancestor \
@@ -168,6 +158,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
+    # Shared-host serialization: the staging lane deploys to the SAME server
+    # and deploy path, so a release deploy and a staging deploy must never
+    # overlap. Job-level concurrency composes with the workflow-level
+    # `production-deploy` group above (both must be satisfied).
+    concurrency:
+      group: telegram-shared-host-deploy
+      cancel-in-progress: false
     steps:
       - name: Check out the exact tested commit
         uses: actions/checkout@v4

@@ -1,37 +1,94 @@
-# Production deployment (GHCR image + SSH)
+# Deployment (GHCR image + SSH)
 
-How every green `main` commit reaches the production server, and the one-time
-server bootstrap an operator performs first. Companion documents:
+How a commit reaches the server — the fast `staging` development lane and the
+manual `main` release lane — plus the one-time server bootstrap an operator
+performs first. Companion documents:
 [`PRODUCTION_HARDENING.md`](PRODUCTION_HARDENING.md) (topology and guarantees),
 [`RUNBOOK.md`](RUNBOOK.md) (day-2 operations), [`PRODUCTION_RUNBOOK.md`](PRODUCTION_RUNBOOK.md).
 
 ## 1. Pipeline overview
 
 ```text
-push to main
-  -> `ci` workflow (ruff, mypy, secrets, pytest+coverage, migration,
+DEVELOPMENT LANE (active): push to `staging`
+  -> deploy-staging workflow: fast checks (ruff check, ruff format --check,
+     compileall, api/worker/bot import smoke)
+  -> cached Docker build of the EXACT pushed SHA -> GHCR
+  -> SSH deploy with scripts/deploy-production.sh DEPLOY_PROFILE=staging
+  -> migrations -> api/worker/single-bot -> health + storefront readiness
+  -> atomic compose promotion; the SAME Telegram bot is replaced in place
+
+RELEASE LANE (manual while `staging` is the active lane): push to `main`
+  -> `ci` workflow ONLY (ruff, mypy, secrets, pytest+coverage, migration,
      provider-branching, task, migration-smoke, leaseweb-contract gates)
-  -> `deploy-production` workflow, ONLY when that CI run concluded `success`
-       1. resolve the exact CI-tested SHA (github.event.workflow_run.head_sha)
+  -> NO automatic deployment
+  -> an operator dispatches `deploy-production` with a full 40-char SHA that
+     must be an ancestor of `main`
+       1. resolve that SHA (workflow input `sha`)
        2. check out that exact SHA
        3. build the Dockerfile, push ghcr.io/<org>/<repo>:<full-sha>
           (an existing SHA tag is never rebuilt or overwritten)
        4. verify the pushed image (entrypoint smoke + production compose config)
-       5. SSH to production, log in to GHCR with the short-lived GITHUB_TOKEN
+       5. SSH to the server, log in to GHCR with the short-lived GITHUB_TOKEN
        6. run scripts/deploy-production.sh with that exact image
        7. report; fail the workflow when health checks fail (even after rollback)
 ```
 
-Failed CI deploys NOTHING: the deploy workflow's build job only starts for
-`conclusion == success` on a `push` to `main`. Pull-request CI runs never
-deploy. Deployments are serialized (`concurrency: production-deploy`,
-`cancel-in-progress: false`): a newer green commit waits for the running
-deploy to finish, then deploys afterwards — a deploy is never cancelled
-halfway.
+`main` deliberately does NOT deploy automatically: `staging` currently owns the
+server and the single Telegram bot token, and a green `main` has no release
+meaning during this phase. Automatic release delivery may only be restored
+together with a server/bot of its own (a second token or a second environment);
+until then both lanes would fight over one single-consumer token. Pull-request
+CI runs never deploy.
 
-Manual redeploys (`workflow_dispatch`, input `sha`) follow the same
-build → verify → deploy → health-check path with an explicit immutable SHA
-(which must be an ancestor of `main`); there is no second, less-safe path.
+Concurrency: each lane is serialized on its own group — `staging-deploy` with
+`cancel-in-progress: true` (a superseded staging deploy is useless, the newest
+push wins) and `production-deploy` with `cancel-in-progress: false` (a release
+deploy is never cancelled halfway). Both deploy jobs additionally join
+`telegram-shared-host-deploy`, so a release deploy and a staging deploy can
+never mutate the same host at the same time.
+
+### The staging lane in one screen
+
+* **Trigger**: every push to `staging` (plus `workflow_dispatch`, which
+  redeploys the current `staging` HEAD; a feature branch is never deployable
+  through this lane).
+* **Checks**: `uv sync --frozen --all-groups`, then
+  `uv run python scripts/verify_ci.py --staging` (= `make staging-check`):
+  `ruff check`, `ruff format --check`, `compileall` over `src` and an
+  api/worker/bot import smoke. Deliberately NO pytest, NO coverage, NO mypy
+  (a cold run measures ~108s here) and NO `pre-commit --all-files`; those
+  belong to the release lane.
+* **Image**: `ghcr.io/<org>/<repo>:<pushed sha>` (immutable, never rebuilt or
+  overwritten when it already exists) plus a convenience `:staging` tag. The
+  deployment always references the SHA tag.
+* **Target**: the SAME server, the SAME compose project
+  (`cloud-platform-production`), the SAME server-owned
+  `deploy.env`/`configuration.toml` and the SAME Telegram bot as production,
+  because the existing GitHub `production` environment is where `PROD_SSH_KEY`,
+  `PROD_KNOWN_HOSTS` and the `PROD_*` variables live (no duplicated secrets).
+  That environment has no protection rules today, so the staging lane adds no
+  approval step; if required reviewers are ever enabled there, move those
+  values to a shared environment (or dedicated staging credentials) BEFORE,
+  otherwise staging deploys inherit the approval.
+* **Deploy engine**: the same `scripts/deploy-production.sh`. A comment in the
+  workflow would build a second, less-safe path; instead `DEPLOY_PROFILE=staging`
+  changes exactly one thing — it skips the one-shot provider catalog refresh,
+  because the worker's scheduled coordinator already owns provider facts. The
+  configuration preflight, migration + head + physical-schema gates, catalog
+  canonicalization, single-bot enforcement, API/health/stabilization and
+  storefront readiness gates are identical, and a failure rolls back the same
+  way.
+* **Database**: the current development database, forward only
+  (`alembic upgrade head`); never reset, recreated, or downgraded.
+* **Bot safety**: compose pins `bot` to `replicas: 1` and the deploy script
+  fails the release unless exactly one bot container is running, so the shared
+  Telegram token can never have two pollers. A cancelled staging deploy can
+  leave the stack mid-transition; the next push repairs it forward, and compose
+  REPLACES the `bot` service instead of adding one.
+* **Not** used by this lane: `deploy/staging/docker-compose.yml` (M12-004,
+  `scripts/deploy.py`) describes a separate isolated stack with its own
+  database, secrets and bot token; the staging lane replaces the running stack
+  instead. Do not start a second database, Redis, deploy path, or bot.
 
 ## 2. Server layout and ownership
 
@@ -161,8 +218,8 @@ ufw --force enable
 #    short-lived GITHUB_TOKEN over the SSH session (never printed or saved).
 ```
 
-First deployment: push to `main` (or dispatch the workflow with the tested
-SHA). The workflow pulls the image, runs migrations, starts
+First deployment: push to `staging` (or dispatch `deploy-production` with a
+specific `main` SHA). The workflow pulls the image, runs migrations, starts
 api + worker + one bot, and health-checks before declaring success.
 
 ## 4. GitHub configuration the operator must set manually
@@ -177,6 +234,12 @@ Environment **`production`** (repository → Settings → Environments):
 | Variable | `PROD_PORT` | SSH port (default `22` when unset) |
 | Variable | `PROD_USER` | `deploy` |
 | Variable | `PROD_DEPLOY_PATH` | `/opt/cloud-server-seller` |
+
+Both lanes read this ONE environment (no duplicated infrastructure secrets):
+`deploy-staging.yml` declares `environment: production` for exactly this
+reason, and its deploy job joins the shared-host concurrency group so the two
+lanes never overlap. Any change made here (rotation, renaming a variable)
+applies to both lanes at once — verify both workflows afterwards.
 
 Package visibility: the GHCR image may stay private — the workflow's
 `GITHUB_TOKEN` pulls it during build/verify, and the same token logs the

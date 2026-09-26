@@ -1,4 +1,4 @@
-.PHONY: sync lint format-check typecheck test check pre-commit api bot worker infra migrate
+.PHONY: sync lint format-check typecheck test check staging-check pre-commit api bot worker infra migrate
 
 # Sync dependencies including dev tools
 sync:
@@ -23,6 +23,13 @@ test:
 # Run all quality gates (lint, format, typecheck, test, task validation)
 check: lint format-check typecheck test
 	uv run python scripts/validate_tasks.py
+
+# Fast staging-lane checks: exactly what .github/workflows/deploy-staging.yml
+# runs before building (ruff check, ruff format --check, compileall over src,
+# import smoke of api/worker/bot). No pytest, no coverage, no mypy: the
+# release lane (`make check`, `verify_ci.py --push-ready`) keeps those.
+staging-check:
+	uv run python scripts/verify_ci.py --staging
 
 # Run pre-commit hooks on all files
 pre-commit:

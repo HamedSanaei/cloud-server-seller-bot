@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Production application-image deployment (idempotent, safe to re-run).
+# Application-image deployment (idempotent, safe to re-run).
+#
+# Shared deploy engine for BOTH lanes: the `main` release path
+# (deploy-production.yml, manual dispatch) and the `staging` development
+# path (deploy-staging.yml, every push). Both deploy the SAME image to the
+# SAME server/compose project, so the same safety gates apply; the only
+# difference is DEPLOY_PROFILE (see below). There is exactly one bot
+# container for the single Telegram token in either lane.
 #
 # Ownership model:
 #
@@ -43,12 +50,19 @@
 #   HEALTH_ATTEMPTS        default: 36 (x HEALTH_INTERVAL seconds for the API)
 #   HEALTH_INTERVAL        default: 5 (seconds between health probes)
 #   STABILIZE_SECONDS      default: 15 (worker/bot restart-stability window)
+#   DEPLOY_PROFILE         default: production. `staging` keeps every gate
+#                          below but SKIPS the one-shot provider catalog
+#                          refresh, which the worker's scheduled coordinator
+#                          already runs every storefront_catalog_sync_interval
+#                          and which would add minutes to every development
+#                          deploy. No other behavior changes with profile.
 #
 # Sequence: validate files -> save rollback image -> switch PLATFORM_IMAGE ->
 # pull -> postgres/redis healthy -> migrate (alembic upgrade head) ->
 # database migration head == image head -> database PHYSICAL schema matches the
 # release -> catalog refresh (catalog auto-sync run: provider facts, pricing,
-# publication) -> catalog canonicalization (offers normalize-selling-currency) ->
+# publication; production profile only - see DEPLOY_PROFILE) -> catalog
+# canonicalization (offers normalize-selling-currency) ->
 # api, worker, exactly one bot -> health/readiness -> STOREFRONT READINESS
 # (offers readiness: an enabled+credentialed+auto-priced provider with stored
 # offers but none sellable fails the release) -> report. On failure the
@@ -88,6 +102,7 @@ load_config() {
     HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-36}"
     HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"
     STABILIZE_SECONDS="${STABILIZE_SECONDS:-15}"
+    DEPLOY_PROFILE="${DEPLOY_PROFILE:-production}"
 }
 
 log() {
@@ -328,6 +343,14 @@ deploy() {
     case "${STABILIZE_SECONDS}" in
         '' | *[!0-9]*) fail "STABILIZE_SECONDS must be a non-negative integer"; return 1 ;;
     esac
+    case "${DEPLOY_PROFILE}" in
+        production | staging) ;;
+        *)
+            fail "DEPLOY_PROFILE must be 'production' or 'staging', got '${DEPLOY_PROFILE}'"
+            return 1
+            ;;
+    esac
+    log "deploy profile      : ${DEPLOY_PROFILE}"
 
     # Still before the mutation window: a rejected configuration must leave
     # the running release completely untouched.
@@ -440,12 +463,21 @@ deploy() {
     # A non-zero exit is NOT fatal — a provider/API outage must not block an
     # unrelated release — but it is never silent, and the storefront readiness
     # gate after the services start stays authoritative.
-    log "refreshing provider catalog facts (bounded one-shot sync)"
-    if PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
-        python -m cloud_platform.cli catalog auto-sync run; then
-        log "catalog refresh completed"
+    if [ "${DEPLOY_PROFILE}" = "staging" ]; then
+        # Staging profile: the worker already owns the periodic refresh (the
+        # advisory-locked coordinator, every storefront_catalog_sync_interval),
+        # so running the full bounded pass here would add minutes of provider
+        # I/O to every development deploy for no new fact. Every gate that
+        # follows (services, health, storefront readiness) is unchanged.
+        log "skipping the one-shot catalog refresh (staging profile: the worker's scheduled sync owns provider facts)"
     else
-        log "[WARN] catalog refresh reported provider errors (counts above); the storefront readiness gate below is authoritative"
+        log "refreshing provider catalog facts (bounded one-shot sync)"
+        if PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+            python -m cloud_platform.cli catalog auto-sync run; then
+            log "catalog refresh completed"
+        else
+            log "[WARN] catalog refresh reported provider errors (counts above); the storefront readiness gate below is authoritative"
+        fi
     fi
 
     # GATE: catalog canonicalization (idempotent release transition).

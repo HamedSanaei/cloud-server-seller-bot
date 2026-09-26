@@ -1,0 +1,262 @@
+name: deploy-staging
+
+# The FAST development lane. Every push to `staging` is validated cheaply,
+# built into an immutable image, and deployed to the CURRENT (development)
+# server, so a change is visible in the SAME Telegram bot within minutes
+# instead of after the release-grade chain.
+#
+# It deliberately does NOT wait for, or duplicate, the `ci` workflow: `staging`
+# is the integration lane and the coding agent already ran the targeted tests
+# for the change. The release-grade lane (`ci` + manual `deploy-production`)
+# stays intact for `main`; this file never weakens it.
+#
+# Reused infrastructure configuration (no duplicates, no second stack):
+#   * the existing environment secrets/variables: PROD_SSH_KEY,
+#     PROD_KNOWN_HOSTS, PROD_HOST, PROD_USER, PROD_PORT, PROD_DEPLOY_PATH;
+#   * the same server, the same server-owned deploy.env/configuration.toml
+#     (bot token, database, redis, provider credentials) and the same compose
+#     project `cloud-platform-production`, whose `bot` service is pinned to
+#     replicas: 1 and gated to exactly one container by the deploy script.
+#   * `deploy/staging/docker-compose.yml` (M12-004) is NOT used by this lane:
+#     that artifact describes a separate isolated stack; this lane replaces
+#     the one running stack.
+#
+# Concurrency: `cancel-in-progress: true` is intentional. A superseded staging
+# deploy is useless, so the newest commit wins. A cancelled mid-flight deploy
+# can leave the stack mid-transition; the next push repairs it forward (the
+# deploy script is idempotent and never downgrades the database), and compose
+# REPLACES the single `bot` service, so two pollers for the one Telegram token
+# cannot be started.
+#
+# The deploy job additionally joins `telegram-shared-host-deploy` with
+# cancel-in-progress: false, because staging and the manual production dispatch
+# mutate the SAME host and deploy path and must never run concurrently.
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Avoid hardlink/permission flakiness of cached virtualenvs between runners.
+  UV_LINK_MODE: copy
+
+jobs:
+  fast-checks:
+    name: Fast staging checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      # --frozen: the lockfile is the single source of truth (as in `ci`).
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups
+      # The same canonical command a developer runs locally (`make
+      # staging-check`): ruff lint + format check, compileall over src, and an
+      # import smoke of api/worker/bot. No pytest, no coverage, no mypy, no
+      # pre-commit: those belong to the release lane.
+      - name: Fast gates (ruff, formatting, import smoke)
+        run: uv run python scripts/verify_ci.py --staging
+
+  build:
+    name: Build immutable image
+    needs: fast-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      image: ${{ steps.resolve.outputs.image }}
+      head: ${{ steps.resolve.outputs.head }}
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve the staging SHA, image and expected alembic head
+        id: resolve
+        run: |
+          set -Eeuo pipefail
+          # Only the integration branch deploys through this lane: a push to
+          # staging (the event that should deploy) or a manual re-run of the
+          # staging HEAD. A feature branch is never deployable here.
+          [ "${{ github.ref }}" = "refs/heads/staging" ] \
+            || { echo "deploy-staging only runs on refs/heads/staging"; exit 1; }
+          sha="${{ github.sha }}"
+          if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "deployment SHA must be a full 40-char hex commit, got '${sha}'"
+            exit 1
+          fi
+          repo_lower="$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')"
+          image="${{ env.REGISTRY }}/${repo_lower}"
+          head="$(python3 -c "import sys; sys.path.insert(0, 'scripts'); import post_deploy_smoke; print(post_deploy_smoke.repo_head_revision())")"
+          [ -n "${head}" ] || { echo "could not resolve the alembic head"; exit 1; }
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "image=${image}" >> "${GITHUB_OUTPUT}"
+          echo "head=${head}" >> "${GITHUB_OUTPUT}"
+          echo "deploying commit ${sha} as ${image}:${sha} (expected alembic head ${head})"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether the immutable tag already exists
+        id: exists
+        run: |
+          set -Eeuo pipefail
+          if docker manifest inspect \
+            "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}" >/dev/null 2>&1; then
+            echo "present=true" >> "${GITHUB_OUTPUT}"
+            echo "immutable tag already exists; reusing it unchanged (same commit, same image)"
+          else
+            echo "present=false" >> "${GITHUB_OUTPUT}"
+            echo "immutable tag absent; building"
+          fi
+
+      # Cache-from/cache-to keep subsequent staging builds fast; the pushed
+      # tag is the exact commit SHA, never a floating tag, and the deployment
+      # always references that SHA tag. `:staging` is only a convenience
+      # pointer for humans pulling the current staging image.
+      - name: Build and push the immutable image
+        if: steps.exists.outputs.present != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}
+            ${{ steps.resolve.outputs.image }}:staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to the current server
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The existing `production` environment is where PROD_SSH_KEY,
+    # PROD_KNOWN_HOSTS and PROD_HOST/PROD_USER/PROD_PORT/PROD_DEPLOY_PATH live,
+    # and staging intentionally reuses them instead of duplicating
+    # infrastructure secrets. It has NO protection rules, so this adds no
+    # approval step. If required reviewers are ever added to that environment,
+    # staging deploys would inherit them - move those values to a shared
+    # environment (or dedicated staging credentials) BEFORE enabling them.
+    environment: production
+    # Shared-host serialization: the manual production dispatch and this lane
+    # mutate the same server and deploy path, so they must never overlap. This
+    # is cancelling nothing: the newest waiters queue in order.
+    concurrency:
+      group: telegram-shared-host-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Check out the exact pushed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Open SSH (ephemeral key file, verified host key)
+        run: |
+          set -Eeuo pipefail
+          install -m 700 -d "${HOME}/.ssh"
+          printf '%s\n' "${{ secrets.PROD_SSH_KEY }}" > "${HOME}/.ssh/prod_key"
+          chmod 600 "${HOME}/.ssh/prod_key"
+          printf '%s\n' "${{ secrets.PROD_KNOWN_HOSTS }}" > "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/known_hosts"
+          [ -s "${HOME}/.ssh/prod_key" ] || { echo "PROD_SSH_KEY is empty"; exit 1; }
+          [ -s "${HOME}/.ssh/known_hosts" ] || { echo "PROD_KNOWN_HOSTS is empty"; exit 1; }
+          [ -n "${{ vars.PROD_HOST }}" ] || { echo "PROD_HOST variable is not set"; exit 1; }
+          [ -n "${{ vars.PROD_USER }}" ] || { echo "PROD_USER variable is not set"; exit 1; }
+          [ -n "${{ vars.PROD_DEPLOY_PATH }}" ] || { echo "PROD_DEPLOY_PATH variable is not set"; exit 1; }
+          echo "ssh material ready (key never printed)"
+
+      - name: Authenticate the server to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          # Short-lived token only; travels over the encrypted SSH session on
+          # stdin and is never printed, stored, or committed.
+          printf '%s' "${GHCR_TOKEN}" | ssh -i "${HOME}/.ssh/prod_key" \
+            -p "${{ vars.PROD_PORT || 22 }}" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
+            "docker login ${{ env.REGISTRY }} -u '${{ github.actor }}' --password-stdin"
+          echo "server GHCR authentication: ok"
+
+      - name: Deliver release compose candidate
+        id: compose
+        run: |
+          set -Eeuo pipefail
+          # The compose contract travels from the same exact commit as the
+          # image, so a staging release can never mix an image with another
+          # commit's compose file.
+          sha="${{ needs.build.outputs.sha }}"
+          candidate=".docker-compose.${sha}.candidate.yml"
+          compose_sha="$(sha256sum deploy/production/docker-compose.yml | awk '{print $1}')"
+          echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=${compose_sha}" >> "${GITHUB_OUTPUT}"
+          echo "release compose candidate ${candidate}: ${compose_sha}"
+          ssh -i "${HOME}/.ssh/prod_key" \
+            -p "${{ vars.PROD_PORT || 22 }}" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
+            "cat > '${{ vars.PROD_DEPLOY_PATH }}/${candidate}'" \
+            < deploy/production/docker-compose.yml
+
+      - name: Deploy the exact image over SSH (staging profile)
+        run: |
+          set -Eeuo pipefail
+          # Same deploy engine as the release lane, with DEPLOY_PROFILE=staging:
+          # identical gates (candidate integrity, configuration preflight,
+          # migrations + head + physical-schema checks, exactly one bot,
+          # API/health/storefront readiness, rollback on failure) minus the
+          # one-shot provider catalog refresh, which the worker's scheduled
+          # coordinator already runs. A nonzero exit fails this workflow.
+          ssh -i "${HOME}/.ssh/prod_key" \
+            -p "${{ vars.PROD_PORT || 22 }}" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
+            "DEPLOY_PATH='${{ vars.PROD_DEPLOY_PATH }}' PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}' EXPECTED_HEAD='${{ needs.build.outputs.head }}' CANDIDATE_COMPOSE_FILE='${{ vars.PROD_DEPLOY_PATH }}/${{ steps.compose.outputs.candidate }}' EXPECTED_COMPOSE_SHA256='${{ steps.compose.outputs.sha256 }}' DEPLOY_PROFILE='staging' bash -s" \
+            < scripts/deploy-production.sh
+
+      - name: Report deployment
+        if: always()
+        run: |
+          echo "commit: ${{ needs.build.outputs.sha }}"
+          echo "image: ${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}"
+          echo "lane: staging (current development server + the same Telegram bot)"
+          echo "expected alembic head: ${{ needs.build.outputs.head }}"
+          echo "target: ${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}:${{ vars.PROD_DEPLOY_PATH }}"
+          echo "bot processes for the token after this deploy: exactly 1 (enforced by the deploy script)"
+
+      - name: Remove ephemeral SSH key
+        if: always()
+        run: rm -f "${HOME}/.ssh/prod_key"
