@@ -32,7 +32,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -546,7 +546,7 @@ class SqlAlchemyAccountCapacityRepository:
         async with self._session_factory() as session:
             result = await session.execute(statement)
             await session.commit()
-        return bool(result.rowcount)
+        return bool(cast(Any, result).rowcount)
 
     async def schedule_recovery(
         self,
@@ -738,7 +738,7 @@ class SqlAlchemyAccountCapacityRepository:
         async with self._session_factory() as session:
             result = await session.execute(statement)
             await session.commit()
-        return bool(result.rowcount)
+        return bool(cast(Any, result).rowcount)
 
     async def record_canary_refusal(
         self,
@@ -901,7 +901,7 @@ class SqlAlchemyAccountCapacityRepository:
         async with self._session_factory() as session:
             result = await session.execute(statement)
             await session.commit()
-        return bool(result.rowcount)
+        return bool(cast(Any, result).rowcount)
 
     async def mark_reminder_sent(
         self,
@@ -924,7 +924,7 @@ class SqlAlchemyAccountCapacityRepository:
         async with self._session_factory() as session:
             result = await session.execute(statement)
             await session.commit()
-        return bool(result.rowcount)
+        return bool(cast(Any, result).rowcount)
 
     async def record_healthy(
         self,
