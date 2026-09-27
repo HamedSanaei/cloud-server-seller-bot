@@ -249,6 +249,16 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
    remain unavailable: both can incur separate charges, and customer price books,
    wallet settlement, and safe reconciliation for those resources are not yet wired.
    The management screen never allocates or replaces an IP implicitly.
+   For Hetzner VPS, management also offers a two-step permanent deletion.
+   The owner-authorized delete saga verifies provider absence before the final
+   usage charge; a pending/requeued deletion is not presented as complete.
+   LeaseWeb ordering VPS has no verified cancellation API, so this button is
+   not offered for that adapter. OS reinstall reports provider acceptance,
+   not completion: refresh the details to see the current provider image.
+   Hetzner password reset requires a running Linux guest with qemu guest agent.
+   Provider-issued reset/rebuild passwords replace any old cached credential
+   and are revealed only once in the private bot chat; a rebuild with no new
+   password invalidates the previously saved password.
    Once the provider confirms an hourly server is running, the worker persists
    its assigned IP and sends the owner a private Telegram success notification.
    New Hetzner system-image servers created without an SSH key can expose their

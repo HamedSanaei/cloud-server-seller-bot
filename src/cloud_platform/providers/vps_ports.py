@@ -42,6 +42,8 @@ __all__ = [
     "VpsMonitoringRecord",
     "VpsNotificationRecord",
     "VpsNotificationSettingsProvider",
+    "VpsOneTimePassword",
+    "VpsPasswordIssued",
     "VpsPowerProvider",
     "VpsReinstallImage",
     "VpsSnapshotManagementProvider",
@@ -129,6 +131,31 @@ class VpsActionAccepted:
 
     provider_server_id: str
     action: str
+
+
+class VpsOneTimePassword:
+    """Provider-issued password: reveal once to the authorized caller; never log."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value: str | None = value
+
+    def reveal(self) -> str | None:
+        value, self._value = self._value, None
+        return value
+
+    def __repr__(self) -> str:
+        return "VpsOneTimePassword(<redacted>)"
+
+    __str__ = __repr__
+
+
+@dataclass(frozen=True, slots=True)
+class VpsPasswordIssued(VpsActionAccepted):
+    """Accepted action with an optional one-time password (none for SSH-key rebuilds)."""
+
+    root_password: VpsOneTimePassword | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,10 +318,11 @@ class VpsMonitoringProvider(Protocol):
 
 
 class VpsCredentialProvider(Protocol):
-    """Credential REFERENCES only — never provider secret values."""
+    """Password reset; credential-reference listing is an independent capability."""
 
-    async def list_vps_credentials(self, provider_server_id: str) -> list[dict[str, str]]: ...
-    async def reset_vps_password(self, provider_server_id: str) -> VpsActionAccepted: ...
+    async def reset_vps_password(
+        self, provider_server_id: str
+    ) -> VpsPasswordIssued | VpsActionAccepted: ...
 
 
 class VpsNotificationSettingsProvider(Protocol):
@@ -337,6 +365,7 @@ class VpsCapabilities:
     console: bool = False
     iso: bool = False
     reinstall: bool = False
+    deletion: bool = False
     ips: bool = False
     snapshots: bool = False
     metrics: bool = False
@@ -353,6 +382,7 @@ class VpsCapabilities:
                 self.console,
                 self.iso,
                 self.reinstall,
+                self.deletion,
                 self.ips,
                 self.snapshots,
                 self.metrics,
@@ -375,6 +405,7 @@ def vps_capabilities_of(provider: Any) -> VpsCapabilities:
         console=_has(provider, "get_console_session"),
         iso=_has(provider, "list_vps_isos", "attach_vps_iso", "detach_vps_iso"),
         reinstall=_has(provider, "list_vps_reinstall_images", "reinstall_vps"),
+        deletion=bool(getattr(provider, "supports_customer_delete", False)),
         ips=_has(
             provider,
             "list_vps_ips",
@@ -393,7 +424,7 @@ def vps_capabilities_of(provider: Any) -> VpsCapabilities:
         ),
         metrics=_has(provider, "get_vps_data_traffic"),
         monitoring=_has(provider, "get_vps_monitoring", "enable_vps_monitoring"),
-        credentials=_has(provider, "list_vps_credentials", "reset_vps_password"),
+        credentials=_has(provider, "reset_vps_password"),
         notifications=_has(
             provider,
             "list_vps_notification_settings",

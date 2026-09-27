@@ -67,6 +67,7 @@ _GROUP_FLAGS: tuple[tuple[str, tuple[ServerOperation, ...]], ...] = (
         ),
     ),
     ("reinstall", (ServerOperation.REINSTALL,)),
+    ("deletion", (ServerOperation.DELETE,)),
     ("password_reset", (ServerOperation.PASSWORD_RESET,)),
     (
         "ip_management",
@@ -114,6 +115,7 @@ _OPERATION_CAPABILITY: dict[ServerOperation, str | None] = {
     ServerOperation.SNAPSHOT_RESTORE: "snapshots",
     ServerOperation.SNAPSHOT_DELETE: "snapshots",
     ServerOperation.REINSTALL: "reinstall",
+    ServerOperation.DELETE: "deletion",
     ServerOperation.PASSWORD_RESET: "credentials",  # pragma: allowlist secret
     ServerOperation.IP_LIST: "ips",
     ServerOperation.IP_SET_RDNS: "ips",
@@ -161,6 +163,7 @@ _STATE_GATES: dict[ServerOperation, frozenset[ServerLifecycleState]] = {
     ServerOperation.REINSTALL: frozenset(
         {ServerLifecycleState.RUNNING, ServerLifecycleState.STOPPED}
     ),
+    ServerOperation.DELETE: frozenset({ServerLifecycleState.RUNNING, ServerLifecycleState.STOPPED}),
     ServerOperation.PASSWORD_RESET: frozenset(
         {ServerLifecycleState.RUNNING, ServerLifecycleState.STOPPED}
     ),
@@ -286,6 +289,7 @@ class ServerManagementPolicy:
     traffic: bool = True
     snapshots: bool = True
     reinstall: bool = True
+    deletion: bool = True
     password_reset: bool = True
     iso: bool = False
     ip_management: bool = True
@@ -307,6 +311,7 @@ class ServerManagementPolicy:
             traffic=bool(getattr(settings, "server_management_traffic", defaults.traffic)),
             snapshots=bool(getattr(settings, "server_management_snapshots", defaults.snapshots)),
             reinstall=bool(getattr(settings, "server_management_reinstall", defaults.reinstall)),
+            deletion=bool(getattr(settings, "server_management_deletion", defaults.deletion)),
             password_reset=bool(
                 getattr(settings, "server_management_password_reset", defaults.password_reset)
             ),

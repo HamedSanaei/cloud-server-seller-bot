@@ -159,5 +159,22 @@ async def test_encrypted_claim_ack_owner_and_crash_retry(scratch_url: str) -> No
                 provider_server_id=provider_server_id,
                 password=password,
             )
+        rotated = secrets.token_urlsafe(40)
+        await store.replace_issued(
+            server_id=server_id,
+            provider_server_id=provider_server_id,
+            password=rotated,
+            username="root",
+        )
+        assert await store.claim_for_owner(server_id=server_id, user_id=intruder) is None
+        rotated_claim = await store.claim_for_owner(server_id=server_id, user_id=owner)
+        assert rotated_claim is not None and rotated_claim.reveal() == rotated
+        await store.invalidate_for_owner(
+            server_id=server_id, user_id=owner, provider_server_id=provider_server_id
+        )
+        assert not await store.has_for_owner(server_id=server_id, user_id=owner)
+        assert not await store.ack_for_owner(
+            server_id=server_id, user_id=owner, claim_id=rotated_claim.claim_id
+        )
     finally:
         await engine.dispose()

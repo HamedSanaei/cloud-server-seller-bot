@@ -300,6 +300,17 @@ def _hold(status: HoldStatus = HoldStatus.CREATED) -> Hold:
 
 
 class TestDeleteRequest:
+    async def test_deferred_request_waits_for_worker_before_provider_deletion(self) -> None:
+        fakes = Fakes(server=_server())
+        service = fakes.make_service()
+        queued = await service.request(USER_ID, SERVER_ID, IK, execute_inline=False)
+        assert queued.requeued and queued.server.state is ServerLifecycleState.DELETE_REQUESTED
+        assert fakes.provider.delete_calls == []
+        counts = await fakes.make_worker(service).process_pending_deletes()
+        assert counts["executed"] == 1
+        assert fakes.servers[SERVER_ID].state is ServerLifecycleState.DELETED
+        assert fakes.provider.delete_calls == ["prov-1"]
+
     async def test_happy_path(self) -> None:
         server = _server()
         fakes = Fakes(server=server)

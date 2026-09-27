@@ -1326,6 +1326,49 @@ class Container:
 
         return ServerManagementPolicy.from_settings(get_settings())
 
+    def delete_command_service(self) -> Any:
+        """Owner-checked, idempotent deletion saga shared with the worker."""
+        from cloud_platform.modules.billing.repository import (
+            PostgresAdvisoryAccrualLock,
+            SqlAlchemyAccrualPeriodRepository,
+        )
+        from cloud_platform.modules.billing.service import FinalChargeService
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.operations.service import DeleteCommandService
+        from cloud_platform.modules.pricing.repository import (
+            SqlAlchemyServerPriceSnapshotRepository,
+        )
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyLedgerRepository,
+        )
+
+        wallets = self.wallet_repository()
+        holds = SqlAlchemyHoldRepository(self.session_factory)
+        hold_service = self.hold_service()
+        final_charge = FinalChargeService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            wallet_repo=wallets,
+            hold_repo=holds,
+            hold_service=hold_service,
+            ledger_repo=SqlAlchemyLedgerRepository(self.session_factory),
+            accrual_repo=SqlAlchemyAccrualPeriodRepository(self.session_factory),
+            snapshot_repo=SqlAlchemyServerPriceSnapshotRepository(self.session_factory),
+            audit_repo=self.audit_repository(),
+            lock=PostgresAdvisoryAccrualLock(self.session_factory),
+        )
+        return DeleteCommandService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            provider_registry=self.provider_registry,
+            final_charge=final_charge,
+            hold_repo=holds,
+            hold_service=hold_service,
+            wallet_repo=wallets,
+            audit_repo=self.audit_repository(),
+        )
+
     def server_management_service(self) -> Any:
         """Customer-facing, ownership-safe server management (Telegram).
 
@@ -1346,6 +1389,7 @@ class Container:
             power=self.power_command_service(),
             operations=SqlAlchemyOperationRepository(self.session_factory),
             credential_store=self.server_credential_store(),
+            delete_command=self.delete_command_service(),
             event_sink=self.business_event_sink(),
             # Commercial status + manual renewal come from the SAME checker the
             # worker runs, so the customer's "renew now" and the automatic pass

@@ -127,6 +127,7 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("features", "server_management", "traffic"): "server_management_traffic",
     ("features", "server_management", "snapshots"): "server_management_snapshots",
     ("features", "server_management", "reinstall"): "server_management_reinstall",
+    ("features", "server_management", "deletion"): "server_management_deletion",
     ("features", "server_management", "password_reset"): ("server_management_password_reset"),
     ("features", "server_management", "iso"): "server_management_iso",
     ("features", "server_management", "ip_management"): ("server_management_ip_management"),
@@ -858,6 +859,7 @@ class Settings(BaseSettings):
     server_management_traffic: bool = True
     server_management_snapshots: bool = True
     server_management_reinstall: bool = True
+    server_management_deletion: bool = True
     server_management_password_reset: bool = True
     server_management_iso: bool = False
     server_management_ip_management: bool = True

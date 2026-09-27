@@ -95,6 +95,7 @@ _OPERATION_LABELS: dict[ServerOperation, str] = {
     ServerOperation.REBOOT: "servers.op.reboot",
     ServerOperation.REINSTALL: "servers.op.reinstall",
     ServerOperation.PASSWORD_RESET: "servers.op.password_reset",  # pragma: allowlist secret
+    ServerOperation.DELETE: "servers.op.delete",
     ServerOperation.SNAPSHOT_CREATE: "servers.op.snapshot_create",
     ServerOperation.SNAPSHOT_RESTORE: "servers.op.snapshot_restore",
     ServerOperation.SNAPSHOT_DELETE: "servers.op.snapshot_delete",
@@ -122,6 +123,7 @@ _CONFIRM_COPY: dict[ServerOperation, tuple[str, str]] = {
         "servers.snapshot_delete_text",
     ),
     ServerOperation.REINSTALL: ("servers.reinstall_title", "servers.reinstall_text"),
+    ServerOperation.DELETE: ("servers.delete_title", "servers.delete_final"),
     ServerOperation.PASSWORD_RESET: ("servers.password_title", "servers.password_text"),
     ServerOperation.IP_NULL_ROUTE: ("servers.ip_null_title", "servers.ip_null_text"),
     ServerOperation.ISO_ATTACH: ("servers.iso_title", "servers.iso_text"),
@@ -174,6 +176,8 @@ SCREENS = frozenset(
         "rename",
         "renew",
         "autorenew",
+        "del1",
+        "del2",
         "ssh",
     }
 )
@@ -354,6 +358,10 @@ class ServerManagementUi:
             return await self._reinstall_confirm(user, args[0], args[1])
         if cb.screen == "pwreset" and len(args) == 1:
             return await self._password_confirm(user, args[0])
+        if cb.screen == "del1" and len(args) == 1:
+            return await self._delete_warning(user, args[0])
+        if cb.screen == "del2" and len(args) == 1:
+            return await self._delete_confirm(user, args[0])
         if cb.screen == "ips" and len(args) == 1:
             return await self._ip_list(user, args[0])
         if cb.screen in {"ipnull", "ipunnull", "iprdns"} and len(args) == 2:
@@ -613,6 +621,8 @@ class ServerManagementUi:
             add("rein", "servers.reinstall_button")
         if ServerOperation.PASSWORD_RESET in allowed:
             add("pwreset", "servers.password_button")
+        if ServerOperation.DELETE in allowed:
+            add("del1", "servers.delete_button")
         if ServerOperation.IP_LIST in allowed:
             add("ips", "servers.ips_button")
         if ServerOperation.ISO_LIST in allowed:
@@ -823,6 +833,8 @@ class ServerManagementUi:
             )
         if operation is ServerOperation.PASSWORD_RESET:
             return await self._mgmt.reset_password(customer, server_id, confirmation_token=token)
+        if operation is ServerOperation.DELETE:
+            return await self._mgmt.delete_server(customer, server_id, confirmation_token=token)
         if operation is ServerOperation.IP_NULL_ROUTE:
             return await self._mgmt.null_route_ip(
                 customer, server_id, ip=args.get("ip", ""), confirmation_token=token
@@ -1149,6 +1161,42 @@ class ServerManagementUi:
             target=image.name,
         )
 
+    async def _delete_warning(self, user: User, ref: str) -> BotScreen:
+        customer = _customer_id(user)
+        server_id = await self._sessions.server_id(customer, ref)
+        if server_id is None:
+            return self._expired_screen()
+        allowed = await self._mgmt.available_operations(customer, server_id)
+        if ServerOperation.DELETE not in allowed:
+            return self._expired_screen()
+        view = await self._mgmt.get_server(customer, server_id)
+        return BotScreen(
+            "\n".join(
+                (
+                    self._t.t("servers.delete_title"),
+                    "",
+                    self._t.t("servers.confirm_target", target=self._target(view)),
+                    self._t.t("servers.delete_warning"),
+                )
+            ),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [self._action_button("del2", "servers.delete_continue", ref)],
+                    [self._back_button("servers", "manage", ref), self._menu_button()],
+                ]
+            ),
+        )
+
+    async def _delete_confirm(self, user: User, ref: str) -> BotScreen:
+        customer = _customer_id(user)
+        server_id = await self._sessions.server_id(customer, ref)
+        if server_id is None:
+            return self._expired_screen()
+        view = await self._mgmt.get_server(customer, server_id)
+        return await self._stage_confirmation(
+            user, ref, ServerOperation.DELETE, arguments={}, target=self._target(view)
+        )
+
     async def _password_confirm(self, user: User, ref: str) -> BotScreen:
         return await self._stage_confirmation(
             user, ref, ServerOperation.PASSWORD_RESET, arguments={}
@@ -1361,6 +1409,14 @@ class ServerManagementUi:
             text = self._t.t("servers.outcome_unknown")
         elif outcome.replayed:
             text = self._t.t("servers.action_in_progress")
+        elif outcome.operation is ServerOperation.REINSTALL:
+            text = self._t.t("servers.reinstall_accepted")
+        elif outcome.operation is ServerOperation.PASSWORD_RESET:
+            text = self._t.t("servers.password_reset_accepted")
+        elif outcome.operation is ServerOperation.DELETE:
+            text = self._t.t(
+                "servers.delete_pending" if outcome.detail == "pending" else "servers.delete_done"
+            )
         else:
             text = self._t.t(
                 "servers.action_done",
@@ -1368,9 +1424,10 @@ class ServerManagementUi:
             )
         rows = [
             [
+                self._action_button("refresh", "servers.refresh_button", ref),
                 self._back_button("servers", "view", ref),
-                self._menu_button(),
-            ]
+            ],
+            [self._menu_button()],
         ]
         return BotScreen(text, InlineKeyboardMarkup(inline_keyboard=rows))
 

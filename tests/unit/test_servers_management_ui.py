@@ -288,6 +288,16 @@ class FakeManagement:
         self._owned(customer_id)
         return ServerActionOutcome(operation=ServerOperation.REINSTALL, accepted=True)
 
+    async def delete_server(
+        self, customer_id: UUID, server_id: UUID, *, confirmation_token: str | None
+    ) -> ServerActionOutcome:
+        self._consume(confirmation_token)
+        self._record("delete_server", server_id=server_id)
+        self._owned(customer_id)
+        return ServerActionOutcome(
+            operation=ServerOperation.DELETE, accepted=True, detail="pending"
+        )
+
     async def reset_password(
         self, customer_id: UUID, server_id: UUID, *, confirmation_token: str | None
     ) -> ServerActionOutcome:
@@ -619,6 +629,24 @@ MANAGEMENT_SENT = "ارسال شد"
 # ---------------------------------------------------------------------------
 # Destructive operations
 # ---------------------------------------------------------------------------
+
+
+class TestDeleteFlow:
+    async def test_delete_requires_two_confirmations_and_only_executes_once(self) -> None:
+        ui, management, _s = make_ui()
+        ref = await _ref(ui)
+        warning = await ui.handle(Callback("servers", "del1", (ref,)), _user())
+        assert TRANSLATOR.t("servers.delete_warning") in warning.text
+        assert management.count("delete_server") == 0
+        confirm = await ui.handle(Callback("servers", "del2", (ref,)), _user())
+        assert TRANSLATOR.t("servers.delete_final") in confirm.text
+        assert management.count("delete_server") == 0
+        callback = _exec_callback(confirm)
+        result = await ui.handle(callback, _user())
+        repeat = await ui.handle(callback, _user())
+        assert TRANSLATOR.t("servers.delete_pending") in result.text
+        assert TRANSLATOR.t("servers.action_in_progress") in repeat.text
+        assert management.count("delete_server") == 1
 
 
 class TestDestructiveFlows:

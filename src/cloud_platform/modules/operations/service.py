@@ -2738,7 +2738,12 @@ class DeleteCommandService:
         )
 
     async def request(
-        self, user_id: UUID, server_id: UUID, idempotency_key: str
+        self,
+        user_id: UUID,
+        server_id: UUID,
+        idempotency_key: str,
+        *,
+        execute_inline: bool = True,
     ) -> DeleteCommandResult:
         if not idempotency_key or not idempotency_key.strip():
             raise DeleteCommandError("idempotency_key is required")
@@ -2791,6 +2796,11 @@ class DeleteCommandService:
                 reason=f"delete requested (key={idempotency_key.strip()})",
                 metadata={"operation_id": str(op.id)},
             )
+
+        if not execute_inline:
+            # The Telegram callback answers promptly; DeleteWorker processes
+            # the durable PENDING intent and verifies provider absence.
+            return DeleteCommandResult(server=server, replayed=False, requeued=True)
 
         claimed = await self._ops.claim(op.id)
         if claimed is None:

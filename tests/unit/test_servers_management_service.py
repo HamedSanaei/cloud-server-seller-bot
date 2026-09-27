@@ -15,6 +15,7 @@ They assert the guarantees the spec calls out explicitly:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -49,6 +50,8 @@ from cloud_platform.providers.vps_ports import (
     VpsIpRecord,
     VpsIsoRecord,
     VpsMonitoringRecord,
+    VpsOneTimePassword,
+    VpsPasswordIssued,
     VpsReinstallImage,
     VpsSnapshotRecord,
 )
@@ -409,6 +412,10 @@ def make_service(
         audit_repo=audit,  # type: ignore[arg-type]
         power=power,  # type: ignore[arg-type]
         event_sink=sink,
+        credential_store=SimpleNamespace(
+            invalidate_for_owner=AsyncMock(),
+            replace_issued=AsyncMock(),
+        ),
     )
     return service, provider, power, audit, sink
 
@@ -697,6 +704,10 @@ class TestConfirmations:
             audit_repo=FakeAuditRepo(),  # type: ignore[arg-type]
             power=FakePower(),  # type: ignore[arg-type]
             event_sink=FakeEventSink(),
+            credential_store=SimpleNamespace(
+                invalidate_for_owner=AsyncMock(),
+                replace_issued=AsyncMock(),
+            ),
         )
         token = await service.issue_confirmation(
             CUSTOMER, SERVER_ID, ServerOperation.PASSWORD_RESET
@@ -751,6 +762,80 @@ class TestConfirmations:
         assert first.accepted is True
         assert second.replayed is True
         assert provider.count("reinstall_vps") == 1
+
+    async def test_password_reset_stores_issued_password_and_never_replays_provider(self) -> None:
+        service, provider, *_ = make_service()
+        provider.reset_vps_password = AsyncMock(
+            return_value=VpsPasswordIssued(
+                PROVIDER_ID, "reset_password", VpsOneTimePassword("issued-test-password")
+            )
+        )
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.PASSWORD_RESET
+        )
+        first = await service.reset_password(CUSTOMER, SERVER_ID, confirmation_token=token)
+        second = await service.reset_password(CUSTOMER, SERVER_ID, confirmation_token=token)
+        assert first.accepted and second.replayed
+        provider.reset_vps_password.assert_awaited_once_with(PROVIDER_ID)
+        service._credential_store.replace_issued.assert_awaited_once_with(
+            server_id=SERVER_ID,
+            provider_server_id=PROVIDER_ID,
+            password="issued-test-password",  # pragma: allowlist secret
+            username="root",
+        )
+
+    async def test_password_storage_failure_does_not_report_reset_success(self) -> None:
+        service, provider, *_ = make_service()
+        provider.reset_vps_password = AsyncMock(
+            return_value=VpsPasswordIssued(
+                PROVIDER_ID, "reset_password", VpsOneTimePassword("issued-test-password")
+            )
+        )
+        service._credential_store.replace_issued.side_effect = RuntimeError(
+            "storage error containing issued-test-password"
+        )
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.PASSWORD_RESET
+        )
+        with pytest.raises(ServerAmbiguousOutcomeError) as excinfo:
+            await service.reset_password(CUSTOMER, SERVER_ID, confirmation_token=token)
+        assert "issued-test-password" not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None
+        provider.reset_vps_password.assert_awaited_once()
+
+    async def test_reinstall_invalidates_old_password_when_provider_returns_none(self) -> None:
+        service, _provider, *_ = make_service()
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.REINSTALL, arguments={"image": "img-ubuntu"}
+        )
+        await service.reinstall(
+            CUSTOMER, SERVER_ID, image_ref="img-ubuntu", confirmation_token=token
+        )
+        service._credential_store.invalidate_for_owner.assert_awaited_once_with(
+            server_id=SERVER_ID, user_id=CUSTOMER, provider_server_id=PROVIDER_ID
+        )
+
+    async def test_delete_requires_supported_adapter_and_owned_confirmation(self) -> None:
+        service, provider, *_ = make_service()
+        command = SimpleNamespace(
+            request=AsyncMock(return_value=SimpleNamespace(replayed=False, requeued=True))
+        )
+        service._delete_command = command
+        with pytest.raises(ServerOperationNotAllowedError):
+            await service.issue_confirmation(CUSTOMER, SERVER_ID, ServerOperation.DELETE)
+        provider.supports_customer_delete = True
+        with pytest.raises(ServerNotFoundError):
+            await service.issue_confirmation(OTHER_CUSTOMER, SERVER_ID, ServerOperation.DELETE)
+        token = await service.issue_confirmation(CUSTOMER, SERVER_ID, ServerOperation.DELETE)
+        outcome = await service.delete_server(CUSTOMER, SERVER_ID, confirmation_token=token)
+        replayed = await service.delete_server(CUSTOMER, SERVER_ID, confirmation_token=token)
+        assert outcome.detail == "pending" and replayed.replayed
+        command.request.assert_awaited_once_with(
+            CUSTOMER,
+            SERVER_ID,
+            idempotency_key=sha256(token.encode()).hexdigest()[:32],
+            execute_inline=False,
+        )
 
     async def test_snapshot_restore_and_delete_mutate_once(self) -> None:
         service, provider, *_ = make_service()
@@ -905,6 +990,14 @@ class TestReads:
         assert all(name in {"get_vps_info", "list_vps_ips"} for name in provider.calls), (
             provider.calls
         )
+
+    async def test_refresh_replaces_stale_os_after_reinstall(self) -> None:
+        server = make_server()
+        server.os = "Debian 12"
+        service, *_ = make_service(server=server)
+        view = await service.refresh_server(CUSTOMER, SERVER_ID)
+        assert view.operating_system == "Ubuntu 24.04"
+        assert server.os == "Ubuntu 24.04"
 
     async def test_snapshots_and_images_are_listed(self) -> None:
         service, *_ = make_service()

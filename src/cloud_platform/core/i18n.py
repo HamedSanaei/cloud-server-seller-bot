@@ -177,9 +177,25 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.reinstall_text": "این عملیات باعث حذف اطلاعات فعلی سرور می‌شود و قابل بازگشت نیست.",
         "servers.reinstall_confirm_button": "✅ نصب مجدد",
         "servers.reinstall_empty": "سیستم‌عاملی برای نصب مجدد در دسترس نیست.",
+        "servers.reinstall_accepted": (
+            "⏳ درخواست نصب مجدد پذیرفته شد؛ نصب سیستم‌عامل هنوز تأیید نشده است.\n"
+            "پس از پایان عملیات، «بروزرسانی» را بزنید تا وضعیت و سیستم‌عامل واقعی نمایش داده شود.\n"
+            "رمز جدید را یک‌بار از «مدیریت سرور» در گفت‌وگوی خصوصی ببینید."
+        ),
+        "servers.delete_button": "🗑 حذف دائمی سرور",
+        "servers.delete_title": "⚠️ حذف سرور",
+        "servers.delete_warning": "حذف سرور برگشت‌ناپذیر است و پس از تأیید نبودن آن نزد ارائه‌دهنده، هزینه نهایی مصرف تسویه می‌شود. برای ادامه یک بار دیگر تأیید کنید.",  # noqa: E501
+        "servers.delete_continue": "⚠️ ادامه به تأیید نهایی",
+        "servers.delete_final": "تمام داده‌های سرور حذف می‌شود؛ هزینه مصرف تا زمان حذف نهایی محاسبه خواهد شد. آیا مطمئن هستید؟",  # noqa: E501
+        "servers.delete_pending": (
+            "⏳ درخواست حذف ثبت شد؛ تسویه نهایی تا تأیید حذف نزد ارائه‌دهنده در انتظار است."
+        ),
+        "servers.delete_done": "✅ حذف سرور نزد ارائه‌دهنده تأیید و تسویه نهایی انجام شد.",
+        "servers.op.delete": "حذف سرور",
         "servers.password_button": "🔑 بازنشانی رمز",
         "servers.password_title": "⚠️ بازنشانی رمز",
         "servers.password_text": "رمز جدید توسط سرویس‌دهنده ساخته می‌شود و رمز فعلی از کار می‌افتد.",
+        "servers.password_reset_accepted": "✅ رمز جدید ساخته و ذخیره شد. از «مدیریت سرور» گزینه «نمایش یک‌باره رمز SSH» را در گفت‌وگوی خصوصی انتخاب کنید.",  # noqa: E501
         "servers.ips_button": "🌐 مدیریت IP",
         "servers.ips_title": "🌐 مدیریت IP",
         "servers.ip_row": "{ip} — {kind}",
@@ -595,9 +611,25 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.reinstall_text": "This erases the current server content and cannot be undone.",
         "servers.reinstall_confirm_button": "✅ Reinstall",
         "servers.reinstall_empty": "No image is available for reinstall right now.",
+        "servers.reinstall_accepted": (
+            "⏳ Reinstall request accepted; OS installation is not yet confirmed.\n"
+            "After it finishes, refresh to see the provider-reported state and operating system.\n"
+            "Reveal any newly issued password once in private chat from Manage server."
+        ),
+        "servers.delete_button": "🗑 Delete server",
+        "servers.delete_title": "⚠️ Delete server",
+        "servers.delete_warning": "Deletion is irreversible. Final usage is settled after provider absence is confirmed. Confirm once more to continue.",  # noqa: E501
+        "servers.delete_continue": "⚠️ Continue to final confirmation",
+        "servers.delete_final": "All server data will be deleted, and usage is charged through final deletion. Are you sure?",  # noqa: E501
+        "servers.delete_pending": (
+            "⏳ Deletion requested; final settlement awaits confirmed provider removal."
+        ),
+        "servers.delete_done": "✅ Provider deletion confirmed and final usage settled.",
+        "servers.op.delete": "delete server",
         "servers.password_button": "🔑 Reset password",
         "servers.password_title": "⚠️ Reset password",
         "servers.password_text": "The provider generates a new password and the current one stops working.",  # noqa: E501  # pragma: allowlist secret
+        "servers.password_reset_accepted": "✅ New password issued and encrypted. In a private chat, open Manage server → Show SSH password once.",  # noqa: E501
         "servers.ips_button": "🌐 IP management",
         "servers.ips_title": "🌐 IP management",
         "servers.ip_row": "{ip} — {kind}",

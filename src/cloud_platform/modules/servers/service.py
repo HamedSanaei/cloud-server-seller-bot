@@ -33,6 +33,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -55,6 +56,11 @@ from cloud_platform.modules.compute.domain import (
 )
 from cloud_platform.modules.operations.domain import OperationRepository, OperationStatus
 from cloud_platform.modules.operations.service import (
+    DeleteActionNotAllowedError,
+    DeleteCommandService,
+    DeleteNotOwnerError,
+    DeleteOperationFailedError,
+    DeleteOperationInProgressError,
     NotServerOwnerError,
     PowerActionNotAllowedError,
     PowerCommandError,
@@ -159,6 +165,12 @@ class RenewalCollector(Protocol):
 
 
 class ServerCredentialStore(Protocol):
+    async def replace_issued(
+        self, *, server_id: UUID, provider_server_id: str, password: str, username: str
+    ) -> None: ...
+    async def invalidate_for_owner(
+        self, *, server_id: UUID, user_id: UUID, provider_server_id: str
+    ) -> None: ...
     async def has_for_owner(self, *, server_id: UUID, user_id: UUID) -> bool: ...
     async def claim_for_owner(self, *, server_id: UUID, user_id: UUID) -> Any | None: ...
     async def ack_for_owner(self, *, server_id: UUID, user_id: UUID, claim_id: UUID) -> bool: ...
@@ -241,6 +253,7 @@ class ServerManagementService:
         clock: Callable[[], datetime] | None = None,
         operations: OperationRepository | None = None,
         credential_store: ServerCredentialStore | None = None,
+        delete_command: DeleteCommandService | None = None,
     ) -> None:
         self._servers = servers
         self._registry = registry
@@ -250,6 +263,7 @@ class ServerManagementService:
         self._power = power
         self._operations = operations
         self._credential_store = credential_store
+        self._delete_command = delete_command
         self._events = event_sink
         # The commercial collector (RenewalChecker) is optional: a deployment
         # that exposes no billing capability simply renders no commercial lines.
@@ -643,6 +657,8 @@ class ServerManagementService:
         """Reinstall with a provider-fetched image (destructive, confirmed)."""
         server = await self._owned(customer_id, server_id)
         context = await self._require(server, ServerOperation.REINSTALL)
+        if self._credential_store is None:
+            raise ServerUnavailableError("encrypted credential storage is unavailable")
         arguments = {"image": str(image_ref)}
         consumed = await self._consume(
             confirmation_token,
@@ -654,13 +670,14 @@ class ServerManagementService:
         )
         if consumed is not None:
             return consumed
-        await self._call(
+        response = await self._call(
             context.provider.reinstall_vps(_provider_id(server), str(image_ref)),
             operation=ServerOperation.REINSTALL,
             server=server,
             customer_id=customer_id,
             arguments=arguments,
         )
+        await self._save_provider_password(server, customer_id, response, required=False)
         await self._emit(
             BusinessEventType.SERVER_REINSTALL_REQUESTED,
             server,
@@ -671,6 +688,83 @@ class ServerManagementService:
         )
         return ServerActionOutcome(operation=ServerOperation.REINSTALL, accepted=True)
 
+    async def _save_provider_password(
+        self, server: CloudServer, customer_id: UUID, response: Any, *, required: bool
+    ) -> None:
+        """Never report a changed password unless its one-time value is encrypted."""
+        secret = getattr(response, "root_password", None)
+        if self._credential_store is None:
+            raise ServerAmbiguousOutcomeError("provider password cannot be stored")
+        try:
+            if secret is None:
+                if required:
+                    raise ServerAmbiguousOutcomeError("provider did not return a password")
+                await self._credential_store.invalidate_for_owner(
+                    server_id=server.id,
+                    user_id=customer_id,
+                    provider_server_id=_provider_id(server),
+                )
+                return
+            password = secret.reveal()
+            if not password:
+                raise ServerAmbiguousOutcomeError("provider password was already consumed")
+            await self._credential_store.replace_issued(
+                server_id=server.id,
+                provider_server_id=_provider_id(server),
+                password=password,
+                username="root",
+            )
+        except ServerAmbiguousOutcomeError:
+            raise
+        except Exception:
+            # Database/provider exceptions can contain the returned secret.
+            raise ServerAmbiguousOutcomeError("provider password storage outcome unknown") from None
+
+    async def delete_server(
+        self,
+        customer_id: UUID,
+        server_id: UUID,
+        *,
+        confirmation_token: str | None,
+    ) -> ServerActionOutcome:
+        """Run the authorized deletion saga, including provider absence and final billing."""
+        server = await self._owned(customer_id, server_id)
+        if self._delete_command is None:
+            raise ServerUnavailableError("deletion workflow is unavailable")
+        consumed = await self._consume(
+            confirmation_token,
+            server,
+            customer_id,
+            ServerOperation.DELETE,
+            arguments=None,
+        )
+        if consumed is not None:
+            return consumed
+        await self._require(server, ServerOperation.DELETE)
+        try:
+            result = await self._delete_command.request(
+                customer_id,
+                server_id,
+                idempotency_key=sha256((confirmation_token or "").encode()).hexdigest()[:32],
+                execute_inline=False,
+            )
+        except DeleteNotOwnerError as exc:
+            raise ServerNotFoundError("server not found") from exc
+        except DeleteActionNotAllowedError as exc:
+            raise ServerOperationNotAllowedError(
+                "server cannot be deleted", operation=ServerOperation.DELETE, reason="state"
+            ) from exc
+        except DeleteOperationInProgressError as exc:
+            raise ServerUnavailableError("deletion is in progress") from exc
+        except DeleteOperationFailedError as exc:
+            raise ServerProviderError("deletion failed; contact support") from exc
+        return ServerActionOutcome(
+            operation=ServerOperation.DELETE,
+            accepted=True,
+            replayed=result.replayed,
+            detail="pending" if result.requeued else "deleted",
+        )
+
     async def reset_password(
         self,
         customer_id: UUID,
@@ -678,14 +772,11 @@ class ServerManagementService:
         *,
         confirmation_token: str | None,
     ) -> ServerActionOutcome:
-        """Reset the OS password (destructive, confirmed).
-
-        The provider response carries no password: the new value must be read
-        through the credential endpoints, so NOTHING is invented or displayed
-        here. The credential endpoints themselves stay operator-only.
-        """
+        """Reset the OS password and encrypt its provider-issued replacement."""
         server = await self._owned(customer_id, server_id)
         context = await self._require(server, ServerOperation.PASSWORD_RESET)
+        if self._credential_store is None:
+            raise ServerUnavailableError("encrypted credential storage is unavailable")
         consumed = await self._consume(
             confirmation_token,
             server,
@@ -696,12 +787,13 @@ class ServerManagementService:
         )
         if consumed is not None:
             return consumed
-        await self._call(
+        response = await self._call(
             context.provider.reset_vps_password(_provider_id(server)),
             operation=ServerOperation.PASSWORD_RESET,
             server=server,
             customer_id=customer_id,
         )
+        await self._save_provider_password(server, customer_id, response, required=True)
         await self._emit(
             BusinessEventType.SERVER_PASSWORD_RESET_REQUESTED,
             server,
@@ -1512,7 +1604,7 @@ class ServerManagementService:
                     server.id,
                     server.state,
                 )
-        if info.image_name and not server.os:
+        if info.image_name and info.image_name != server.os:
             server.os = info.image_name
         ipv4 = info.metadata.get("ipv4")
         ipv6 = info.metadata.get("ipv6")

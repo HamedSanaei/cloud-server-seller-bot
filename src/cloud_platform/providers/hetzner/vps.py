@@ -1,6 +1,6 @@
 """Hetzner Cloud's supported provider-neutral VPS management ports.
 
-Only inventory, power and reinstall are exposed. In particular Hetzner snapshots
+Inventory, power, reinstall and password reset are exposed. Hetzner snapshots
 are billable images, and its console requires a separate password which the
 provider-neutral ConsoleSession cannot represent; neither is advertised here.
 """
@@ -11,7 +11,13 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from cloud_platform.providers.errors import ProviderError, ProviderNotFound, ProviderOutcomeUnknown
-from cloud_platform.providers.vps_ports import VpsActionAccepted, VpsInfo, VpsReinstallImage
+from cloud_platform.providers.vps_ports import (
+    VpsActionAccepted,
+    VpsInfo,
+    VpsOneTimePassword,
+    VpsPasswordIssued,
+    VpsReinstallImage,
+)
 
 if TYPE_CHECKING:
     from cloud_platform.providers.hetzner.client import HetznerCloudProvider
@@ -78,6 +84,8 @@ class HetznerVpsManagement:
     No own transport, token, retry or close lifecycle. Callers must verify
     ownership and gate destructive actions before invoking these port methods.
     """
+
+    supports_customer_delete = True
 
     def __init__(self, provider: HetznerCloudProvider) -> None:
         self._provider = provider
@@ -204,7 +212,7 @@ class HetznerVpsManagement:
 
     async def reinstall_vps(
         self, provider_server_id: str, image_id: str, market_app_id: str | None = None
-    ) -> VpsActionAccepted:
+    ) -> VpsPasswordIssued:
         server_id = _server_id(provider_server_id)
         if market_app_id is not None:
             raise ProviderError("Hetzner market apps are not supported by reinstall")
@@ -218,7 +226,27 @@ class HetznerVpsManagement:
             "POST", f"/servers/{server_id}/actions/rebuild", json={"image": image_id}
         )
         _accepted(payload, server_id)
-        return VpsActionAccepted(server_id, "reinstall")
+        return VpsPasswordIssued(server_id, "reinstall", _issued_password(payload, required=False))
+
+    async def reset_vps_password(self, provider_server_id: str) -> VpsPasswordIssued:
+        """Reset Linux root password via qemu guest agent; return issued value once."""
+        server_id = _server_id(provider_server_id)
+        payload = await self._provider._mutation_request(
+            "POST", f"/servers/{server_id}/actions/reset_password"
+        )
+        _accepted(payload, server_id)
+        return VpsPasswordIssued(
+            server_id, "reset_password", _issued_password(payload, required=True)
+        )
+
+
+def _issued_password(payload: dict[str, Any], *, required: bool) -> VpsOneTimePassword | None:
+    password = payload.get("root_password")
+    if password is None and not required:
+        return None  # Hetzner can omit a password for SSH-key-based rebuilds.
+    if not isinstance(password, str) or not password.strip():
+        raise ProviderOutcomeUnknown("Hetzner action response lacks a valid root password")
+    return VpsOneTimePassword(password)
 
 
 def _accepted(payload: dict[str, Any], server_id: str) -> None:

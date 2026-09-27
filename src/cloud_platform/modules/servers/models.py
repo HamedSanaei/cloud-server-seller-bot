@@ -104,6 +104,7 @@ class ServerOperation(StrEnum):
     SNAPSHOT_RESTORE = "snapshot_restore"
     SNAPSHOT_DELETE = "snapshot_delete"
     REINSTALL = "reinstall"
+    DELETE = "delete"
     PASSWORD_RESET = "password_reset"  # pragma: allowlist secret
     IP_LIST = "ip_list"
     IP_SET_RDNS = "ip_set_rdns"
@@ -131,6 +132,7 @@ DESTRUCTIVE_SERVER_OPERATIONS: frozenset[ServerOperation] = frozenset(
         ServerOperation.SNAPSHOT_RESTORE,
         ServerOperation.SNAPSHOT_DELETE,
         ServerOperation.REINSTALL,
+        ServerOperation.DELETE,
         ServerOperation.PASSWORD_RESET,
         ServerOperation.IP_NULL_ROUTE,
         ServerOperation.ISO_ATTACH,
