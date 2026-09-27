@@ -68,7 +68,6 @@ from cloud_platform.modules.servers.models import (
     TrafficUsageView,
     format_bytes,
 )
-from cloud_platform.modules.servers.policies import ServerManagementPolicy
 from cloud_platform.modules.servers.service import (
     ServerAmbiguousOutcomeError,
     ServerConfirmationError,
@@ -364,7 +363,7 @@ class ServerManagementUi:
         rows: list[list[InlineKeyboardButton]] = []
         for index, view in enumerate(page.items, start=1):
             ref = await self._sessions.ref_for(user.id, view.server_id)  # type: ignore[arg-type]
-            blocks.append(self._list_block(index, view))
+            blocks.append(await self._list_block(index, view))
             blocks.append("")
             rows.append(
                 [
@@ -379,15 +378,33 @@ class ServerManagementUi:
         blocks.append(self._t.t("servers.list_header"))
         return BotScreen("\n".join(blocks).strip(), InlineKeyboardMarkup(inline_keyboard=rows))
 
-    def _list_block(self, index: int, view: CustomerServerView) -> str:
-        """One customer-friendly server block (unknown fields are omitted)."""
-        title = view.location_label or view.display_name or self._t.t("servers.unnamed")
+    async def _list_block(self, index: int, view: CustomerServerView) -> str:
+        """One readable server card; omit facts unavailable from the purchase."""
+        title = (
+            view.plan or view.display_name or view.location_label or self._t.t("servers.unnamed")
+        )
         lines = [self._t.t("servers.list_index", index=str(index), title=title)]
+        if view.provider_key:
+            lines.append(self._t.t("servers.list_provider", provider=view.provider_key.title()))
         if view.ip:
             lines.append(self._t.t("servers.list_ip", ip=view.ip))
         elif view.state is CustomerServerState.PROVISIONING:
             lines.append(self._t.t("servers.list_ip_pending"))
-        if view.operating_system:
+        cpu, ram = view.cpu, view.ram_gb
+        offer_id = view.offer_id
+        if offer_id is None and self._orders is not None:
+            order = await self._orders.get_by_server(view.server_id)
+            offer_id = order.offer_id if order is not None else None
+        if offer_id is not None and self._offers_repo is not None:
+            offer = await self._offers_repo.get(offer_id)
+            if offer is not None and offer.provider_key == view.provider_key:
+                cpu = cpu or offer.vcpu
+                ram = ram or offer.ram_gb
+        if cpu:
+            lines.append(self._t.t("servers.list_cpu", cpu=cpu))
+        if ram:
+            lines.append(self._t.t("servers.list_ram", ram=ram))
+        if view.operating_system and view.operating_system != title:
             lines.append(self._t.t("servers.list_os", os=view.operating_system))
         lines.append(self._t.t("servers.list_state", state=self._state(view.state)))
         return "\n".join(lines)
@@ -534,8 +551,7 @@ class ServerManagementUi:
 
     async def _manage_screen(self, user: User, ref: str, view: CustomerServerView) -> BotScreen:
         """Spec §1: the ⚙️ مدیریت سرور submenu, built from the policy."""
-        policy = self._mgmt.policy
-        allowed = self._allowed_operations(view, policy)
+        allowed = await self._mgmt.available_operations(user.id, view.server_id)  # type: ignore[arg-type]
         rows: list[list[InlineKeyboardButton]] = []
 
         def add(screen: str, key: str, *extra: str) -> None:
@@ -593,37 +609,6 @@ class ServerManagementUi:
             ]
         )
         return BotScreen(text, InlineKeyboardMarkup(inline_keyboard=rows))
-
-    def _allowed_operations(
-        self, view: CustomerServerView, policy: ServerManagementPolicy
-    ) -> set[ServerOperation]:
-        """The operations the policy exposes for THIS server right now.
-
-        Derived from the customer state (so ``START`` disappears while the
-        server runs) plus the operator policy. Provider capability is checked
-        again by the service before anything is called, so this is purely
-        presentational.
-        """
-        allowed: set[ServerOperation] = set()
-        if view.state is CustomerServerState.STOPPED:
-            allowed |= {ServerOperation.START, ServerOperation.REBOOT}
-        if view.state is CustomerServerState.RUNNING:
-            allowed |= {ServerOperation.STOP, ServerOperation.REBOOT}
-        for operation in (
-            ServerOperation.CONSOLE,
-            ServerOperation.TRAFFIC,
-            ServerOperation.SNAPSHOT_LIST,
-            ServerOperation.REINSTALL,
-            ServerOperation.PASSWORD_RESET,
-            ServerOperation.IP_LIST,
-            ServerOperation.ISO_LIST,
-            ServerOperation.MONITORING,
-            ServerOperation.RENAME,
-            ServerOperation.RENEW_NOW,
-            ServerOperation.AUTO_RENEW,
-        ):
-            allowed.add(operation)
-        return {op for op in allowed if policy.allows(op)}
 
     async def _refresh_screen(self, user: User, ref: str) -> BotScreen:
         """Spec §27: read-only reconciliation, then the refreshed details."""

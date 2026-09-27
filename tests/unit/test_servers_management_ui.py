@@ -17,6 +17,8 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 from cloud_platform.bot.servers_ui import ServerManagementUi
@@ -94,6 +96,7 @@ class FakeManagement:
     """
 
     policy: ServerManagementPolicy = field(default_factory=ServerManagementPolicy)
+    available: frozenset[ServerOperation] | None = None
     view: CustomerServerView = field(default_factory=_view)
     owner: UUID = CUSTOMER
     # NOTE: the data attributes are deliberately NOT named after the methods
@@ -186,6 +189,21 @@ class FakeManagement:
         if server_id != SERVER_ID:
             raise ServerNotFoundError("server not found")
         return self.view
+
+    async def available_operations(
+        self, customer_id: UUID, server_id: UUID
+    ) -> frozenset[ServerOperation]:
+        self._owned(customer_id)
+        if server_id != SERVER_ID:
+            raise ServerNotFoundError("server not found")
+        if self.available is not None:
+            return self.available
+        allowed = {op for op in ServerOperation if self.policy.allows(op)}
+        if self.view.state is not CustomerServerState.RUNNING:
+            allowed.discard(ServerOperation.STOP)
+        if self.view.state is not CustomerServerState.STOPPED:
+            allowed.discard(ServerOperation.START)
+        return frozenset(allowed)
 
     async def refresh_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         self._record("refresh_server", server_id=server_id)
@@ -432,6 +450,39 @@ class TestList:
         assert len(manage) == 1
         assert str(SERVER_ID) not in str(manage[0].callback_data)  # type: ignore[attr-defined]
 
+    async def test_list_shows_provider_ip_and_purchased_offer_specs(self) -> None:
+        offer_id = uuid4()
+        management = FakeManagement(
+            view=_view(provider_key="hetzner", offer_id=offer_id, cpu=None, ram_gb=None)
+        )
+        offers = SimpleNamespace(
+            get=AsyncMock(return_value=SimpleNamespace(provider_key="hetzner", vcpu=4, ram_gb=8))
+        )
+        ui, _, _ = make_ui(management, offers_repo=offers)
+        screen = await ui.list_screen(_user())
+
+        assert "Hetzner" in screen.text
+        assert "88.1.2.3" in screen.text
+        assert "4 هسته" in screen.text
+        assert "8 گیگابایت" in screen.text
+        offers.get.assert_awaited_once_with(offer_id)
+
+    async def test_monthly_order_offer_and_missing_specs(self) -> None:
+        offer_id = uuid4()
+        management = FakeManagement(view=_view(provider_key="leaseweb", ip=None))
+        orders = SimpleNamespace(
+            get_by_server=AsyncMock(return_value=SimpleNamespace(offer_id=offer_id))
+        )
+        offers = SimpleNamespace(
+            get=AsyncMock(return_value=SimpleNamespace(provider_key="leaseweb", vcpu=2, ram_gb=4))
+        )
+        ui, _, _ = make_ui(management, orders=orders, offers_repo=offers)
+        screen = await ui.list_screen(_user())
+        assert "Leaseweb" in screen.text
+        assert "2 هسته" in screen.text
+        assert "4 گیگابایت" in screen.text
+        assert "88.1.2.3" not in screen.text
+
     async def test_empty_list_points_at_the_storefront(self) -> None:
         management = FakeManagement()
         management.owner = CUSTOMER
@@ -474,6 +525,21 @@ class TestDetails:
         assert TRANSLATOR.t("servers.power_off") in labels
         assert TRANSLATOR.t("servers.reboot") in labels
         assert TRANSLATOR.t("servers.power_on") not in labels
+
+    async def test_manage_menu_hides_unsupported_provider_actions(self) -> None:
+        management = FakeManagement(
+            view=_view(provider_key="hetzner"),
+            available=frozenset(
+                {ServerOperation.STOP, ServerOperation.REBOOT, ServerOperation.REINSTALL}
+            ),
+        )
+        ui, _, _ = make_ui(management)
+        screen = await ui.handle(Callback("servers", "manage", (await _ref(ui),)), _user())
+        labels = [button.text for button in _buttons(screen)]  # type: ignore[attr-defined]
+        assert TRANSLATOR.t("servers.reinstall_button") in labels
+        assert TRANSLATOR.t("servers.power_off") in labels
+        assert TRANSLATOR.t("servers.snapshots_button") not in labels
+        assert TRANSLATOR.t("servers.ips_button") not in labels
 
     async def test_stopped_server_offers_start_not_stop(self) -> None:
         management = FakeManagement(view=_view(state=CustomerServerState.STOPPED))

@@ -243,6 +243,12 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
    a top-up action when the wallet is short; `پشتیبانی` shows the support
    contact. A market or provider with no enabled+priced offer is hidden, so
    an empty Iranian catalogue simply does not appear.
+   For Hetzner-owned hourly servers, the management menu exposes provider-backed
+   power and confirmed OS reinstall after the resource is attached and running.
+   The menu hides unsupported actions. Snapshot creation and Primary IP replacement
+   remain unavailable: both can incur separate charges, and customer price books,
+   wallet settlement, and safe reconciliation for those resources are not yet wired.
+   The management screen never allocates or replaces an IP implicitly.
 7. **Wallet funding** — manual for the MVP:
    `uv run python -m cloud_platform.cli users find <telegram_id>` then
    `uv run python -m cloud_platform.cli wallet credit <user_id> <minor> "<reason>"`

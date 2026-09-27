@@ -408,16 +408,18 @@ def parse_hourly_instance(
 
 
 def _instance_region(payload: dict[str, Any]) -> str:
-    """The location id from ``datacenter.location`` (never inferred)."""
+    """Use Hetzner's location object; reject conflicting location evidence."""
+    location = payload.get("location")
+    direct = str(location.get("name") or "").strip() if isinstance(location, dict) else ""
     datacenter = payload.get("datacenter")
-    if not isinstance(datacenter, dict):
+    nested = ""
+    if isinstance(datacenter, dict):
+        dc_location = datacenter.get("location")
+        if isinstance(dc_location, dict):
+            nested = str(dc_location.get("name") or "").strip()
+    if direct and nested and direct != nested:
         return ""
-    location = datacenter.get("location")
-    if isinstance(location, dict):
-        return str(location.get("name") or "").strip()
-    if isinstance(location, str):
-        return location.strip()
-    return ""
+    return direct or nested
 
 
 def _instance_addresses(payload: dict[str, Any]) -> tuple[str | None, str | None]:

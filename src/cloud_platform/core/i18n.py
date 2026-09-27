@@ -275,6 +275,9 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.auto_renew_unavailable": "ℹ️ تغییر تمدید خودکار برای این سرور در دسترس نیست.",  # noqa: RUF001
         "servers.unnamed": "سرور بدون نام",
         "servers.list_index": "{index}. {title}",
+        "servers.list_provider": "🏢 ارائه‌دهنده: {provider}",
+        "servers.list_cpu": "⚙️ پردازنده: {cpu} هسته",
+        "servers.list_ram": "🧠 رم: {ram} گیگابایت",
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 IP هنوز اختصاص نیافته",
         "servers.list_os": "💿 {os}",
@@ -673,6 +676,9 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.auto_renew_unavailable": "ℹ️ Auto-renew cannot be changed for this server.",  # noqa: RUF001
         "servers.unnamed": "Unnamed server",
         "servers.list_index": "{index}. {title}",
+        "servers.list_provider": "🏢 Provider: {provider}",
+        "servers.list_cpu": "⚙️ CPU: {cpu} cores",
+        "servers.list_ram": "🧠 RAM: {ram} GB",
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 no IP assigned yet",
         "servers.list_os": "💿 {os}",

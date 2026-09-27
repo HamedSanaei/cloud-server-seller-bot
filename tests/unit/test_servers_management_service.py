@@ -15,6 +15,7 @@ They assert the guarantees the spec calls out explicitly:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -414,6 +415,29 @@ class TestOwnership:
             await service.get_server(OTHER_CUSTOMER, SERVER_ID)
         with pytest.raises(ServerNotFoundError):
             await service.get_server(OTHER_CUSTOMER, uuid4())
+
+    async def test_menu_actions_require_owned_server_and_adapter_capability(self) -> None:
+        provider = FakeProvider()
+        provider.vps_management = SimpleNamespace(
+            get_vps_info=provider.get_vps_info,
+            list_vps_info=provider.list_vps_info,
+            start_vps=provider.start_vps,
+            stop_vps=provider.stop_vps,
+            reboot_vps=provider.reboot_vps,
+            list_vps_reinstall_images=provider.list_vps_reinstall_images,
+            reinstall_vps=provider.reinstall_vps,
+        )
+        service, *_ = make_service(provider=provider)
+        with pytest.raises(ServerNotFoundError):
+            await service.available_operations(OTHER_CUSTOMER, SERVER_ID)
+        allowed = await service.available_operations(CUSTOMER, SERVER_ID)
+        assert ServerOperation.REBOOT in allowed
+        assert ServerOperation.STOP in allowed
+        assert ServerOperation.REINSTALL in allowed
+        assert ServerOperation.SNAPSHOT_LIST not in allowed
+        assert ServerOperation.IP_LIST not in allowed
+        assert ServerOperation.PASSWORD_RESET not in allowed
+        assert provider.calls == []
 
     async def test_foreign_start_makes_no_provider_call(self) -> None:
         service, provider, power, *_ = make_service()

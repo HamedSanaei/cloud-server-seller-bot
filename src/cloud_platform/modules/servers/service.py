@@ -273,6 +273,25 @@ class ServerManagementService:
         server = await self._owned(customer_id, server_id)
         return await self._detail_view(server)
 
+    async def available_operations(
+        self, customer_id: UUID, server_id: UUID
+    ) -> frozenset[ServerOperation]:
+        """Provider- and ownership-aware actions for the management menu."""
+        server = await self._owned(customer_id, server_id)
+        context = await self._context(server)
+        capabilities = context.capabilities if context is not None else _NO_PROVIDER_CAPABILITIES
+        return frozenset(
+            operation
+            for operation in ServerOperation
+            if policies.operation_allowed(
+                operation,
+                policy=self._policy,
+                capabilities=capabilities,
+                state=server.state,
+            )
+            is None
+        )
+
     async def refresh_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         """Read-only refresh: provider state, IPs and image land on the row.
 
@@ -1183,7 +1202,8 @@ class ServerManagementService:
             )
         except KeyError:
             return None
-        return _ProviderContext(provider=provider, capabilities=vps_capabilities_of(provider))
+        management = getattr(provider, "vps_management", provider)
+        return _ProviderContext(provider=management, capabilities=vps_capabilities_of(management))
 
     async def _require(self, server: CloudServer, operation: ServerOperation) -> _ProviderContext:
         """The provider context, or the specific reason the operation is denied."""
@@ -1435,6 +1455,12 @@ class ServerManagementService:
                 )
         if info.image_name and not server.os:
             server.os = info.image_name
+        ipv4 = info.metadata.get("ipv4")
+        ipv6 = info.metadata.get("ipv6")
+        if isinstance(ipv4, str) and ipv4:
+            server.ipv4 = ipv4
+        if isinstance(ipv6, str) and ipv6:
+            server.ipv6 = ipv6
         await self._servers.save(server)
 
     async def _apply_provider_ips(self, server: CloudServer, context: _ProviderContext) -> None:
@@ -1478,6 +1504,8 @@ class ServerManagementService:
             server_id=server.id,
             state=policies.customer_state(server.state),
             display_name=server.os or None,
+            provider_key=server.provider_key,
+            offer_id=_offer_id_of(server),
             provider_display_name=_reference_of(server),
             location_code=_datacenter_of(server),
             location_label=_location_text(location),
@@ -1558,6 +1586,16 @@ def _reference_of(server: CloudServer) -> str | None:
     return getattr(server, "provider_reference", None) or None
 
 
+def _offer_id_of(server: CloudServer) -> UUID | None:
+    fingerprint = server.offer_fingerprint
+    if not isinstance(fingerprint, dict):
+        return None
+    try:
+        return UUID(str(fingerprint["offer_id"]))
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 def _plan_of(server: CloudServer) -> str | None:
     """The sellable plan name, when the platform recorded one."""
     return getattr(server, "plan_name", None) or None
@@ -1575,6 +1613,8 @@ def _with_refresh_error(view: CustomerServerView, error: str) -> CustomerServerV
         server_id=view.server_id,
         state=view.state,
         display_name=view.display_name,
+        provider_key=view.provider_key,
+        offer_id=view.offer_id,
         provider_display_name=view.provider_display_name,
         location_code=view.location_code,
         location_label=view.location_label,

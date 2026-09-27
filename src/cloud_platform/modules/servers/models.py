@@ -182,6 +182,8 @@ class CustomerServerView:
     server_id: UUID
     state: CustomerServerState
     display_name: str | None = None
+    provider_key: str | None = None
+    offer_id: UUID | None = None
     provider_display_name: str | None = None
     location_code: str | None = None
     location_label: str | None = None

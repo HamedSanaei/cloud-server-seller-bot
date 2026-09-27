@@ -486,11 +486,16 @@ def test_an_instance_without_a_lifecycle_status_still_normalizes() -> None:
     assert instance.status == ""
 
 
-def test_an_instance_with_a_flattened_location_is_not_trusted() -> None:
-    """Only the documented ``datacenter.location`` nest proves the region."""
-    payload = _server(location="fsn1")
-    payload.pop("datacenter")
-    assert hz.parse_hourly_instance(payload) is None
+def test_top_level_location_object_proves_the_region_without_datacenter() -> None:
+    payload = _server(datacenter=None, location={"id": 1, "name": "fsn1"})
+    instance = hz.parse_hourly_instance(payload)
+    assert instance is not None
+    assert instance.region == "fsn1"
+
+
+def test_conflicting_or_flattened_location_is_not_trusted() -> None:
+    assert hz.parse_hourly_instance(_server(location={"name": "nbg1"})) is None
+    assert hz.parse_hourly_instance(_server(datacenter=None, location="fsn1")) is None
 
 
 def test_an_instance_without_addresses_still_normalizes() -> None:
