@@ -9,15 +9,17 @@ methods are patched at the class level.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.types import CallbackQuery, Chat, Message, Update
 from aiogram.types import User as TelegramUser
 
-from cloud_platform.bot.main import register_handlers
+from cloud_platform.bot.main import _send_ssh_password, register_handlers
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.ui import BotUi
 from cloud_platform.modules.navigation.domain import Callback, encode_callback
@@ -76,6 +78,62 @@ def _message(text: str, *, user_id: int = 10, username: str | None = None) -> Me
         from_user=TelegramUser(id=user_id, is_bot=False, first_name="T", username=username),
         text=text,
     )
+
+
+def test_ssh_password_reveal_requires_private_chat_and_acks_after_send(
+    _patch_outgoing: dict[str, AsyncMock],
+) -> None:
+    claim_id, server_id = uuid4(), uuid4()
+    secret = MagicMock(claim_id=claim_id)
+    secret.username = "root"
+    secret.reveal.return_value = "provider-issued-test-value"
+    ui = MagicMock(spec=MonthlyBotUi)
+    ui.claim_ssh_password = AsyncMock(return_value=(server_id, secret))
+    ui.finish_ssh_password = AsyncMock(return_value=True)
+    user = MagicMock(id=uuid4())
+    query = CallbackQuery(
+        id="ssh",
+        from_user=TelegramUser(id=10, is_bot=False, first_name="T"),
+        chat_instance="ci",
+        message=Message(message_id=4, date=1, chat=Chat(id=10, type="private")),
+    )
+    asyncio.run(_send_ssh_password(query, ui, user, "owned-ref"))
+    assert "provider-issued-test-value" in _patch_outgoing["answer"].await_args.args[0]
+    assert _patch_outgoing["answer"].await_args.kwargs["protect_content"] is True
+    ui.finish_ssh_password.assert_awaited_once_with(user, server_id, claim_id, delivered=True)
+
+    ui.claim_ssh_password.reset_mock()
+    group_query = CallbackQuery(
+        id="group",
+        from_user=TelegramUser(id=10, is_bot=False, first_name="T"),
+        chat_instance="ci",
+        message=Message(message_id=5, date=1, chat=Chat(id=-100, type="supergroup")),
+    )
+    asyncio.run(_send_ssh_password(group_query, ui, user, "owned-ref"))
+    ui.claim_ssh_password.assert_not_awaited()
+
+
+def test_ssh_delivery_failure_releases_secret_for_retry(
+    _patch_outgoing: dict[str, AsyncMock],
+) -> None:
+    claim_id, server_id = uuid4(), uuid4()
+    secret = MagicMock(claim_id=claim_id)
+    secret.username = "root"
+    secret.reveal.return_value = "provider-issued-test-value"
+    ui = MagicMock(spec=MonthlyBotUi)
+    ui.claim_ssh_password = AsyncMock(return_value=(server_id, secret))
+    ui.finish_ssh_password = AsyncMock(return_value=True)
+    _patch_outgoing["answer"].side_effect = RuntimeError("send unavailable")
+    user = MagicMock(id=uuid4())
+    query = CallbackQuery(
+        id="failed-send",
+        from_user=TelegramUser(id=10, is_bot=False, first_name="T"),
+        chat_instance="ci",
+        message=Message(message_id=6, date=1, chat=Chat(id=10, type="private")),
+    )
+    asyncio.run(_send_ssh_password(query, ui, user, "owned-ref"))
+    ui.finish_ssh_password.assert_awaited_once_with(user, server_id, claim_id, delivered=False)
+    assert "provider-issued-test-value" not in str(_patch_outgoing["ack"].await_args)
 
 
 def test_start_command_shows_greeting_plus_menu(

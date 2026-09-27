@@ -126,12 +126,39 @@ order_os_only_free = true
 contract_term = "1_MONTH"
 billing_cycle = "1_MONTH"
 # Hourly cloud: how long ONE definitive provider account-capacity refusal
-# (Leaseweb PC-2031 "Customer limit reached") keeps that credential out of
-# NEW-order publication. Leaseweb publishes no quota endpoint, so capacity is
-# learned from a refusal; the window is bounded so one refusal can never disable
-# an account permanently, and the catalog sync re-probes once it expires.
-# Existing servers, orders and reconciliation are never affected. Minimum 60.
+# (Leaseweb PC-2031 "Customer limit reached") is treated as FRESH evidence.
+# Leaseweb publishes no quota endpoint, so capacity is only learned from a
+# refusal. While the refusal is fresh the account is `limit_reached`; after the
+# window elapses it becomes `unknown_after_limit` and STILL takes no NEW orders
+# — expiry removes freshness, never the fact that recovery is unproven. Only
+# positive proof restores `healthy`: a real order the provider ACCEPTED during
+# an automatic canary window, or the manual emergency override
+# (`leaseweb cloud accounts override-clear --account <id>`) after provider
+# instances were actually freed. Existing servers, orders and reconciliation
+# are never affected by this state. Minimum 60.
 cloud_account_limit_ttl_seconds = 3600
+# --- Automatic capacity recovery (LEASEWEB-MULTIACCOUNT) -------------------
+# Normal recovery needs NO operator action. A read-only controller keeps each
+# account's instance baseline, brings the next attempt window forward when an
+# instance disappears (or an app-owned instance is deleted), and spends
+# EXACTLY ONE real customer order as a canary — serialized by a durable
+# PostgreSQL lease. A provider ACCEPTANCE proves recovery; another PC-2031
+# backs off exponentially. No synthetic/billable probe server is ever created.
+cloud_capacity_recovery_enabled = true
+# Controller cadence in seconds (hour-dividing minute sets only; anything else
+# falls back to 3 minutes).
+cloud_capacity_recovery_interval_seconds = 180
+# Exponential backoff between canary attempts, in seconds. The LAST value is
+# the permanent cap. Defaults: 15m, 30m, 1h, 2h, then every 6h.
+cloud_capacity_recovery_backoff_seconds = [900, 1800, 3600, 7200, 21600]
+# How long ONE in-flight canary order holds the durable lease before it expires
+# on its own. Minimum 60.
+cloud_capacity_canary_lease_seconds = 900
+# Operator reminder cadence while an account stays blocked: the first card
+# `delay` seconds after the refusal, then every `interval` seconds. Cards are
+# deduplicated by the durable outbox, so a controller re-run never re-sends.
+cloud_capacity_outage_reminder_delay_seconds = 1800
+cloud_capacity_outage_reminder_interval_seconds = 21600
 
 # --- Multiple Leaseweb credential accounts (LEASEWEB-MULTIACCOUNT) ----------
 # A Leaseweb API key / Sales Organization only sees a narrow set of locations,
@@ -199,6 +226,21 @@ display_name = "Hetzner"
 api_token = "CHANGE_ME"
 base_url = "https://api.hetzner.cloud/v1"
 
+# Hetzner monthly VPS and Cloud hourly share one provider but use separate
+# offer families. Keep disabled on a staging/production-shared config: enabling
+# here enables BOTH deployments. First isolate staging configuration and run
+# `python -m cloud_platform.cli hetzner cloud doctor` (read-only). An HTTP 401
+# means the configured Cloud project token cannot authenticate; no live
+# inventory or sellability can then be verified. Diagnostics never create,
+# delete, or change provider resources and never print the credential.
+[providers.hetzner.families.vps]
+billing_model = "prepaid_monthly_fixed"
+display_name = "وی‌پی‌اس"
+
+[providers.hetzner.families.cloud]
+billing_model = "hourly"
+display_name = "کلود"
+
 # Commercial product families (STOREFRONT-REWORK): one provider can sell
 # more than one product type. Each family names its billing model
 # ("prepaid_monthly_fixed" or "hourly") and its customer-facing product
@@ -261,6 +303,15 @@ markup_percent = 25
 auto_publish = true
 
 [storefront.pricing.hetzner]
+mode = "markup"
+markup_percent = 25
+auto_publish = true
+
+# Cloud hourly is priced from the official per-location price_hourly.gross.
+# price_monthly.gross is a provider COST cap, not a customer selling price;
+# the bot shows a 730-hour customer estimate, not a monthly flat fee or cap.
+# This family-specific policy overrides the monthly Hetzner VPS policy.
+[storefront.pricing."hetzner.hourly"]
 mode = "markup"
 markup_percent = 25
 auto_publish = true

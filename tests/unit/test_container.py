@@ -55,3 +55,38 @@ async def test_close_container():
     # After closing, next get_container should create new instance
     container = await get_container()
     assert container is not None
+
+
+@pytest.mark.asyncio
+async def test_hetzner_hourly_adapter_is_configured_only_when_enabled(monkeypatch):
+    from types import SimpleNamespace
+
+    from cloud_platform.core import container as container_module
+
+    container = create_container()
+    monkeypatch.setattr(
+        container_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            providers_enabled={"hetzner": False},
+            hetzner_api_token="fixture-token",
+            hetzner_api_base_url="https://api.hetzner.cloud/v1",
+            leaseweb_api_key="",
+        ),
+    )
+    assert "hetzner" not in container.hourly_cloud_providers()
+
+    monkeypatch.setattr(
+        container_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            providers_enabled={"hetzner": True},
+            hetzner_api_token="fixture-token",
+            hetzner_api_base_url="https://api.hetzner.cloud/v1",
+            leaseweb_api_key="",
+        ),
+    )
+    adapter = container.hourly_cloud_providers()["hetzner"]
+    assert container.hourly_cloud_resolver().adapter_for("hetzner", None) is adapter
+    assert container.hourly_cloud_resolver().adapter_for("hetzner", "other-account") is None
+    await container.close()

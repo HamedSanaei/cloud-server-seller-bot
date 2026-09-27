@@ -182,6 +182,8 @@ class CustomerServerView:
     server_id: UUID
     state: CustomerServerState
     display_name: str | None = None
+    provider_key: str | None = None
+    offer_id: UUID | None = None
     provider_display_name: str | None = None
     location_code: str | None = None
     location_label: str | None = None
@@ -200,6 +202,7 @@ class CustomerServerView:
     contract_ends_at: str | None = None
     next_renewal_at: datetime | None = None
     refresh_error: str | None = None
+    failure_reason: str | None = None
     #: True when the local row is authoritative for identity but the provider
     #: state could not be read (provider down / not yet provisioned).
     state_from_provider: bool = False

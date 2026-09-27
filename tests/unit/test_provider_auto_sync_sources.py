@@ -129,6 +129,25 @@ class TestHetznerSource:
         assert report.persisted == 2
         assert report.verified == frozenset({("cx22", "fsn1")})
 
+    async def test_hourly_failure_does_not_change_monthly_success(self) -> None:
+        syncer = _hetzner_syncer()
+        syncer.sync_offers.side_effect = [
+            OfferSyncResult(
+                locations=(LocationOfferReport("fsn1", 1),),
+                offers_written=1,
+                marked_unavailable=0,
+                warnings=(),
+                verified=frozenset({("cx22", "fsn1")}),
+            ),
+            RuntimeError("hourly endpoint unreadable"),
+        ]
+        monthly = await HetznerCatalogSyncSource(syncer).sync_catalog()
+        hourly = await HetznerCatalogSyncSource(syncer, billing_model="hourly").sync_catalog()
+        assert monthly.ok and monthly.billing_model == "prepaid_monthly_fixed"
+        assert monthly.verified == frozenset({("cx22", "fsn1")})
+        assert not hourly.ok and hourly.billing_model == "hourly"
+        assert any("hourly endpoint unreadable" in error for error in hourly.errors)
+
     async def test_location_sync_failure_fails_the_run(self) -> None:
         report = await HetznerCatalogSyncSource(
             _hetzner_syncer(locations=RuntimeError("auth"))

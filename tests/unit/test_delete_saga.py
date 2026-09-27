@@ -34,6 +34,7 @@ from cloud_platform.providers.base import ProviderServer
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderNotFound,
+    ProviderOutcomeUnknown,
     ProviderUnavailable,
 )
 from cloud_platform.providers.waiter import WaitOutcome, WaitResult
@@ -435,6 +436,34 @@ class TestSagaSteps:
         assert fakes.final.calls == []  # no billing before confirmed absence
         actions = [c.args[0].action for c in fakes.audit.append.call_args_list]
         assert "server.delete_requeued" in actions
+
+    async def test_ambiguous_delete_requires_read_only_absence_before_final_charge(self) -> None:
+        class ProbeWaiter:
+            async def wait_for(self, probe):
+                observed = await probe()
+                return WaitResult(
+                    WaitOutcome.COMPLETED
+                    if observed.state.value == "completed"
+                    else WaitOutcome.TIMEOUT,
+                    1,
+                    0.1,
+                    observed.detail,
+                )
+
+        absent = _FakeProvider(delete_error=ProviderOutcomeUnknown("ambiguous"))
+        absent.absent = True
+        fakes = Fakes(server=_server(), provider=absent, waiter=ProbeWaiter())
+        result = await fakes.make_service().request(USER_ID, SERVER_ID, IK)
+        assert result.server.state is ServerLifecycleState.DELETED
+        assert absent.get_calls == 1
+        assert len(fakes.final.calls) == 1
+
+        present = _FakeProvider(delete_error=ProviderOutcomeUnknown("ambiguous"))
+        fakes = Fakes(server=_server(), provider=present, waiter=ProbeWaiter())
+        result = await fakes.make_service().request(USER_ID, SERVER_ID, IK)
+        assert result.requeued is True
+        assert result.server.state is ServerLifecycleState.DELETING
+        assert fakes.final.calls == []
 
     async def test_permanent_provider_error_fails(self) -> None:
         server = _server()

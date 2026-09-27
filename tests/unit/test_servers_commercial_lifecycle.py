@@ -163,9 +163,23 @@ class FakeServerRepo:
         return self.rows.get(server_id)
 
     async def list_by_user_paged(
-        self, user_id: UUID, *, offset: int, limit: int
+        self,
+        user_id: UUID,
+        *,
+        offset: int,
+        limit: int,
+        hide_failed_before: datetime | None = None,
     ) -> tuple[list[CloudServer], int]:
         owned = [s for s in self.rows.values() if s.user_id == user_id]
+        if hide_failed_before is not None:
+            owned = [
+                s
+                for s in owned
+                if s.state is not ServerLifecycleState.ERROR
+                or s.provider_server_id is not None
+                or (s.updated_at or s.created_at or datetime.max.replace(tzinfo=UTC))
+                > hide_failed_before
+            ]
         return owned[offset : offset + limit], len(owned)
 
     async def save(self, server: CloudServer) -> CloudServer:
@@ -514,6 +528,16 @@ class FakeManagement:
     async def get_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         await self._owned(customer_id)
         return self.view
+
+    async def available_operations(
+        self, customer_id: UUID, server_id: UUID
+    ) -> frozenset[ServerOperation]:
+        await self._owned(customer_id)
+        return frozenset(op for op in ServerOperation if self.policy.allows(op))
+
+    async def has_ssh_password(self, customer_id: UUID, server_id: UUID) -> bool:
+        await self._owned(customer_id)
+        return False
 
     async def refresh_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         await self._owned(customer_id)

@@ -10,7 +10,7 @@ import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -36,7 +36,12 @@ from cloud_platform.modules.catalog.repository import (
     provider_key_to_uuid,
 )
 from cloud_platform.modules.catalog.service import PricingIngestionService
-from cloud_platform.modules.offers.domain import OfferSpecUpdate, TechnicalSpec
+from cloud_platform.modules.offers.domain import (
+    BILLING_MODEL_HOURLY,
+    BILLING_MODEL_MONTHLY,
+    OfferSpecUpdate,
+    TechnicalSpec,
+)
 from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 from cloud_platform.providers.errors import (
     ProviderAuthError,
@@ -46,13 +51,17 @@ from cloud_platform.providers.errors import (
     ProviderRateLimited,
     ProviderUnavailable,
 )
+from cloud_platform.providers.hetzner import hourly
 
 logger = logging.getLogger(__name__)
 
-#: Hetzner's identity and billing currency. Provider metadata, not prices —
-#: all price values are ingested from the API payload (M04-005).
 PROVIDER_KEY = "hetzner"
-CURRENCY = "EUR"
+
+#: Hetzner's identity and billing currency. Provider metadata, not prices —
+#: all price values are ingested from the API payload (M04-005). Defined with
+#: the hourly parser so there is ONE currency constant, re-exported here for
+#: the existing importers (``client``).
+CURRENCY = hourly.CURRENCY
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,7 +225,8 @@ class HetznerCatalogSyncer:
         """Upsert locations to the provider_locations table. Returns (upserted, skipped).
 
         Country/city/network-zone come from the provider payload (M08-002);
-        the row is keyed by (provider, location_id) so the sync is idempotent.
+        new rows use the provider's location NAME; numeric legacy rows remain
+        untouched for existing contracts that reference the old location id.
         """
         if not locations_data:
             return 0, 0
@@ -228,14 +238,13 @@ class HetznerCatalogSyncer:
             provider_id = await self._resolve_provider_id(session)
 
             for item in locations_data:
-                loc_id = str(item["id"])
+                loc_id = str(item["name"])
                 stmt = select(ProviderLocation).where(
                     ProviderLocation.provider_id == provider_id,
                     ProviderLocation.location_id == loc_id,
                 )
                 result = await session.execute(stmt)
                 existing = result.scalars().first()
-
                 country = _normalize_country(item.get("country"))
                 city = str(item.get("city") or "").strip() or None
                 network_zone = str(item.get("network_zone") or "").strip() or None
@@ -451,23 +460,16 @@ class HetznerCatalogSyncer:
 
     # --- Sellable-offer sync (the customer-facing price book) ---
 
-    async def sync_offers(self) -> OfferSyncResult:
-        """Turn real Hetzner server types into ``SellableOffer`` rows.
+    async def sync_offers(self, billing_model: str = BILLING_MODEL_MONTHLY) -> OfferSyncResult:
+        """Persist one Hetzner billing line without touching the other.
 
-        For every location the provider reports, the LOCATION-SCOPED list
-        endpoint (``/server_types?location=...``) is authoritative: each server
-        type it returns with a monthly price at that location becomes one
-        offer, identified by ``(provider, product, location)``. A location that
-        fails is isolated — its offers are left untouched rather than being
-        marked unavailable — while every other location still syncs.
-
-        Provider cost is recorded as integer minor units parsed from the
-        provider's Decimal string (never float, never hard-coded).
-        ``enabled`` and ``selling_price_minor`` are NEVER written here: the
-        operator owns both, so a newly discovered server type arrives switched
-        off and unpriced. Nothing is ever deleted — a server type or location
-        that stops being offered is marked provider-unavailable.
+        Location-scoped ``/server_types`` is the sole membership and pricing
+        source. An incomplete location is never treated as evidence of removal.
+        Operator prices and publication settings belong to the offer repository,
+        not this provider observation.
         """
+        if billing_model not in (BILLING_MODEL_MONTHLY, BILLING_MODEL_HOURLY):
+            raise ValueError("unsupported Hetzner billing model")
         repo = SqlAlchemySellableOfferRepository(
             self._session_factory,
             catalog_currency=self._catalog_currency,
@@ -498,12 +500,26 @@ class HetznerCatalogSyncer:
             counted = 0
             location_failed = False
             for item in items:
-                spec = _offer_spec_from_hetzner(item, location_id)
-                if spec is None:
-                    warnings.append(
-                        f"{location_id}: server type {item.get('name')} has no monthly price"
-                    )
-                    continue
+                if billing_model == BILLING_MODEL_HOURLY:
+                    parsed = hourly.parse_hourly_plan(item, location_id)
+                    if isinstance(parsed, hourly.HetznerHourlyRejection):
+                        warnings.append(
+                            f"{location_id}: server type {parsed.plan_id}: {parsed.reason}"
+                        )
+                        if parsed.reason not in (
+                            hourly.REASON_DEPRECATED,
+                            hourly.REASON_UNAVAILABLE_AT_LOCATION,
+                        ):
+                            location_failed = True
+                        continue
+                    spec = _hourly_offer_spec(parsed)
+                else:
+                    spec = _offer_spec_from_hetzner(item, location_id)
+                    if spec is None:
+                        warnings.append(
+                            f"{location_id}: server type {item.get('name')} has no monthly price"
+                        )
+                        continue
                 try:
                     await repo.upsert_from_provider(
                         provider_key=PROVIDER_KEY,
@@ -531,7 +547,7 @@ class HetznerCatalogSyncer:
                 LocationOfferReport(
                     location_id=location_id,
                     products=counted,
-                    error="persistence failure" if location_failed else None,
+                    error="incomplete observation" if location_failed else None,
                 )
             )
 
@@ -539,8 +555,10 @@ class HetznerCatalogSyncer:
         # partial view of the catalog must not retire offers we simply could
         # not look at this round.
         marked = 0
-        if not any(report.error for report in reports) and locations:
-            marked = await repo.mark_unavailable(PROVIDER_KEY, available)
+        if not any(report.error for report in reports) and not location_errors and locations:
+            marked = await repo.mark_unavailable(
+                PROVIDER_KEY, available, billing_model=billing_model
+            )
         else:
             warnings.append("skipped mark_unavailable: current availability unreadable")
 
@@ -554,7 +572,7 @@ class HetznerCatalogSyncer:
         )
 
     async def probe_locations(self) -> tuple[list[str], list[str]]:
-        """READ-ONLY: the locations this credential can see (ids, errors)."""
+        """READ-ONLY: the locations this credential can see (names, errors)."""
         return await self._offer_locations()
 
     async def probe_server_types(self, location_id: str) -> list[dict[str, Any]]:
@@ -562,7 +580,7 @@ class HetznerCatalogSyncer:
         return await self._server_types_at(location_id)
 
     async def _offer_locations(self) -> tuple[list[str], list[str]]:
-        """Every location id the credential can see (paginated, isolated)."""
+        """Every location name the credential can see (paginated, isolated)."""
         found: list[str] = []
         errors: list[str] = []
         page = 1
@@ -577,7 +595,11 @@ class HetznerCatalogSyncer:
             data = payload.get("locations", [])
             if not data:
                 break
-            found.extend(str(item["id"]) for item in data if item.get("id"))
+            found.extend(
+                str(item.get("name") or item.get("id"))
+                for item in data
+                if item.get("name") or item.get("id")
+            )
             next_page = ((payload.get("meta") or {}).get("pagination") or {}).get("next_page")
             if not isinstance(next_page, int) or next_page <= page:
                 break
@@ -614,16 +636,6 @@ def _int_or_none(value: str | None) -> int | None:
         return None
 
 
-def _decimal_or_none(value: Any) -> Decimal | None:
-    """Parse a provider price string into a Decimal, or None if absent."""
-    if value is None or isinstance(value, (bool, float)):
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    return Decimal(text)
-
-
 @dataclass(frozen=True, slots=True)
 class _OfferSpec:
     """One server type at one location, ready to be written to the price book."""
@@ -639,10 +651,15 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
     without a provider price there is nothing safe to sell, so the caller
     records a warning instead of inventing one.
     """
-    monthly_exact = _monthly_exact_for_location(item, location_id)
-    monthly = _monthly_minor_for_location(item, location_id)
-    if monthly is None or monthly_exact is None:
+    if bool(item.get("deprecated", False)) or item.get("deprecation"):
         return None
+    if hourly._location_availability(item, location_id) is False:
+        return None
+    price_entry, _ = hourly._location_price_entry(item, location_id)
+    monthly_exact = _monthly_value(price_entry) if price_entry is not None else None
+    if monthly_exact is None:
+        return None
+    monthly = hourly.minor_units(monthly_exact)
     # The server type NAME is the stable, human-meaningful provider reference
     # an operator can match against the Hetzner console (and the provider
     # accepts it wherever an id is accepted).
@@ -656,9 +673,11 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
         update=OfferSpecUpdate(
             name=name,
             vcpu=int(item.get("cores") or 0),
-            ram_gb=_memory_gb(item.get("memory")),
+            ram_gb=hourly.memory_gb(item.get("memory")),
             disk_gb=int(item.get("disk") or 0),
-            traffic=_traffic_label(item.get("included_traffic")),
+            traffic=hourly.traffic_label(
+                price_entry.get("included_traffic", item.get("included_traffic"))
+            ),
             provider_cost_minor=monthly,
             provider_cost_currency=CURRENCY,
             technical_metadata=TechnicalSpec(
@@ -667,6 +686,7 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
                 storage_type=str(storage_type) if storage_type else None,
                 deprecated=bool(item.get("deprecated", False)),
             ).to_metadata(),
+            billing_model=BILLING_MODEL_MONTHLY,
             billing_parameters={
                 "contract_term": "1_MONTH",
                 "billing_cycle": "1_MONTH",
@@ -681,54 +701,40 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
     )
 
 
-def _monthly_exact_for_location(item: dict[str, Any], location_id: str) -> Decimal | None:
-    """Return the provider's exact monthly gross value for a location."""
-    raw_prices = [raw for raw in item.get("prices", []) if isinstance(raw, dict)]
-    for raw in raw_prices:
-        declared = str(raw.get("location") or raw.get("location_name") or "")
-        if declared == location_id:
-            return _monthly_value(raw)
-    if len(raw_prices) == 1:
-        return _monthly_value(raw_prices[0])
-    return None
-
-
-def _monthly_minor_for_location(item: dict[str, Any], location_id: str) -> int | None:
-    """Provider monthly price at one location, as integer minor units.
-
-    The provider's Decimal STRING is scaled to minor units — never parsed as
-    float, never rounded implicitly.
-    """
-    raw_prices = [raw for raw in item.get("prices", []) if isinstance(raw, dict)]
-    for raw in raw_prices:
-        declared = str(raw.get("location") or raw.get("location_name") or "")
-        if declared != location_id:
-            continue
-        return _monthly_minor(raw)
-    # A location-scoped request can return a single already-filtered price.
-    if len(raw_prices) == 1:
-        return _monthly_minor(raw_prices[0])
-    return None
+def _hourly_offer_spec(plan: hourly.HetznerHourlyPlan) -> _OfferSpec:
+    """Keep the provider's hourly RATE and independent monthly CAP as cost facts."""
+    return _OfferSpec(
+        product_id=plan.plan_id,
+        update=OfferSpecUpdate(
+            name=plan.plan_id,
+            vcpu=plan.vcpu,
+            ram_gb=plan.ram_gb,
+            disk_gb=plan.disk_gb,
+            traffic=plan.traffic,
+            provider_cost_minor=plan.hourly_cost_minor,
+            provider_cost_currency=plan.currency,
+            billing_model=BILLING_MODEL_HOURLY,
+            technical_metadata=TechnicalSpec(
+                architecture=plan.architecture,
+                cpu_type=plan.cpu_type,
+                storage_type=plan.storage_type,
+            ).to_metadata(),
+            billing_parameters={
+                "provider_hourly_rate": plan.hourly_rate_exact,
+                "provider_monthly_rate": plan.monthly_rate_exact,
+                "provider_monthly_cost_minor": plan.monthly_cap_minor,
+                "hourly_price_source": "server_types.location",
+                "server_type_id": plan.server_type_id,
+                "location": plan.location_id,
+            },
+        ),
+    )
 
 
 def _monthly_value(raw: dict[str, Any]) -> Decimal | None:
-    gross = (raw.get("monthly") or {}).get("gross")
-    if gross is None or isinstance(gross, (bool, float)):
-        return None
-    try:
-        value = Decimal(str(gross))
-    except (InvalidOperation, ValueError):
-        return None
-    if value <= 0 or not value.is_finite():
-        return None
+    """Read the official monthly gross through the shared price parser."""
+    value, _reason = hourly._gross_decimal(raw, hourly.MONTHLY_PRICE_KEY)
     return value
-
-
-def _monthly_minor(raw: dict[str, Any]) -> int | None:
-    value = _monthly_value(raw)
-    if value is None or isinstance(value, (bool, float)):
-        return None
-    return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _normalize_country(value: Any) -> str | None:
@@ -744,36 +750,6 @@ def _normalize_country(value: Any) -> str | None:
     return code
 
 
-def _memory_gb(value: Any) -> int:
-    """Hetzner reports memory in GB as a decimal string ("4.0") -> integer GB."""
-    if value is None:
-        return 0
-    try:
-        return int(Decimal(str(value)).to_integral_value(rounding=ROUND_HALF_UP))
-    except (InvalidOperation, ValueError):
-        return 0
-
-
-def _traffic_label(value: Any) -> str | None:
-    """Included traffic (bytes, provider-reported) -> display label.
-
-    Rendered in binary terabytes, the unit the provider itself uses for
-    included traffic, from Decimal arithmetic only.
-    """
-    if value is None or isinstance(value, (bool, float)):
-        return None
-    try:
-        total = Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
-    if total <= 0:
-        return None
-    terabytes = total / (Decimal(2) ** 40)
-    if terabytes == terabytes.to_integral_value():
-        return f"{int(terabytes)} TB"
-    return f"{terabytes.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)} TB"
-
-
 def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:
     """Map one Hetzner /server_types entry to provider-neutral PlanPricing.
 
@@ -785,12 +761,16 @@ def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:
         if not isinstance(raw, dict):
             continue
         location_id = str(raw.get("location") or raw.get("location_name") or "unknown")
+        hourly_cost = hourly._gross_decimal(raw, hourly.HOURLY_PRICE_KEY)[0]
+        monthly_cost = hourly._gross_decimal(raw, hourly.MONTHLY_PRICE_KEY)[0]
+        if hourly_cost is None and monthly_cost is None:
+            continue
         prices.append(
             ProviderPriceEntry(
                 location_id=location_id,
                 currency=CURRENCY,
-                hourly=_decimal_or_none((raw.get("hourly") or {}).get("gross")),
-                monthly=_decimal_or_none((raw.get("monthly") or {}).get("gross")),
+                hourly=hourly_cost,
+                monthly=monthly_cost,
             )
         )
 

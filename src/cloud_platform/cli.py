@@ -763,12 +763,11 @@ async def hetzner_sync_offers() -> int:
 
 
 async def hetzner_doctor() -> DoctorResult:
-    """Read-only Hetzner pre-flight: credentials, catalog and storefront.
+    """Read-only Hetzner *monthly VPS* pre-flight: credentials and storefront.
 
-    Answers, without mutating anything, WHY the Hetzner storefront is empty:
-    is the token configured, does the API answer, which locations does this
-    token see, does each location offer server types, and which offer gate is
-    still closed. Counts and class names only — never a token, never a price.
+    Reports only prepaid-monthly offers; hourly Cloud has its own independent
+    ``hetzner cloud doctor`` and must never make monthly readiness green.
+    Counts and class names only — never a token, never a price.
     """
     from cloud_platform.db.session import SessionFactory
     from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
@@ -815,10 +814,10 @@ async def hetzner_doctor() -> DoctorResult:
         rows = [
             row
             for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
-            if row.provider_key == "hetzner"
+            if row.provider_key == "hetzner" and row.billing_model == "prepaid_monthly_fixed"
         ]
-        counts = _offer_gate_counts(rows)
-        lines.append("Storefront gates: " + _visibility_line("customer-visible", counts))
+        counts = _offer_gate_counts(rows, settings.fx_catalog_pricing_currency.strip().upper())
+        lines.append("Monthly VPS storefront gates: " + _visibility_line("offers", counts))
         if not counts["sellable"]:
             ok = False
             lines.append(
@@ -828,6 +827,174 @@ async def hetzner_doctor() -> DoctorResult:
             )
     except Exception as exc:
         lines.append(f"[WARN] offer rows unavailable ({type(exc).__name__})")
+    return DoctorResult(ok, lines)
+
+
+async def hetzner_cloud_doctor() -> DoctorResult:
+    """Read-only hourly pre-flight: official catalog reads and isolated offer gates.
+
+    Never invokes catalog sync, provisioning, or a provider mutation. An
+    unreadable API or price book is unknown, not proof of missing inventory.
+    Only hourly Hetzner rows count toward Cloud readiness; monthly VPS rows
+    cannot make the Cloud family appear ready.
+    """
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.catalog.image_compatibility import (
+        image_architecture_conflict,
+        image_compatible,
+    )
+    from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+    from cloud_platform.modules.offers.domain import is_sellable_in_currency
+    from cloud_platform.modules.offers.repository import (
+        SqlAlchemyCatalogSyncStateRepository,
+        SqlAlchemySellableOfferRepository,
+    )
+    from cloud_platform.providers.errors import ProviderAuthError
+    from cloud_platform.providers.hetzner.hourly import HetznerHourlyCloudProvider
+
+    settings = get_settings()
+    lines = ["Hetzner Cloud hourly doctor (read-only)"]
+    ok = True
+    if not settings.providers_enabled.get("hetzner", False):
+        lines.append("[WARN] Hetzner provider disabled; neither family is customer-visible")
+        ok = False
+    families = settings.provider_families.get("hetzner", {})
+    if not any(attrs.get("billing_model") == "hourly" for attrs in families.values()):
+        lines.append("[WARN] no configured Hetzner Cloud hourly family")
+        ok = False
+    policies = pricing_policies_from_settings(settings)
+    policy = policies.get("hetzner.hourly") or policies.get("hetzner")
+    if policy is None:
+        lines.append("[WARN] no hourly pricing policy; provider costs cannot auto-publish")
+        lines.append('  action: configure [storefront.pricing."hetzner.hourly"]')
+        ok = False
+    else:
+        source = "hetzner.hourly" if "hetzner.hourly" in policies else "hetzner"
+        lines.append(
+            f"pricing policy: {source} (auto_publish={'yes' if policy.auto_publish else 'no'})"
+        )
+        if not policy.auto_publish:
+            ok = False
+
+    if not settings.hetzner_api_token:
+        lines.append("[WARN] Hetzner Cloud token not configured; live catalog not checked")
+        ok = False
+    else:
+        from collections import Counter
+
+        rejection_counts: Counter[str] = Counter()
+        image_architectures: Counter[str] = Counter()
+        type_ids: set[str] = set()
+        pair_count = 0
+        image_ids: set[str] = set()
+        provider = HetznerHourlyCloudProvider(
+            token=settings.hetzner_api_token, base_url=settings.hetzner_api_base_url
+        )
+        try:
+            try:
+                locations = await provider.read_locations()
+            except ProviderAuthError:
+                lines.append(
+                    "[FAIL] Hetzner Cloud API rejected the configured token (HTTP 401/403)"
+                )
+                ok = False
+            except Exception as exc:
+                lines.append(f"[WARN] live locations unreadable ({type(exc).__name__})")
+                ok = False
+            else:
+                lines.append(f"live locations: {len(locations)}")
+                if not locations:
+                    ok = False
+                for location in locations:
+                    # Location identifiers originate from the provider; print
+                    # counts only, never raw payloads or exception messages.
+                    try:
+                        read = await provider.read_instance_types(location.id)
+                        images = await provider.list_images(location.id)
+                    except ProviderAuthError:
+                        lines.append(
+                            "  [FAIL] Hetzner Cloud API rejected the configured token "
+                            "(HTTP 401/403)"
+                        )
+                        ok = False
+                        continue
+                    except Exception as exc:
+                        lines.append(
+                            f"  location catalog unreadable ({type(exc).__name__}); "
+                            "existing offers remain unverified"
+                        )
+                        ok = False
+                        continue
+                    type_ids.update(plan.plan_id for plan in read.plans)
+                    pair_count += len(read.plans)
+                    rejection_counts.update(item.reason for item in read.rejected)
+                    image_ids.update(image.id for image in images)
+                    image_architectures.update(image.architecture for image in images)
+                    compatible_types = sum(
+                        any(
+                            image_compatible(image, plan_id=plan.plan_id, location_id=location.id)
+                            and not image_architecture_conflict(image, plan.architecture)
+                            for image in images
+                        )
+                        for plan in read.plans
+                    )
+                    lines.append(
+                        f"  location: priced available types={len(read.plans)} "
+                        f"rejected={len(read.rejected)} installable images={len(images)} "
+                        f"types with compatible images={compatible_types}"
+                    )
+                    if not compatible_types:
+                        ok = False
+                lines.append(
+                    f"live server types: {len(type_ids)}, "
+                    f"proven type/location pairs: {pair_count}, system images: {len(image_ids)}"
+                )
+                lines.append(f"image architectures: {dict(sorted(image_architectures.items()))}")
+                lines.append(f"rejected pairs by reason: {dict(sorted(rejection_counts.items()))}")
+        finally:
+            await provider.aclose()
+
+    try:
+        rows = [
+            row
+            for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+            if row.provider_key == "hetzner" and row.billing_model == "hourly"
+        ]
+        states = {
+            state.provider_key: state
+            for state in await SqlAlchemyCatalogSyncStateRepository(SessionFactory).list_all()
+        }
+    except Exception as exc:
+        lines.append(f"[WARN] hourly catalog state unreadable ({type(exc).__name__})")
+        return DoctorResult(False, lines)
+    currency = settings.fx_catalog_pricing_currency.strip().upper()
+    counts = _offer_gate_counts(rows, currency)
+    lines.append(f"hourly offers stored: {len(rows)}")
+    lines.append("hourly storefront gates: " + _visibility_line("offers", counts))
+    lines.append(
+        f"hourly sellable in {currency}: "
+        f"{sum(1 for row in rows if is_sellable_in_currency(row, currency))}"
+    )
+    state = states.get("hetzner.hourly")
+    if state is None or state.last_attempted_at is None:
+        lines.append("hourly catalog sync: never recorded")
+    else:
+        last_success = state.last_success_at.isoformat() if state.last_success_at else "never"
+        lines.append(
+            f"hourly catalog sync: last attempt {state.last_attempted_at.isoformat()}, "
+            f"last success {last_success}"
+        )
+        lines.append(
+            f"  discovered={state.discovered} persisted={state.persisted} "
+            f"priced={state.prices_updated} published={state.published} retired={state.retired}"
+        )
+        lines.append(f"  last sync warnings={len(state.warnings)} errors={len(state.errors)}")
+    if not counts["sellable"]:
+        ok = False
+        lines.append(
+            "[WARN] Cloud hourly is not on sale; check read-only catalog auto-sync doctor "
+            "and offers doctor (monthly VPS rows do not count)"
+        )
     return DoctorResult(ok, lines)
 
 
@@ -2190,18 +2357,22 @@ async def leaseweb_cloud_doctor() -> int:
             print(f"  account {account.account_id}: Public Cloud ACCESSIBLE")
             print(f"    regions: {len(capability.regions)}")
             for region_id, type_count in sorted(capability.regions):
-                # Image read status is per-region, from the OWNING account.
+                # One verdict per region, from the OWNING account, using the
+                # SAME evidence rule the catalog sync and checkout use: the
+                # global image catalog is display-only and must never be
+                # reported as "this account can serve the region".
                 try:
                     provider = cloud_router.client_for(account.account_id)
-                    images = await provider.list_images(region_id)
+                    verdict = await _region_image_verdict(provider, region_id)
                     print(
                         f"    region {region_id}: {type_count} instance type(s), "
-                        f"{len(images)} image(s) readable"
+                        f"image capability {verdict.state.value}: {verdict.safe_note()}"
                     )
                 except Exception as exc:
                     print(
                         f"    region {region_id}: {type_count} instance type(s), "
-                        f"images unreadable ({type(exc).__name__})"
+                        f"image capability inconclusive ({type(exc).__name__}): "
+                        "routing keeps the last proven state"
                     )
         else:
             reason = _cloud_unavailable_reason(capability)
@@ -2306,6 +2477,50 @@ async def leaseweb_cloud_doctor() -> int:
     return 0
 
 
+async def _cloud_sellable_offer_count() -> int:
+    """Read-only count of hourly Cloud offers a customer can buy right now.
+
+    Uses the SAME sellability rule as the storefront (canonical currency +
+    valid provenance + publication state), so a metric can never claim an
+    offer the customer cannot check out. Returns 0 when the price book cannot
+    be read: metrics are informational and must never crash a diagnostic.
+    """
+    try:
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.offers.domain import is_sellable_in_currency
+        from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
+
+        currency = str(get_settings().fx_catalog_pricing_currency).strip().upper()
+        rows = await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+        return sum(
+            1
+            for row in rows
+            if str(getattr(row, "billing_model", "") or "") == "hourly"
+            and is_sellable_in_currency(row, currency)
+        )
+    except Exception:
+        return 0
+
+
+async def _capacity_storefront_metrics(
+    capacity_repo: Any | None, *, sellable_offers: int
+) -> dict[str, Any]:
+    """Read-only capacity/storefront metrics shared by the doctor and readiness.
+
+    Returns an empty map when the capacity rows are unavailable: metrics are
+    informational and must never turn a diagnostic command into a crash.
+    """
+    if capacity_repo is None:
+        return {}
+    try:
+        from cloud_platform.modules.provider_capacity.status import capacity_status
+
+        records = await capacity_repo.list_for_provider("leaseweb")
+        return dict(capacity_status("leaseweb", records, sellable_offers=sellable_offers).metrics())
+    except Exception:
+        return {}
+
+
 def _cloud_capacity_repository() -> Any | None:
     """Open the durable per-account capacity store (None when unavailable).
 
@@ -2323,7 +2538,88 @@ def _cloud_capacity_repository() -> Any | None:
         return None
 
 
-async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = None) -> int:
+async def _region_image_verdict(provider: Any, region_id: str) -> Any:
+    """The capability verdict for one region, from the provider itself.
+
+    Uses the adapter's single region-image implementation when it exists so
+    the doctor cannot disagree with the catalog sync and checkout; legacy
+    adapters (tests/doubles) keep working through the plain image read.
+    """
+    reader = getattr(provider, "region_images_verdict", None)
+    if callable(reader):
+        return await reader(region_id)
+
+    class _LegacyVerdict:
+        def __init__(self, count: int) -> None:
+            from cloud_platform.providers.leaseweb.cloud import RegionImagesState
+
+            self.state = RegionImagesState.PROVEN if count else RegionImagesState.EMPTY
+            self._count = count
+
+        def safe_note(self) -> str:
+            return f"region-scoped read: {self._count} usable image(s)"
+
+    return _LegacyVerdict(len(await provider.list_images(region_id)))
+
+
+async def _leaseweb_cloud_accounts_reconcile(
+    capacity_repo: Any | None, *, dry_run: bool = False
+) -> int:
+    """Recover historical capacity refusals into the durable store.
+
+    Read-only against the provider (it never calls it at all): the evidence is
+    the platform's own failed create operations, and the classification is the
+    audited Leaseweb capacity classifier. Idempotent, so re-running is safe.
+    """
+    if capacity_repo is None:
+        print("error: capacity store unavailable; nothing was reconciled")
+        return 1
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.provider_capacity.reconciliation import (
+        CapacityReconciliationService,
+    )
+    from cloud_platform.providers.leaseweb.capacity_evidence import (
+        SqlAlchemyHistoricalCapacityEvidenceSource,
+    )
+
+    service = CapacityReconciliationService(
+        capacity_repo=capacity_repo,
+        evidence_source=SqlAlchemyHistoricalCapacityEvidenceSource(SessionFactory),
+        ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
+    )
+    if dry_run:
+        source = SqlAlchemyHistoricalCapacityEvidenceSource(SessionFactory)
+        try:
+            evidence = await source.failed_capacity_evidence("leaseweb")
+        except Exception as exc:
+            print(f"error: historical evidence unreadable ({type(exc).__name__})")
+            return 1
+        print(f"capacity reconcile (dry run): {len(evidence)} provable refusal(s)")
+        for item in evidence:
+            print(
+                f"  {item.source_ref}: account={item.credential_account_id} "
+                f"code={item.error_code or '-'} correlationId={item.correlation_id or '-'} "
+                f"observed_at={item.observed_at.isoformat() if item.observed_at else '-'}"
+            )
+        return 0
+    try:
+        report = await service.run("leaseweb")
+    except Exception as exc:
+        print(f"error: capacity reconciliation failed ({type(exc).__name__})")
+        return 1
+    print(f"capacity reconcile: {report.summary()}")
+    for account_id, state in report.applied:
+        print(f"  applied: account={account_id} state={state}")
+    for source_ref in report.already_recorded:
+        print(f"  already recorded: {source_ref}")
+    for source_ref in report.failed:
+        print(f"  failed: {source_ref}")
+    return 0
+
+
+async def leaseweb_cloud_accounts(
+    action: str = "doctor", account: str | None = None, dry_run: bool = False
+) -> int:
     """Read-only per-account hourly-Cloud capacity / eligibility diagnostics.
 
     Answers, per credential account and without ever printing a secret:
@@ -2337,10 +2633,26 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
       provider error code of the last refusal (e.g. ``PC-2031``), its
       correlation id, and when the signal stops applying.
 
-    ``clear --account <id>`` marks one account eligible for new orders again
-    (the recorded refusal evidence is kept for diagnostics) — this is how an
-    operator re-probes after freeing provider capacity. Nothing here places,
-    retries or cancels a provider order, and no existing resource is touched.
+    NORMAL recovery is automatic and needs no operator action: a read-only
+    controller keeps the account's instance baseline, brings the next attempt
+    window forward when an instance is freed (or a local delete happens), and
+    spends exactly ONE real customer order as a canary, serialized by a durable
+    PostgreSQL lease. An accepted order proves recovery; another ``PC-2031``
+    backs off exponentially. This command shows that state (attempts, next
+    window, baseline, in-flight canary).
+
+    ``clear --account <id>`` / ``override-clear --account <id>`` is the
+    EMERGENCY OVERRIDE only: it marks one account eligible again immediately
+    (the recorded refusal evidence is kept for diagnostics) when the operator
+    has already freed provider capacity and does not want to wait for the next
+    canary window. An ELAPSED cooling window is reported as
+    ``unknown-after-limit`` and is deliberately NOT eligible, because time
+    passing is not proof that provider capacity returned.
+
+    ``reconcile [--dry-run]`` recovers refusals that were only ever recorded as
+    historical provider-operation failures (idempotent, no provider call, no
+    credential material). Nothing here places, retries or cancels a provider
+    order, and no existing resource is touched.
     """
     from cloud_platform.providers.leaseweb.cloud_accounts import (
         build_cloud_account_router,
@@ -2361,7 +2673,7 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
     if capacity_repo is None:
         print("[WARN] capacity store unavailable; capacity reported as UNKNOWN")
 
-    if action == "clear":
+    if action in ("clear", "override-clear"):
         target = str(account or "").strip()
         if not target:
             print("error: clear requires --account <credential account id>")
@@ -2383,6 +2695,11 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
             f"(previous refusals recorded: {record.observations}); "
             "it is eligible for NEW orders again"
         )
+        print(
+            "note: this is the MANUAL EMERGENCY OVERRIDE. Normal recovery is "
+            "automatic (instance baseline + one canary order + backoff) and "
+            "needs no operator action."
+        )
         return 0
 
     records: dict[str, Any] = {}
@@ -2392,6 +2709,21 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
                 records[record.credential_account_id] = record
         except Exception as exc:
             print(f"[WARN] capacity state unreadable ({type(exc).__name__})")
+
+    if action == "reconcile":
+        return await _leaseweb_cloud_accounts_reconcile(capacity_repo, dry_run=dry_run)
+
+    history: dict[str, tuple[Any, ...]] = {}
+    if capacity_repo is not None:
+        try:
+            for account_id in {definition.account_id for definition in accounts} | set(records):
+                events = await capacity_repo.list_events(
+                    "leaseweb", credential_account_id=account_id, limit=5
+                )
+                if events:
+                    history[account_id] = tuple(events)
+        except Exception as exc:
+            print(f"[WARN] capacity history unreadable ({type(exc).__name__})")
 
     print(f"leaseweb cloud accounts ({len(accounts)} configured)")
     limit_reached: list[str] = []
@@ -2439,35 +2771,117 @@ async def leaseweb_cloud_accounts(action: str = "doctor", account: str | None = 
             + (str(region_count) if region_count is not None else "unknown")
         )
         print(f"  instances currently held: {instances}")
+        if capability is not None and capability.accessible:
+            # Per-region capability verdict: the SAME evidence rule the catalog
+            # sync and checkout use. A rejected region filter is reported as
+            # "unserved" with its reason instead of being hidden behind a global
+            # image count, so this view can never claim a capability the sync
+            # denies.
+            for region_id, _types in sorted(capability.regions):
+                try:
+                    verdict = await _region_image_verdict(provider, region_id)
+                except Exception as exc:
+                    print(
+                        f"  region {region_id}: image capability inconclusive "
+                        f"({type(exc).__name__}) - routing keeps the last proven state"
+                    )
+                    continue
+                print(
+                    f"  region {region_id}: image capability {verdict.state.value} "
+                    f"({verdict.safe_note()})"
+                )
 
         record = records.get(account_id)
         if record is None:
             print("  capacity: healthy (never observed)")
             continue
-        if record.is_limit_reached():
+        if record.state.value == "recovery_candidate":
+            print(
+                "  capacity: RECOVERY CANDIDATE - one real order may prove "
+                "recovery now (single canary, durable lease)"
+            )
+        elif record.is_limit_reached():
             reference = record.observed_at.isoformat() if record.observed_at else "-"
             expires = record.expires_at.isoformat() if record.expires_at else "-"
+            blocked = record.blocked_reason() or "limit-reached"
             print(
-                f"  capacity: LIMIT-REACHED ({record.error_code or 'provider limit'}) "
-                "- no NEW orders are published through this account"
+                f"  capacity: NOT ELIGIBLE for NEW orders ({blocked}, "
+                f"{record.error_code or 'provider limit'})"
             )
-            print(f"    last refusal: {reference}; applies until {expires}")
+            print(f"    refusal observed: {reference}; cooling window ended: {expires}")
             print(f"    correlationId: {record.correlation_id or '-'}")
             print(f"    affected: {record.location_id or '-'} / {record.product_id or '-'}")
+            if blocked == "unknown-after-limit":
+                # The whole point of the state: elapsed time is NOT recovery.
+                print(
+                    "    recovery unproven: the cooling window elapsed without any "
+                    "positive evidence that provider capacity returned"
+                )
             limit_reached.append(account_id)
         else:
+            print(f"  capacity: healthy (refusals recorded: {record.observations})")
+        if record.error_code or record.recovery_attempts:
+            print(f"  recovery attempts so far: {record.recovery_attempts}")
+        if record.baseline_instance_count is not None:
             print(
-                f"  capacity: healthy (refusals recorded: {record.observations}"
-                + ("; signal expired" if record.state.value == "limit_reached" else "")
-                + ")"
+                "  recovery baseline: "
+                f"{record.baseline_instance_count} instance(s) observed "
+                f"{record.baseline_observed_at.isoformat() if record.baseline_observed_at else '-'}"
             )
+        if record.next_recovery_attempt_at is not None:
+            print(
+                f"  next automatic recovery window: {record.next_recovery_attempt_at.isoformat()}"
+            )
+        if record.canary_lease_held():
+            lease_ends = (
+                record.canary_lease_expires_at.isoformat()
+                if record.canary_lease_expires_at is not None
+                else "-"
+            )
+            print(
+                "  canary order in flight (ref "
+                f"{record.canary_lease_ref or '-'}, lease ends {lease_ends})"
+            )
+        if record.outage_notified_at is not None:
+            print(
+                "  operator feed: outage card sent "
+                f"{record.outage_notified_at.isoformat()}"
+                + (
+                    f"; last reminder {record.last_reminder_at.isoformat()}"
+                    if record.last_reminder_at is not None
+                    else ""
+                )
+            )
+        for event in history.get(account_id, ()):
+            print(
+                f"    evidence {event.kind.value}: "
+                f"{event.created_at.isoformat() if event.created_at else '-'} "
+                f"state={event.state.value} code={event.error_code or '-'} "
+                f"correlationId={event.correlation_id or '-'} "
+                f"source={event.source_ref or 'live'}"
+            )
+
+    metric_values = await _capacity_storefront_metrics(
+        capacity_repo, sellable_offers=await _cloud_sellable_offer_count()
+    )
+    if metric_values:
+        print()
+        print("storefront capacity metrics (leaseweb):")
+        for name, value in metric_values.items():
+            print(f"  {name}: {value}")
 
     print()
     if limit_reached:
         print("result: NEW hourly orders are NOT published through: " + ", ".join(limit_reached))
         print(
-            "action: free capacity on the provider account (or wait for the "
-            "configured TTL), then run 'leaseweb cloud accounts clear --account <id>'"
+            "action: NO operator action is required — automatic canary recovery "
+            "keeps probing (instance inventory/base deletion + exponential "
+            "backoff) and restores publication once a real order is accepted."
+        )
+        print(
+            "  emergency override only: 'leaseweb cloud accounts "
+            "override-clear --account <id>' after you already freed provider "
+            "capacity; an elapsed cooling window alone does NOT restore eligibility"
         )
         return 1
     print("result: every configured account may receive NEW hourly orders")
@@ -2579,7 +2993,11 @@ async def leaseweb_cloud_create_preview(
     try:
         try:
             types = await provider.list_instance_types(region)
-            images = await provider.list_images(region)
+            # A create preview must use the SAME region-scoped image evidence a
+            # real create would: the global catalog is display-only and must
+            # never make an unserved region look installable.
+            images_reader = getattr(provider, "installable_images", None) or provider.list_images
+            images = await images_reader(region)
         except Exception as exc:
             print(f"error: provider catalog unreadable ({type(exc).__name__})")
             return 1
@@ -3196,11 +3614,14 @@ async def offers_readiness() -> int:
     stored: dict[str, int] = {}
     sellable: dict[str, int] = {}
     operator_disabled: dict[str, int] = {}
+    cloud_sellable = 0
     for row in rows:
         key = str(row.provider_key)
         stored[key] = stored.get(key, 0) + 1
         if is_sellable_in_currency(row, catalog_currency):
             sellable[key] = sellable.get(key, 0) + 1
+            if str(getattr(row, "billing_model", "") or "") == "hourly":
+                cloud_sellable += 1
         if getattr(row, "operator_disabled", False):
             operator_disabled[key] = operator_disabled.get(key, 0) + 1
 
@@ -3271,6 +3692,61 @@ async def offers_readiness() -> int:
             f"{provider_key}: {total} stored offer(s) but ZERO sellable in "
             f"{catalog_currency} (none has a canonical currency plus valid FX provenance)"
         )
+
+    # Provider totals alone are insufficient for multi-family providers:
+    # one healthy monthly VPS must not mask a stranded hourly Cloud family.
+    # Keep first-start behavior unchanged: a never-run family sync is a
+    # warning, whereas a recorded discovery with zero persisted rows fails.
+    for provider_key, families in settings.provider_families.items():
+        if provider_key not in served or catalog is None:
+            continue
+        if catalog.market_of(provider_key) is None or not catalog.is_enabled(provider_key):
+            continue
+        for family_key, attrs in families.items():
+            billing = attrs.get("billing_model")
+            if billing not in ("hourly", "prepaid_monthly_fixed"):
+                continue
+            if f"{provider_key}.{billing}" not in policies and provider_key not in policies:
+                continue
+            family_rows = [
+                row
+                for row in rows
+                if row.provider_key == provider_key and row.billing_model == billing
+            ]
+            family_sellable = sum(
+                1 for row in family_rows if is_sellable_in_currency(row, catalog_currency)
+            )
+            label = f"{provider_key}.{family_key} ({billing})"
+            if family_sellable:
+                lines.append(
+                    f"[OK  ] {label}: {family_sellable} sellable of {len(family_rows)} stored"
+                )
+            elif not family_rows:
+                state_key = f"{provider_key}.hourly" if billing == "hourly" else provider_key
+                state = states.get(state_key)
+                discovered = int(getattr(state, "discovered", 0) or 0)
+                if discovered:
+                    failures.append(f"{label}: discovered {discovered} plan(s) but stored none")
+                else:
+                    lines.append(f"[WARN] {label}: no stored offers yet")
+            elif all(getattr(row, "operator_disabled", False) for row in family_rows):
+                lines.append(f"[WARN] {label}: all offers operator-disabled")
+            else:
+                failures.append(
+                    f"{label}: {len(family_rows)} stored offer(s) but ZERO sellable in "
+                    f"{catalog_currency}"
+                )
+
+    # CAPACITY/STOREFRONT METRICS (LEASEWEB-MULTIACCOUNT): a provider can have
+    # sellable rows yet be temporarily closed because every credential account
+    # is out of capacity. These counters make that state explicit; they are
+    # informational — the gate above still owns pass/fail.
+    for name, value in (
+        await _capacity_storefront_metrics(
+            _cloud_capacity_repository(), sellable_offers=cloud_sellable
+        )
+    ).items():
+        print(f"[INFO] {name}: {value}")
 
     for line in lines:
         print(line)
@@ -3635,6 +4111,111 @@ async def renewals_check() -> int:
 # ---------------------------------------------------------------------------
 
 
+def _age_text(moment: Any) -> str:
+    """Human age of a stored timestamp (naive DB values are read as UTC)."""
+    from datetime import UTC, datetime
+
+    if moment is None:
+        return "none"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    seconds = max(0, int((datetime.now(UTC) - moment).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h"
+
+
+async def business_log_doctor() -> DoctorResult:
+    """Read-only: the operator Telegram feed's durable outbox state.
+
+    Reports whether the feed is configured and ACTIVE (enabled AND a chat id
+    present), the per-status counts of ``business_log_events``, the age of the
+    oldest undelivered event, the last successful delivery and the most
+    recent stored (already sanitized) delivery error. Never prints a chat id,
+    a bot token, a provider key or an event payload: a doctor run must be safe
+    to paste into an issue.
+    """
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.businesslog.domain import (
+        STATUS_ABANDONED,
+        STATUS_PENDING,
+        STATUS_RETRY,
+        STATUS_SENDING,
+        STATUS_SENT,
+        BusinessLogPolicy,
+    )
+    from cloud_platform.modules.businesslog.repository import (
+        SqlAlchemyBusinessLogRepository,
+    )
+
+    policy = BusinessLogPolicy.from_settings(get_settings())
+    lines: list[str] = []
+    ok = True
+
+    def report(name: str, passed: bool, detail: str = "") -> None:
+        nonlocal ok
+        ok = ok and passed
+        mark = "OK " if passed else "FAIL"
+        lines.append(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+
+    report("Logger enabled", policy.enabled, "[telegram.logger] enabled")
+    report(
+        "Chat configured",
+        bool(policy.chat_id),
+        "chat id present (value never printed)" if policy.chat_id else "chat id is missing",
+    )
+    if not policy.active:
+        report(
+            "Active policy",
+            False,
+            "enabled=false or no chat id: every business event is dropped",
+        )
+        return DoctorResult(ok=False, lines=lines)
+    report("Active policy", True, "durable outbox → Telegram dispatcher")
+    try:
+        snapshot = await SqlAlchemyBusinessLogRepository(SessionFactory).operator_snapshot()
+    except Exception as exc:
+        report("Outbox readable", False, f"{type(exc).__name__}: {exc}")
+        return DoctorResult(ok=False, lines=lines)
+    report("Outbox readable", True, "business_log_events")
+    counts = snapshot.counts
+    for status in (STATUS_PENDING, STATUS_SENDING, STATUS_RETRY, STATUS_SENT, STATUS_ABANDONED):
+        lines.append(f"      {status.lower():<9} {counts.get(status, 0)}")
+    outstanding_statuses = (STATUS_PENDING, STATUS_SENDING, STATUS_RETRY)
+    outstanding = sum(counts.get(status, 0) for status in outstanding_statuses)
+    lines.append(
+        "      oldest outstanding: "
+        + (_age_text(snapshot.oldest_outstanding_at) if outstanding else "none")
+    )
+    lines.append("      last sent: " + _age_text(snapshot.last_sent_at))
+    last_error = snapshot.last_error or "none"
+    lines.append(f"      last delivery error: {last_error[:300]}")
+    report(
+        "No abandoned events",
+        counts.get(STATUS_ABANDONED, 0) == 0,
+        f"{counts.get(STATUS_ABANDONED, 0)} event(s) were never delivered",
+    )
+    if counts.get(STATUS_PENDING, 0) and counts.get(STATUS_SENT, 0) == 0:
+        # A feed that has never delivered anything but has pending rows is the
+        # signature of a dispatcher that is not running (or cannot reach
+        # Telegram) — worth calling out explicitly.
+        report("Dispatcher delivering", False, "pending events exist but none was ever sent")
+    # Capacity/storefront context is INFORMATIONAL here: an empty Cloud
+    # storefront must never make the LOGGER doctor fail (the capacity doctor
+    # owns that verdict), but the operator reading this report wants to know
+    # whether an outage is what the feed is about to report.
+    for name, value in (
+        await _capacity_storefront_metrics(
+            _cloud_capacity_repository(), sellable_offers=await _cloud_sellable_offer_count()
+        )
+    ).items():
+        lines.append(f"      {name}: {value}")
+    return DoctorResult(ok=ok, lines=lines)
+
+
 def _parser() -> argparse.ArgumentParser:
     from cloud_platform.modules.markets.domain import MARKET_ORDER
 
@@ -3652,6 +4233,12 @@ def _parser() -> argparse.ArgumentParser:
     htz_sub = htz.add_subparsers(dest="subcommand", required=True)
     htz_sub.add_parser("doctor", help="read-only pre-flight diagnostics")
     htz_sub.add_parser("sync-offers", help="refresh the sellable-offer price book")
+    htz_cloud = htz_sub.add_parser("cloud", help="Hetzner Cloud hourly diagnostics")
+    htz_cloud_sub = htz_cloud.add_subparsers(dest="hetzner_cloud", required=True)
+    htz_cloud_sub.add_parser("doctor", help="read-only hourly locations, types, images and offers")
+    htz_hourly = htz_sub.add_parser("hourly", help="Hetzner hourly diagnostics")
+    htz_hourly_sub = htz_hourly.add_subparsers(dest="hetzner_cloud", required=True)
+    htz_hourly_sub.add_parser("doctor", help="read-only hourly locations, types, images and offers")
 
     accounts = lsw_sub.add_parser("accounts", help="read-only credential accounts")
     accounts_sub = accounts.add_subparsers(dest="leaseweb_accounts", required=True)
@@ -3684,19 +4271,28 @@ def _parser() -> argparse.ArgumentParser:
     lsw_cloud_sub.add_parser("doctor", help="read-only regions/types/images per region")
     lsw_cloud_accounts = lsw_cloud_sub.add_parser(
         "accounts",
-        help="read-only per-account capacity state (doctor | clear)",
+        help="read-only per-account capacity state (doctor | override-clear | reconcile)",
     )
     lsw_cloud_accounts.add_argument(
         "action",
         nargs="?",
-        choices=["doctor", "clear"],
+        choices=["doctor", "clear", "override-clear", "reconcile"],
         default="doctor",
-        help="doctor reports; clear marks one account eligible again (keeps evidence)",
+        help=(
+            "doctor reports the automatic recovery state; clear/override-clear "
+            "is the MANUAL EMERGENCY override; reconcile recovers historical "
+            "refusals from failed operations (idempotent)"
+        ),
     )
     lsw_cloud_accounts.add_argument(
         "--account",
         default=None,
-        help="credential account id (required by 'clear')",
+        help="credential account id (required by 'clear'/'override-clear')",
+    )
+    lsw_cloud_accounts.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="reconcile: print the provable historical refusals without applying them",
     )
     lsw_cloud_catalog = lsw_cloud_sub.add_parser(
         "catalog", help="read-only normalized hourly catalog"
@@ -3812,6 +4408,12 @@ def _parser() -> argparse.ArgumentParser:
         "doctor", help="read-only: compare the real config with the canonical template"
     )
 
+    business_log = sub.add_parser("business-log", help="operator Telegram feed diagnostics")
+    business_log_sub = business_log.add_subparsers(dest="subcommand", required=True)
+    business_log_sub.add_parser(
+        "doctor", help="read-only: outbox status, oldest pending, last delivery error"
+    )
+
     users = sub.add_parser("users")
     users_sub = users.add_subparsers(dest="subcommand", required=True)
     find = users_sub.add_parser("find")
@@ -3915,7 +4517,9 @@ async def _dispatch(args: argparse.Namespace) -> int:
             if args.leaseweb_cloud == "doctor":
                 return await leaseweb_cloud_doctor()
             if args.leaseweb_cloud == "accounts":
-                return await leaseweb_cloud_accounts(args.action, args.account)
+                return await leaseweb_cloud_accounts(
+                    args.action, args.account, dry_run=bool(getattr(args, "dry_run", False))
+                )
             if args.leaseweb_cloud == "catalog":
                 return await leaseweb_cloud_catalog(args.region)
             if args.leaseweb_cloud == "create-preview":
@@ -3954,6 +4558,10 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return 0 if result.ok else 1
         if args.subcommand == "sync-offers":
             return await hetzner_sync_offers()
+        if args.subcommand in {"cloud", "hourly"} and args.hetzner_cloud == "doctor":
+            result = await hetzner_cloud_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
         print(f"unknown hetzner subcommand {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "offers":
@@ -3983,6 +4591,13 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.subcommand == "doctor":
             return await config_doctor()
         print(f"unknown command config {args.subcommand}")  # pragma: no cover
+        return 2
+    if args.command == "business-log":
+        if args.subcommand == "doctor":
+            result = await business_log_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
+        print(f"unknown command business-log {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "catalog":
         if args.subcommand == "auto-sync" and args.subsubcommand == "doctor":

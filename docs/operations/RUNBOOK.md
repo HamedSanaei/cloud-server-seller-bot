@@ -176,6 +176,31 @@ sequence on any environment (local, staging, VPS via `./platform.sh`):
 (M10-005), cost circuit breaker (M10-004), per-user freeze with resource
 containment (M10-007), and the game-day drill (M16-008).
 
+## Hetzner hourly Cloud catalog and activation
+
+Hetzner's monthly VPS and hourly Cloud offers share the provider server type
+and named location (for example, `cx22`/`fsn1`), but have separate
+`billing_model` identities and pricing. The periodic `catalog_auto_sync` runs
+the two billing families independently; a failed hourly observation does not
+retire monthly offers. Hourly provider costs use the exact
+`price_hourly.gross` fact, while `price_monthly.gross` is retained as a
+provider-cost cap, **not** a customer billing cap. Customer monthly amounts
+shown during hourly checkout are estimates.
+
+Check `python -m cloud_platform.cli hetzner hourly doctor` and
+`python -m cloud_platform.cli offers readiness` before enabling the provider.
+The doctor makes read-only API calls and prints aggregate inventory, image
+architectures, offer gates, and last sync diagnostics; it never creates or
+deletes a server. A valid Hetzner credential and a completed automatic catalog
+cycle are prerequisites for any sellable hourly offer. Do not enable Hetzner
+after an authentication failure.
+
+The active staging lane and manual main release currently mount the **same**
+server-owned `configuration.toml` and poll the same bot token. There is no
+staging-only Hetzner `enabled` switch in this topology. Do not flip that
+shared flag under a staging-only authorization; arrange isolated configuration
+or explicit authorization for the shared environment first.
+
 ## Monthly Leaseweb VPS storefront (LEASEWEB-MVP)
 
 The MVP sells fixed-price **prepaid monthly** Leaseweb VPS products
@@ -218,6 +243,26 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
    a top-up action when the wallet is short; `پشتیبانی` shows the support
    contact. A market or provider with no enabled+priced offer is hidden, so
    an empty Iranian catalogue simply does not appear.
+   For Hetzner-owned hourly servers, the management menu exposes provider-backed
+   power and confirmed OS reinstall after the resource is attached and running.
+   The menu hides unsupported actions. Snapshot creation and Primary IP replacement
+   remain unavailable: both can incur separate charges, and customer price books,
+   wallet settlement, and safe reconciliation for those resources are not yet wired.
+   The management screen never allocates or replaces an IP implicitly.
+   Once the provider confirms an hourly server is running, the worker persists
+   its assigned IP and sends the owner a private Telegram success notification.
+   New Hetzner system-image servers created without an SSH key can expose their
+   provider-issued root username and initial password once through the private
+   `سرورهای من` management menu. The password is encrypted at rest, sent as a
+   protected Telegram message, then removed from storage after delivery; passwords
+   from servers created before this feature cannot be recovered from Hetzner.
+   Configure a stable URL-safe base64-encoded 32-byte key in the server-owned
+   `security.provider_credential_encryption_key` before creating servers that
+   return initial passwords. Keep it across deployments: losing or rotating the
+   key without re-encrypting stored secrets makes pending passwords unreadable.
+   A failed creation displays a safe failure category in the server list; a failed
+   attempt without a provider resource disappears from that list after one hour
+   (its operation history remains available for investigation).
 7. **Wallet funding** — manual for the MVP:
    `uv run python -m cloud_platform.cli users find <telegram_id>` then
    `uv run python -m cloud_platform.cli wallet credit <user_id> <minor> "<reason>"`

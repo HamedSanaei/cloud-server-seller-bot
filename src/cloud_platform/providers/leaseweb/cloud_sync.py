@@ -181,6 +181,50 @@ def select_hourly_owner(
     return OwnerChoice(account_id, images_state, item, published=False, reason=reason)
 
 
+def offer_spec_from_item(
+    item: CloudInstanceType,
+    region_id: str,
+    *,
+    publishable: bool,
+    account_id: str,
+) -> OfferSpecUpdate:
+    """The ONE translation from a provider observation to a catalog write.
+
+    Shared by the periodic catalog sync and the targeted capacity
+    republication, so an offer that legitimately moved to another credential
+    account is written with exactly the same facts (cost, currency, technical
+    metadata, publication decision) a normal sync would have written — never a
+    hand-rolled partial update.
+    """
+    billing_parameters: dict[str, object] = {
+        "contract_type": "HOURLY",
+        "monthly_estimate_source": "hourly_rate",
+        "instance_type_id": item.id,
+        "region": region_id,
+        # Exact provider hourly rate (verbatim decimal text):
+        # sub-cent precision the integer minor field cannot
+        # hold stays auditable here instead of being rounded
+        # away silently.
+        "provider_hourly_rate": item.hourly_rate_exact,
+    }
+    if item.monthly_cost_minor is not None:
+        billing_parameters["provider_monthly_cost_minor"] = item.monthly_cost_minor
+    return OfferSpecUpdate(
+        name=item.name,
+        vcpu=item.vcpu,
+        ram_gb=item.ram_gb,
+        disk_gb=item.disk_gb,
+        traffic=item.traffic,
+        provider_cost_minor=item.hourly_cost_minor,
+        provider_cost_currency=item.currency,
+        billing_parameters=billing_parameters,
+        technical_metadata=_technical_spec(item),
+        billing_model="hourly",
+        provider_available=publishable,
+        provider_account_id=account_id,
+    )
+
+
 def _technical_spec(item: CloudInstanceType) -> dict[str, object]:
     # Exact provider facts that do not fit the coarse integer spec fields
     # ride along as namespaced metadata (strings/lists only, never float):
@@ -500,32 +544,11 @@ class LeasewebHourlyCloudSyncer:
                     f"{region_id}: {type_id} not published through account "
                     f"{account_id} ({choice.reason})"
                 )
-            billing_parameters: dict[str, object] = {
-                "contract_type": "HOURLY",
-                "monthly_estimate_source": "hourly_rate",
-                "instance_type_id": item.id,
-                "region": region_id,
-                # Exact provider hourly rate (verbatim decimal text):
-                # sub-cent precision the integer minor field cannot
-                # hold stays auditable here instead of being rounded
-                # away silently.
-                "provider_hourly_rate": item.hourly_rate_exact,
-            }
-            if item.monthly_cost_minor is not None:
-                billing_parameters["provider_monthly_cost_minor"] = item.monthly_cost_minor
-            update = OfferSpecUpdate(
-                name=item.name,
-                vcpu=item.vcpu,
-                ram_gb=item.ram_gb,
-                disk_gb=item.disk_gb,
-                traffic=item.traffic,
-                provider_cost_minor=item.hourly_cost_minor,
-                provider_cost_currency=item.currency,
-                billing_parameters=billing_parameters,
-                technical_metadata=_technical_spec(item),
-                billing_model="hourly",
-                provider_available=publishable,
-                provider_account_id=account_id,
+            update = offer_spec_from_item(
+                item,
+                region_id,
+                publishable=publishable,
+                account_id=account_id,
             )
             counted = 0
             region_failed = False

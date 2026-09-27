@@ -26,6 +26,10 @@ from cloud_platform.modules.businesslog.domain import (
 
 __all__ = [
     "admin_adjustment_event",
+    "capacity_outage_event",
+    "capacity_recovered_event",
+    "capacity_recovery_reminder_event",
+    "capacity_storefront_outage_event",
     "provider_accepted_event",
     "purchase_failed_event",
     "purchase_requested_event",
@@ -50,30 +54,187 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
-def _user_fields(user: Any) -> dict[str, Any]:
-    """Identity fields of a platform user (never a credential)."""
-    if user is None:
-        return {}
-    return compact(
-        user_id=_text(getattr(user, "id", None)),
-        telegram_user_id=getattr(user, "telegram_user_id", None),
-        username=getattr(user, "username", None),
+def _user_fields(user: Any, user_id: UUID | str | None = None) -> dict[str, Any]:
+    """Identity fields of a platform user (never a credential).
+
+    Worker/reconciler call sites may hold only the durable ``user_id`` of a
+    server; ``user_id`` is then the fallback identity (the richer Telegram
+    fields are added only when a loaded user is available).
+    """
+    fields: dict[str, Any] = {}
+    if user is not None:
+        fields = compact(
+            user_id=_text(getattr(user, "id", None)),
+            telegram_user_id=getattr(user, "telegram_user_id", None),
+            username=getattr(user, "username", None),
+        )
+    if user_id is not None and "user_id" not in fields:
+        fields["user_id"] = _text(user_id)
+    return fields
+
+
+# -- provider credential-account capacity (LEASEWEB-MULTIACCOUNT) ----------
+
+
+def _moment_epoch(moment: datetime | None) -> str:
+    """A stable dedupe token for one incident: its own timestamp, not "now"."""
+    return str(int((moment or datetime.now(UTC)).timestamp()))
+
+
+def capacity_outage_event(
+    *,
+    provider_key: str,
+    credential_account: str,
+    error_code: str | None = None,
+    correlation_id: str | None = None,
+    location_id: str | None = None,
+    product_id: str | None = None,
+    observations: int | None = None,
+    attempts: int | None = None,
+    next_attempt_at: datetime | None = None,
+    blocked_reason: str | None = None,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """A definitive capacity refusal stopped NEW orders through one account.
+
+    Keyed by the refusal's OWN instant, so the same outage can never produce a
+    second card while a NEW refusal (a new window) produces exactly one.
+    """
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=f"provider.capacity.outage:{credential_account}:{_moment_epoch(moment)}",
+        event_type=BusinessEventType.PROVIDER_CAPACITY_LIMIT_REACHED,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            credential_account=credential_account,
+            error_code=error_code,
+            correlation_id=correlation_id,
+            location=location_id,
+            product_id=product_id,
+            category="provider_capacity",
+            reason=blocked_reason,
+            attempts=attempts,
+            next_attempt=(next_attempt_at.isoformat() if next_attempt_at is not None else None),
+            action="automatic canary recovery is scheduled; no operator action is required",
+            **_counts(observations=observations),
+        ),
+        created_at=moment,
     )
+
+
+def capacity_storefront_outage_event(
+    *,
+    provider_key: str,
+    blocked_accounts: tuple[str, ...],
+    total_accounts: int,
+    sellable_offers: int,
+    outage_since: datetime | None = None,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """HIGH-impact: EVERY configured capacity account is blocked.
+
+    Deduplicated per outage window (the earliest blocked observation is the
+    key), so the operator gets one card when the Cloud storefront becomes
+    unavailable rather than one per controller run.
+    """
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=(
+            f"provider.capacity.storefront:{provider_key}:{_moment_epoch(outage_since or moment)}"
+        ),
+        event_type=BusinessEventType.PROVIDER_CAPACITY_STOREFRONT_UNAVAILABLE,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            category="provider_capacity",
+            storefront="unavailable",
+            accounts_blocked=len(blocked_accounts),
+            accounts_total=total_accounts,
+            sellable_offers=sellable_offers,
+            credential_account=blocked_accounts[0] if blocked_accounts else None,
+            reason="all capacity accounts are blocked and no Cloud offer is sellable",
+            action="automatic recovery keeps probing; a manual override is the emergency path",
+        ),
+        created_at=moment,
+    )
+
+
+def capacity_recovery_reminder_event(
+    *,
+    provider_key: str,
+    credential_account: str,
+    attempts: int,
+    next_attempt_at: datetime | None = None,
+    blocked_reason: str | None = None,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """Periodic reminder while an account stays blocked (30 min, then 6 h)."""
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=(f"provider.capacity.reminder:{credential_account}:{_moment_epoch(moment)}"),
+        event_type=BusinessEventType.PROVIDER_CAPACITY_RECOVERY_REMINDER,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            credential_account=credential_account,
+            category="provider_capacity",
+            attempts=attempts,
+            next_attempt=(next_attempt_at.isoformat() if next_attempt_at is not None else None),
+            reason=blocked_reason,
+            action="the automatic canary is scheduled; no operator action is required",
+        ),
+        created_at=moment,
+    )
+
+
+def capacity_recovered_event(
+    *,
+    provider_key: str,
+    credential_account: str,
+    attempts: int = 0,
+    at: datetime | None = None,
+) -> BusinessEvent:
+    """A real customer order was ACCEPTED: provider capacity is proven again."""
+    moment = at or datetime.now(UTC)
+    return BusinessEvent(
+        event_key=f"provider.capacity.recovered:{credential_account}:{_moment_epoch(moment)}",
+        event_type=BusinessEventType.PROVIDER_CAPACITY_RECOVERED,
+        payload=compact(
+            at=_at(moment),
+            provider=provider_key,
+            credential_account=credential_account,
+            category="provider_capacity",
+            attempts=attempts,
+        ),
+        created_at=moment,
+    )
+
+
+def _counts(**values: int | None) -> dict[str, int]:
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def purchase_requested_event(
     *,
     user: Any,
     server_id: UUID | str,
-    order_id: UUID | str,
+    order_id: UUID | str | None = None,
     provider_key: str,
-    market: str,
-    location_id: str,
-    plan_name: str,
-    product_id: str,
-    os_name: str | None,
-    selling_price_minor: int,
-    currency: str,
+    market: str = "",
+    location_id: str | None = None,
+    plan_name: str | None = None,
+    product_id: str | None = None,
+    os_name: str | None = None,
+    image_id: str | None = None,
+    selling_price_minor: int | None = None,
+    currency: str | None = None,
+    provider_cost_minor: int | None = None,
+    provider_cost_currency: str | None = None,
+    credential_account: str | None = None,
+    operation_key: str | None = None,
+    kind: str | None = None,
+    user_id: UUID | str | None = None,
     at: datetime | None = None,
 ) -> BusinessEvent:
     """The customer confirmed a purchase and a durable intent now exists."""
@@ -82,17 +243,28 @@ def purchase_requested_event(
         event_type=BusinessEventType.PURCHASE_REQUESTED,
         payload=compact(
             at=_at(at),
+            kind=kind,
             market=market,
             provider=provider_key,
+            credential_account=credential_account,
             location=location_id,
             plan=plan_name,
             product_id=product_id,
             os=os_name,
-            selling_price=format_minor(selling_price_minor, currency),
+            image=image_id,
+            selling_price=(
+                format_minor(selling_price_minor, currency) if selling_price_minor else None
+            ),
             currency=currency,
+            provider_cost=(
+                format_minor(provider_cost_minor, provider_cost_currency)
+                if provider_cost_minor is not None
+                else None
+            ),
             server_id=_text(server_id),
             order_id=_text(order_id),
-            **_user_fields(user),
+            operation_key=operation_key,
+            **_user_fields(user, user_id),
         ),
         created_at=at,
     )
@@ -102,15 +274,20 @@ def provider_accepted_event(
     *,
     user: Any,
     server_id: UUID | str,
-    order_id: UUID | str,
+    order_id: UUID | str | None = None,
     provider_key: str,
-    provider_order_id: str,
-    product_id: str,
-    location_id: str,
-    plan_name: str,
-    provider_cost_minor: int,
-    currency: str,
-    operation_key: str,
+    provider_order_id: str | None = None,
+    product_id: str | None = None,
+    location_id: str | None = None,
+    plan_name: str | None = None,
+    provider_cost_minor: int | None = None,
+    currency: str | None = None,
+    operation_key: str | None = None,
+    credential_account: str | None = None,
+    image_id: str | None = None,
+    state: str | None = None,
+    kind: str | None = None,
+    user_id: UUID | str | None = None,
     at: datetime | None = None,
 ) -> BusinessEvent:
     """The provider accepted the order and the order id is durably stored."""
@@ -119,17 +296,25 @@ def provider_accepted_event(
         event_type=BusinessEventType.PROVIDER_ACCEPTED,
         payload=compact(
             at=_at(at),
+            kind=kind,
             provider=provider_key,
+            credential_account=credential_account,
             provider_order_id=provider_order_id,
             product_id=product_id,
             location=location_id,
             plan=plan_name,
-            provider_cost=format_minor(provider_cost_minor, currency),
+            image=image_id,
+            state=state,
+            provider_cost=(
+                format_minor(provider_cost_minor, currency)
+                if provider_cost_minor is not None
+                else None
+            ),
             currency=currency,
             server_id=_text(server_id),
             order_id=_text(order_id),
             operation_key=operation_key,
-            **_user_fields(user),
+            **_user_fields(user, user_id),
         ),
         created_at=at,
     )
@@ -141,11 +326,15 @@ def vps_provisioned_event(
     server_id: UUID | str,
     provider_key: str,
     provider_order_id: str | None,
-    location_id: str,
-    plan_name: str,
+    location_id: str | None = None,
+    plan_name: str | None = None,
     state: str,
     ipv4: str | None = None,
     ipv6: str | None = None,
+    credential_account: str | None = None,
+    image_id: str | None = None,
+    kind: str | None = None,
+    user_id: UUID | str | None = None,
     at: datetime | None = None,
 ) -> BusinessEvent:
     """The VPS is provisioned and activated (delivery reached the customer)."""
@@ -154,15 +343,18 @@ def vps_provisioned_event(
         event_type=BusinessEventType.VPS_PROVISIONED,
         payload=compact(
             at=_at(at),
+            kind=kind,
             provider=provider_key,
+            credential_account=credential_account,
             provider_order_id=provider_order_id,
             server_id=_text(server_id),
             location=location_id,
             plan=plan_name,
+            image=image_id,
             state=state,
             ipv4=ipv4,
             ipv6=ipv6,
-            **_user_fields(user),
+            **_user_fields(user, user_id),
         ),
         created_at=at,
     )
@@ -172,35 +364,58 @@ def purchase_failed_event(
     *,
     user: Any,
     server_id: UUID | str,
-    order_id: UUID | str | None,
+    order_id: UUID | str | None = None,
     provider_key: str,
-    provider_order_id: str | None,
-    operation_key: str | None,
+    provider_order_id: str | None = None,
+    operation_key: str | None = None,
     category: str,
     reason: str,
     market: str = "",
+    stage: str | None = None,
+    location_id: str | None = None,
+    plan_name: str | None = None,
+    product_id: str | None = None,
+    image_id: str | None = None,
+    error_code: str | None = None,
+    correlation_id: str | None = None,
+    credential_account: str | None = None,
+    kind: str | None = None,
+    user_id: UUID | str | None = None,
     at: datetime | None = None,
 ) -> BusinessEvent:
     """Definitive failure or an ambiguous outcome requiring a human.
 
     ``category`` is a short, safe label (never a raw HTTP body) so the
-    operator can triage: ``provider_rejected``, ``outcome_unknown``,
-    ``needs_review``, ``settlement_review``, ``recovery_escalated``.
+    operator can triage: ``provider_capacity``, ``provider_rejected``,
+    ``provider_auth``, ``offer_revalidation_failed``, ``image_unavailable``,
+    ``invalid_contract``, ``infrastructure_failure``, ``outcome_unknown``,
+    ``recovery_required``. The event key is category-scoped, so the same
+    server can report a definitive failure and (later) an ambiguity, while
+    every repeated reconciliation pass of the SAME failure dedupes.
     """
     return BusinessEvent(
         event_key=f"purchase.failed:{server_id}:{category}",
         event_type=BusinessEventType.PURCHASE_FAILED,
         payload=compact(
             at=_at(at),
+            kind=kind,
             market=market,
             provider=provider_key,
+            credential_account=credential_account,
+            location=location_id,
+            plan=plan_name,
+            product_id=product_id,
+            image=image_id,
+            stage=stage,
+            category=category,
+            reason=reason,
+            error_code=error_code,
+            correlation_id=correlation_id,
             server_id=_text(server_id),
             order_id=_text(order_id),
             provider_order_id=provider_order_id,
             operation_key=operation_key,
-            category=category,
-            reason=reason,
-            **_user_fields(user),
+            **_user_fields(user, user_id),
         ),
         created_at=at,
     )

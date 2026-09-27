@@ -141,8 +141,16 @@ class TestProductionDriftIsRejected:
             assert healthy.columns[table] - production.columns[table] == {column}
 
     def test_the_gate_only_passes_once_the_repair_revision_ships(self) -> None:
-        """The gate is meaningful only with 0038 in the release it guards."""
-        assert repo_head_revision() == "0045"
+        """The gate is meaningful only with 0038 in the release it guards.
+
+        Deliberately pinned to the CURRENT head: every new migration must update
+        this number, which is the moment to confirm that what it ships is also
+        what ``required_schema()`` (the release's own metadata) now demands —
+        0047 does, with the automatic canary-recovery columns on
+        ``provider_account_capacity`` (baseline census, attempt schedule,
+        durable canary lease, outage bookkeeping).
+        """
+        assert repo_head_revision() == "0047"
         assert REPAIR_MIGRATION.is_file()
         source = REPAIR_MIGRATION.read_text(encoding="utf-8")
         assert DRIFTED_TABLE in source

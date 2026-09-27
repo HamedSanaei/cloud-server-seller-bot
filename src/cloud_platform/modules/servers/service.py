@@ -29,6 +29,7 @@ records in :mod:`cloud_platform.modules.servers.models`.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -52,6 +53,7 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.operations.domain import OperationRepository, OperationStatus
 from cloud_platform.modules.operations.service import (
     NotServerOwnerError,
     PowerActionNotAllowedError,
@@ -68,6 +70,7 @@ from cloud_platform.modules.servers.confirmations import (
 from cloud_platform.modules.servers.models import (
     BILLABLE_SERVER_OPERATIONS,
     CustomerServerPage,
+    CustomerServerState,
     CustomerServerView,
     IpAddressView,
     MonitoringView,
@@ -155,6 +158,15 @@ class RenewalCollector(Protocol):
         ...
 
 
+class ServerCredentialStore(Protocol):
+    async def has_for_owner(self, *, server_id: UUID, user_id: UUID) -> bool: ...
+    async def claim_for_owner(self, *, server_id: UUID, user_id: UUID) -> Any | None: ...
+    async def ack_for_owner(self, *, server_id: UUID, user_id: UUID, claim_id: UUID) -> bool: ...
+    async def release_for_owner(
+        self, *, server_id: UUID, user_id: UUID, claim_id: UUID
+    ) -> bool: ...
+
+
 class ServerManagementError(Exception):
     """Base class for every customer server-management failure.
 
@@ -227,6 +239,8 @@ class ServerManagementService:
         event_sink: BusinessEventSink | None = None,
         renewal_collector: RenewalCollector | None = None,
         clock: Callable[[], datetime] | None = None,
+        operations: OperationRepository | None = None,
+        credential_store: ServerCredentialStore | None = None,
     ) -> None:
         self._servers = servers
         self._registry = registry
@@ -234,6 +248,8 @@ class ServerManagementService:
         self._confirmations = confirmations
         self._audit = AuditTrail(audit_repo)
         self._power = power
+        self._operations = operations
+        self._credential_store = credential_store
         self._events = event_sink
         # The commercial collector (RenewalChecker) is optional: a deployment
         # that exposes no billing capability simply renders no commercial lines.
@@ -256,22 +272,84 @@ class ServerManagementService:
         requested = max(1, int(page))
         offset = (requested - 1) * page_size
         rows, total = await self._servers.list_by_user_paged(
-            customer_id, offset=offset, limit=page_size
+            customer_id,
+            offset=offset,
+            limit=page_size,
+            hide_failed_before=self._clock() - timedelta(hours=1),
         )
         pages = max(1, -(-total // page_size))
         if requested > pages:
             requested = pages
             offset = (requested - 1) * page_size
             rows, total = await self._servers.list_by_user_paged(
-                customer_id, offset=offset, limit=page_size
+                customer_id,
+                offset=offset,
+                limit=page_size,
+                hide_failed_before=self._clock() - timedelta(hours=1),
             )
-        items = tuple(self._local_view(row) for row in rows)
+        items = tuple([await self._with_failure_reason(self._local_view(row)) for row in rows])
         return CustomerServerPage(items=items, page=requested, page_size=page_size, total=total)
 
     async def get_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         """The customer-safe view of one owned server (local state)."""
         server = await self._owned(customer_id, server_id)
-        return await self._detail_view(server)
+        return await self._with_failure_reason(await self._detail_view(server))
+
+    async def _with_failure_reason(self, view: CustomerServerView) -> CustomerServerView:
+        if view.state is not CustomerServerState.ERROR or self._operations is None:
+            return view
+        operation = await self._operations.get_by_key(f"server-create:{view.server_id}")
+        if operation is None or operation.status is not OperationStatus.FAILED:
+            return view
+        return replace(view, failure_reason=_customer_failure_reason(operation.error))
+
+    async def has_ssh_password(self, customer_id: UUID, server_id: UUID) -> bool:
+        server = await self._owned(customer_id, server_id)
+        return bool(
+            self._credential_store is not None
+            and server.provider_server_id
+            and await self._credential_store.has_for_owner(server_id=server.id, user_id=customer_id)
+        )
+
+    async def claim_ssh_password(self, customer_id: UUID, server_id: UUID) -> Any | None:
+        server = await self._owned(customer_id, server_id)
+        if self._credential_store is None or not server.provider_server_id:
+            return None
+        return await self._credential_store.claim_for_owner(
+            server_id=server.id, user_id=customer_id
+        )
+
+    async def finish_ssh_password(
+        self, customer_id: UUID, server_id: UUID, claim_id: UUID, *, delivered: bool
+    ) -> bool:
+        await self._owned(customer_id, server_id)
+        if self._credential_store is None:
+            return False
+        action = (
+            self._credential_store.ack_for_owner
+            if delivered
+            else self._credential_store.release_for_owner
+        )
+        return await action(server_id=server_id, user_id=customer_id, claim_id=claim_id)
+
+    async def available_operations(
+        self, customer_id: UUID, server_id: UUID
+    ) -> frozenset[ServerOperation]:
+        """Provider- and ownership-aware actions for the management menu."""
+        server = await self._owned(customer_id, server_id)
+        context = await self._context(server)
+        capabilities = context.capabilities if context is not None else _NO_PROVIDER_CAPABILITIES
+        return frozenset(
+            operation
+            for operation in ServerOperation
+            if policies.operation_allowed(
+                operation,
+                policy=self._policy,
+                capabilities=capabilities,
+                state=server.state,
+            )
+            is None
+        )
 
     async def refresh_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         """Read-only refresh: provider state, IPs and image land on the row.
@@ -1183,7 +1261,8 @@ class ServerManagementService:
             )
         except KeyError:
             return None
-        return _ProviderContext(provider=provider, capabilities=vps_capabilities_of(provider))
+        management = getattr(provider, "vps_management", provider)
+        return _ProviderContext(provider=management, capabilities=vps_capabilities_of(management))
 
     async def _require(self, server: CloudServer, operation: ServerOperation) -> _ProviderContext:
         """The provider context, or the specific reason the operation is denied."""
@@ -1435,6 +1514,12 @@ class ServerManagementService:
                 )
         if info.image_name and not server.os:
             server.os = info.image_name
+        ipv4 = info.metadata.get("ipv4")
+        ipv6 = info.metadata.get("ipv6")
+        if isinstance(ipv4, str) and ipv4:
+            server.ipv4 = ipv4
+        if isinstance(ipv6, str) and ipv6:
+            server.ipv6 = ipv6
         await self._servers.save(server)
 
     async def _apply_provider_ips(self, server: CloudServer, context: _ProviderContext) -> None:
@@ -1478,6 +1563,8 @@ class ServerManagementService:
             server_id=server.id,
             state=policies.customer_state(server.state),
             display_name=server.os or None,
+            provider_key=server.provider_key,
+            offer_id=_offer_id_of(server),
             provider_display_name=_reference_of(server),
             location_code=_datacenter_of(server),
             location_label=_location_text(location),
@@ -1558,6 +1645,16 @@ def _reference_of(server: CloudServer) -> str | None:
     return getattr(server, "provider_reference", None) or None
 
 
+def _offer_id_of(server: CloudServer) -> UUID | None:
+    fingerprint = server.offer_fingerprint
+    if not isinstance(fingerprint, dict):
+        return None
+    try:
+        return UUID(str(fingerprint["offer_id"]))
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 def _plan_of(server: CloudServer) -> str | None:
     """The sellable plan name, when the platform recorded one."""
     return getattr(server, "plan_name", None) or None
@@ -1575,6 +1672,8 @@ def _with_refresh_error(view: CustomerServerView, error: str) -> CustomerServerV
         server_id=view.server_id,
         state=view.state,
         display_name=view.display_name,
+        provider_key=view.provider_key,
+        offer_id=view.offer_id,
         provider_display_name=view.provider_display_name,
         location_code=view.location_code,
         location_label=view.location_label,
@@ -1592,6 +1691,7 @@ def _with_refresh_error(view: CustomerServerView, error: str) -> CustomerServerV
         contract_ends_at=view.contract_ends_at,
         next_renewal_at=view.next_renewal_at,
         refresh_error=error,
+        failure_reason=view.failure_reason,
         state_from_provider=view.state_from_provider,
         extra_ips=view.extra_ips,
         commercial_status=view.commercial_status,
@@ -1659,6 +1759,26 @@ def _snapshot_ref(provider_snapshot_id: str) -> str:
     the screen holds it only for the duration of the flow.
     """
     return str(provider_snapshot_id)
+
+
+def _customer_failure_reason(error: str | None) -> str:
+    """Return a safe translation key; ledger text may contain secrets."""
+    if not error:
+        return "servers.failure_generic"
+    lowered = error.lower()
+    if "capacity" in lowered or "resource limit" in lowered:
+        return "servers.failure_capacity"
+    if "insufficient funds" in lowered:
+        return "servers.failure_balance"
+    if re.search(r"\bHTTP\s+(401|403)\b", error, re.IGNORECASE):
+        return "servers.failure_auth"
+    if re.search(r"\bHTTP\s+422\b", error, re.IGNORECASE):
+        return "servers.failure_invalid"
+    if re.search(r"\bHTTP\s+429\b", error, re.IGNORECASE):
+        return "servers.failure_rate"
+    if re.search(r"\bHTTP\s+5[0-9]{2}\b", error, re.IGNORECASE):
+        return "servers.failure_provider"
+    return "servers.failure_generic"
 
 
 def _safe_reason(exc: BaseException) -> str:

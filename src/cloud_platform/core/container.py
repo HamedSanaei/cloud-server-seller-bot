@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from base64 import b64decode
+from binascii import Error as Base64Error
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -172,7 +174,11 @@ class Container:
     #: syncers through these fields).
     owned_resources: tuple[Any, ...] = field(default=(), repr=False)
     _global_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
+    _hetzner_hourly_provider: Any | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _domestic_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
+    _server_credentials: Any | None = field(default=None, init=False, repr=False, compare=False)
     # Lifecycle guard: :meth:`initialize` registers provider adapters, and
     # the registry rejects duplicates. The flag makes a second initialize a
     # no-op instead of a double registration; it is set only after a fully
@@ -481,34 +487,29 @@ class Container:
         )
 
     def hourly_cloud_resolver(self) -> Any | None:
-        """Provider-neutral (provider_key, account_id) -> cloud adapter dispatch.
-
-        Built from the Leaseweb cloud account router so hourly image reads
-        and creation resolve the exact credential that owns the offer.
-        ``None`` means no hourly credential is configured (legacy dict
-        fallback still applies in the services). No provider-name
-        branching: the account id selects the adapter.
-        """
+        """Resolve hourly adapters by provider and pinned credential account."""
         router = self.leaseweb_cloud_account_router
-        if router is None:
+        fallback = self.hourly_cloud_providers()
+        if router is None and not fallback:
             return None
 
         class _Resolver:
-            def __init__(self, cloud_router: Any, fallback: dict[str, Any]) -> None:
+            def __init__(self, cloud_router: Any, providers: dict[str, Any]) -> None:
                 self._router = cloud_router
-                self._fallback = dict(fallback)
+                self._fallback = providers
 
             def adapter_for(
                 self, provider_key: str, credential_account_id: str | None = None
             ) -> Any | None:
-                if provider_key != "leaseweb":
+                if provider_key != "leaseweb" or self._router is None:
+                    if credential_account_id not in (None, ""):
+                        return None
                     return self._fallback.get(provider_key)
                 try:
                     return self._router.client_for(credential_account_id)
                 except Exception:
-                    # Fail closed to the logical default only for legacy
-                    # rows without an account; a pinned unknown account
-                    # must not silently fall back to another credential.
+                    # Legacy unpinned rows may use the logical default; pinned
+                    # accounts never fall back to a different credential.
                     if not (credential_account_id or "").strip():
                         providers = getattr(self._router, "providers", {}) or {}
                         if isinstance(providers, dict) and providers:
@@ -523,7 +524,7 @@ class Container:
                             return next(iter(providers.values()))
                     return None
 
-        return _Resolver(router, self.hourly_cloud_providers())
+        return _Resolver(router, fallback)
 
     def hourly_cloud_provider(self) -> Any | None:
         """Hourly cloud adapter for live image reads (None when unconfigured).
@@ -550,9 +551,174 @@ class Container:
         return hourly_provider_from_settings(get_settings())
 
     def hourly_cloud_providers(self) -> dict[str, Any]:
-        """Hourly adapters keyed by provider (the storefront image screens)."""
-        provider = self.hourly_cloud_provider()
-        return {"leaseweb": provider} if provider is not None else {}
+        """Configured hourly adapters keyed by provider."""
+        providers: dict[str, Any] = {}
+        leaseweb = self.hourly_cloud_provider()
+        if leaseweb is not None:
+            providers["leaseweb"] = leaseweb
+        settings = get_settings()
+        if settings.providers_enabled.get("hetzner", False) and settings.hetzner_api_token:
+            adapter = self._hetzner_hourly_provider
+            if adapter is None:
+                from cloud_platform.providers.hetzner.hourly import HetznerHourlyCloudProvider
+
+                adapter = HetznerHourlyCloudProvider(
+                    token=settings.hetzner_api_token,
+                    base_url=settings.hetzner_api_base_url,
+                )
+                object.__setattr__(self, "_hetzner_hourly_provider", adapter)
+            providers["hetzner"] = adapter
+        return providers
+
+    def capacity_republisher(self) -> Any | None:
+        """Reacts to a NEW capacity refusal by refreshing future publication.
+
+        Built from the same Leaseweb cloud account router the hourly service
+        uses, so the alternate account is selected with the SAME read-only
+        proof the catalog sync demands. ``None`` when no Cloud router is
+        configured: the periodic catalog walk remains the only refresher.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is None:
+            return None
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+        from cloud_platform.providers.leaseweb.capacity_republish import (
+            LeasewebCapacityRepublisher,
+        )
+
+        return LeasewebCapacityRepublisher(
+            session_factory=self.session_factory,
+            router=router,
+            capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
+        )
+
+    def leaseweb_capacity_reconciliation(self) -> Any | None:
+        """Idempotent recovery of historical PC-2031 refusals (read-only).
+
+        ``None`` when no Leaseweb Cloud scope exists, so the worker startup can
+        simply skip it instead of inventing evidence.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is None and not get_settings().leaseweb_api_key:
+            return None
+        from cloud_platform.modules.provider_capacity.reconciliation import (
+            CapacityReconciliationService,
+        )
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+        from cloud_platform.providers.leaseweb.capacity_evidence import (
+            SqlAlchemyHistoricalCapacityEvidenceSource,
+        )
+
+        return CapacityReconciliationService(
+            capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
+            evidence_source=SqlAlchemyHistoricalCapacityEvidenceSource(self.session_factory),
+            ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
+        )
+
+    def capacity_recovery_backoff(self) -> tuple[int, ...]:
+        """The configured canary backoff schedule (validated, with fallback).
+
+        A malformed schedule must never take a process down: the documented
+        default applies and the misconfiguration is logged loudly.
+        """
+        from cloud_platform.modules.provider_capacity.domain import (
+            DEFAULT_RECOVERY_BACKOFF_SECONDS,
+            validate_recovery_backoff,
+        )
+
+        try:
+            return validate_recovery_backoff(
+                tuple(get_settings().leaseweb_cloud_capacity_recovery_backoff_seconds)
+            )
+        except ValueError:
+            logger.warning(
+                "leaseweb_cloud_capacity_recovery_backoff_seconds is invalid; "
+                "using the default %s-second schedule",
+                DEFAULT_RECOVERY_BACKOFF_SECONDS,
+                exc_info=True,
+            )
+            return DEFAULT_RECOVERY_BACKOFF_SECONDS
+
+    def cloud_capacity_recovery_service(self) -> Any | None:
+        """Read-only automatic capacity recovery controller (LEASEWEB-MULTIACCOUNT).
+
+        ``None`` when no Cloud router is configured: a deployment without
+        Leaseweb Cloud credentials has nothing to recover, and the controller
+        is never invented out of thin air.
+        """
+        router = self.leaseweb_cloud_account_router
+        if router is None:
+            return None
+        settings = get_settings()
+        from cloud_platform.modules.provider_capacity.recovery import (
+            CloudCapacityRecoveryService,
+        )
+        from cloud_platform.modules.provider_capacity.repository import (
+            SqlAlchemyAccountCapacityRepository,
+        )
+        from cloud_platform.providers.leaseweb.capacity_inventory import (
+            LeasewebCloudInventorySource,
+        )
+
+        return CloudCapacityRecoveryService(
+            capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
+            inventory_source=LeasewebCloudInventorySource(router=router),
+            event_sink=self.business_event_sink(),
+            sellable_offers_source=self.sellable_cloud_offer_count,
+            backoff_seconds=self.capacity_recovery_backoff(),
+            reminder_delay_seconds=(settings.leaseweb_cloud_capacity_outage_reminder_delay_seconds),
+            reminder_interval_seconds=(
+                settings.leaseweb_cloud_capacity_outage_reminder_interval_seconds
+            ),
+            ttl_seconds=settings.leaseweb_cloud_account_limit_ttl_seconds,
+            enabled=settings.leaseweb_cloud_capacity_recovery_enabled,
+        )
+
+    async def sellable_cloud_offer_count(self) -> int:
+        """Read-only count of Cloud offers a customer can actually buy today.
+
+        Uses the SAME sellability rule as the storefront (canonical currency +
+        valid provenance + publication state), so the readiness metric can
+        never claim an offer the customer cannot check out.
+        """
+        from cloud_platform.modules.offers.domain import is_sellable_in_currency
+
+        settings = get_settings()
+        currency = str(settings.fx_catalog_pricing_currency).strip().upper()
+        rows = await self.sellable_offer_repository().list_all()
+        count = 0
+        for row in rows:
+            if str(getattr(row, "billing_model", "") or "") != "hourly":
+                continue
+            if not is_sellable_in_currency(row, currency):
+                continue
+            count += 1
+        return count
+
+    def server_credential_store(self) -> Any:
+        """Shared encrypted, owner-scoped one-time credential store."""
+        if self._server_credentials is None:
+            from cloud_platform.core.secrets import FernetSecretBox, MasterKey
+            from cloud_platform.modules.hourly.credentials import SqlAlchemyServerCredentialStore
+
+            configured = (get_settings().provider_credential_encryption_key or "").strip()
+            if not configured or configured == "CHANGE_ME":
+                raise ValueError("provider credential encryption key is not configured")
+            try:
+                material = b64decode(configured.encode("ascii"), altchars=b"-_", validate=True)
+            except (ValueError, UnicodeEncodeError, Base64Error) as exc:
+                raise ValueError("provider credential encryption key is invalid") from exc
+            box = FernetSecretBox(MasterKey(material=material))
+            object.__setattr__(
+                self,
+                "_server_credentials",
+                SqlAlchemyServerCredentialStore(self.session_factory, box=box),
+            )
+        return self._server_credentials
 
     def hourly_cloud_service(self) -> Any:
         """The hourly instance creation command (no provider calls, no charge)."""
@@ -590,8 +756,24 @@ class Container:
             # it too, but this catches an offer published before the refusal.
             capacity_repo=SqlAlchemyAccountCapacityRepository(self.session_factory),
             capacity_ttl_seconds=get_settings().leaseweb_cloud_account_limit_ttl_seconds,
+            # The moment a refusal is recorded, future-order publication is
+            # refreshed so the storefront stops advertising the limited
+            # account instead of waiting for the next catalog walk.
+            capacity_republisher=self.capacity_republisher(),
+            # AUTOMATIC RECOVERY: one real order per account may act as the
+            # canary once the read-only controller opens a window. The lease
+            # serializes it; the backoff spaces the attempts out.
+            canary_lease_seconds=(get_settings().leaseweb_cloud_capacity_canary_lease_seconds),
+            canary_backoff_seconds=self.capacity_recovery_backoff(),
             catalog_currency=get_settings().fx_catalog_pricing_currency,
             catalog_stale_limit_seconds=(get_settings().fx_frankfurter_catalog_max_stale_seconds),
+            # Operator business feed: the hourly lifecycle cards ride the SAME
+            # durable outbox as the monthly/payment flows (the worker owns
+            # Telegram delivery, never this service). Disabled configuration
+            # yields the null sink, so no financial path gains a dependency.
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
+            credential_store=self.server_credential_store(),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:
@@ -804,6 +986,12 @@ class Container:
             return NullBusinessEventSink()
         return OutboxBusinessEventSink(self.business_log_repository(), policy)
 
+    def customer_provisioned_sink(self) -> Any:
+        """Outbox for customer success cards, independent of operator logger."""
+        from cloud_platform.modules.businesslog.domain import CustomerProvisionedSink
+
+        return CustomerProvisionedSink(self.business_log_repository())
+
     def business_log_dispatcher(self, bot: Any) -> Any:
         """The delivery worker for the operator channel (worker process only)."""
         from cloud_platform.modules.businesslog.domain import BusinessLogDispatcher
@@ -814,6 +1002,7 @@ class Container:
             self.business_log_repository(),
             TelegramBusinessLogChannel(bot, policy.chat_id),
             policy,
+            user_repo=self.user_repository(),
         )
 
     def payment_gateways(self) -> dict[str, Any]:
@@ -1145,6 +1334,7 @@ class Container:
         provider-neutral VPS ports.
         """
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
         from cloud_platform.modules.servers.service import ServerManagementService
 
         return ServerManagementService(
@@ -1154,6 +1344,8 @@ class Container:
             confirmations=self.confirmation_verifier(),
             audit_repo=_audit_repository(self.session_factory),
             power=self.power_command_service(),
+            operations=SqlAlchemyOperationRepository(self.session_factory),
+            credential_store=self.server_credential_store(),
             event_sink=self.business_event_sink(),
             # Commercial status + manual renewal come from the SAME checker the
             # worker runs, so the customer's "renew now" and the automatic pass
@@ -1323,6 +1515,7 @@ class Container:
         # containers without being listed in ``owned_resources``.
         await close_resource(self.leaseweb_account_router)
         await close_resource(self.leaseweb_cloud_account_router)
+        await close_resource(self._hetzner_hourly_provider)
 
         if self.engine is not None and id(self.engine) not in seen:
             engine_id = id(self.engine)

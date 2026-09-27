@@ -20,6 +20,7 @@ from cloud_platform.providers.errors import (
     ProviderNotFound,
     ProviderUnavailable,
 )
+from cloud_platform.providers.leaseweb import cloud as cloud_module
 from cloud_platform.providers.leaseweb.cloud import (
     CloudInstanceType,
     CloudRegion,
@@ -541,3 +542,127 @@ class TestHourlyCloudSyncSource:
         source = self._source(self._result(offers_written=0, errors=["r1: ProviderError"]))
         report = await source.sync_catalog()
         assert report.ok is False
+
+
+# ---------------------------------------------------------------------------
+# Adapter: the entitlement-agnostic account instance census
+# ---------------------------------------------------------------------------
+
+
+def _instance_payload(instance_id: str, region: str = "eu-central-1") -> dict[str, Any]:
+    return {
+        "id": instance_id,
+        "reference": instance_id,
+        "state": "RUNNING",
+        "region": region,
+    }
+
+
+def _envelope(items: list[dict[str, Any]], total: int | None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"instances": items}
+    if total is not None:
+        payload["_metadata"] = {"totalCount": total, "limit": 100, "offset": 0}
+    return payload
+
+
+class TestAccountInstanceCensus:
+    """``read_all_instances``: the census recovery measures refusals against.
+
+    Leaseweb Public Cloud credentials are region-scoped, so the ``region``
+    query parameter is rejected for every region outside the credential's own
+    one: a per-region walk is never exhaustive and the census must be the
+    account-scoped unfiltered read.
+    """
+
+    async def test_the_census_is_read_without_a_region_filter(self) -> None:
+        provider = _provider()
+        provider._transport.request = mock.AsyncMock(
+            return_value=_envelope([_instance_payload("i-1"), _instance_payload("i-2")], 2)
+        )
+        read = await provider.read_all_instances()
+        assert read.complete is True
+        assert read.raw_items == 2
+        assert read.total_count == 2
+        assert [instance.id for instance in read.instances] == ["i-1", "i-2"]
+        method, path = provider._transport.request.call_args.args[:2]
+        assert method == "GET" and path == "/publicCloud/v1/instances"
+        call_params = provider._transport.request.call_args.kwargs["params"]
+        assert "region" not in call_params
+        assert call_params == {"limit": cloud_module.INVENTORY_PAGE_SIZE, "offset": 0}
+
+    async def test_the_census_carries_each_instance_region_as_provider_fact(self) -> None:
+        provider = _provider()
+        provider._transport.request = mock.AsyncMock(
+            return_value=_envelope([_instance_payload("i-1", "eu-west-2")], 1)
+        )
+        read = await provider.read_all_instances()
+        assert [instance.region for instance in read.instances] == ["eu-west-2"]
+
+    async def test_the_census_paginates_until_the_envelope_is_exhausted(self) -> None:
+        provider = _provider()
+        first_page = [_instance_payload(f"i-{index}") for index in range(100)]
+        provider._transport.request = mock.AsyncMock(
+            side_effect=[
+                _envelope(first_page, 101),
+                _envelope([_instance_payload("i-100")], 101),
+            ]
+        )
+        read = await provider.read_all_instances()
+        assert read.complete is True
+        assert read.raw_items == 101
+        assert len(read.instances) == 101
+        offsets = [
+            call.kwargs["params"]["offset"] for call in provider._transport.request.call_args_list
+        ]
+        assert offsets == [0, 100]
+
+    async def test_a_census_that_cannot_be_exhausted_is_incomplete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lower bound must never be published as the account census."""
+        monkeypatch.setattr(cloud_module, "INVENTORY_MAX_PAGES", 3)
+        provider = _provider()
+        provider._transport.request = mock.AsyncMock(
+            return_value=_envelope([_instance_payload("i-1")], 900)
+        )
+        read = await provider.read_all_instances()
+        assert read.complete is False
+        assert read.total_count == 900
+        assert read.raw_items == 3
+        assert provider._transport.request.call_count == 3
+
+    async def test_a_short_page_without_an_envelope_ends_the_census(self) -> None:
+        """With no envelope to consult, a short page is the end of the list."""
+        provider = _provider()
+        provider._transport.request = mock.AsyncMock(
+            return_value=_envelope([_instance_payload("i-1")], None)
+        )
+        read = await provider.read_all_instances()
+        assert read.complete is True
+        assert read.total_count is None
+        assert provider._transport.request.call_count == 1
+
+    async def test_an_account_holding_nothing_reads_as_complete_and_empty(self) -> None:
+        """Zero is a fact (a real account holds none), never an unknown."""
+        provider = _provider()
+        provider._transport.request = mock.AsyncMock(return_value=_envelope([], 0))
+        read = await provider.read_all_instances()
+        assert read.complete is True
+        assert read.instances == ()
+        assert read.raw_items == 0
+
+    async def test_unparsable_entries_stay_visible_in_the_raw_count(self) -> None:
+        """Schema drift must be observable, not silently shrink the census."""
+        provider = _provider()
+        provider._transport.request = mock.AsyncMock(
+            return_value=_envelope([_instance_payload("i-1"), {"state": "RUNNING"}], 2)
+        )
+        read = await provider.read_all_instances()
+        assert read.raw_items == 2
+        assert len(read.instances) == 1
+
+    async def test_a_transport_failure_propagates_to_the_caller(self) -> None:
+        provider = _provider()
+        provider._transport.request = mock.AsyncMock(side_effect=ProviderUnavailable("timed out"))
+        with pytest.raises(ProviderUnavailable):
+            await provider.read_all_instances()

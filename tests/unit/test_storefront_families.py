@@ -483,6 +483,69 @@ class TestBillingSeparation:
         view = await service.cloud_locations_screen(PROVIDER, "cloud", 1)
         assert [item.location_id for item in view.items] == ["eu-west-3"]
 
+    async def test_hetzner_configured_monthly_and_cloud_families_never_cross(self) -> None:
+        import dataclasses
+
+        monthly = dataclasses.replace(
+            _offer(location_id="fsn1", product_id="cx22"), provider_key="hetzner"
+        )
+        cloud = dataclasses.replace(
+            _cloud_offer(location_id="nbg1"),
+            provider_key="hetzner",
+            product_id="cpx22",
+            id=uuid4(),
+        )
+        catalog = ProviderCatalog(
+            markets={"hetzner": "foreign"},
+            display_names={"hetzner": "Hetzner"},
+            enabled={"hetzner": True},
+            families={
+                "hetzner": {
+                    "vps": {"billing_model": BILLING_MODEL_MONTHLY, "display_name": "VPS"},
+                    "cloud": {"billing_model": BILLING_MODEL_HOURLY, "display_name": "Cloud"},
+                }
+            },
+        )
+        view = _service([monthly, cloud], catalog=catalog)
+        families, _, _ = await view.families_screen("hetzner")
+        assert {(family.family_key, family.sellable_count) for family in families} == {
+            ("vps", 1),
+            ("cloud", 1),
+        }
+        vps = await view.family_locations_screen("hetzner", "vps")
+        hourly = await view.cloud_locations_screen("hetzner", "cloud")
+        assert [location.location_id for location in vps.items] == ["fsn1"]
+        assert [location.location_id for location in hourly.items] == ["nbg1"]
+
+    async def test_hetzner_same_type_location_keeps_billing_family_identity(self) -> None:
+        import dataclasses
+
+        monthly = dataclasses.replace(
+            _offer(location_id="fsn1", product_id="cx22"), provider_key="hetzner"
+        )
+        cloud = dataclasses.replace(
+            monthly,
+            id=uuid4(),
+            billing_model=BILLING_MODEL_HOURLY,
+            selling_price_minor=1,
+        )
+        catalog = ProviderCatalog(
+            markets={"hetzner": "foreign"},
+            display_names={"hetzner": "Hetzner"},
+            enabled={"hetzner": True},
+            families={
+                "hetzner": {
+                    "vps": {"billing_model": BILLING_MODEL_MONTHLY, "display_name": "VPS"},
+                    "cloud": {"billing_model": BILLING_MODEL_HOURLY, "display_name": "Cloud"},
+                }
+            },
+        )
+        view = _service([monthly, cloud], catalog=catalog)
+        vps = await view.family_plans_screen("hetzner", "vps", "fsn1")
+        hourly = await view.cloud_plans_screen("hetzner", "fsn1", "other")
+        assert [item.offer_id for item in vps.items] == [monthly.id]
+        assert [item.offer_id for item in hourly.items] == [cloud.id]
+
     async def test_monthly_checkout_rejects_hourly_offer(self) -> None:
         from cloud_platform.modules.checkout.service import (
             MonthlyCheckoutService,

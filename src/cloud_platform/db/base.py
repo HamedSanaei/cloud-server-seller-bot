@@ -412,11 +412,31 @@ class Server(Base):
     catalog_entry = relationship("Catalog", back_populates="servers")
 
 
+class ServerCreateCredential(Base):
+    """Encrypted, one-time provider-issued login for an owned server.
+
+    No plaintext column exists. The provider identity prevents a credential
+    captured at POST time from being offered before server correlation is saved.
+    """
+
+    __tablename__ = "server_create_credentials"
+
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), primary_key=True)
+    provider_server_id = Column(String, nullable=False)
+    ciphertext = Column(Text, nullable=True)  # NULL is consumed tombstone; never reissue.
+    username = Column(String, nullable=True)  # Verified provider image login only.
+    key_id = Column(String(12), nullable=False)
+    algorithm = Column(String(32), nullable=False)
+    claim_id = Column(PG_UUID, nullable=True)
+    claim_expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class SellableOffer(Base):
-    """One explicitly sellable fixed-price monthly offer (LEASEWEB-MVP).
+    """One explicitly sellable monthly or hourly offer at a location.
 
     The row is the SINGLE gate for selling a provider product: a product/
-    location combination is sellable only when the provider currently
+    location/billing-model combination is sellable only when the provider currently
     reports it (``provider_available``), the operator enabled it
     (``enabled``), and it has an explicit customer selling price
     (``selling_price_minor > 0``). Provider cost and customer selling price
@@ -430,9 +450,9 @@ class SellableOffer(Base):
         location_id: Provider location code (e.g. "AMS-01")
         name: Product display name
         vcpu / ram_gb / disk_gb / traffic: Product specs (refresh on sync)
-        provider_cost_minor: Provider price per month (minor units)
+        provider_cost_minor: Provider price per billing unit (minor units)
         provider_cost_currency: Provider price currency
-        selling_price_minor: Admin-configured customer price per month (0 = not priced)
+        selling_price_minor: Customer price per billing unit (0 = not priced)
         selling_currency: Customer price currency
         billing_parameters: Contract/billing params (JSONB, e.g. contractTerm/billingCycle)
         provider_available: Whether the provider currently reports the product
@@ -444,8 +464,8 @@ class SellableOffer(Base):
             (provider_account_id, location_id, product_id); the per-account
             product list is durable in ``provider_routes``, while this row is
             the single operator-priced, customer-visible offer for one
-            (provider, location, product). NULL for providers without
-            credential accounts and for pre-multi-account leaseweb rows.
+            (provider, location, product, billing model). NULL for providers
+            without credential accounts and for pre-multi-account leaseweb rows.
     """
 
     __tablename__ = "sellable_offers"
@@ -454,7 +474,8 @@ class SellableOffer(Base):
             "provider_key",
             "product_id",
             "location_id",
-            name="uq_sellable_offers_provider_product_location",
+            "billing_model",
+            name="uq_sellable_offers_provider_product_location_billing",
         ),
     )
 
@@ -671,20 +692,33 @@ class ProviderAccountCapacity(Base):
     One row per ``(provider_key, credential_account_id)``: capacity is an
     ACCOUNT fact, not a location fact. Nothing here is credential material.
     The row never gates management/reconciliation of existing resources; it
-    only keeps NEW orders off an account whose limit is currently reached, and
-    ``expires_at`` returns the account to normal publication after the TTL.
+    only keeps NEW orders off an account whose limit is currently reached.
+    ``expires_at`` marks when the refusal stops being FRESH — an elapsed
+    window produces ``unknown_after_limit`` (recovery unproven), never
+    ``healthy``; only an operator clear or a verified positive provider signal
+    returns an account to normal publication.
 
     Attributes:
         provider_key: Logical provider (e.g. "leaseweb")
         credential_account_id: Stable non-secret account handle
-        state: healthy | limit_reached
+        state: healthy | limit_reached | unknown_after_limit
         error_code: Provider error code of the last refusal (e.g. "PC-2031")
         correlation_id: Provider routing id (safe to quote to support)
         location_id: Location of the refused create, when known
         product_id: Instance type of the refused create, when known
         observations: How many definitive refusals were recorded
         observed_at: When the current state was last observed
-        expires_at: When a limit_reached state stops applying (NULL = healthy)
+        expires_at: When the refusal stops being fresh (NULL = healthy)
+        baseline_instance_count: Instances held when the refusal was learned
+        baseline_instance_ids_hash: Stable hash of those instance ids
+        baseline_observed_at: When that baseline census was taken
+        recovery_attempts: Canary attempts actually exercised (reset on proof)
+        last_recovery_attempt_at: When the last canary attempt started
+        next_recovery_attempt_at: When the next attempt window may open
+        canary_lease_ref: Durable single-canary lease owner (operation key)
+        canary_lease_expires_at: When an in-flight canary lease expires
+        outage_notified_at: When the outage card was enqueued
+        last_reminder_at: When the last outage reminder was enqueued
     """
 
     __tablename__ = "provider_account_capacity"
@@ -708,10 +742,83 @@ class ProviderAccountCapacity(Base):
     observations = Column(Integer, nullable=False, server_default="0")
     observed_at = Column(DateTime(timezone=True), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Automatic canary recovery (LEASEWEB-MULTIACCOUNT): read-only inventory
+    # baseline, exponential backoff schedule and the durable single-canary
+    # lease. NULL means "nothing scheduled/leased", never "eligible".
+    baseline_instance_count = Column(Integer, nullable=True)
+    baseline_instance_ids_hash = Column(String(64), nullable=True)
+    baseline_observed_at = Column(DateTime(timezone=True), nullable=True)
+    recovery_attempts = Column(Integer, nullable=False, server_default="0")
+    last_recovery_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    next_recovery_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    canary_lease_ref = Column(String(128), nullable=True)
+    canary_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    outage_notified_at = Column(DateTime(timezone=True), nullable=True)
+    last_reminder_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(
         DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
     )
+
+
+class ProviderAccountCapacityEvent(Base):
+    """Append-only evidence log behind a credential account's capacity row.
+
+    The capacity row answers "what do we believe right now?"; this table
+    answers "why, and exactly when, did we learn it?". Two things depend on
+    it:
+
+    * **Exactly-once reconciliation.** A historical provider-operation failure
+      that proves a refusal (Leaseweb ``PC-2031``) is backfilled with its
+      operation key as ``source_ref``; the partial unique index below makes a
+      repeated reconciliation a no-op instead of a second observation.
+    * **Operator audit.** Which refusals were seen live, which were recovered
+      from history, and when an operator cleared the account.
+
+    Nothing here is credential material: an error code, a correlation id and
+    the location/product of the refused create only.
+
+    Attributes:
+        provider_key: Logical provider (e.g. "leaseweb")
+        credential_account_id: Stable non-secret account handle
+        kind: refusal | backfill | cleared
+        state: Resulting capacity state of the transition
+        source_ref: Idempotency anchor (provider operation key), when known
+        observed_at / expires_at: The incident's own timeline
+    """
+
+    __tablename__ = "provider_account_capacity_events"
+    __table_args__ = (
+        Index(
+            "ix_provider_account_capacity_events_account",
+            "provider_key",
+            "credential_account_id",
+            "created_at",
+        ),
+        Index(
+            "uq_provider_account_capacity_events_source",
+            "provider_key",
+            "credential_account_id",
+            "kind",
+            "source_ref",
+            unique=True,
+            postgresql_where=sa.text("source_ref IS NOT NULL"),
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    provider_key = Column(String(32), nullable=False)
+    credential_account_id = Column(String(64), nullable=False)
+    kind = Column(String(16), nullable=False)
+    state = Column(String(32), nullable=False)
+    error_code = Column(String(64), nullable=True)
+    correlation_id = Column(String(64), nullable=True)
+    location_id = Column(String(64), nullable=True)
+    product_id = Column(String(128), nullable=True)
+    source_ref = Column(String(128), nullable=True)
+    observed_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
 
 
 class RenewalRecord(Base):

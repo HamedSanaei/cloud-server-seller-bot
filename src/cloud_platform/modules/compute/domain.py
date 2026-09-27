@@ -423,9 +423,9 @@ class ServerRepository(Protocol):
         ...
 
     async def list_by_user_paged(
-        self, user_id: UUID, *, offset: int, limit: int
+        self, user_id: UUID, *, offset: int, limit: int, hide_failed_before: datetime | None = None
     ) -> tuple[list[CloudServer], int]:
-        """One page of a user's servers, newest first, plus the total count."""
+        """One page and total; optionally hide old unprovisioned failures."""
         ...
 
     async def count_active(self, user_id: UUID) -> int:

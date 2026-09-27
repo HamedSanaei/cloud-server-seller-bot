@@ -275,10 +275,30 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.auto_renew_unavailable": "ℹ️ تغییر تمدید خودکار برای این سرور در دسترس نیست.",  # noqa: RUF001
         "servers.unnamed": "سرور بدون نام",
         "servers.list_index": "{index}. {title}",
+        "servers.list_provider": "🏢 ارائه‌دهنده: {provider}",
+        "servers.list_cpu": "⚙️ پردازنده: {cpu} هسته",
+        "servers.list_ram": "🧠 رم: {ram} گیگابایت",
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 IP هنوز اختصاص نیافته",
         "servers.list_os": "💿 {os}",
         "servers.list_state": "{state}",
+        "servers.failure_reason": "❌ دلیل خطای ساخت: {reason}",
+        "servers.failure_generic": "ساخت سرور ناموفق بود؛ برای بررسی با پشتیبانی تماس بگیرید.",
+        "servers.failure_capacity": "ظرفیت ساخت سرور در ارائه‌دهنده کافی نبود.",
+        "servers.failure_balance": "موجودی کافی برای ساخت سرور نبود.",
+        "servers.failure_auth": "احراز هویت ارائه‌دهنده ناموفق بود؛ با پشتیبانی تماس بگیرید.",
+        "servers.failure_invalid": "ارائه‌دهنده مشخصات ساخت سرور را نپذیرفت.",
+        "servers.failure_rate": "محدودیت درخواست ارائه‌دهنده مانع ساخت سرور شد.",
+        "servers.failure_provider": "سرویس ارائه‌دهنده هنگام ساخت در دسترس نبود.",
+        "servers.ssh_button": "🔐 نمایش یک‌باره رمز SSH",
+        "servers.ssh_private_only": "رمز فقط در گفت‌وگوی خصوصی با ربات نمایش داده می‌شود.",
+        "servers.ssh_unavailable": (
+            "رمز اولیه در دسترس نیست؛ از کلید SSH یا پشتیبانی استفاده کنید."
+        ),
+        "servers.ssh_secret": (
+            "🔐 ورود SSH\nکاربر: {username}\nرمز اولیه: {password}\n"  # noqa: RUF001
+            "این پیام را محفوظ نگه دارید؛ رمز دیگر در پنل نمایش داده نمی‌شود."
+        ),
         "servers.list_manage_n": "⚙️ مدیریت {index}",
         "servers.snapshots_list_button": "📋 لیست Snapshotها",  # noqa: RUF001
         "servers.snapshot_create_title": "➕ ساخت Snapshot",  # noqa: RUF001
@@ -345,9 +365,9 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.cloud_plans_title": "\U0001f4be \u06cc\u06a9 \u067e\u0644\u0646 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f \u2014 {location}:",  # noqa: E501
         "store.cloud_detail_title": "\u2601\ufe0f {name}",
         "store.cloud_detail_family": "\U0001f9e9 {family}",
-        "store.cloud_detail_price": "\U0001f4b5 \u0642\u06cc\u0645\u062a:\n{hourly}\n\u0628\u0631\u0622\u0648\u0631\u062f \u0645\u0627\u0647\u0627\u0646\u0647:\n{monthly}",  # noqa: E501
+        "store.cloud_detail_price": "\U0001f4b5 \u0642\u06cc\u0645\u062a:\n{hourly}\n\u0628\u0631\u0622\u0648\u0631\u062f \u0645\u0635\u0631\u0641 \u06f7\u06f3\u06f0 \u0633\u0627\u0639\u062a\u06cc (\u0646\u0647 \u0647\u0632\u06cc\u0646\u0647 \u062b\u0627\u0628\u062a \u06cc\u0627 \u0633\u0642\u0641 \u0645\u0627\u0647\u0627\u0646\u0647):\n{monthly}",  # noqa: E501
         "store.price_per_hour": "{price} / \u0633\u0627\u0639\u062a",
-        "store.price_per_month": "{price} / \u0645\u0627\u0647",
+        "store.price_per_month": "{price}",
         "store.cloud_images_title": "💿 سیستم‌عامل را انتخاب کنید:",
         "store.cloud_selected_plan": "🖥 پلن انتخابی: {name}",
         "store.cloud_selected_specs": "⚙️ {vcpu} vCPU · 🧠 {ram} GB · 💾 {disk} GB",
@@ -363,7 +383,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.cloud_confirm_location": "\u0644\u0648\u06a9\u06cc\u0634\u0646: {location}",
         "store.cloud_confirm_specs": "CPU: {vcpu} vCPU\nRAM: {ram} GB\nDisk: {disk} GB",
         "store.cloud_confirm_os": "OS: {os}",
-        "store.cloud_confirm_cost": "\U0001f4b0 \u0647\u0632\u06cc\u0646\u0647:\n{hourly}\n{monthly}",  # noqa: E501
+        "store.cloud_confirm_cost": "\U0001f4b0 \u0647\u0632\u06cc\u0646\u0647:\n{hourly}\n\u0628\u0631\u0622\u0648\u0631\u062f \u0645\u0635\u0631\u0641 \u06f7\u06f3\u06f0 \u0633\u0627\u0639\u062a\u06cc (\u0646\u0647 \u0647\u0632\u06cc\u0646\u0647 \u062b\u0627\u0628\u062a \u06cc\u0627 \u0633\u0642\u0641 \u0645\u0627\u0647\u0627\u0646\u0647):\n{monthly}",  # noqa: E501
         "store.cloud_confirm_warning": "\u26a0\ufe0f \u062a\u0627 \u0632\u0645\u0627\u0646\u06cc \u06a9\u0647 Resource \u062d\u0630\u0641 \u0646\u0634\u062f\u0647\u060c \u0647\u0632\u06cc\u0646\u0647 Cloud \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0627\u062f\u0627\u0645\u0647 \u062f\u0627\u0634\u062a\u0647 \u0628\u0627\u0634\u062f.",  # noqa: E501
         "store.cloud_confirm_create": "\u2705 \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631",
         "store.cloud_created": "\u2601\ufe0f \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0634\u062f! \u0634\u0646\u0627\u0633\u0647: {server_id}",  # noqa: E501
@@ -673,10 +693,30 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.auto_renew_unavailable": "ℹ️ Auto-renew cannot be changed for this server.",  # noqa: RUF001
         "servers.unnamed": "Unnamed server",
         "servers.list_index": "{index}. {title}",
+        "servers.list_provider": "🏢 Provider: {provider}",
+        "servers.list_cpu": "⚙️ CPU: {cpu} cores",
+        "servers.list_ram": "🧠 RAM: {ram} GB",
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 no IP assigned yet",
         "servers.list_os": "💿 {os}",
         "servers.list_state": "{state}",
+        "servers.failure_reason": "❌ Creation failed: {reason}",
+        "servers.failure_generic": "Server creation failed; contact support for details.",
+        "servers.failure_capacity": "Provider capacity was insufficient.",
+        "servers.failure_balance": "Insufficient balance to create this server.",
+        "servers.failure_auth": "Provider authentication failed; contact support.",
+        "servers.failure_invalid": "The provider rejected the server configuration.",
+        "servers.failure_rate": "Provider rate limiting prevented server creation.",
+        "servers.failure_provider": "The provider was unavailable during creation.",
+        "servers.ssh_button": "🔐 Show SSH password once",
+        "servers.ssh_private_only": "SSH credentials are shown only in a private bot chat.",
+        "servers.ssh_unavailable": (
+            "No initial password is available; use your SSH key or contact support."
+        ),
+        "servers.ssh_secret": (
+            "🔐 SSH login\nUser: {username}\nInitial password: {password}\n"
+            "Store this message securely; the password cannot be shown again."
+        ),
         "servers.list_manage_n": "⚙️ Manage {index}",
         "servers.snapshots_list_button": "📋 List snapshots",
         "servers.snapshot_create_title": "➕ Create snapshot",  # noqa: RUF001
@@ -741,9 +781,9 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.cloud_plans_title": "\U0001f4be Choose a plan \u2014 {location}:",
         "store.cloud_detail_title": "\u2601\ufe0f {name}",
         "store.cloud_detail_family": "\U0001f9e9 {family}",
-        "store.cloud_detail_price": "\U0001f4b5 Price:\n{hourly}\nMonthly estimate:\n{monthly}",
+        "store.cloud_detail_price": "\U0001f4b5 Price:\n{hourly}\n730-hour usage estimate (not a fixed monthly fee or cap):\n{monthly}",  # noqa: E501
         "store.price_per_hour": "{price} / hour",
-        "store.price_per_month": "{price} / month",
+        "store.price_per_month": "{price}",
         "store.cloud_images_title": "💿 Choose an operating system:",
         "store.cloud_selected_plan": "🖥 Selected plan: {name}",
         "store.cloud_selected_specs": "⚙️ {vcpu} vCPU · 🧠 {ram} GB · 💾 {disk} GB",
@@ -759,7 +799,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.cloud_confirm_location": "Location: {location}",
         "store.cloud_confirm_specs": "CPU: {vcpu} vCPU\nRAM: {ram} GB\nDisk: {disk} GB",
         "store.cloud_confirm_os": "OS: {os}",
-        "store.cloud_confirm_cost": "\U0001f4b0 Cost:\n{hourly}\n{monthly}",
+        "store.cloud_confirm_cost": "\U0001f4b0 Cost:\n{hourly}\n730-hour usage estimate (not a fixed monthly fee or cap):\n{monthly}",  # noqa: E501
         "store.cloud_confirm_warning": "\u26a0\ufe0f Until the resource is deleted, cloud charges can continue.",  # noqa: E501
         "store.cloud_confirm_create": "\u2705 Create server",
         "store.cloud_created": "\u2601\ufe0f Hourly server requested! ID: {server_id}",

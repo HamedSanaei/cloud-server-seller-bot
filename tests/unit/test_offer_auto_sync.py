@@ -212,6 +212,7 @@ class FakeOffersRepo:
         product_id: str,
         location_id: str,
         provider_account_id: str | None = None,
+        billing_model: str | None = None,
     ) -> SellableOffer | None:
         # Single-account tests: the triple is the identity; the account
         # qualifier is accepted (port signature) and ignored when no

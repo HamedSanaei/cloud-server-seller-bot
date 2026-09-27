@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
 
 import httpx
@@ -32,6 +31,7 @@ from cloud_platform.providers.errors import (
     ProviderUnavailable,
 )
 from cloud_platform.providers.health import AccountHealth
+from cloud_platform.providers.hetzner import hourly
 from cloud_platform.providers.hetzner.backoff import RateLimitBackoff, RateLimitPolicy
 from cloud_platform.providers.hetzner.sync import CURRENCY
 
@@ -330,6 +330,10 @@ class HetznerCloudProvider:
         self.floating_ips = HetznerFloatingIpApi(self)
         self.volumes = HetznerVolumeApi(self)
         self.networks = HetznerNetworkApi(self)
+        # VPS ports share this credential holder and its HTTP client.
+        from cloud_platform.providers.hetzner.vps import HetznerVpsManagement
+
+        self.vps_management = HetznerVpsManagement(self)
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
@@ -488,21 +492,12 @@ class HetznerCloudProvider:
 
     @staticmethod
     def _monthly_minor_for_location(item: dict[str, Any], location_id: str) -> int | None:
-        """Provider monthly price at one location in integer minor units.
-
-        Decimal -> minor only: the provider string is never parsed as float.
-        """
-        for raw in item.get("prices", []):
-            if not isinstance(raw, dict):
-                continue
-            if str(raw.get("location") or raw.get("location_name") or "") != location_id:
-                continue
-            gross = (raw.get("monthly") or {}).get("gross")
-            if gross is None:
-                return None
-            value = Decimal(str(gross))
-            return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
-        return None
+        """Use the catalog's authoritative location and price parser."""
+        raw, _reason = hourly._location_price_entry(item, location_id)
+        if raw is None or hourly._location_availability(item, location_id) is False:
+            return None
+        value, _reason = hourly._gross_decimal(raw, hourly.MONTHLY_PRICE_KEY)
+        return hourly.minor_units(value) if value is not None else None
 
     async def get_os_options(self, location_id: str, product_id: str) -> list[OfferOsOption]:
         """Selectable system images for one server type at one location.
@@ -643,22 +638,45 @@ class HetznerCloudProvider:
 
     async def delete_server(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
         del idempotency_key
-        try:
-            await self._request("DELETE", f"/servers/{provider_server_id}")
-        except ProviderNotFound:
+        # This API has no DELETE idempotency key. Prove absence before issuing
+        # a mutation, especially when the operation is re-entered after a
+        # timeout or a worker restart.
+        if await self.get_server(provider_server_id) is None:
             return
+        headers = None
+        if self._credential_source is not None:
+            credential = await self._credential_source.get()
+            headers = self._auth_headers(credential.value)
+        try:
+            response = await self._client.request(
+                "DELETE", f"/servers/{provider_server_id}", headers=headers
+            )
+        except httpx.RequestError as exc:
+            raise ProviderOutcomeUnknown("Hetzner delete outcome unknown") from exc
+        if response.status_code == 404:
+            return
+        if response.status_code == 429 or response.status_code >= 500:
+            raise ProviderOutcomeUnknown(
+                f"Hetzner delete outcome unknown (HTTP {response.status_code})"
+            )
+        if response.status_code in {401, 403}:
+            raise ProviderAuthError(f"Hetzner delete refused (HTTP {response.status_code})")
+        if response.status_code in {409, 423}:
+            raise ProviderConflict(f"Hetzner delete conflict (HTTP {response.status_code})")
+        if response.is_error:
+            raise ProviderError(f"Hetzner delete refused (HTTP {response.status_code})")
 
     async def power_on(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
         del idempotency_key
-        await self._request("POST", f"/servers/{provider_server_id}/actions/poweron")
+        await self.vps_management.start_vps(provider_server_id)
 
     async def power_off(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
         del idempotency_key
-        await self._request("POST", f"/servers/{provider_server_id}/actions/poweroff")
+        await self.vps_management.stop_vps(provider_server_id)
 
     async def reboot(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
         del idempotency_key
-        await self._request("POST", f"/servers/{provider_server_id}/actions/reboot")
+        await self.vps_management.reboot_vps(provider_server_id)
 
     async def set_reverse_dns(self, provider_server_id: str, ip: str, ptr: str | None) -> None:
         """Set/reset the reverse DNS (PTR) of one server IP (M13-007).
@@ -683,7 +701,7 @@ class HetznerCloudProvider:
         REFERENCE is ever sent - no credential material.
         """
         del idempotency_key
-        payload = await self._request(
+        payload = await self._mutation_request(
             "POST",
             f"/servers/{provider_server_id}/actions/rebuild",
             json={"image": image_id},
@@ -738,7 +756,7 @@ class HetznerCloudProvider:
         Returns the new image id, read from the action's resources.
         """
         del idempotency_key
-        payload = await self._request(
+        payload = await self._mutation_request(
             "POST",
             f"/servers/{provider_server_id}/actions/create_image",
             json={"type": "snapshot", "description": description},
@@ -787,8 +805,13 @@ class HetznerCloudProvider:
         async with metrics.provider_call(self.key, operation):
             return await self._perform_request(method, path, **kwargs)
 
+    async def _mutation_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """One mutation, never retried; ambiguous acceptance is surfaced to callers."""
+        return await self._request(method, path, _mutation=True, **kwargs)
+
     async def _perform_request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        max_retries = self._backoff.policy.max_retries
+        mutation = kwargs.pop("_mutation", False)
+        max_retries = self._backoff.policy.max_retries if method.upper() == "GET" else 0
         if self._credential_source is not None and "headers" not in kwargs:
             credential = await self._credential_source.get()
             kwargs["headers"] = self._auth_headers(credential.value)
@@ -797,7 +820,11 @@ class HetznerCloudProvider:
         while True:
             try:
                 response = await self._client.request(method, path, **kwargs)
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            except httpx.RequestError as exc:
+                if mutation:
+                    raise ProviderOutcomeUnknown(
+                        "Hetzner mutation transport outcome unknown"
+                    ) from exc
                 raise ProviderUnavailable(str(exc)) from exc
 
             self.last_rate_limit = RateLimitSnapshot(
@@ -814,6 +841,8 @@ class HetznerCloudProvider:
             attempt += 1
 
         assert response is not None
+        if mutation and response.status_code == 408:
+            raise ProviderOutcomeUnknown("Hetzner mutation outcome unknown (HTTP 408)")
         if response.status_code == 401 or response.status_code == 403:
             raise ProviderAuthError(_error_message(response))
         if response.status_code == 404:
@@ -821,15 +850,28 @@ class HetznerCloudProvider:
         if response.status_code in {409, 423}:
             raise ProviderConflict(_error_message(response))
         if response.status_code == 429:
+            if mutation:
+                raise ProviderOutcomeUnknown("Hetzner mutation outcome unknown (HTTP 429)")
             raise ProviderRateLimited(_error_message(response), self.last_rate_limit.reset_at_unix)
         if response.status_code >= 500:
+            if mutation:
+                raise ProviderOutcomeUnknown(
+                    f"Hetzner mutation outcome unknown (HTTP {response.status_code})"
+                )
             raise ProviderUnavailable(_error_message(response))
         if response.is_error:
             raise ProviderError(_error_message(response))
         if response.status_code == 204 or not response.content:
             return {}
-        data = response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            if mutation:
+                raise ProviderOutcomeUnknown("Hetzner mutation returned invalid JSON") from exc
+            raise ProviderError("provider returned invalid JSON") from exc
         if not isinstance(data, dict):
+            if mutation:
+                raise ProviderOutcomeUnknown("Hetzner mutation returned unexpected JSON shape")
             raise ProviderError("provider returned unexpected JSON shape")
         return data
 

@@ -11,10 +11,16 @@ actually depends on:
   select-then-mutate upsert — two concurrent workers recording the SAME refusal
   must serialize on the row lock and end with ONE row and TWO observations,
   never a duplicate-key error and never a lost observation;
-* a ``limit_reached`` window is TIME BOUNDED in the database itself
-  (``expires_at``), so an account comes back to normal publication on its own;
+* an ELAPSED window settles to ``unknown_after_limit`` — the refusal stops
+  being fresh, but the account is still excluded until an operator or a
+  verified positive signal proves recovery (expiry is not evidence);
+  ``settle_expired`` persists exactly that transition;
 * an unknown state value (a newer release's enum) reads as "cannot take new
   orders", never as healthy — the fail-closed direction;
+* historical provider-operation failures are reconciled into the store EXACTLY
+  ONCE (the partial unique index on the evidence log is the anchor), so a
+  restart or a second worker cannot double-count one refusal or resurrect it
+  after an operator cleared the account;
 * ``clear`` really removes the row while ``record_healthy`` keeps the evidence.
 
 The scratch DATABASE is created and dropped by this module on the target
@@ -27,23 +33,41 @@ import asyncio
 import contextlib
 import os
 import subprocess
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import make_url
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
+from cloud_platform.db.base import Operation as _OperationModel
+from cloud_platform.db.base import Provider as _ProviderModel
+from cloud_platform.db.base import ProviderAccount as _ProviderAccountModel
 from cloud_platform.db.base import ProviderAccountCapacity as _CapacityModel
+from cloud_platform.db.base import ProviderAccountCapacityEvent as _CapacityEventModel
+from cloud_platform.db.base import Server as _ServerModel
+from cloud_platform.db.base import User as _UserModel
 from cloud_platform.modules.provider_capacity.domain import (
     AccountCapacity,
     AccountCapacityState,
+    CapacityEventKind,
     CapacityObservation,
+    HistoricalCapacityEvidence,
+)
+from cloud_platform.modules.provider_capacity.reconciliation import (
+    CapacityReconciliationService,
 )
 from cloud_platform.modules.provider_capacity.repository import (
     SqlAlchemyAccountCapacityRepository,
+)
+from cloud_platform.providers.leaseweb.capacity_evidence import (
+    SqlAlchemyHistoricalCapacityEvidenceSource,
+    parse_capacity_evidence,
 )
 
 DB_URL = os.environ.get("CLOUD_PLATFORM_TEST_POSTGRES_URL", "").strip()
@@ -124,25 +148,72 @@ def _scratch_database() -> Iterator[str]:
         asyncio.run(_recreate_scratch_database(DB_URL))
 
 
+@dataclass(slots=True)
+class CapacityEnvironment:
+    """A migrated scratch database plus the handles a test needs."""
+
+    repo: SqlAlchemyAccountCapacityRepository
+    factory: async_sessionmaker[AsyncSession]
+    url: str
+
+
 @pytest.fixture()
-def capacity_repo() -> Iterator[SqlAlchemyAccountCapacityRepository]:
-    """A repository bound to a fresh, migrated scratch database."""
+def scratch_url() -> Iterator[str]:
+    """A freshly migrated scratch database, dropped again on exit.
+
+    Synchronous on purpose: creating the database and running ``alembic upgrade
+    head`` are blocking operations that must not be executed inside the test's
+    event loop.
+    """
     if not DB_URL:  # pragma: no cover - skipped by the marker
         pytest.skip("live PostgreSQL tests require CLOUD_PLATFORM_TEST_POSTGRES_URL")
     with _scratch_database() as url:
-        engine = create_async_engine(url)
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        try:
-            yield SqlAlchemyAccountCapacityRepository(factory)
-        finally:
-            asyncio.run(engine.dispose())
+        yield url
+
+
+def _engine(url: str) -> Any:
+    """A test engine that opens a connection per checkout (``NullPool``).
+
+    Pooling would pin asyncpg connections to the event loop of the test that
+    opened them; a later test's loop would then try to close a foreign
+    transport (``AttributeError: 'NoneType' object has no attribute 'send'``
+    from the Windows proactor loop). One connection per session removes the
+    cross-loop state entirely.
+    """
+    return create_async_engine(url, poolclass=NullPool)
+
+
+@pytest.fixture()
+async def capacity_repo(scratch_url: str) -> AsyncIterator[SqlAlchemyAccountCapacityRepository]:
+    """A repository bound to a fresh, migrated scratch database."""
+    engine = _engine(scratch_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield SqlAlchemyAccountCapacityRepository(factory)
+    finally:
+        # Disposed inside the TEST's own loop: ``asyncio.run(engine.dispose())``
+        # would close asyncpg transports from a loop that never opened them.
+        await engine.dispose()
+
+
+@pytest.fixture()
+async def capacity_environment(scratch_url: str) -> AsyncIterator[CapacityEnvironment]:
+    """The repository PLUS the session factory (restart + evidence tests)."""
+    engine = _engine(scratch_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield CapacityEnvironment(
+            repo=SqlAlchemyAccountCapacityRepository(factory), factory=factory, url=scratch_url
+        )
+    finally:
+        await engine.dispose()
 
 
 pytestmark = requires_postgres
 
 
 async def _insert_raw_state(url: str, state: str) -> None:
-    engine = create_async_engine(url)
+    engine = _engine(url)
     try:
         factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:
@@ -190,22 +261,29 @@ class TestCapacityPersistence:
         assert stored.product_id == "lsw.m4.large"
         assert await capacity_repo.limit_reached_accounts(PROVIDER, now=now) == frozenset({ACCOUNT})
 
-    async def test_the_window_is_time_bounded_and_the_evidence_survives(
+    async def test_an_elapsed_window_settles_to_unproven_not_healthy(
         self, capacity_repo: SqlAlchemyAccountCapacityRepository
     ) -> None:
+        """The production shape of 8fc2e573: the refusal outlived its window.
+
+        Expiry must NOT re-admit the account — nobody proved the provider
+        limit lifted.
+        """
         now = datetime.now(UTC)
         past = now - timedelta(hours=2)
         await capacity_repo.record_limit_reached(
             provider_key=PROVIDER,
             credential_account_id=ACCOUNT,
-            observation=CapacityObservation(error_code="PC-2031"),
+            observation=CapacityObservation(error_code="PC-2031", correlation_id="cid"),
             ttl_seconds=60,
             now=past,
         )
-        # Expired: eligible again, and the account is no longer excluded.
-        assert await capacity_repo.limit_reached_accounts(PROVIDER, now=now) == frozenset()
+        assert await capacity_repo.limit_reached_accounts(PROVIDER, now=now) == frozenset({ACCOUNT})
         stored = await capacity_repo.get(PROVIDER, ACCOUNT)
         assert stored is not None
+        assert stored.state is AccountCapacityState.UNKNOWN_AFTER_LIMIT
+        assert stored.accepts_new_orders(now=now) is False
+        assert stored.blocked_reason(now=now) == "unknown-after-limit"
         assert stored.error_code == "PC-2031"
         assert stored.observations == 1
 
@@ -267,23 +345,36 @@ class TestCapacityPersistence:
     async def test_accounts_and_providers_do_not_interfere(
         self, capacity_repo: SqlAlchemyAccountCapacityRepository
     ) -> None:
+        now = datetime.now(UTC)
         await capacity_repo.record_limit_reached(
             provider_key=PROVIDER,
             credential_account_id=ACCOUNT,
             observation=CapacityObservation(error_code="PC-2031"),
             ttl_seconds=3600,
+            now=now,
         )
         await capacity_repo.record_limit_reached(
             provider_key=PROVIDER,
             credential_account_id="sales-org-uk",
             observation=CapacityObservation(error_code="PC-2031"),
             ttl_seconds=60,
-            now=datetime.now(UTC) - timedelta(hours=2),
+            now=now - timedelta(hours=2),
         )
-        # expiring the UK signal must not touch the north one
-        assert await capacity_repo.limit_reached_accounts(PROVIDER) == frozenset({ACCOUNT})
-        assert await capacity_repo.get(PROVIDER, "sales-org-uk") is not None
+        # Both accounts stay out of NEW orders: the UK window elapsed, which is
+        # not recovery, only a loss of freshness — and each record keeps its
+        # own reason.
+        assert await capacity_repo.limit_reached_accounts(PROVIDER, now=now) == frozenset(
+            {ACCOUNT, "sales-org-uk"}
+        )
+        north = await capacity_repo.get(PROVIDER, ACCOUNT)
+        uk = await capacity_repo.get(PROVIDER, "sales-org-uk")
+        assert north is not None and north.state is AccountCapacityState.LIMIT_REACHED
+        assert uk is not None and uk.state is AccountCapacityState.UNKNOWN_AFTER_LIMIT
+        assert north.blocked_reason(now=now) == "limit-reached"
+        assert uk.blocked_reason(now=now) == "unknown-after-limit"
+        # A different provider is never affected by Leaseweb capacity rows.
         assert await capacity_repo.get("hetzner", ACCOUNT) is None
+        assert await capacity_repo.list_for_provider("hetzner") == ()
 
     async def test_the_records_are_listed_deterministically(
         self, capacity_repo: SqlAlchemyAccountCapacityRepository
@@ -309,10 +400,14 @@ class TestFailClosedStates:
         await _insert_raw_state(url, "some_future_state")
         stored = await capacity_repo.get(PROVIDER, ACCOUNT)
         assert stored is not None
-        assert stored.state is AccountCapacityState.LIMIT_REACHED
+        assert stored.state in (
+            AccountCapacityState.LIMIT_REACHED,
+            AccountCapacityState.UNKNOWN_AFTER_LIMIT,
+        )
+        assert stored.accepts_new_orders() is False
         assert await capacity_repo.limit_reached_accounts(PROVIDER) == frozenset({ACCOUNT})
 
-    async def test_a_naive_stored_expiry_does_not_immortalize_the_signal(
+    async def test_a_naive_stored_expiry_is_read_as_utc_and_still_excludes(
         self, capacity_repo: SqlAlchemyAccountCapacityRepository
     ) -> None:
         """timestamptz round-trips as aware; a naive value is read as UTC."""
@@ -328,7 +423,10 @@ class TestFailClosedStates:
         assert stored is not None
         assert stored.expires_at is not None
         assert stored.is_limit_reached(now=now + timedelta(minutes=1)) is True
-        assert stored.is_limit_reached(now=now + timedelta(hours=2)) is False
+        # The window elapsed: the state is "unproven", never "eligible".
+        settled = stored.settled(now=now + timedelta(hours=2))
+        assert settled.state is AccountCapacityState.UNKNOWN_AFTER_LIMIT
+        assert settled.is_limit_reached(now=now + timedelta(hours=2)) is True
 
 
 class TestConcurrentRefusals:
@@ -360,7 +458,7 @@ class TestConcurrentRefusals:
         assert stored.observations == 4
         assert stored.is_limit_reached(now=now) is True
         # Exactly one row exists for the account (unique identity + upsert).
-        engine = create_async_engine(_with_database(DB_URL, SCRATCH_DB))
+        engine = _engine(_with_database(DB_URL, SCRATCH_DB))
         try:
             factory = async_sessionmaker(engine, expire_on_commit=False)
             async with factory() as session:
@@ -370,6 +468,502 @@ class TestConcurrentRefusals:
         finally:
             await engine.dispose()
         assert int(count) == 1
+
+
+class TestRecoverySemantics:
+    async def test_settle_expired_persists_the_transition_and_keeps_excluding(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        """The stored row must agree with what the platform believes."""
+        repo = capacity_environment.repo
+        now = datetime.now(UTC)
+        await repo.record_limit_reached(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            observation=CapacityObservation(error_code="PC-2031"),
+            ttl_seconds=60,
+            now=now - timedelta(hours=1),
+        )
+        assert await repo.settle_expired(PROVIDER, now=now) == (ACCOUNT,)
+        assert await repo.settle_expired(PROVIDER, now=now) == ()
+        stored = await repo.get(PROVIDER, ACCOUNT)
+        assert stored is not None
+        assert stored.state is AccountCapacityState.UNKNOWN_AFTER_LIMIT
+        assert stored.accepts_new_orders(now=now) is False
+        assert await repo.limit_reached_accounts(PROVIDER, now=now) == frozenset({ACCOUNT})
+
+    async def test_a_restart_reads_the_same_durable_state(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        """A new process (fresh repository over the same database) keeps the
+        exclusion and the evidence — nothing lives in memory."""
+        now = datetime.now(UTC)
+        await capacity_environment.repo.record_limit_reached(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            observation=CapacityObservation(error_code="PC-2031", correlation_id="cid"),
+            ttl_seconds=3600,
+            now=now,
+        )
+        restarted = SqlAlchemyAccountCapacityRepository(capacity_environment.factory)
+        stored = await restarted.get(PROVIDER, ACCOUNT)
+        assert stored is not None
+        assert stored.is_limit_reached(now=now) is True
+        assert stored.correlation_id == "cid"
+        assert await restarted.limit_reached_accounts(PROVIDER, now=now) == frozenset({ACCOUNT})
+
+    async def test_an_operator_clear_is_recorded_and_restores_eligibility(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        repo = capacity_environment.repo
+        await repo.record_limit_reached(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            observation=CapacityObservation(error_code="PC-2031"),
+            ttl_seconds=60,
+            now=datetime.now(UTC) - timedelta(hours=1),
+        )
+        assert await repo.limit_reached_accounts(PROVIDER) == frozenset({ACCOUNT})
+        cleared = await repo.record_healthy(PROVIDER, ACCOUNT)
+        assert cleared.state is AccountCapacityState.HEALTHY
+        assert cleared.accepts_new_orders() is True
+        assert await repo.limit_reached_accounts(PROVIDER) == frozenset()
+        events = await repo.list_events(PROVIDER, credential_account_id=ACCOUNT)
+        assert [event.kind for event in events] == [
+            CapacityEventKind.CLEARED,
+            CapacityEventKind.REFUSAL,
+        ]
+
+
+async def _seed_failed_create(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    operation_key: str,
+    error_text: str,
+    account_id: str = ACCOUNT,
+    server_id: str,
+    recorded_at: datetime | None = None,
+) -> None:
+    """Insert the MINIMAL real rows a historical failure needs.
+
+    A failed hourly create is an ``operations`` row joined to the ``servers``
+    row that pins the credential account — exactly what the production
+    evidence (server 5e4bf88c, operation ``server-create:...``) looks like.
+
+    ``recorded_at`` is the operation's real timestamp, and it decides the
+    reconciled state: the production incident is DAYS old (its cooling window
+    elapsed, so it can only land as ``unknown_after_limit``), while a failure
+    from minutes ago is genuinely fresh ``limit_reached`` evidence.
+    """
+    import uuid
+
+    naive_now = (recorded_at or datetime.now(UTC)).replace(tzinfo=None)
+    async with factory() as session:
+        user = _UserModel(
+            username=f"evidence-{uuid.uuid4().hex[:8]}", email=f"{uuid.uuid4().hex[:8]}@test"
+        )
+        provider = _ProviderModel(name=f"leaseweb-{uuid.uuid4().hex[:8]}")
+        session.add_all([user, provider])
+        await session.flush()
+        account = _ProviderAccountModel(provider_id=provider.id, user_id=user.id)
+        session.add(account)
+        await session.flush()
+        server = _ServerModel(
+            id=uuid.UUID(server_id),
+            user_id=user.id,
+            provider_id=provider.id,
+            provider_account_id=account.id,
+            state="error",
+            price_per_quantum=1,
+            currency="USD",
+            billing_model="hourly",
+            credential_account_id=account_id,
+        )
+        operation = _OperationModel(
+            operation_key=operation_key,
+            operation_type="server_create",
+            resource_type="cloud_server",
+            resource_id=server.id,
+            provider_key="leaseweb",
+            status="failed",
+            error=error_text,
+            attempts=1,
+            created_at=naive_now,
+            updated_at=naive_now,
+        )
+        session.add_all([server, operation])
+        await session.commit()
+
+
+PC2031_TEXT = (
+    "provider account has no capacity for new instances: errorCode=PC-2031; Customer limit "
+    "reached; correlationId=07376219-7bcd-43d9-a5ea-4128fa57345a; HTTP 400"
+)
+VALIDATION_TEXT = (
+    "hourly offer revalidation failed: errorCode=400; Validation Failed; region: "
+    'The value "eu-west-9" is not valid region; HTTP 400'
+)
+HISTORICAL_SERVER = "5e4bf88c-cabe-4ab1-9eb4-cf448e046382"
+
+
+class TestHistoricalReconciliation:
+    async def test_a_historical_pc2031_is_recovered_exactly_once(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        """Production fact: an account refused a create BEFORE the capacity
+        feature existed, so the store was empty and the next customer order hit
+        the same wall. The reconciliation closes that gap — once."""
+        factory = capacity_environment.factory
+        await _seed_failed_create(
+            factory,
+            operation_key=f"server-create:{HISTORICAL_SERVER}",
+            error_text=PC2031_TEXT,
+            server_id=HISTORICAL_SERVER,
+            # The production incident predates the capacity feature by days.
+            recorded_at=datetime.now(UTC) - timedelta(days=3),
+        )
+        service = CapacityReconciliationService(
+            capacity_repo=capacity_environment.repo,
+            evidence_source=SqlAlchemyHistoricalCapacityEvidenceSource(factory),
+            ttl_seconds=3600,
+        )
+
+        first = await service.run("leaseweb")
+        assert first.evidence_found == 1
+        assert first.applied == ((ACCOUNT, AccountCapacityState.UNKNOWN_AFTER_LIMIT.value),)
+        assert await capacity_environment.repo.limit_reached_accounts(PROVIDER) == frozenset(
+            {ACCOUNT}
+        )
+        stored = await capacity_environment.repo.get(PROVIDER, ACCOUNT)
+        assert stored is not None
+        assert stored.error_code == "PC-2031"
+        assert stored.correlation_id == "07376219-7bcd-43d9-a5ea-4128fa57345a"
+        # The refusal is historical: its window is over, so it can never be
+        # published as fresh evidence — and never as healthy either.
+        assert stored.accepts_new_orders() is False
+
+        # Re-running (another worker, a restart, an operator retry) applies
+        # nothing: the operation key is the idempotency anchor.
+        second = await service.run("leaseweb")
+        assert second.applied == ()
+        assert second.already_recorded == (f"server-create:{HISTORICAL_SERVER}",)
+        stored = await capacity_environment.repo.get(PROVIDER, ACCOUNT)
+        assert stored is not None
+        assert stored.observations == 1
+        async with factory() as session:
+            rows = (
+                await session.execute(
+                    sa.select(_CapacityEventModel.kind, _CapacityEventModel.source_ref).where(
+                        _CapacityEventModel.provider_key == PROVIDER
+                    )
+                )
+            ).all()
+        assert [tuple(row) for row in rows] == [
+            (CapacityEventKind.BACKFILL.value, f"server-create:{HISTORICAL_SERVER}")
+        ]
+
+    async def test_an_unrelated_validation_failure_is_never_recovered(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        """A generic HTTP 400 (region/image/validation) must never be
+        reinterpreted as a capacity refusal."""
+        factory = capacity_environment.factory
+        await _seed_failed_create(
+            factory,
+            operation_key=f"server-create:{HISTORICAL_SERVER}",
+            error_text=VALIDATION_TEXT,
+            server_id=HISTORICAL_SERVER,
+        )
+        service = CapacityReconciliationService(
+            capacity_repo=capacity_environment.repo,
+            evidence_source=SqlAlchemyHistoricalCapacityEvidenceSource(factory),
+            ttl_seconds=3600,
+        )
+        report = await service.run("leaseweb")
+        assert report.evidence_found == 0
+        assert report.applied == ()
+        assert await capacity_environment.repo.get(PROVIDER, ACCOUNT) is None
+        # And the classifier itself agrees, field by field.
+        assert (
+            parse_capacity_evidence(
+                VALIDATION_TEXT,
+                provider_key=PROVIDER,
+                credential_account_id=ACCOUNT,
+                source_ref="op",
+            )
+            is None
+        )
+
+    async def test_concurrent_reconciliations_append_one_evidence_row(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        """Three workers starting at once must not triple-count one refusal."""
+        factory = capacity_environment.factory
+        await _seed_failed_create(
+            factory,
+            operation_key=f"server-create:{HISTORICAL_SERVER}",
+            error_text=PC2031_TEXT,
+            server_id=HISTORICAL_SERVER,
+        )
+        evidence = HistoricalCapacityEvidence(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            source_ref=f"server-create:{HISTORICAL_SERVER}",
+            error_code="PC-2031",
+            correlation_id="07376219-7bcd-43d9-a5ea-4128fa57345a",
+            observed_at=datetime.now(UTC) - timedelta(days=1),
+        )
+        results = await asyncio.gather(
+            *[
+                capacity_environment.repo.record_historical_evidence(evidence, ttl_seconds=3600)
+                for _ in range(3)
+            ],
+            return_exceptions=True,
+        )
+        applied = [result for result in results if not isinstance(result, Exception)]
+        assert len([result for result in applied if result is not None]) == 1
+        stored = await capacity_environment.repo.get(PROVIDER, ACCOUNT)
+        assert stored is not None
+        assert stored.observations == 1
+        assert len(await capacity_environment.repo.list_events(PROVIDER)) == 1
+
+    async def test_an_operator_clear_outranks_older_history(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        """Positive proof recorded AFTER the incident wins: history is logged
+        but does not re-block an account the operator has cleared."""
+        repo = capacity_environment.repo
+        await repo.record_healthy(PROVIDER, ACCOUNT)
+        evidence = HistoricalCapacityEvidence(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            source_ref=f"server-create:{HISTORICAL_SERVER}",
+            error_code="PC-2031",
+            observed_at=datetime.now(UTC) - timedelta(days=1),
+        )
+        assert await repo.record_historical_evidence(evidence, ttl_seconds=3600) is not None
+        stored = await repo.get(PROVIDER, ACCOUNT)
+        assert stored is not None
+        assert stored.state is AccountCapacityState.HEALTHY
+        assert stored.accepts_new_orders() is True
+
+
+class TestAutomaticRecoveryPersistence:
+    """Canary recovery durability: the lease, the backoff and the proof.
+
+    These are PostgreSQL-only contracts by construction: the single-canary
+    serialization is ONE conditional UPDATE (only a real database decides who
+    wins the row), the baseline comparison is a row-locked read-modify-write,
+    and the recovery evidence must outrank an older historical refusal after a
+    restart.
+    """
+
+    async def _blocked(self, repo: SqlAlchemyAccountCapacityRepository) -> None:
+        await repo.record_limit_reached(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            observation=CapacityObservation(
+                error_code="PC-2031", correlation_id="07376219-7bcd-43d9-a5ea-4128fa57345a"
+            ),
+            ttl_seconds=3600,
+        )
+
+    async def _open_window(
+        self, repo: SqlAlchemyAccountCapacityRepository, *, now: datetime
+    ) -> AccountCapacity:
+        await repo.schedule_recovery(PROVIDER, ACCOUNT, delay_seconds=60, now=now)
+        opened = await repo.open_recovery_window(PROVIDER, ACCOUNT, now=now + timedelta(seconds=61))
+        assert opened is not None and opened.state is AccountCapacityState.RECOVERY_CANDIDATE
+        return opened
+
+    async def test_only_one_canary_lease_can_win_and_it_expires(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        await self._open_window(capacity_repo, now=now)
+
+        results = await asyncio.gather(
+            *[
+                capacity_repo.begin_canary_attempt(
+                    provider_key=PROVIDER,
+                    credential_account_id=ACCOUNT,
+                    ref=f"server-create:{index}",
+                    lease_seconds=900,
+                    now=now,
+                )
+                for index in range(3)
+            ],
+            return_exceptions=True,
+        )
+        winners = [result for result in results if not isinstance(result, Exception)]
+        assert len([result for result in winners if result is not None]) == 1
+        held = await capacity_repo.get(PROVIDER, ACCOUNT)
+        assert held is not None and held.canary_lease_held(now=now) is True
+        assert held.canary_lease_ref in {f"server-create:{index}" for index in range(3)}
+
+        # While the lease is held, another order cannot become the canary…
+        assert (
+            await capacity_repo.begin_canary_attempt(
+                provider_key=PROVIDER,
+                credential_account_id=ACCOUNT,
+                ref="server-create:late",
+                lease_seconds=900,
+                now=now + timedelta(seconds=1),
+            )
+            is None
+        )
+        # …and once it EXPIRES (a crashed worker), the window is usable again.
+        after = now + timedelta(hours=1)
+        retry = await capacity_repo.begin_canary_attempt(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            ref="server-create:late",
+            lease_seconds=900,
+            now=after,
+        )
+        assert retry is not None and retry.canary_lease_ref == "server-create:late"
+
+    async def test_a_refused_canary_backs_off_exactly_once(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        await self._open_window(capacity_repo, now=now)
+        ref = "server-create:canary-refused"
+        assert (
+            await capacity_repo.begin_canary_attempt(
+                provider_key=PROVIDER,
+                credential_account_id=ACCOUNT,
+                ref=ref,
+                lease_seconds=900,
+                now=now,
+            )
+            is not None
+        )
+        refused = await capacity_repo.record_canary_refusal(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            ref=ref,
+            observation=CapacityObservation(error_code="PC-2031", correlation_id="canary-cid"),
+            delay_seconds=1800,
+            ttl_seconds=3600,
+            now=now + timedelta(minutes=1),
+        )
+        assert refused is not None
+        assert refused.state is AccountCapacityState.LIMIT_REACHED
+        assert refused.recovery_attempts == 1
+        assert refused.canary_lease_ref is None
+        assert refused.next_recovery_attempt_at is not None
+        assert refused.next_recovery_attempt_at.replace(tzinfo=UTC) >= now + timedelta(minutes=30)
+        assert await capacity_repo.limit_reached_accounts(PROVIDER, now=now) == frozenset({ACCOUNT})
+        # Replaying the same attempt is a NO-OP: no second attempt, no second
+        # piece of evidence.
+        replay = await capacity_repo.record_canary_refusal(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            ref=ref,
+            observation=CapacityObservation(error_code="PC-2031"),
+            delay_seconds=1800,
+            now=now + timedelta(minutes=2),
+        )
+        assert replay is None
+        stored = await capacity_repo.get(PROVIDER, ACCOUNT)
+        assert stored is not None and stored.recovery_attempts == 1
+        kinds = [event.kind for event in await capacity_repo.list_events(PROVIDER)]
+        assert kinds.count(CapacityEventKind.RECOVERY_ATTEMPT) == 1
+        assert kinds.count(CapacityEventKind.REFUSAL) == 2  # the original + the canary
+
+    async def test_an_accepted_canary_proves_recovery_and_outranks_history(
+        self, capacity_environment: CapacityEnvironment
+    ) -> None:
+        repo = capacity_environment.repo
+        now = datetime.now(UTC)
+        await self._blocked(repo)
+        await self._open_window(repo, now=now)
+        ref = "server-create:canary-accepted"
+        assert (
+            await repo.begin_canary_attempt(
+                provider_key=PROVIDER,
+                credential_account_id=ACCOUNT,
+                ref=ref,
+                lease_seconds=900,
+                now=now,
+            )
+            is not None
+        )
+        proven = await repo.record_recovery_proven(PROVIDER, ACCOUNT, ref=ref, now=now)
+        assert proven is not None and proven.state is AccountCapacityState.HEALTHY
+        assert proven.recovery_attempts == 0
+        assert proven.next_recovery_attempt_at is None
+        assert proven.outage_notified_at is None
+        assert await repo.limit_reached_accounts(PROVIDER) == frozenset()
+        # A restart reads the SAME proof, and the canary acceptance (a genuine
+        # positive signal) outranks an OLDER historical refusal.
+        restarted = SqlAlchemyAccountCapacityRepository(capacity_environment.factory)
+        assert (await restarted.get(PROVIDER, ACCOUNT)).state is AccountCapacityState.HEALTHY
+        history = HistoricalCapacityEvidence(
+            provider_key=PROVIDER,
+            credential_account_id=ACCOUNT,
+            source_ref=f"server-create:{HISTORICAL_SERVER}",
+            error_code="PC-2031",
+            observed_at=now - timedelta(days=1),
+        )
+        await restarted.record_historical_evidence(history, ttl_seconds=3600)
+        assert await restarted.limit_reached_accounts(PROVIDER) == frozenset()
+
+    async def test_the_inventory_baseline_brings_the_window_forward(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        baseline = await capacity_repo.record_inventory_census(
+            PROVIDER,
+            ACCOUNT,
+            instance_count=3,
+            ids_hash="hash-three",
+            now=now,
+        )
+        assert baseline is not None and baseline.baseline_instance_count == 3
+        # A LOWER count is local evidence that capacity may have been freed: the
+        # next window is brought forward to NOW and opens in the same pass.
+        census = await capacity_repo.record_inventory_census(
+            PROVIDER,
+            ACCOUNT,
+            instance_count=2,
+            ids_hash="hash-two",
+            now=now + timedelta(minutes=5),
+        )
+        assert census is not None
+        assert census.next_recovery_attempt_at is not None
+        opened = await capacity_repo.open_recovery_window(
+            PROVIDER, ACCOUNT, now=now + timedelta(minutes=5)
+        )
+        assert opened is not None and opened.state is AccountCapacityState.RECOVERY_CANDIDATE
+        # A candidate is published again for its single canary, but it is NOT
+        # "healthy": nothing has been proven yet.
+        assert opened.accepts_new_orders() is True
+        assert opened.accepts_canary() is True
+        assert await capacity_repo.limit_reached_accounts(PROVIDER) == frozenset()
+
+    async def test_a_local_delete_brings_recovery_forward(
+        self, capacity_repo: SqlAlchemyAccountCapacityRepository
+    ) -> None:
+        now = datetime.now(UTC)
+        await self._blocked(capacity_repo)
+        assert await capacity_repo.bring_forward_recovery(PROVIDER, ACCOUNT, now=now) is True
+        record = await capacity_repo.get(PROVIDER, ACCOUNT)
+        assert record is not None and record.next_recovery_attempt_at is not None
+        # Earliest wins: a second delete never pushes a live schedule LATER.
+        assert (
+            await capacity_repo.bring_forward_recovery(
+                PROVIDER, ACCOUNT, now=now + timedelta(hours=1)
+            )
+            is False
+        )
+        # A healthy account has nothing to bring forward.
+        await capacity_repo.record_healthy(PROVIDER, ACCOUNT)
+        assert await capacity_repo.bring_forward_recovery(PROVIDER, ACCOUNT, now=now) is False
 
 
 def test_the_scratch_database_never_touches_the_configured_one() -> None:

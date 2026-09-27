@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -118,17 +118,23 @@ class SqlAlchemyServerRepository:
             return [_to_domain(server_row, str(name)) for server_row, name in rows]
 
     async def list_by_user_paged(
-        self, user_id: UUID, *, offset: int, limit: int
+        self, user_id: UUID, *, offset: int, limit: int, hide_failed_before: datetime | None = None
     ) -> tuple[list[CloudServer], int]:
         base = _server_stmt().where(_ServerModel.user_id == user_id)
+        visible = _ServerModel.user_id == user_id
+        if hide_failed_before is not None:
+            visible = and_(
+                visible,
+                or_(
+                    _ServerModel.state != ServerLifecycleState.ERROR.value,
+                    _ServerModel.provider_server_id.is_not(None),
+                    func.coalesce(_ServerModel.updated_at, _ServerModel.created_at)
+                    > hide_failed_before.replace(tzinfo=None),
+                ),
+            )
+            base = _server_stmt().where(visible)
         async with self._session_factory() as session:
-            count = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(_ServerModel)
-                    .where(_ServerModel.user_id == user_id)
-                )
-            ).scalar_one()
+            count = (await session.execute(select(func.count()).where(visible))).scalar_one()
             rows = (
                 await session.execute(
                     base.order_by(
@@ -315,6 +321,8 @@ class SqlAlchemyServerRepository:
                 server.contained_from.value if server.contained_from is not None else None
             )
             cast_any.provider_server_id = server.provider_server_id
+            cast_any.ipv4 = server.ipv4
+            cast_any.ipv6 = server.ipv6
             cast_any.last_accrued_at = server.last_accrued_at
             # servers.deleted_at is a legacy naive-UTC column while the domain
             # carries an aware UTC value (last_accrued_at / low_balance_since

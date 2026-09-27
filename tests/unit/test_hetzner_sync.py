@@ -69,9 +69,7 @@ class TestHetznerCatalogSyncer:
         mock_session.commit = AsyncMock()
         mock_session.flush = AsyncMock()
         mock_session.add = MagicMock()
-        # provider lookup per page (found: deterministic uuid), then one location
-        # lookup per location (all missing -> created).
-        # Page 1: 2 locations, page 2: 1 location -> 1+2 + 1+1 executions.
+        # Provider lookup per page, then one location-name lookup per item.
         provider_result = MagicMock(scalars=lambda: MagicMock(first=lambda: uuid4()))
         missing_result = MagicMock(scalars=lambda: MagicMock(first=lambda: None))
         mock_session.execute = AsyncMock(
@@ -98,10 +96,10 @@ class TestHetznerCatalogSyncer:
         locations = [a for a in added if a.__class__.__name__ == "ProviderLocation"]
         assert len(locations) == 3
         by_id = {loc.location_id: loc for loc in locations}
-        assert by_id["1"].country_code == "DE"
-        assert by_id["1"].city == "Falkenstein"
-        assert by_id["3"].country_code == "FI"
-        assert by_id["3"].city == "Helsinki"
+        assert by_id["fsn1"].country_code == "DE"
+        assert by_id["fsn1"].city == "Falkenstein"
+        assert by_id["hel1"].country_code == "FI"
+        assert by_id["hel1"].city == "Helsinki"
 
     @pytest.mark.asyncio
     async def test_sync_plans_success(self, syncer):
@@ -123,13 +121,13 @@ class TestHetznerCatalogSyncer:
                     "prices": [
                         {
                             "location": "fsn1",
-                            "hourly": {"gross": "0.0219"},
-                            "monthly": {"gross": "15.87"},
+                            "price_hourly": {"gross": "0.0219"},
+                            "price_monthly": {"gross": "15.87"},
                         },
                         {
                             "location": "nbg1",
-                            "hourly": {"gross": "0.0225"},
-                            "monthly": {"gross": "16.14"},
+                            "price_hourly": {"gross": "0.0225"},
+                            "price_monthly": {"gross": "16.14"},
                         },
                     ],
                 }
@@ -175,6 +173,17 @@ class TestHetznerCatalogSyncer:
         # Decimal math: 0.0219 EUR/h -> 2.19 -> 2 minor; 0.0225 -> 2.25 -> 2.
         assert {a.price_per_quantum for a in added} == {2}
         assert all(a.currency == "EUR" for a in added)
+
+    def test_legacy_price_keys_fail_closed(self):
+        from cloud_platform.providers.hetzner.sync import (
+            _monthly_value,
+            _plan_pricing_from_hetzner,
+        )
+
+        old = {"location": "fsn1", "hourly": {"gross": "0.0063"}, "monthly": {"gross": "3.92"}}
+        assert _monthly_value(old) is None
+        with pytest.raises(ValueError, match="at least one price"):
+            _plan_pricing_from_hetzner({"id": 1, "name": "cx22", "prices": [old]})
 
     @pytest.mark.asyncio
     async def test_sync_images_success(self, syncer):

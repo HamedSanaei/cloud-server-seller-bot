@@ -234,15 +234,25 @@ class TestServerMappingAndDelete:
         assert server.ipv6 == "2001:db8::1"
         assert server.metadata["labels"] == {"platform-operation": "op-1"}
 
-    async def test_delete_server_treats_404_as_idempotent(self) -> None:
-        gone = _provider(lambda request: _error(404, "not_found", "already gone"))
-        try:
-            assert await gone.delete_server("1", IdempotencyKey("op-delete-1")) is None
-        finally:
-            await gone.close()
+    async def test_delete_server_proves_absence_before_mutating(self) -> None:
+        requests: list[str] = []
+        visible = True
 
-        ok = _provider(lambda request: httpx.Response(200, json={}))
+        def respond(request: httpx.Request) -> httpx.Response:
+            nonlocal visible
+            requests.append(request.method)
+            if request.method == "GET":
+                if visible:
+                    return httpx.Response(200, json={"server": _server_item()})
+                return _error(404, "not_found", "already gone")
+            assert request.method == "DELETE"
+            visible = False
+            return httpx.Response(200, json={"action": {"id": 1}})
+
+        provider = _provider(respond)
         try:
-            assert await ok.delete_server("1", IdempotencyKey("op-delete-1")) is None
+            await provider.delete_server("123", IdempotencyKey("op-delete-1"))
+            await provider.delete_server("123", IdempotencyKey("op-delete-1"))
         finally:
-            await ok.close()
+            await provider.close()
+        assert requests == ["GET", "DELETE", "GET"]

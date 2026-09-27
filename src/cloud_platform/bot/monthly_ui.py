@@ -2077,6 +2077,20 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("servers.disabled"), self._menu_only())
         return await self._servers_ui.handle(cb, user)
 
+    async def claim_ssh_password(self, user: User, ref: str) -> tuple[UUID, Any] | None:
+        if self._servers_ui is None:
+            return None
+        return await self._servers_ui.claim_ssh_password(user, ref)
+
+    async def finish_ssh_password(
+        self, user: User, server_id: UUID, claim_id: UUID, *, delivered: bool
+    ) -> bool:
+        if self._servers_ui is None:
+            return False
+        return await self._servers_ui.finish_ssh_password(
+            user, server_id, claim_id, delivered=delivered
+        )
+
     async def handle_text(self, text: str, user: User | None) -> BotScreen | None:
         """Route a free-text message to the My Servers prompts (rename, rDNS).
 

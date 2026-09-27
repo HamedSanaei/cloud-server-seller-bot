@@ -831,6 +831,7 @@ class SellableOfferRepository(Protocol):
         product_id: str,
         location_id: str,
         provider_account_id: str | None = None,
+        billing_model: str = BILLING_MODEL_MONTHLY,
     ) -> SellableOffer | None: ...
 
     async def list_all(self) -> list[SellableOffer]: ...

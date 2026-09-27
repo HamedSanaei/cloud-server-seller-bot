@@ -176,7 +176,7 @@ class TestCatalogAutoSyncSchedule:
     def test_only_the_catalog_job_gets_the_longer_timeout(self, settings: Settings) -> None:
         by_name = _cron_by_name(ws._cron_jobs())
         others = {name: job for name, job in by_name.items() if name != "catalog_auto_sync"}
-        assert len(others) == 13
+        assert len(others) == 14
         assert all(job.timeout_s is None for job in others.values())
         # And no worker role widened the generic timeout itself.
         for settings_cls in (

@@ -9,6 +9,9 @@ Usage:
     uv run python scripts/verify_ci.py --push-ready   # full gates + coverage
     uv run python scripts/verify_ci.py --static       # fast gates only
     uv run python scripts/verify_ci.py --staging      # the staging lane gate
+    uv run python scripts/verify_ci.py --staging \
+        --test tests/unit/test_business_log.py \
+        --test tests/unit/test_hourly_state_machine.py   # targeted + staging gate
 
 Steps (--staging) - what `.github/workflows/deploy-staging.yml` runs before
 building and deploying; also available locally as `make staging-check`:
@@ -19,6 +22,12 @@ building and deploying; also available locally as `make staging-check`:
 Deliberately NO pytest, NO coverage, NO mypy and NO pre-commit: staging is the
 fast development lane, and the release lane (`ci` + `--push-ready`) keeps the
 high-confidence gates.
+
+`--test <path-or-test-id>` (only with `--staging`) runs exactly the explicitly
+named tests, then the staging steps, then stops. It never discovers tests on
+its own, never adds coverage or mypy and never starts Docker: it exists so the
+whole staging contract is ONE command, and so there is no reason to reach for
+`--push-ready` on a staging change.
 
 Steps (--push-ready):
     1. ruff check
@@ -108,7 +117,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="staging-lane gates (ruff + compileall + import smoke; no tests)",
     )
+    parser.add_argument(
+        "--test",
+        action="append",
+        default=[],
+        metavar="TARGET",
+        help=(
+            "explicit test path/test id to run before the staging steps "
+            "(repeatable; requires --staging). No discovery, no coverage, no mypy."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    targets = [target for target in args.test if str(target).strip()]
+    if targets and not args.staging:
+        parser.error("--test is only available with --staging (targeted staging validation)")
 
     if args.push_ready:
         steps = PUSH_READY_STEPS
@@ -117,6 +140,20 @@ def main(argv: list[str] | None = None) -> int:
         steps = STAGING_STEPS
     else:
         steps = STATIC_STEPS
+    if targets:
+        # Targeted tests first: a broken behavior must fail before the cheap
+        # static gate spends time on the rest of the tree.
+        targeted = [
+            "uv",
+            "run",
+            "pytest",
+            "-q",
+            "--no-cov",
+            "-p",
+            "no:cacheprovider",
+            *targets,
+        ]
+        steps = [targeted, *steps]
     for cmd in steps:
         code = _run(cmd)
         if code != 0:

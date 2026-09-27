@@ -15,13 +15,16 @@ They assert the guarantees the spec calls out explicitly:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
 
 from cloud_platform.modules.businesslog.domain import BusinessEvent, BusinessEventType
 from cloud_platform.modules.compute.domain import CloudServer, ServerLifecycleState
+from cloud_platform.modules.operations.domain import OperationStatus
 from cloud_platform.modules.operations.service import PowerCommandResult
 from cloud_platform.modules.servers.confirmations import ConfirmationVerifier
 from cloud_platform.modules.servers.models import (
@@ -73,9 +76,23 @@ class FakeServerRepo:
         return self.rows.get(server_id)
 
     async def list_by_user_paged(
-        self, user_id: UUID, *, offset: int, limit: int
+        self,
+        user_id: UUID,
+        *,
+        offset: int,
+        limit: int,
+        hide_failed_before: datetime | None = None,
     ) -> tuple[list[CloudServer], int]:
         owned = [s for s in self.rows.values() if s.user_id == user_id]
+        if hide_failed_before is not None:
+            owned = [
+                s
+                for s in owned
+                if s.state is not ServerLifecycleState.ERROR
+                or s.provider_server_id is not None
+                or (s.updated_at or s.created_at or datetime.max.replace(tzinfo=UTC))
+                > hide_failed_before
+            ]
         owned.sort(key=lambda s: str(s.id))
         return owned[offset : offset + limit], len(owned)
 
@@ -408,12 +425,80 @@ class TestOwnership:
         assert page.items == ()
         assert provider.calls == []
 
+    async def test_failed_create_reason_visible_until_one_hour_then_hidden(self) -> None:
+        now = datetime(2026, 9, 27, 12, tzinfo=UTC)
+        server = make_server(state=ServerLifecycleState.ERROR, provider_server_id=None)
+        server.created_at = now - timedelta(hours=2)
+        server.updated_at = now - timedelta(minutes=59)
+        service, *_ = make_service(server=server)
+        service._clock = lambda: now
+        operation = SimpleNamespace(
+            status=OperationStatus.FAILED,
+            error="capacity exceeded; password=hunter2",
+        )
+        service._operations = SimpleNamespace(get_by_key=AsyncMock(return_value=operation))
+        page = await service.list_servers(CUSTOMER)
+        assert page.total == 1
+        assert page.items[0].failure_reason == "servers.failure_capacity"
+        server.updated_at = now - timedelta(hours=1)
+        page = await service.list_servers(CUSTOMER)
+        assert page.total == 0
+        assert await service.get_server(CUSTOMER, SERVER_ID) is not None
+
+    async def test_failed_running_server_with_provider_resource_is_not_hidden(self) -> None:
+        now = datetime(2026, 9, 27, 12, tzinfo=UTC)
+        server = make_server(state=ServerLifecycleState.ERROR)
+        server.updated_at = now - timedelta(days=2)
+        service, *_ = make_service(server=server)
+        service._clock = lambda: now
+        page = await service.list_servers(CUSTOMER)
+        assert page.total == 1
+
+    async def test_ssh_secret_is_owner_scoped_and_not_claimed_for_foreign_user(self) -> None:
+        service, *_ = make_service()
+        store = SimpleNamespace(
+            has_for_owner=AsyncMock(return_value=True),
+            claim_for_owner=AsyncMock(return_value=SimpleNamespace(claim_id=uuid4())),
+            ack_for_owner=AsyncMock(return_value=True),
+            release_for_owner=AsyncMock(return_value=True),
+        )
+        service._credential_store = store
+        with pytest.raises(ServerNotFoundError):
+            await service.claim_ssh_password(OTHER_CUSTOMER, SERVER_ID)
+        store.claim_for_owner.assert_not_awaited()
+        assert await service.has_ssh_password(CUSTOMER, SERVER_ID)
+        assert await service.claim_ssh_password(CUSTOMER, SERVER_ID) is not None
+        store.claim_for_owner.assert_awaited_once_with(server_id=SERVER_ID, user_id=CUSTOMER)
+
     async def test_foreign_server_is_indistinguishable_from_missing(self) -> None:
         service, *_ = make_service()
         with pytest.raises(ServerNotFoundError):
             await service.get_server(OTHER_CUSTOMER, SERVER_ID)
         with pytest.raises(ServerNotFoundError):
             await service.get_server(OTHER_CUSTOMER, uuid4())
+
+    async def test_menu_actions_require_owned_server_and_adapter_capability(self) -> None:
+        provider = FakeProvider()
+        provider.vps_management = SimpleNamespace(
+            get_vps_info=provider.get_vps_info,
+            list_vps_info=provider.list_vps_info,
+            start_vps=provider.start_vps,
+            stop_vps=provider.stop_vps,
+            reboot_vps=provider.reboot_vps,
+            list_vps_reinstall_images=provider.list_vps_reinstall_images,
+            reinstall_vps=provider.reinstall_vps,
+        )
+        service, *_ = make_service(provider=provider)
+        with pytest.raises(ServerNotFoundError):
+            await service.available_operations(OTHER_CUSTOMER, SERVER_ID)
+        allowed = await service.available_operations(CUSTOMER, SERVER_ID)
+        assert ServerOperation.REBOOT in allowed
+        assert ServerOperation.STOP in allowed
+        assert ServerOperation.REINSTALL in allowed
+        assert ServerOperation.SNAPSHOT_LIST not in allowed
+        assert ServerOperation.IP_LIST not in allowed
+        assert ServerOperation.PASSWORD_RESET not in allowed
+        assert provider.calls == []
 
     async def test_foreign_start_makes_no_provider_call(self) -> None:
         service, provider, power, *_ = make_service()

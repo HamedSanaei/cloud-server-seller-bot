@@ -24,6 +24,138 @@ async def startup(ctx: dict[str, object]) -> None:
         otlp_endpoint=settings.otel_exporter_endpoint,
         sample_ratio=settings.otel_sample_ratio,
     )
+    _log_business_logger_state(settings)
+    # Durable capacity knowledge must exist BEFORE the first checkout after a
+    # deployment: an account that refused a create before the capacity feature
+    # existed is otherwise considered eligible and is handed the next order.
+    # Idempotent (one evidence row per provider operation) and read-only.
+    await reconcile_capacity_evidence_once()
+
+
+def _log_business_logger_state(settings: object) -> None:
+    """Log ONCE whether the operator business feed can actually deliver.
+
+    A misconfigured feed used to be silent: ``enabled=true`` without a chat
+    id reads as "logging works" while every event is dropped by the policy.
+    Reports presence only — never the chat id or the bot token.
+    """
+    enabled = bool(getattr(settings, "telegram_logger_enabled", False))
+    chat_id = int(getattr(settings, "telegram_logger_chat_id", 0) or 0)
+    if enabled and not chat_id:
+        logger.error(
+            "business logger is enabled but telegram.logger.chat_id is not "
+            "configured; the operator feed cannot deliver"
+        )
+        return
+    if enabled:
+        logger.info("business logger enabled; durable Telegram outbox active")
+        return
+    logger.info("business logger disabled; operator feed inactive")
+
+
+async def reconcile_capacity_evidence_once() -> None:
+    """Recover historical capacity refusals exactly once per process.
+
+    Best effort by design: a reconciliation failure must never stop the
+    worker from starting (the CLI command exists for an explicit operator
+    run), and the routine is idempotent, so a crash-retry is harmless.
+    """
+    global _CAPACITY_EVIDENCE_RECONCILED
+    if _CAPACITY_EVIDENCE_RECONCILED:
+        return
+    _CAPACITY_EVIDENCE_RECONCILED = True
+    async with metrics.job("reconcile_capacity_evidence"):
+        from cloud_platform.core.container import create_container
+
+        container = None
+        try:
+            container = create_container()
+            reconciler = container.leaseweb_capacity_reconciliation()
+            if reconciler is None:
+                logger.info("capacity reconciliation skipped: no leaseweb cloud scope")
+                return
+            report = await reconciler.run("leaseweb")
+            logger.info("capacity reconciliation: %s", report.summary())
+        except Exception:
+            logger.exception("capacity reconciliation failed; worker continues")
+        finally:
+            if container is not None:
+                await container.close()
+
+
+#: One reconciliation per worker process (arq may call ``startup`` again after
+#: a restart in the same process); the routine itself is also idempotent.
+_CAPACITY_EVIDENCE_RECONCILED = False
+
+
+def capacity_recovery_minutes() -> set[int]:
+    """Cron minute set for the read-only capacity recovery controller.
+
+    Mirrors :func:`catalog_auto_sync_minutes`: only hour-dividing intervals are
+    expressible as an arq minute set; anything else falls back to the default 3
+    minutes so the controller keeps running instead of silently disappearing.
+    """
+    try:
+        interval = int(get_settings().leaseweb_cloud_capacity_recovery_interval_seconds)
+    except Exception:
+        interval = 180
+    if interval < 60 or 3600 % interval != 0:
+        logger.warning(
+            "capacity recovery interval %ss is not an hour-dividing minute cadence; "
+            "using 3 minutes",
+            interval,
+        )
+        interval = 180
+    return set(range(0, 60, interval // 60))
+
+
+async def reconcile_cloud_capacity(ctx: dict[str, object]) -> None:
+    """Read-only AUTOMATIC capacity recovery (LEASEWEB-MULTIACCOUNT).
+
+    PC-2031 used to require the operator to remember ``leaseweb cloud accounts
+    clear``. This scheduled pass removes that dependency: it reads each
+    credential account's instance inventory (read-only), keeps the baseline the
+    refusal was learned against, brings the next window forward when an
+    instance disappeared, opens the scheduled canary window, and emits the
+    deduplicated operator cards. It NEVER creates, deletes, powers or probes
+    anything: the canary is a real customer order, serialized by the durable
+    PostgreSQL lease in the checkout path.
+
+    Idempotent and safe to overlap with an operator CLI run: every write is
+    guarded ("earliest schedule wins") and the operator cards dedupe through
+    the durable outbox ``event_key``.
+    """
+    del ctx
+    async with metrics.job("reconcile_cloud_capacity"):
+        from cloud_platform.core.container import create_container
+
+        container = None
+        try:
+            container = create_container()
+            await container.initialize()
+            service = container.cloud_capacity_recovery_service()
+            if service is None:
+                logger.info("capacity recovery skipped: no leaseweb cloud scope")
+                return
+            report = await service.run("leaseweb")
+            logger.info("capacity recovery: %s", report.summary())
+            for outcome in report.outcomes:
+                logger.info(
+                    "capacity recovery account=%s state=%s attempts=%d baseline=%s "
+                    "count=%s window=%s notes=%s",
+                    outcome.credential_account_id,
+                    outcome.state,
+                    outcome.recovery_attempts,
+                    outcome.baseline_count,
+                    outcome.inventory_count,
+                    "open" if outcome.window_opened else "-",
+                    ",".join(outcome.notes) or "-",
+                )
+        except Exception:
+            logger.exception("capacity recovery pass failed; worker continues")
+        finally:
+            if container is not None:
+                await container.close()
 
 
 async def shutdown(ctx: dict[str, object]) -> None:
@@ -87,6 +219,13 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
                 server_repo=server_repo,
                 provider_registry=container.provider_registry,
                 audit_repo=audit_repo,
+                # The reconciler owns the final PROVISIONING -> RUNNING
+                # transition of an hourly cloud instance, so the operator's
+                # "vps provisioned" card is emitted from here, through the
+                # same durable outbox.
+                event_sink=container.business_event_sink(),
+                user_repo=container.user_repository(),
+                customer_sink=container.customer_provisioned_sink(),
             ).reconcile()
             logger.info(
                 "provider resource reconciliation: create=%s state=%s",
@@ -325,6 +464,9 @@ async def _process_deletes_impl(ctx: dict[str, object], owned_resources: list[An
             hold_service=hold_service,
             wallet_repo=wallet_repo,
             audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+            # A successful provider deletion is local evidence that capacity may
+            # have been freed: bring that account's recovery window forward.
+            capacity_recovery=_account_capacity_repository(),
         )
         worker = DeleteWorker(
             operation_repo=SqlAlchemyOperationRepository(SessionFactory),
@@ -754,6 +896,7 @@ async def run_catalog_auto_sync_once() -> Any:
                     )
                     owned_resources.append(hetzner_syncer)
                     sources.append(HetznerCatalogSyncSource(hetzner_syncer))
+                    sources.append(HetznerCatalogSyncSource(hetzner_syncer, billing_model="hourly"))
                 else:
                     logger.info(
                         "catalog auto-sync: hetzner credential missing; skipping provider "
@@ -1059,21 +1202,15 @@ async def reconcile_tetraminator_payments(ctx: dict[str, object]) -> None:
 
 
 async def deliver_business_log_events(ctx: dict[str, object]) -> None:
-    """Deliver queued operator-channel business events (release hardening).
+    """Deliver queued operator and private customer cards from the durable outbox.
 
-    The ONLY place a business event reaches Telegram. Events were enqueued
-    durably by the application services, so this job can fail, retry or lag
-    without ever affecting checkout, settlement, ordering or reconciliation.
-    Claiming is atomic and retries are bounded, so a re-run cannot flood the
-    channel. Skipped entirely when the logger channel is not configured.
+    Customer success notices do not depend on the optional operator logger.
+    Claiming remains atomic and retries are bounded.
     """
     del ctx
     async with metrics.job("deliver_business_log_events"):
-        from cloud_platform.core.config import get_settings
-
-        settings = get_settings()
-        if not settings.telegram_logger_enabled or not settings.telegram_logger_chat_id:
-            return
+        # The same outbox delivers private customer cards even with the
+        # optional private operator channel switched off.
         token = _telegram_bot_token()
         if token is None:
             return
@@ -1124,6 +1261,11 @@ def _cron_jobs() -> list[Any]:
             run_at_startup=True,
             timeout=catalog_timeout,
         ),
+        cron(
+            reconcile_cloud_capacity,
+            minute=capacity_recovery_minutes(),
+            run_at_startup=True,
+        ),
         cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
         cron(reconcile_provider_resources, minute=every_three_minutes, run_at_startup=True),
@@ -1152,6 +1294,7 @@ class WorkerSettings:
         reconcile_payments,
         sync_leaseweb_offers,
         catalog_auto_sync,
+        reconcile_cloud_capacity,
         process_cloud_creates,
         reconcile_cloud_creates,
         process_leaseweb_orders,
@@ -1180,6 +1323,7 @@ PROVISIONING_FUNCTIONS: list[Any] = [
     process_deletes,
     reconcile_deletes,
     catalog_auto_sync,
+    reconcile_cloud_capacity,
     process_cloud_creates,
     reconcile_cloud_creates,
     process_leaseweb_orders,
@@ -1210,6 +1354,11 @@ def _role_cron_jobs(role: str) -> list[Any]:
                 minute=catalog_auto_sync_minutes(),
                 run_at_startup=True,
                 timeout=catalog_auto_sync_timeout(),
+            ),
+            cron(
+                reconcile_cloud_capacity,
+                minute=capacity_recovery_minutes(),
+                run_at_startup=True,
             ),
             cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
             cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
