@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, cast
 
 import httpx
@@ -32,6 +31,7 @@ from cloud_platform.providers.errors import (
     ProviderUnavailable,
 )
 from cloud_platform.providers.health import AccountHealth
+from cloud_platform.providers.hetzner import hourly
 from cloud_platform.providers.hetzner.backoff import RateLimitBackoff, RateLimitPolicy
 from cloud_platform.providers.hetzner.sync import CURRENCY
 
@@ -488,21 +488,12 @@ class HetznerCloudProvider:
 
     @staticmethod
     def _monthly_minor_for_location(item: dict[str, Any], location_id: str) -> int | None:
-        """Provider monthly price at one location in integer minor units.
-
-        Decimal -> minor only: the provider string is never parsed as float.
-        """
-        for raw in item.get("prices", []):
-            if not isinstance(raw, dict):
-                continue
-            if str(raw.get("location") or raw.get("location_name") or "") != location_id:
-                continue
-            gross = (raw.get("monthly") or {}).get("gross")
-            if gross is None:
-                return None
-            value = Decimal(str(gross))
-            return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
-        return None
+        """Use the catalog's authoritative location and price parser."""
+        raw, _reason = hourly._location_price_entry(item, location_id)
+        if raw is None or hourly._location_availability(item, location_id) is False:
+            return None
+        value, _reason = hourly._gross_decimal(raw, hourly.MONTHLY_PRICE_KEY)
+        return hourly.minor_units(value) if value is not None else None
 
     async def get_os_options(self, location_id: str, product_id: str) -> list[OfferOsOption]:
         """Selectable system images for one server type at one location.
@@ -643,10 +634,33 @@ class HetznerCloudProvider:
 
     async def delete_server(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
         del idempotency_key
-        try:
-            await self._request("DELETE", f"/servers/{provider_server_id}")
-        except ProviderNotFound:
+        # This API has no DELETE idempotency key. Prove absence before issuing
+        # a mutation, especially when the operation is re-entered after a
+        # timeout or a worker restart.
+        if await self.get_server(provider_server_id) is None:
             return
+        headers = None
+        if self._credential_source is not None:
+            credential = await self._credential_source.get()
+            headers = self._auth_headers(credential.value)
+        try:
+            response = await self._client.request(
+                "DELETE", f"/servers/{provider_server_id}", headers=headers
+            )
+        except httpx.RequestError as exc:
+            raise ProviderOutcomeUnknown("Hetzner delete outcome unknown") from exc
+        if response.status_code == 404:
+            return
+        if response.status_code == 429 or response.status_code >= 500:
+            raise ProviderOutcomeUnknown(
+                f"Hetzner delete outcome unknown (HTTP {response.status_code})"
+            )
+        if response.status_code in {401, 403}:
+            raise ProviderAuthError(f"Hetzner delete refused (HTTP {response.status_code})")
+        if response.status_code in {409, 423}:
+            raise ProviderConflict(f"Hetzner delete conflict (HTTP {response.status_code})")
+        if response.is_error:
+            raise ProviderError(f"Hetzner delete refused (HTTP {response.status_code})")
 
     async def power_on(self, provider_server_id: str, idempotency_key: IdempotencyKey) -> None:
         del idempotency_key

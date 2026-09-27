@@ -2557,6 +2557,10 @@ class DeleteOperationExecutor:
             )
         except ProviderNotFound:
             pass  # 404 on delete: the resource is already absent - success
+        except ProviderOutcomeUnknown:
+            # A timeout/5xx may have applied the DELETE. Read-only absence is
+            # the only safe proof; never mark the server deleted on ambiguity.
+            pass
         except ProviderError as exc:
             if classify_provider_error(exc) is ErrorClass.RETRYABLE:
                 operation.requeue(str(exc))

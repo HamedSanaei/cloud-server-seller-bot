@@ -35,7 +35,19 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
+import httpx
+
+from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.modules.catalog.image_compatibility import image_compatible
 from cloud_platform.modules.fx.domain import SUPPORTED_CURRENCIES, currency_exponent
+from cloud_platform.providers.errors import (
+    ProviderAuthError,
+    ProviderCapacityError,
+    ProviderConflict,
+    ProviderError,
+    ProviderNotFound,
+    ProviderOutcomeUnknown,
+)
 
 #: Hetzner's identity and billing currency. Provider metadata, not prices --
 #: all price values are ingested from the API payload (M04-005).
@@ -153,6 +165,14 @@ class HetznerHourlyInstance:
     ipv4: str | None = None
     ipv6: str | None = None
     account_id: str | None = None
+
+    @property
+    def id(self) -> str:
+        return self.provider_server_id
+
+    @property
+    def state(self) -> str:
+        return self.status
 
     @property
     def name(self) -> str:
@@ -457,13 +477,348 @@ def traffic_label(value: Any) -> str | None:
     return f"{terabytes.quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)} TB"
 
 
+@dataclass(frozen=True, slots=True)
+class HetznerHourlyLocation:
+    id: str
+    name: str
+    country_code: str | None
+    city: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class HetznerHourlyImage:
+    id: str
+    label: str
+    os_family: str
+    architecture: str
+
+
+@dataclass(frozen=True, slots=True)
+class HetznerHourlyRootDisk:
+    size_gb: int
+    storage_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class HetznerHourlyCheckoutFacts:
+    instance_type: HetznerHourlyPlan
+    root_disk: HetznerHourlyRootDisk
+
+
+class HetznerHourlyCloudProvider:
+    """Application-facing hourly server port; monthly provider is unchanged.
+
+    Hetzner has no generic POST idempotency key: deterministic server name and
+    read-only, exhaustively paginated lookup are the recovery identity. The
+    caller's durable operation ledger serializes competing creates.
+    """
+
+    key = "hetzner"
+
+    def __init__(self, token: str, base_url: str = "https://api.hetzner.cloud/v1") -> None:
+        # Deferred import avoids the legacy client -> sync -> hourly import cycle.
+        from cloud_platform.providers.hetzner.client import HetznerCloudProvider
+
+        self._provider = HetznerCloudProvider(token=token, base_url=base_url)
+
+    async def close(self) -> None:
+        await self._provider.close()
+
+    async def aclose(self) -> None:
+        await self.close()
+
+    async def _pages(
+        self, path: str, key: str, params: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        """Consume documented meta.pagination.next_page; never search partial data."""
+        items: list[dict[str, Any]] = []
+        page = 1
+        for _ in range(1000):
+            payload = await self._provider._request(
+                "GET", path, params={**(params or {}), "page": page, "per_page": 50}
+            )
+            raw = payload.get(key)
+            meta = payload.get("meta")
+            pagination = meta.get("pagination") if isinstance(meta, dict) else None
+            if not isinstance(raw, list) or not isinstance(pagination, dict):
+                raise ProviderError(f"{path} returned an incomplete list envelope")
+            if any(not isinstance(item, dict) for item in raw):
+                raise ProviderError(f"{path} returned an invalid list entry")
+            items.extend(raw)
+            next_page = pagination.get("next_page")
+            if next_page is None:
+                return items
+            if isinstance(next_page, bool) or not isinstance(next_page, int) or next_page <= page:
+                raise ProviderError(f"{path} returned invalid pagination")
+            page = next_page
+        raise ProviderError(f"{path} exceeded safe pagination limit")
+
+    async def read_locations(self) -> tuple[HetznerHourlyLocation, ...]:
+        items = await self._pages("/locations", "locations")
+        locations: list[HetznerHourlyLocation] = []
+        for item in items:
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ProviderError("location response has no provider name")
+            locations.append(
+                HetznerHourlyLocation(
+                    id=name,
+                    name=str(item.get("description") or name),
+                    country_code=str(item.get("country") or "") or None,
+                    city=str(item.get("city") or "") or None,
+                )
+            )
+        return tuple(locations)
+
+    async def list_locations(self) -> list[HetznerHourlyLocation]:
+        return list(await self.read_locations())
+
+    async def read_instance_types(self, location: str) -> HourlyPlansRead:
+        items = await self._pages("/server_types", "server_types", {"location": location})
+        return parse_hourly_plans(items, location)
+
+    async def list_instance_types(self, location: str) -> list[HetznerHourlyPlan]:
+        return list((await self.read_instance_types(location)).plans)
+
+    async def list_images(self, location: str) -> list[HetznerHourlyImage]:
+        """System images are global; location feasibility comes from type facts."""
+        if not any(item.id == location for item in await self.read_locations()):
+            raise ProviderNotFound(f"unknown Hetzner location {location!r}")
+        items = await self._pages(
+            "/images", "images", {"type": "system", "include_deprecated": "false"}
+        )
+        images: list[HetznerHourlyImage] = []
+        for item in items:
+            if (
+                item.get("type") != "system"
+                or item.get("status") != "available"
+                or item.get("deprecated") is True
+                or item.get("deprecation")
+            ):
+                continue
+            image_id = item.get("id")
+            arch = item.get("architecture")
+            if image_id is None or not isinstance(arch, str) or not arch.strip():
+                continue
+            images.append(
+                HetznerHourlyImage(
+                    id=str(image_id),
+                    label=str(item.get("name") or item.get("description") or image_id),
+                    os_family=str(item.get("os_flavor") or "unknown"),
+                    architecture=arch.strip(),
+                )
+            )
+        return images
+
+    async def installable_images(self, location: str) -> list[HetznerHourlyImage]:
+        return await self.list_images(location)
+
+    async def validate_hourly_offer_for_checkout(
+        self,
+        *,
+        location_id: str,
+        product_id: str,
+        image_id: str,
+        expected_cost_minor: int,
+        currency: str,
+        expected_cost_exact: str,
+        root_disk_size_gb: int | None = None,
+        root_disk_storage_type: str | None = None,
+    ) -> HetznerHourlyCheckoutFacts:
+        if currency != CURRENCY:
+            raise ProviderConflict(f"Hetzner hourly currency changed from {currency!r}")
+        plan = next(
+            (
+                item
+                for item in await self.list_instance_types(location_id)
+                if item.plan_id == product_id
+            ),
+            None,
+        )
+        if plan is None:
+            raise ProviderNotFound(f"server type {product_id!r} unavailable at {location_id!r}")
+        if plan.hourly_cost_minor != expected_cost_minor:
+            raise ProviderConflict(f"hourly cost changed for {product_id!r} at {location_id!r}")
+        try:
+            expected = Decimal(expected_cost_exact)
+        except (ValueError, InvalidOperation, TypeError) as exc:
+            raise ProviderConflict("invalid pinned exact hourly rate") from exc
+        if not expected.is_finite() or expected <= 0 or expected != Decimal(plan.hourly_rate_exact):
+            raise ProviderConflict(
+                f"exact hourly rate changed for {product_id!r} at {location_id!r}"
+            )
+        return await self._validate_image_and_disk(
+            plan, image_id, location_id, root_disk_size_gb, root_disk_storage_type
+        )
+
+    async def _validate_image_and_disk(
+        self,
+        plan: HetznerHourlyPlan,
+        image_id: str,
+        location_id: str,
+        root_disk_size_gb: int | None,
+        root_disk_storage_type: str | None,
+    ) -> HetznerHourlyCheckoutFacts:
+        image = next(
+            (item for item in await self.list_images(location_id) if item.id == image_id),
+            None,
+        )
+        if image is None or not image_compatible(
+            image, plan_id=plan.plan_id, architecture=plan.architecture, location_id=location_id
+        ):
+            raise ProviderNotFound(f"image {image_id!r} incompatible or unavailable")
+        if plan.disk_gb <= 0 or not plan.storage_type:
+            raise ProviderConflict(f"server type {plan.plan_id!r} lacks a provable root disk")
+        disk = HetznerHourlyRootDisk(plan.disk_gb, plan.storage_type.upper())
+        if root_disk_size_gb is not None or root_disk_storage_type is not None:
+            if (
+                root_disk_size_gb != disk.size_gb
+                or str(root_disk_storage_type or "").upper() != disk.storage_type
+            ):
+                raise ProviderConflict("pinned root disk differs from Hetzner server type")
+        return HetznerHourlyCheckoutFacts(plan, disk)
+
+    async def get_instance(self, instance_id: str) -> HetznerHourlyInstance | None:
+        try:
+            payload = await self._provider._request("GET", f"/servers/{instance_id}")
+        except ProviderNotFound:
+            return None
+        instance = parse_hourly_instance(payload.get("server"))
+        if instance is None:
+            raise ProviderError("GET /servers/{id} returned an incomplete server identity")
+        return instance
+
+    async def find_by_reference(self, region: str, reference: str) -> HetznerHourlyInstance | None:
+        """A name-filtered exhaustive read, rejecting duplicate or unproven matches."""
+        matches: list[HetznerHourlyInstance] = []
+        for raw in await self._pages("/servers", "servers", {"name": reference}):
+            if raw.get("name") != reference:
+                continue
+            instance = parse_hourly_instance(raw)
+            if instance is None:
+                raise ProviderError("reference matched a server without complete identity")
+            matches.append(instance)
+        if len(matches) > 1:
+            raise ProviderConflict(f"multiple Hetzner servers share reference {reference!r}")
+        if not matches:
+            return None
+        if matches[0].region != region:
+            raise ProviderConflict("server reference is already used in a different location")
+        return matches[0]
+
+    async def create_instance(
+        self,
+        *,
+        instance_type: str,
+        image_id: str,
+        region: str,
+        reference: str,
+        root_disk_size_gb: int,
+        root_disk_storage_type: str,
+        idempotency_key: IdempotencyKey,
+        ssh_key_id: str | None = None,
+        image_label: str | None = None,
+        os_family: str | None = None,
+    ) -> HetznerHourlyInstance:
+        del idempotency_key, image_label, os_family
+        existing = await self.find_by_reference(region, reference)
+        if existing is not None:
+            if existing.plan_id != instance_type or existing.image_id != image_id:
+                raise ProviderConflict("server reference belongs to a different pinned contract")
+            return existing
+        plan = next(
+            (p for p in await self.list_instance_types(region) if p.plan_id == instance_type),
+            None,
+        )
+        if plan is None:
+            raise ProviderNotFound(f"server type {instance_type!r} unavailable at {region!r}")
+        await self._validate_image_and_disk(
+            plan, image_id, region, root_disk_size_gb, root_disk_storage_type
+        )
+        body: dict[str, Any] = {
+            "name": reference,
+            "server_type": instance_type,
+            "image": image_id,
+            "location": region,
+        }
+        if ssh_key_id is not None:
+            body["ssh_keys"] = [ssh_key_id]
+        # No _provider._request: its 429 retry is appropriate for GET but not
+        # for a billable POST without provider-supported idempotency.
+        try:
+            response = await self._provider._client.request("POST", "/servers", json=body)
+        except httpx.RequestError as exc:
+            raise ProviderOutcomeUnknown("Hetzner create transport outcome unknown") from exc
+        if response.status_code == 429 or response.status_code >= 500:
+            raise ProviderOutcomeUnknown(
+                f"Hetzner create outcome unknown (HTTP {response.status_code})"
+            )
+        if response.status_code == 422:
+            try:
+                error = response.json().get("error", {})
+            except (ValueError, AttributeError):
+                error = {}
+            if isinstance(error, dict) and error.get("code") == "resource_limit_exceeded":
+                raise ProviderCapacityError("Hetzner account resource limit exceeded")
+        if response.status_code in {401, 403}:
+            raise ProviderAuthError(f"Hetzner create refused (HTTP {response.status_code})")
+        if response.status_code == 404:
+            raise ProviderNotFound("Hetzner create resource not found")
+        if response.status_code in {409, 423}:
+            raise ProviderConflict(f"Hetzner create conflict (HTTP {response.status_code})")
+        if response.is_error:
+            raise ProviderError(f"Hetzner create refused (HTTP {response.status_code})")
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ProviderOutcomeUnknown("Hetzner create returned invalid JSON") from exc
+        instance = parse_hourly_instance(
+            payload.get("server") if isinstance(payload, dict) else None
+        )
+        if (
+            instance is None
+            or instance.region != region
+            or instance.reference != reference
+            or instance.plan_id != instance_type
+            or instance.image_id != image_id
+        ):
+            raise ProviderOutcomeUnknown("Hetzner create response identity not proven")
+        return instance
+
+    async def delete_instance(
+        self, instance_id: str, idempotency_key: IdempotencyKey | None = None
+    ) -> None:
+        del idempotency_key
+        try:
+            response = await self._provider._client.request("DELETE", f"/servers/{instance_id}")
+        except httpx.RequestError as exc:
+            raise ProviderOutcomeUnknown("Hetzner delete transport outcome unknown") from exc
+        if response.status_code == 404:
+            return
+        if response.status_code == 429 or response.status_code >= 500:
+            raise ProviderOutcomeUnknown(
+                f"Hetzner delete outcome unknown (HTTP {response.status_code})"
+            )
+        if response.status_code in {401, 403}:
+            raise ProviderAuthError(f"Hetzner delete refused (HTTP {response.status_code})")
+        if response.status_code in {409, 423}:
+            raise ProviderConflict(f"Hetzner delete conflict (HTTP {response.status_code})")
+        if response.is_error:
+            raise ProviderError(f"Hetzner delete refused (HTTP {response.status_code})")
+
+
 __all__ = [
     "CURRENCY",
     "HOURLY_PRICE_KEY",
     "MONTHLY_PRICE_KEY",
+    "HetznerHourlyCheckoutFacts",
+    "HetznerHourlyCloudProvider",
+    "HetznerHourlyImage",
     "HetznerHourlyInstance",
+    "HetznerHourlyLocation",
     "HetznerHourlyPlan",
     "HetznerHourlyRejection",
+    "HetznerHourlyRootDisk",
     "HourlyPlansRead",
     "exact_text",
     "memory_gb",

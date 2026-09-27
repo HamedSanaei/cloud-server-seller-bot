@@ -124,6 +124,8 @@ RECOVERABLE_HOURLY_PROVIDER_STATES = frozenset(
         # state, not an unrecognized one. Anything else outside this set
         # still resolves to outcome-unknown for reconcile-or-review.
         "creating",
+        "initializing",
+        "starting",
         "provisioning",
         "provisioned",
         "active",

@@ -172,6 +172,9 @@ class Container:
     #: syncers through these fields).
     owned_resources: tuple[Any, ...] = field(default=(), repr=False)
     _global_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
+    _hetzner_hourly_provider: Any | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
     _domestic_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
     # Lifecycle guard: :meth:`initialize` registers provider adapters, and
     # the registry rejects duplicates. The flag makes a second initialize a
@@ -481,34 +484,29 @@ class Container:
         )
 
     def hourly_cloud_resolver(self) -> Any | None:
-        """Provider-neutral (provider_key, account_id) -> cloud adapter dispatch.
-
-        Built from the Leaseweb cloud account router so hourly image reads
-        and creation resolve the exact credential that owns the offer.
-        ``None`` means no hourly credential is configured (legacy dict
-        fallback still applies in the services). No provider-name
-        branching: the account id selects the adapter.
-        """
+        """Resolve hourly adapters by provider and pinned credential account."""
         router = self.leaseweb_cloud_account_router
-        if router is None:
+        fallback = self.hourly_cloud_providers()
+        if router is None and not fallback:
             return None
 
         class _Resolver:
-            def __init__(self, cloud_router: Any, fallback: dict[str, Any]) -> None:
+            def __init__(self, cloud_router: Any, providers: dict[str, Any]) -> None:
                 self._router = cloud_router
-                self._fallback = dict(fallback)
+                self._fallback = providers
 
             def adapter_for(
                 self, provider_key: str, credential_account_id: str | None = None
             ) -> Any | None:
-                if provider_key != "leaseweb":
+                if provider_key != "leaseweb" or self._router is None:
+                    if credential_account_id not in (None, ""):
+                        return None
                     return self._fallback.get(provider_key)
                 try:
                     return self._router.client_for(credential_account_id)
                 except Exception:
-                    # Fail closed to the logical default only for legacy
-                    # rows without an account; a pinned unknown account
-                    # must not silently fall back to another credential.
+                    # Legacy unpinned rows may use the logical default; pinned
+                    # accounts never fall back to a different credential.
                     if not (credential_account_id or "").strip():
                         providers = getattr(self._router, "providers", {}) or {}
                         if isinstance(providers, dict) and providers:
@@ -523,7 +521,7 @@ class Container:
                             return next(iter(providers.values()))
                     return None
 
-        return _Resolver(router, self.hourly_cloud_providers())
+        return _Resolver(router, fallback)
 
     def hourly_cloud_provider(self) -> Any | None:
         """Hourly cloud adapter for live image reads (None when unconfigured).
@@ -550,9 +548,24 @@ class Container:
         return hourly_provider_from_settings(get_settings())
 
     def hourly_cloud_providers(self) -> dict[str, Any]:
-        """Hourly adapters keyed by provider (the storefront image screens)."""
-        provider = self.hourly_cloud_provider()
-        return {"leaseweb": provider} if provider is not None else {}
+        """Configured hourly adapters keyed by provider."""
+        providers: dict[str, Any] = {}
+        leaseweb = self.hourly_cloud_provider()
+        if leaseweb is not None:
+            providers["leaseweb"] = leaseweb
+        settings = get_settings()
+        if settings.providers_enabled.get("hetzner", False) and settings.hetzner_api_token:
+            adapter = self._hetzner_hourly_provider
+            if adapter is None:
+                from cloud_platform.providers.hetzner.hourly import HetznerHourlyCloudProvider
+
+                adapter = HetznerHourlyCloudProvider(
+                    token=settings.hetzner_api_token,
+                    base_url=settings.hetzner_api_base_url,
+                )
+                object.__setattr__(self, "_hetzner_hourly_provider", adapter)
+            providers["hetzner"] = adapter
+        return providers
 
     def capacity_republisher(self) -> Any | None:
         """Reacts to a NEW capacity refusal by refreshing future publication.
@@ -1467,6 +1480,7 @@ class Container:
         # containers without being listed in ``owned_resources``.
         await close_resource(self.leaseweb_account_router)
         await close_resource(self.leaseweb_cloud_account_router)
+        await close_resource(self._hetzner_hourly_provider)
 
         if self.engine is not None and id(self.engine) not in seen:
             engine_id = id(self.engine)
