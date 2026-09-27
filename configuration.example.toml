@@ -226,6 +226,21 @@ display_name = "Hetzner"
 api_token = "CHANGE_ME"
 base_url = "https://api.hetzner.cloud/v1"
 
+# Hetzner monthly VPS and Cloud hourly share one provider but use separate
+# offer families. Keep disabled on a staging/production-shared config: enabling
+# here enables BOTH deployments. First isolate staging configuration and run
+# `python -m cloud_platform.cli hetzner cloud doctor` (read-only). An HTTP 401
+# means the configured Cloud project token cannot authenticate; no live
+# inventory or sellability can then be verified. Diagnostics never create,
+# delete, or change provider resources and never print the credential.
+[providers.hetzner.families.vps]
+billing_model = "prepaid_monthly_fixed"
+display_name = "وی‌پی‌اس"
+
+[providers.hetzner.families.cloud]
+billing_model = "hourly"
+display_name = "کلود"
+
 # Commercial product families (STOREFRONT-REWORK): one provider can sell
 # more than one product type. Each family names its billing model
 # ("prepaid_monthly_fixed" or "hourly") and its customer-facing product
@@ -288,6 +303,15 @@ markup_percent = 25
 auto_publish = true
 
 [storefront.pricing.hetzner]
+mode = "markup"
+markup_percent = 25
+auto_publish = true
+
+# Cloud hourly is priced from the official per-location price_hourly.gross.
+# price_monthly.gross is a provider COST cap, not a customer selling price;
+# the bot shows a 730-hour customer estimate, not a monthly flat fee or cap.
+# This family-specific policy overrides the monthly Hetzner VPS policy.
+[storefront.pricing."hetzner.hourly"]
 mode = "markup"
 markup_percent = 25
 auto_publish = true

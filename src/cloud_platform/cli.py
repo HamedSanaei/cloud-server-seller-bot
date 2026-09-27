@@ -763,12 +763,11 @@ async def hetzner_sync_offers() -> int:
 
 
 async def hetzner_doctor() -> DoctorResult:
-    """Read-only Hetzner pre-flight: credentials, catalog and storefront.
+    """Read-only Hetzner *monthly VPS* pre-flight: credentials and storefront.
 
-    Answers, without mutating anything, WHY the Hetzner storefront is empty:
-    is the token configured, does the API answer, which locations does this
-    token see, does each location offer server types, and which offer gate is
-    still closed. Counts and class names only — never a token, never a price.
+    Reports only prepaid-monthly offers; hourly Cloud has its own independent
+    ``hetzner cloud doctor`` and must never make monthly readiness green.
+    Counts and class names only — never a token, never a price.
     """
     from cloud_platform.db.session import SessionFactory
     from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
@@ -815,10 +814,10 @@ async def hetzner_doctor() -> DoctorResult:
         rows = [
             row
             for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
-            if row.provider_key == "hetzner"
+            if row.provider_key == "hetzner" and row.billing_model == "prepaid_monthly_fixed"
         ]
-        counts = _offer_gate_counts(rows)
-        lines.append("Storefront gates: " + _visibility_line("customer-visible", counts))
+        counts = _offer_gate_counts(rows, settings.fx_catalog_pricing_currency.strip().upper())
+        lines.append("Monthly VPS storefront gates: " + _visibility_line("offers", counts))
         if not counts["sellable"]:
             ok = False
             lines.append(
@@ -828,6 +827,174 @@ async def hetzner_doctor() -> DoctorResult:
             )
     except Exception as exc:
         lines.append(f"[WARN] offer rows unavailable ({type(exc).__name__})")
+    return DoctorResult(ok, lines)
+
+
+async def hetzner_cloud_doctor() -> DoctorResult:
+    """Read-only hourly pre-flight: official catalog reads and isolated offer gates.
+
+    Never invokes catalog sync, provisioning, or a provider mutation. An
+    unreadable API or price book is unknown, not proof of missing inventory.
+    Only hourly Hetzner rows count toward Cloud readiness; monthly VPS rows
+    cannot make the Cloud family appear ready.
+    """
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.catalog.image_compatibility import (
+        image_architecture_conflict,
+        image_compatible,
+    )
+    from cloud_platform.modules.offers.auto_sync import pricing_policies_from_settings
+    from cloud_platform.modules.offers.domain import is_sellable_in_currency
+    from cloud_platform.modules.offers.repository import (
+        SqlAlchemyCatalogSyncStateRepository,
+        SqlAlchemySellableOfferRepository,
+    )
+    from cloud_platform.providers.errors import ProviderAuthError
+    from cloud_platform.providers.hetzner.hourly import HetznerHourlyCloudProvider
+
+    settings = get_settings()
+    lines = ["Hetzner Cloud hourly doctor (read-only)"]
+    ok = True
+    if not settings.providers_enabled.get("hetzner", False):
+        lines.append("[WARN] Hetzner provider disabled; neither family is customer-visible")
+        ok = False
+    families = settings.provider_families.get("hetzner", {})
+    if not any(attrs.get("billing_model") == "hourly" for attrs in families.values()):
+        lines.append("[WARN] no configured Hetzner Cloud hourly family")
+        ok = False
+    policies = pricing_policies_from_settings(settings)
+    policy = policies.get("hetzner.hourly") or policies.get("hetzner")
+    if policy is None:
+        lines.append("[WARN] no hourly pricing policy; provider costs cannot auto-publish")
+        lines.append('  action: configure [storefront.pricing."hetzner.hourly"]')
+        ok = False
+    else:
+        source = "hetzner.hourly" if "hetzner.hourly" in policies else "hetzner"
+        lines.append(
+            f"pricing policy: {source} (auto_publish={'yes' if policy.auto_publish else 'no'})"
+        )
+        if not policy.auto_publish:
+            ok = False
+
+    if not settings.hetzner_api_token:
+        lines.append("[WARN] Hetzner Cloud token not configured; live catalog not checked")
+        ok = False
+    else:
+        from collections import Counter
+
+        rejection_counts: Counter[str] = Counter()
+        image_architectures: Counter[str] = Counter()
+        type_ids: set[str] = set()
+        pair_count = 0
+        image_ids: set[str] = set()
+        provider = HetznerHourlyCloudProvider(
+            token=settings.hetzner_api_token, base_url=settings.hetzner_api_base_url
+        )
+        try:
+            try:
+                locations = await provider.read_locations()
+            except ProviderAuthError:
+                lines.append(
+                    "[FAIL] Hetzner Cloud API rejected the configured token (HTTP 401/403)"
+                )
+                ok = False
+            except Exception as exc:
+                lines.append(f"[WARN] live locations unreadable ({type(exc).__name__})")
+                ok = False
+            else:
+                lines.append(f"live locations: {len(locations)}")
+                if not locations:
+                    ok = False
+                for location in locations:
+                    # Location identifiers originate from the provider; print
+                    # counts only, never raw payloads or exception messages.
+                    try:
+                        read = await provider.read_instance_types(location.id)
+                        images = await provider.list_images(location.id)
+                    except ProviderAuthError:
+                        lines.append(
+                            "  [FAIL] Hetzner Cloud API rejected the configured token "
+                            "(HTTP 401/403)"
+                        )
+                        ok = False
+                        continue
+                    except Exception as exc:
+                        lines.append(
+                            f"  location catalog unreadable ({type(exc).__name__}); "
+                            "existing offers remain unverified"
+                        )
+                        ok = False
+                        continue
+                    type_ids.update(plan.plan_id for plan in read.plans)
+                    pair_count += len(read.plans)
+                    rejection_counts.update(item.reason for item in read.rejected)
+                    image_ids.update(image.id for image in images)
+                    image_architectures.update(image.architecture for image in images)
+                    compatible_types = sum(
+                        any(
+                            image_compatible(image, plan_id=plan.plan_id, location_id=location.id)
+                            and not image_architecture_conflict(image, plan.architecture)
+                            for image in images
+                        )
+                        for plan in read.plans
+                    )
+                    lines.append(
+                        f"  location: priced available types={len(read.plans)} "
+                        f"rejected={len(read.rejected)} installable images={len(images)} "
+                        f"types with compatible images={compatible_types}"
+                    )
+                    if not compatible_types:
+                        ok = False
+                lines.append(
+                    f"live server types: {len(type_ids)}, "
+                    f"proven type/location pairs: {pair_count}, system images: {len(image_ids)}"
+                )
+                lines.append(f"image architectures: {dict(sorted(image_architectures.items()))}")
+                lines.append(f"rejected pairs by reason: {dict(sorted(rejection_counts.items()))}")
+        finally:
+            await provider.aclose()
+
+    try:
+        rows = [
+            row
+            for row in await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
+            if row.provider_key == "hetzner" and row.billing_model == "hourly"
+        ]
+        states = {
+            state.provider_key: state
+            for state in await SqlAlchemyCatalogSyncStateRepository(SessionFactory).list_all()
+        }
+    except Exception as exc:
+        lines.append(f"[WARN] hourly catalog state unreadable ({type(exc).__name__})")
+        return DoctorResult(False, lines)
+    currency = settings.fx_catalog_pricing_currency.strip().upper()
+    counts = _offer_gate_counts(rows, currency)
+    lines.append(f"hourly offers stored: {len(rows)}")
+    lines.append("hourly storefront gates: " + _visibility_line("offers", counts))
+    lines.append(
+        f"hourly sellable in {currency}: "
+        f"{sum(1 for row in rows if is_sellable_in_currency(row, currency))}"
+    )
+    state = states.get("hetzner.hourly")
+    if state is None or state.last_attempted_at is None:
+        lines.append("hourly catalog sync: never recorded")
+    else:
+        last_success = state.last_success_at.isoformat() if state.last_success_at else "never"
+        lines.append(
+            f"hourly catalog sync: last attempt {state.last_attempted_at.isoformat()}, "
+            f"last success {last_success}"
+        )
+        lines.append(
+            f"  discovered={state.discovered} persisted={state.persisted} "
+            f"priced={state.prices_updated} published={state.published} retired={state.retired}"
+        )
+        lines.append(f"  last sync warnings={len(state.warnings)} errors={len(state.errors)}")
+    if not counts["sellable"]:
+        ok = False
+        lines.append(
+            "[WARN] Cloud hourly is not on sale; check read-only catalog auto-sync doctor "
+            "and offers doctor (monthly VPS rows do not count)"
+        )
     return DoctorResult(ok, lines)
 
 
@@ -3526,6 +3693,50 @@ async def offers_readiness() -> int:
             f"{catalog_currency} (none has a canonical currency plus valid FX provenance)"
         )
 
+    # Provider totals alone are insufficient for multi-family providers:
+    # one healthy monthly VPS must not mask a stranded hourly Cloud family.
+    # Keep first-start behavior unchanged: a never-run family sync is a
+    # warning, whereas a recorded discovery with zero persisted rows fails.
+    for provider_key, families in settings.provider_families.items():
+        if provider_key not in served or catalog is None:
+            continue
+        if catalog.market_of(provider_key) is None or not catalog.is_enabled(provider_key):
+            continue
+        for family_key, attrs in families.items():
+            billing = attrs.get("billing_model")
+            if billing not in ("hourly", "prepaid_monthly_fixed"):
+                continue
+            if f"{provider_key}.{billing}" not in policies and provider_key not in policies:
+                continue
+            family_rows = [
+                row
+                for row in rows
+                if row.provider_key == provider_key and row.billing_model == billing
+            ]
+            family_sellable = sum(
+                1 for row in family_rows if is_sellable_in_currency(row, catalog_currency)
+            )
+            label = f"{provider_key}.{family_key} ({billing})"
+            if family_sellable:
+                lines.append(
+                    f"[OK  ] {label}: {family_sellable} sellable of {len(family_rows)} stored"
+                )
+            elif not family_rows:
+                state_key = f"{provider_key}.hourly" if billing == "hourly" else provider_key
+                state = states.get(state_key)
+                discovered = int(getattr(state, "discovered", 0) or 0)
+                if discovered:
+                    failures.append(f"{label}: discovered {discovered} plan(s) but stored none")
+                else:
+                    lines.append(f"[WARN] {label}: no stored offers yet")
+            elif all(getattr(row, "operator_disabled", False) for row in family_rows):
+                lines.append(f"[WARN] {label}: all offers operator-disabled")
+            else:
+                failures.append(
+                    f"{label}: {len(family_rows)} stored offer(s) but ZERO sellable in "
+                    f"{catalog_currency}"
+                )
+
     # CAPACITY/STOREFRONT METRICS (LEASEWEB-MULTIACCOUNT): a provider can have
     # sellable rows yet be temporarily closed because every credential account
     # is out of capacity. These counters make that state explicit; they are
@@ -4022,6 +4233,12 @@ def _parser() -> argparse.ArgumentParser:
     htz_sub = htz.add_subparsers(dest="subcommand", required=True)
     htz_sub.add_parser("doctor", help="read-only pre-flight diagnostics")
     htz_sub.add_parser("sync-offers", help="refresh the sellable-offer price book")
+    htz_cloud = htz_sub.add_parser("cloud", help="Hetzner Cloud hourly diagnostics")
+    htz_cloud_sub = htz_cloud.add_subparsers(dest="hetzner_cloud", required=True)
+    htz_cloud_sub.add_parser("doctor", help="read-only hourly locations, types, images and offers")
+    htz_hourly = htz_sub.add_parser("hourly", help="Hetzner hourly diagnostics")
+    htz_hourly_sub = htz_hourly.add_subparsers(dest="hetzner_cloud", required=True)
+    htz_hourly_sub.add_parser("doctor", help="read-only hourly locations, types, images and offers")
 
     accounts = lsw_sub.add_parser("accounts", help="read-only credential accounts")
     accounts_sub = accounts.add_subparsers(dest="leaseweb_accounts", required=True)
@@ -4341,6 +4558,10 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return 0 if result.ok else 1
         if args.subcommand == "sync-offers":
             return await hetzner_sync_offers()
+        if args.subcommand in {"cloud", "hourly"} and args.hetzner_cloud == "doctor":
+            result = await hetzner_cloud_doctor()
+            print("\n".join(result.lines))
+            return 0 if result.ok else 1
         print(f"unknown hetzner subcommand {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "offers":

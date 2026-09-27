@@ -219,6 +219,49 @@ class TestStorefrontReadiness:
         assert "[OK  ] leaseweb: 1 sellable of 3 stored" in out
         assert "storefront readiness: OK" in out
 
+    async def test_monthly_sellable_cannot_mask_unsellable_hetzner_cloud(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
+    ) -> None:
+        from types import SimpleNamespace
+
+        monthly = await _canonical_offer(provider_key="hetzner", product_id="cx22")
+        hourly = _legacy_foreign_offer(
+            provider_key="hetzner",
+            product_id="cpx22",
+            location_id="nbg1",
+            billing_model="hourly",
+            selling_price_minor=0,
+        )
+        _patch(
+            monkeypatch,
+            [monthly, hourly],
+            policies={
+                "hetzner": PricingPolicy(mode="markup", markup_percent=25, auto_publish=True),
+                "hetzner.hourly": PricingPolicy(
+                    mode="markup", markup_percent=25, auto_publish=True
+                ),
+            },
+            registry_keys=("hetzner",),
+        )
+        monkeypatch.setattr(
+            cli,
+            "get_settings",
+            lambda: SimpleNamespace(
+                fx_catalog_pricing_currency="USD",
+                provider_families={
+                    "hetzner": {
+                        "vps": {"billing_model": "prepaid_monthly_fixed"},
+                        "cloud": {"billing_model": "hourly"},
+                    }
+                },
+            ),
+        )
+
+        assert await cli.offers_readiness() == 1
+        output = capsys.readouterr().out
+        assert "[OK  ] hetzner: 1 sellable of 2 stored" in output
+        assert "[FAIL] hetzner.cloud (hourly): 1 stored offer(s) but ZERO sellable" in output
+
     async def test_disabled_provider_is_never_required_to_have_offers(
         self, monkeypatch: pytest.MonkeyPatch, capsys: Any
     ) -> None:

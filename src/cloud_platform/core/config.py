@@ -715,9 +715,9 @@ class Settings(BaseSettings):
     providers_enabled: dict[str, bool] = Field(default_factory=dict)
     # Commercial product families per provider
     # (``[providers.<key>.families.<family>]`` sections): each family names
-    # its billing model and customer-facing product name, e.g. leaseweb
-    # ``vps`` (monthly) and ``cloud`` (hourly). Absent = one implicit family
-    # per billing model found in the provider's sellable offers.
+    # its billing model and customer-facing product name, e.g. Hetzner and
+    # Leaseweb each have ``vps`` (monthly) and ``cloud`` (hourly). Absent =
+    # one implicit family per billing model found in the sellable offers.
     provider_families: dict[str, dict[str, dict[str, str]]] = Field(default_factory=dict)
     # --- Automatic catalog sync + pricing policy (server-owned) --------------
     # The periodic coordinator refreshes provider costs, reprices auto-priced
