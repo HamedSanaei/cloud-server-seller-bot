@@ -28,6 +28,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from ipaddress import ip_address
 from typing import Any, ClassVar, NoReturn, Protocol
 from uuid import UUID, uuid4
 
@@ -36,7 +37,11 @@ from cloud_platform.db.timestamps import from_db_utc
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.billing.service import FinalChargeService, MissingSnapshotError
-from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.domain import (
+    BusinessEventSink,
+    CustomerProvisionedSink,
+    emit_safe,
+)
 from cloud_platform.modules.businesslog.events import vps_provisioned_event
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_HOURLY,
@@ -1001,12 +1006,14 @@ class ServerStateReconciler:
         #: Optional user lookup used only to enrich that card with the safe
         #: identity (Telegram id / username).
         user_repo: Any | None = None,
+        customer_sink: CustomerProvisionedSink | None = None,
     ) -> None:
         self._servers = server_repo
         self._registry = provider_registry
         self._audit = AuditTrail(audit_repo)
         self._events = event_sink
         self._users = user_repo
+        self._customer_sink = customer_sink
 
     async def reconcile(self) -> dict[StateReconciliationOutcome, int]:
         """Reconcile all provider-backed servers; returns a count per outcome."""
@@ -1047,6 +1054,10 @@ class ServerStateReconciler:
         plan = plan_state_repair(server.state, remote_state)
 
         if plan.action is StateAction.NONE:
+            if server.state is ServerLifecycleState.RUNNING and remote is not None:
+                if self._sync_remote_ips(server, remote):
+                    await self._servers.save(server)
+                await self._notify_hourly_customer(server)
             return StateReconciliationOutcome.CONSISTENT
         if plan.action is StateAction.IN_PROGRESS:
             return StateReconciliationOutcome.IN_PROGRESS
@@ -1055,6 +1066,8 @@ class ServerStateReconciler:
             old = server.state
             try:
                 server.transition_to(plan.target)
+                if plan.target is ServerLifecycleState.RUNNING and remote is not None:
+                    self._sync_remote_ips(server, remote)
                 await self._servers.save(server)
             except Exception:
                 logger.exception(
@@ -1076,10 +1089,38 @@ class ServerStateReconciler:
             )
             if plan.target is ServerLifecycleState.RUNNING:
                 await self._emit_hourly_provisioned(server)
+                await self._notify_hourly_customer(server)
             return StateReconciliationOutcome.REPAIRED
 
         # StateAction.CONTAIN
         return await self._contain(server, f"state reconciliation: {plan.reason}")
+
+    @staticmethod
+    def _sync_remote_ips(server: CloudServer, remote: ProviderServer) -> bool:
+        """Keep confirmed provider addresses with the RUNNING row, if valid."""
+        changed = False
+        for field_name, version in (("ipv4", 4), ("ipv6", 6)):
+            value = getattr(remote, field_name, None)
+            if not value:
+                continue
+            try:
+                address = ip_address(value)
+            except ValueError:
+                continue
+            if address.version == version and getattr(server, field_name) != str(address):
+                setattr(server, field_name, str(address))
+                changed = True
+        return changed
+
+    async def _notify_hourly_customer(self, server: CloudServer) -> None:
+        if str(getattr(server, "billing_model", "")) != BILLING_MODEL_HOURLY:
+            return
+        if self._customer_sink is None:
+            return
+        try:
+            await self._customer_sink.succeeded(server)
+        except Exception:
+            logger.warning("customer success notification could not be queued for %s", server.id)
 
     async def _emit_hourly_provisioned(self, server: CloudServer) -> None:
         """Emit the ONE ``vps_provisioned`` card for an hourly cloud server.

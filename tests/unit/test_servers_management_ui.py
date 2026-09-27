@@ -205,6 +205,10 @@ class FakeManagement:
             allowed.discard(ServerOperation.START)
         return frozenset(allowed)
 
+    async def has_ssh_password(self, customer_id: UUID, server_id: UUID) -> bool:
+        self._owned(customer_id)
+        return False
+
     async def refresh_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         self._record("refresh_server", server_id=server_id)
         self._owned(customer_id)
@@ -466,6 +470,19 @@ class TestList:
         assert "4 هسته" in screen.text
         assert "8 گیگابایت" in screen.text
         offers.get.assert_awaited_once_with(offer_id)
+
+    async def test_failed_create_shows_reason_without_raw_error(self) -> None:
+        management = FakeManagement(
+            view=_view(
+                state=CustomerServerState.ERROR,
+                ip=None,
+                failure_reason="servers.failure_capacity",
+            )
+        )
+        ui, _, _ = make_ui(management)
+        screen = await ui.list_screen(_user())
+        assert "ظرفیت" in screen.text
+        assert "None" not in screen.text
 
     async def test_monthly_order_offer_and_missing_specs(self) -> None:
         offer_id = uuid4()

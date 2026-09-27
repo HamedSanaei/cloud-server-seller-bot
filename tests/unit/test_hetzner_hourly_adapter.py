@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 
 import httpx
 import pytest
@@ -314,7 +315,10 @@ async def test_create_attaches_proven_provider_identity_and_classifies_quota() -
         if request.method == "POST":
             if create_status == 422:
                 return reply({"error": {"code": "resource_limit_exceeded"}}, 422)
-            return reply({"server": server(), "action": {"status": "running"}}, 201)
+            return reply(
+                {"server": server(), "action": {"status": "running"}, "root_password": None},
+                201,
+            )
         if request.url.path == "/v1/servers":
             return reply(envelope("servers", []))
         if request.url.path == "/v1/server_types":
@@ -346,6 +350,59 @@ async def test_create_attaches_proven_provider_identity_and_classifies_quota() -
         create_status = 422
         with pytest.raises(ProviderCapacityError):
             await provider.create_instance(**kwargs)
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_create_password_is_one_time_and_only_from_top_level_without_ssh_key() -> None:
+    issued = secrets.token_urlsafe(32)
+    posted: list[dict] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posted.append(json.loads(request.content))
+            return reply(
+                {
+                    "server": server(),
+                    "action": {"status": "running"},
+                    "next_actions": [],
+                    "root_password": issued if len(posted) == 1 else None,
+                },
+                201,
+            )
+        if request.url.path == "/v1/servers":
+            return reply(envelope("servers", []))
+        if request.url.path == "/v1/server_types":
+            return reply(envelope("server_types", [server_type()]))
+        if request.url.path == "/v1/locations":
+            return reply(envelope("locations", [{"id": 1, "name": "fsn1"}]))
+        if request.url.path == "/v1/images":
+            return reply(envelope("images", [image()]))
+        raise AssertionError(request.url)
+
+    provider = adapter(handle)
+    kwargs = dict(
+        instance_type="cx22",
+        image_id="100",
+        region="fsn1",
+        reference="srv-123",
+        root_disk_size_gb=40,
+        root_disk_storage_type="local",
+        idempotency_key=IdempotencyKey("test-key-123"),
+    )
+    try:
+        created = await provider.create_instance(**kwargs)
+        assert created.create_password is not None
+        assert created.ssh_username == "root"
+        assert issued not in repr(created)
+        assert created.create_password.reveal() == issued
+        assert created.create_password.reveal() is None
+        with_key = await provider.create_instance(**kwargs, ssh_key_id="selected-key")
+        assert with_key.create_password is None
+        assert with_key.ssh_username is None
+        assert "ssh_keys" not in posted[0]
+        assert posted[1]["ssh_keys"] == ["selected-key"]
     finally:
         await provider.close()
 

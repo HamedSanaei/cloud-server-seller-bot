@@ -174,6 +174,7 @@ SCREENS = frozenset(
         "rename",
         "renew",
         "autorenew",
+        "ssh",
     }
 )
 
@@ -268,6 +269,24 @@ class ServerManagementUi:
         if not page_view.items:
             return BotScreen(self._t.t("servers.empty"), self._menu_only())
         return await self._list_screen(user, page_view)
+
+    async def claim_ssh_password(self, user: User, ref: str) -> tuple[UUID, Any] | None:
+        if user.id is None:
+            return None
+        server_id = await self._sessions.server_id(user.id, ref)
+        if server_id is None:
+            return None
+        claim = await self._mgmt.claim_ssh_password(user.id, server_id)
+        return (server_id, claim) if claim is not None else None
+
+    async def finish_ssh_password(
+        self, user: User, server_id: UUID, claim_id: UUID, *, delivered: bool
+    ) -> bool:
+        if user.id is None:
+            return False
+        return await self._mgmt.finish_ssh_password(
+            user.id, server_id, claim_id, delivered=delivered
+        )
 
     async def handle_text(self, text: str, user: User | None) -> BotScreen | None:
         """Consume a free-text answer (rename, reverse DNS), else ``None``.
@@ -407,6 +426,13 @@ class ServerManagementUi:
         if view.operating_system and view.operating_system != title:
             lines.append(self._t.t("servers.list_os", os=view.operating_system))
         lines.append(self._t.t("servers.list_state", state=self._state(view.state)))
+        if view.failure_reason:
+            lines.append(
+                self._t.t(
+                    "servers.failure_reason",
+                    reason=self._t.t(view.failure_reason),
+                )
+            )
         return "\n".join(lines)
 
     def _pager(self, page: CustomerServerPage) -> list[InlineKeyboardButton]:
@@ -493,6 +519,13 @@ class ServerManagementUi:
             limit = view.traffic_limit or format_bytes(view.traffic_limit_bytes) or "—"
             lines.append(self._t.t("servers.spec_traffic", used=used, limit=limit))
         lines.append(self._t.t("servers.spec_state", value=self._state(view.state)))
+        if view.failure_reason:
+            lines.append(
+                self._t.t(
+                    "servers.failure_reason",
+                    reason=self._t.t(view.failure_reason),
+                )
+            )
         if view.contract_started_at:
             lines.append(self._t.t("servers.spec_started", value=view.contract_started_at))
         if view.contract_ends_at:
@@ -588,6 +621,8 @@ class ServerManagementUi:
             add("mon", "servers.monitoring_button")
         if ServerOperation.RENAME in allowed:
             add("rename", "servers.rename_button")
+        if await self._mgmt.has_ssh_password(user.id, view.server_id):  # type: ignore[arg-type]
+            add("ssh", "servers.ssh_button")
         if ServerOperation.RENEW_NOW in allowed and view.commercial_payable:
             add("renew", "servers.renew_button")
         if ServerOperation.AUTO_RENEW in allowed and view.auto_renew_enabled is not None:

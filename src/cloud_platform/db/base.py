@@ -412,6 +412,26 @@ class Server(Base):
     catalog_entry = relationship("Catalog", back_populates="servers")
 
 
+class ServerCreateCredential(Base):
+    """Encrypted, one-time provider-issued login for an owned server.
+
+    No plaintext column exists. The provider identity prevents a credential
+    captured at POST time from being offered before server correlation is saved.
+    """
+
+    __tablename__ = "server_create_credentials"
+
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), primary_key=True)
+    provider_server_id = Column(String, nullable=False)
+    ciphertext = Column(Text, nullable=True)  # NULL is consumed tombstone; never reissue.
+    username = Column(String, nullable=True)  # Verified provider image login only.
+    key_id = Column(String(12), nullable=False)
+    algorithm = Column(String(32), nullable=False)
+    claim_id = Column(PG_UUID, nullable=True)
+    claim_expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class SellableOffer(Base):
     """One explicitly sellable monthly or hourly offer at a location.
 

@@ -282,6 +282,23 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.list_ip_pending": "🌐 IP هنوز اختصاص نیافته",
         "servers.list_os": "💿 {os}",
         "servers.list_state": "{state}",
+        "servers.failure_reason": "❌ دلیل خطای ساخت: {reason}",
+        "servers.failure_generic": "ساخت سرور ناموفق بود؛ برای بررسی با پشتیبانی تماس بگیرید.",
+        "servers.failure_capacity": "ظرفیت ساخت سرور در ارائه‌دهنده کافی نبود.",
+        "servers.failure_balance": "موجودی کافی برای ساخت سرور نبود.",
+        "servers.failure_auth": "احراز هویت ارائه‌دهنده ناموفق بود؛ با پشتیبانی تماس بگیرید.",
+        "servers.failure_invalid": "ارائه‌دهنده مشخصات ساخت سرور را نپذیرفت.",
+        "servers.failure_rate": "محدودیت درخواست ارائه‌دهنده مانع ساخت سرور شد.",
+        "servers.failure_provider": "سرویس ارائه‌دهنده هنگام ساخت در دسترس نبود.",
+        "servers.ssh_button": "🔐 نمایش یک‌باره رمز SSH",
+        "servers.ssh_private_only": "رمز فقط در گفت‌وگوی خصوصی با ربات نمایش داده می‌شود.",
+        "servers.ssh_unavailable": (
+            "رمز اولیه در دسترس نیست؛ از کلید SSH یا پشتیبانی استفاده کنید."
+        ),
+        "servers.ssh_secret": (
+            "🔐 ورود SSH\nکاربر: {username}\nرمز اولیه: {password}\n"  # noqa: RUF001
+            "این پیام را محفوظ نگه دارید؛ رمز دیگر در پنل نمایش داده نمی‌شود."
+        ),
         "servers.list_manage_n": "⚙️ مدیریت {index}",
         "servers.snapshots_list_button": "📋 لیست Snapshotها",  # noqa: RUF001
         "servers.snapshot_create_title": "➕ ساخت Snapshot",  # noqa: RUF001
@@ -683,6 +700,23 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.list_ip_pending": "🌐 no IP assigned yet",
         "servers.list_os": "💿 {os}",
         "servers.list_state": "{state}",
+        "servers.failure_reason": "❌ Creation failed: {reason}",
+        "servers.failure_generic": "Server creation failed; contact support for details.",
+        "servers.failure_capacity": "Provider capacity was insufficient.",
+        "servers.failure_balance": "Insufficient balance to create this server.",
+        "servers.failure_auth": "Provider authentication failed; contact support.",
+        "servers.failure_invalid": "The provider rejected the server configuration.",
+        "servers.failure_rate": "Provider rate limiting prevented server creation.",
+        "servers.failure_provider": "The provider was unavailable during creation.",
+        "servers.ssh_button": "🔐 Show SSH password once",
+        "servers.ssh_private_only": "SSH credentials are shown only in a private bot chat.",
+        "servers.ssh_unavailable": (
+            "No initial password is available; use your SSH key or contact support."
+        ),
+        "servers.ssh_secret": (
+            "🔐 SSH login\nUser: {username}\nInitial password: {password}\n"
+            "Store this message securely; the password cannot be shown again."
+        ),
         "servers.list_manage_n": "⚙️ Manage {index}",
         "servers.snapshots_list_button": "📋 List snapshots",
         "servers.snapshot_create_title": "➕ Create snapshot",  # noqa: RUF001

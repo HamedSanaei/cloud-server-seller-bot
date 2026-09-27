@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from base64 import b64decode
+from binascii import Error as Base64Error
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -176,6 +178,7 @@ class Container:
         default=None, init=False, repr=False, compare=False
     )
     _domestic_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
+    _server_credentials: Any | None = field(default=None, init=False, repr=False, compare=False)
     # Lifecycle guard: :meth:`initialize` registers provider adapters, and
     # the registry rejects duplicates. The flag makes a second initialize a
     # no-op instead of a double registration; it is set only after a fully
@@ -696,6 +699,27 @@ class Container:
             count += 1
         return count
 
+    def server_credential_store(self) -> Any:
+        """Shared encrypted, owner-scoped one-time credential store."""
+        if self._server_credentials is None:
+            from cloud_platform.core.secrets import FernetSecretBox, MasterKey
+            from cloud_platform.modules.hourly.credentials import SqlAlchemyServerCredentialStore
+
+            configured = (get_settings().provider_credential_encryption_key or "").strip()
+            if not configured or configured == "CHANGE_ME":
+                raise ValueError("provider credential encryption key is not configured")
+            try:
+                material = b64decode(configured.encode("ascii"), altchars=b"-_", validate=True)
+            except (ValueError, UnicodeEncodeError, Base64Error) as exc:
+                raise ValueError("provider credential encryption key is invalid") from exc
+            box = FernetSecretBox(MasterKey(material=material))
+            object.__setattr__(
+                self,
+                "_server_credentials",
+                SqlAlchemyServerCredentialStore(self.session_factory, box=box),
+            )
+        return self._server_credentials
+
     def hourly_cloud_service(self) -> Any:
         """The hourly instance creation command (no provider calls, no charge)."""
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
@@ -749,6 +773,7 @@ class Container:
             # yields the null sink, so no financial path gains a dependency.
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
+            credential_store=self.server_credential_store(),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:
@@ -961,6 +986,12 @@ class Container:
             return NullBusinessEventSink()
         return OutboxBusinessEventSink(self.business_log_repository(), policy)
 
+    def customer_provisioned_sink(self) -> Any:
+        """Outbox for customer success cards, independent of operator logger."""
+        from cloud_platform.modules.businesslog.domain import CustomerProvisionedSink
+
+        return CustomerProvisionedSink(self.business_log_repository())
+
     def business_log_dispatcher(self, bot: Any) -> Any:
         """The delivery worker for the operator channel (worker process only)."""
         from cloud_platform.modules.businesslog.domain import BusinessLogDispatcher
@@ -971,6 +1002,7 @@ class Container:
             self.business_log_repository(),
             TelegramBusinessLogChannel(bot, policy.chat_id),
             policy,
+            user_repo=self.user_repository(),
         )
 
     def payment_gateways(self) -> dict[str, Any]:
@@ -1302,6 +1334,7 @@ class Container:
         provider-neutral VPS ports.
         """
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
         from cloud_platform.modules.servers.service import ServerManagementService
 
         return ServerManagementService(
@@ -1311,6 +1344,8 @@ class Container:
             confirmations=self.confirmation_verifier(),
             audit_repo=_audit_repository(self.session_factory),
             power=self.power_command_service(),
+            operations=SqlAlchemyOperationRepository(self.session_factory),
+            credential_store=self.server_credential_store(),
             event_sink=self.business_event_sink(),
             # Commercial status + manual renewal come from the SAME checker the
             # worker runs, so the customer's "renew now" and the automatic pass

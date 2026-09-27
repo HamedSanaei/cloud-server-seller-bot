@@ -116,7 +116,12 @@ class SqlAlchemyBusinessLogRepository:
             return True
 
     async def claim_due(
-        self, *, limit: int, now: datetime, stale_after_seconds: int
+        self,
+        *,
+        limit: int,
+        now: datetime,
+        stale_after_seconds: int,
+        customer_only: bool = False,
     ) -> list[BusinessLogRecord]:
         """Atomically claim up to ``limit`` due (or stale) rows."""
         stale_before = now - timedelta(seconds=stale_after_seconds)
@@ -124,6 +129,8 @@ class SqlAlchemyBusinessLogRepository:
         claimable = (_Model.status.in_([STATUS_PENDING, STATUS_RETRY]) & due) | (
             (_Model.status == STATUS_SENDING) & (_Model.claimed_at <= stale_before)
         )
+        if customer_only:
+            claimable &= _Model.event_type == "customer.server_provisioned"
         claimed: list[BusinessLogRecord] = []
         async with self._session_factory() as session:
             candidates = (

@@ -17,12 +17,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 import pytest
 
 from cloud_platform.modules.businesslog.domain import BusinessEvent, BusinessEventType
 from cloud_platform.modules.compute.domain import CloudServer, ServerLifecycleState
+from cloud_platform.modules.operations.domain import OperationStatus
 from cloud_platform.modules.operations.service import PowerCommandResult
 from cloud_platform.modules.servers.confirmations import ConfirmationVerifier
 from cloud_platform.modules.servers.models import (
@@ -74,9 +76,23 @@ class FakeServerRepo:
         return self.rows.get(server_id)
 
     async def list_by_user_paged(
-        self, user_id: UUID, *, offset: int, limit: int
+        self,
+        user_id: UUID,
+        *,
+        offset: int,
+        limit: int,
+        hide_failed_before: datetime | None = None,
     ) -> tuple[list[CloudServer], int]:
         owned = [s for s in self.rows.values() if s.user_id == user_id]
+        if hide_failed_before is not None:
+            owned = [
+                s
+                for s in owned
+                if s.state is not ServerLifecycleState.ERROR
+                or s.provider_server_id is not None
+                or (s.updated_at or s.created_at or datetime.max.replace(tzinfo=UTC))
+                > hide_failed_before
+            ]
         owned.sort(key=lambda s: str(s.id))
         return owned[offset : offset + limit], len(owned)
 
@@ -408,6 +424,51 @@ class TestOwnership:
         page = await service.list_servers(OTHER_CUSTOMER)
         assert page.items == ()
         assert provider.calls == []
+
+    async def test_failed_create_reason_visible_until_one_hour_then_hidden(self) -> None:
+        now = datetime(2026, 9, 27, 12, tzinfo=UTC)
+        server = make_server(state=ServerLifecycleState.ERROR, provider_server_id=None)
+        server.created_at = now - timedelta(hours=2)
+        server.updated_at = now - timedelta(minutes=59)
+        service, *_ = make_service(server=server)
+        service._clock = lambda: now
+        operation = SimpleNamespace(
+            status=OperationStatus.FAILED,
+            error="capacity exceeded; password=hunter2",
+        )
+        service._operations = SimpleNamespace(get_by_key=AsyncMock(return_value=operation))
+        page = await service.list_servers(CUSTOMER)
+        assert page.total == 1
+        assert page.items[0].failure_reason == "servers.failure_capacity"
+        server.updated_at = now - timedelta(hours=1)
+        page = await service.list_servers(CUSTOMER)
+        assert page.total == 0
+        assert await service.get_server(CUSTOMER, SERVER_ID) is not None
+
+    async def test_failed_running_server_with_provider_resource_is_not_hidden(self) -> None:
+        now = datetime(2026, 9, 27, 12, tzinfo=UTC)
+        server = make_server(state=ServerLifecycleState.ERROR)
+        server.updated_at = now - timedelta(days=2)
+        service, *_ = make_service(server=server)
+        service._clock = lambda: now
+        page = await service.list_servers(CUSTOMER)
+        assert page.total == 1
+
+    async def test_ssh_secret_is_owner_scoped_and_not_claimed_for_foreign_user(self) -> None:
+        service, *_ = make_service()
+        store = SimpleNamespace(
+            has_for_owner=AsyncMock(return_value=True),
+            claim_for_owner=AsyncMock(return_value=SimpleNamespace(claim_id=uuid4())),
+            ack_for_owner=AsyncMock(return_value=True),
+            release_for_owner=AsyncMock(return_value=True),
+        )
+        service._credential_store = store
+        with pytest.raises(ServerNotFoundError):
+            await service.claim_ssh_password(OTHER_CUSTOMER, SERVER_ID)
+        store.claim_for_owner.assert_not_awaited()
+        assert await service.has_ssh_password(CUSTOMER, SERVER_ID)
+        assert await service.claim_ssh_password(CUSTOMER, SERVER_ID) is not None
+        store.claim_for_owner.assert_awaited_once_with(server_id=SERVER_ID, user_id=CUSTOMER)
 
     async def test_foreign_server_is_indistinguishable_from_missing(self) -> None:
         service, *_ = make_service()

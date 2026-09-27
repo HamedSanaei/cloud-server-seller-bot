@@ -6,9 +6,9 @@ adjustments — in a private Telegram channel. That feed is an integration
 concern, so it is modelled as one:
 
 - **Structured events** (:class:`BusinessEventType` + :class:`BusinessEvent`)
-  with a stable, deterministic ``event_key``. The key makes emission and
-  delivery idempotent, so a retried checkout, a re-run worker or a retried
-  delivery can never post the same business event twice.
+  with a stable, deterministic ``event_key``. Repeated lifecycle passes
+  enqueue only one row; a crash after Telegram accepts a message but before
+  marking it sent can still cause a delivery replay.
 - **A durable outbox**. :class:`BusinessEventSink` only *enqueues* (one DB
   insert, unique key). Nothing is sent inline. A Telegram outage therefore
   cannot fail a checkout, roll back a wallet charge, re-POST a provider
@@ -33,6 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from ipaddress import ip_address
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -49,11 +50,12 @@ STATUS_ABANDONED = "ABANDONED"
 
 
 class BusinessEventType(StrEnum):
-    """Every business event the operator channel can carry."""
+    """Operator events plus the explicitly routed private customer success."""
 
     PURCHASE_REQUESTED = "purchase.requested"
     PROVIDER_ACCEPTED = "purchase.provider_accepted"
     VPS_PROVISIONED = "purchase.vps_provisioned"
+    CUSTOMER_PROVISIONED = "customer.server_provisioned"
     PURCHASE_FAILED = "purchase.failed"
     RECHARGE_CREATED = "recharge.created"
     RECHARGE_SUCCEEDED = "recharge.succeeded"
@@ -106,6 +108,7 @@ _FLAGS: Mapping[BusinessEventType, str] = {
     BusinessEventType.PURCHASE_REQUESTED: "log_purchases",
     BusinessEventType.PROVIDER_ACCEPTED: "log_purchases",
     BusinessEventType.VPS_PROVISIONED: "log_purchases",
+    BusinessEventType.CUSTOMER_PROVISIONED: "log_purchases",
     BusinessEventType.PURCHASE_FAILED: "log_order_failures",
     BusinessEventType.RECHARGE_CREATED: "log_recharges",
     BusinessEventType.RECHARGE_SUCCEEDED: "log_recharges",
@@ -398,11 +401,9 @@ class BusinessLogPolicy:
 
 @dataclass(frozen=True, slots=True)
 class BusinessEvent:
-    """One operator-channel business event.
+    """One durable event, routed by type to operator or customer.
 
-    ``event_key`` is the durable identity: enqueueing the same key twice is a
-    no-op, so repeating the same operation (Telegram double tap, worker
-    retry, reconciler pass) never duplicates a channel message.
+    ``event_key`` deduplicates enqueueing across retries and reconciler passes.
     """
 
     event_key: str
@@ -485,7 +486,7 @@ def uuid_text(value: UUID | str | None) -> str | None:
 
 
 class BusinessEventSink(Protocol):
-    """Port: durably record a business event (never sends inline)."""
+    """Port: durably record an operator event (never sends inline)."""
 
     async def emit(self, event: BusinessEvent) -> bool:
         """Persist ``event``; True when it was newly recorded."""
@@ -527,8 +528,15 @@ class BusinessLogRepository(Protocol):
         """Insert the row; False when ``event_key`` already exists."""
         ...
 
-    async def claim_due(self, *, limit: int, now: datetime, stale_after_seconds: int) -> list[Any]:
-        """Atomically claim due (or stale) rows for delivery."""
+    async def claim_due(
+        self,
+        *,
+        limit: int,
+        now: datetime,
+        stale_after_seconds: int,
+        customer_only: bool = False,
+    ) -> list[Any]:
+        """Atomically claim due rows; optionally leave operator rows untouched."""
         ...
 
     async def mark_sent(self, event_key: str, *, at: datetime) -> None: ...
@@ -588,11 +596,68 @@ class OutboxBusinessEventSink:
             return False
 
 
+class CustomerProvisionedSink:
+    """Enqueue one customer delivery independently of operator logger settings."""
+
+    def __init__(self, repository: BusinessLogRepository) -> None:
+        self._repo = repository
+
+    async def succeeded(
+        self, server: Any, *, ipv4: str | None = None, ipv6: str | None = None
+    ) -> bool:
+        """Only a durably RUNNING server can produce a customer success card."""
+        from cloud_platform.modules.compute.domain import ServerLifecycleState
+
+        if server.state is not ServerLifecycleState.RUNNING:
+            return False
+        payload: dict[str, Any] = {"user_id": str(server.user_id), "server_id": str(server.id)}
+        for field_name, value, version in (
+            ("ipv4", ipv4 or server.ipv4, 4),
+            ("ipv6", ipv6 or server.ipv6, 6),
+        ):
+            try:
+                address = ip_address(value) if value else None
+            except ValueError:
+                address = None
+            if address is not None and address.version == version:
+                payload[field_name] = str(address)
+        event = BusinessEvent(
+            event_key=f"customer.server_provisioned:{server.id}",
+            event_type=BusinessEventType.CUSTOMER_PROVISIONED,
+            payload=payload,
+        )
+        return await self._repo.enqueue(
+            event_key=event.event_key,
+            event_type=event.event_type.value,
+            payload=event.sanitized_payload(),
+        )
+
+
+def render_customer_provisioned(payload: Mapping[str, Any]) -> str:
+    """Customer card built only from vetted server identity and literal IPs."""
+    server_id = UUID(str(payload["server_id"]))
+    lines = ["✅ سرور شما آماده شد!", f"🆔 شناسه سرور: {str(server_id)[:8]}"]
+    for key, version in (("ipv4", 4), ("ipv6", 6)):
+        value = payload.get(key)
+        if value:
+            try:
+                address = ip_address(str(value))
+            except ValueError:
+                continue
+            if address.version == version:
+                lines.append(f"🌐 IPv{version}: {address}")
+    return "\n".join(lines)
+
+
 class BusinessLogChannel(Protocol):
     """Port: delivery transport for one rendered business event."""
 
     async def send(self, text: str) -> None:
         """Deliver ``text`` to the operator channel; raising means retry."""
+        ...
+
+    async def send_customer(self, chat_id: int, text: str) -> None:
+        """Deliver a private customer card; raising means retry."""
         ...
 
 
@@ -627,22 +692,26 @@ class BusinessLogDispatcher:
         repository: BusinessLogRepository,
         channel: BusinessLogChannel,
         policy: BusinessLogPolicy,
+        user_repo: Any | None = None,
     ) -> None:
         self._repo = repository
         self._channel = channel
         self._policy = policy
+        self._users = user_repo
 
     async def deliver(
         self, *, now: datetime | None = None, limit: int | None = None
     ) -> DeliveryReport:
         """One delivery pass over the outbox."""
-        if not self._policy.active:
+        if not self._policy.active and self._users is None:
             return DeliveryReport()
         moment = now or datetime.now(UTC)
+        claim_options = {"customer_only": True} if not self._policy.active else {}
         claimed = await self._repo.claim_due(
             limit=limit or self._policy.batch_size,
             now=moment,
             stale_after_seconds=self._policy.stale_claim_seconds,
+            **claim_options,
         )
         sent = retried = abandoned = 0
         for record in claimed:
@@ -653,9 +722,8 @@ class BusinessLogDispatcher:
                 await self._repo.mark_abandoned(
                     key, error=f"exceeded {self._policy.max_attempts} delivery attempts"
                 )
-                # An abandoned row is a business event the operator never saw:
-                # it must be visible in the application log, not just in the
-                # table. No token or chat id is ever logged.
+                # An abandoned customer or operator event must be visible
+                # in the application log. No token or chat id is logged.
                 logger.error(
                     "business log event ABANDONED: event_key=%s event_type=%s attempts=%s "
                     "max_attempts=%s",
@@ -667,7 +735,18 @@ class BusinessLogDispatcher:
                 abandoned += 1
                 continue
             try:
-                await self._channel.send(self.render(record))
+                if event_type == BusinessEventType.CUSTOMER_PROVISIONED.value:
+                    if self._users is None:
+                        raise ValueError("customer delivery is not configured")
+                    payload = dict(getattr(record, "payload", {}) or {})
+                    user_id = UUID(str(payload["user_id"]))
+                    user = await self._users.get(user_id)
+                    chat_id = getattr(user, "telegram_user_id", None)
+                    if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0:
+                        raise ValueError("customer has no Telegram identity")
+                    await self._channel.send_customer(chat_id, render_customer_provisioned(payload))
+                else:
+                    await self._channel.send(self.render(record))
             except Exception as exc:
                 delay = self._policy.backoff_base_seconds * (2 ** (attempts - 1))
                 next_attempt_at = moment + timedelta(seconds=delay)
@@ -710,6 +789,8 @@ class BusinessLogDispatcher:
         created = getattr(record, "created_at", None)
         if created is not None and "at" not in payload:
             payload["at"] = str(created)
+        if event_type is BusinessEventType.CUSTOMER_PROVISIONED:
+            return render_customer_provisioned(payload)
         return render_event(event_type, payload)
 
 
@@ -727,6 +808,7 @@ __all__ = [
     "BusinessLogError",
     "BusinessLogPolicy",
     "BusinessLogRepository",
+    "CustomerProvisionedSink",
     "DeliveryReport",
     "NullBusinessEventSink",
     "OutboxBusinessEventSink",
@@ -734,6 +816,7 @@ __all__ = [
     "emit_safe",
     "event_key",
     "format_minor",
+    "render_customer_provisioned",
     "render_event",
     "uuid_text",
 ]

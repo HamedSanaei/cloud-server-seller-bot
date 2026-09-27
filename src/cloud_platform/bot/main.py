@@ -24,6 +24,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from aiogram import Bot, Dispatcher
+from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
@@ -33,7 +34,7 @@ from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import Container, close_container, get_container
 from cloud_platform.core.i18n import Locale, Translator, get_catalog
 from cloud_platform.core.session_store import SessionStoreUnavailable
-from cloud_platform.modules.navigation.domain import decode_callback
+from cloud_platform.modules.navigation.domain import CallbackError, decode_callback
 from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.users.onboarding import handle_start
 
@@ -103,6 +104,51 @@ def _button_matches(text: str, key: str) -> bool:
         except Exception:
             pass
     return False
+
+
+async def _send_ssh_password(
+    query: CallbackQuery, monthly_ui: MonthlyBotUi, user: User | None, ref: str
+) -> None:
+    """Only a signed owner callback in a private chat can claim a one-time secret."""
+    message = query.message
+    if (
+        user is None
+        or user.id is None
+        or not isinstance(message, Message)
+        or message.chat.type != ChatType.PRIVATE
+        or query.from_user is None
+        or message.chat.id != query.from_user.id
+    ):
+        await query.answer(_t.t("servers.ssh_private_only"), show_alert=True)
+        return
+    try:
+        claimed = await monthly_ui.claim_ssh_password(user, ref)
+    except Exception:
+        logger.warning("SSH password claim unavailable")
+        await query.answer(_t.t("servers.ssh_unavailable"), show_alert=True)
+        return
+    if claimed is None:
+        await query.answer(_t.t("servers.ssh_unavailable"), show_alert=True)
+        return
+    server_id, secret = claimed
+    password = secret.reveal()
+    if not password:
+        await monthly_ui.finish_ssh_password(user, server_id, secret.claim_id, delivered=False)
+        await query.answer(_t.t("servers.ssh_unavailable"), show_alert=True)
+        return
+    try:
+        await message.answer(
+            _t.t("servers.ssh_secret", username=secret.username, password=password),
+            protect_content=True,
+        )
+    except Exception:
+        # Do not log exception text: a Telegram error may echo the message body.
+        logger.warning("SSH password delivery failed")
+        await monthly_ui.finish_ssh_password(user, server_id, secret.claim_id, delivered=False)
+        await query.answer(_t.t("servers.err_retry"), show_alert=True)
+        return
+    await monthly_ui.finish_ssh_password(user, server_id, secret.claim_id, delivered=True)
+    await query.answer()
 
 
 def register_handlers(
@@ -179,6 +225,15 @@ def register_handlers(
         user = await _resolve_user(container, query.from_user)
         chat_id = query.message.chat.id if isinstance(query.message, Message) else None
         data = query.data or ""
+        cb = None
+        if "|" in data:
+            try:
+                cb = decode_callback(data, get_settings().callback_signing_key)
+            except CallbackError:
+                pass
+        if cb is not None and cb.flow == "servers" and cb.screen == "ssh" and len(cb.args) == 1:
+            await _send_ssh_password(query, monthly_ui, user, cb.args[0])
+            return
         # Monthly flows first (LEASEWEB-MVP), everything else -> legacy UI.
         # Undecodable (tampered/foreign) button data is still rejected — it
         # is only rendered as the main menu plus a safe notice instead of a

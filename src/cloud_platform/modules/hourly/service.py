@@ -586,6 +586,9 @@ class HourlyCloudService:
         #: identity (Telegram id / username). Optional: without it the card
         #: still carries the platform user id of the server.
         user_repo: Any | None = None,
+        #: Durable, encrypted one-time store for passwords issued by a POST.
+        #: Required before using an adapter that can issue a password.
+        credential_store: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -616,6 +619,7 @@ class HourlyCloudService:
         self._catalog_stale_limit_seconds = catalog_stale_limit_seconds
         self._events = event_sink
         self._users = user_repo
+        self._credential_store = credential_store
 
     def _adapter_for(self, provider_key: str, credential_account_id: str | None) -> Any:
         """Exact cloud adapter for a pinned credential account (fail closed).
@@ -1987,6 +1991,14 @@ class HourlyCloudService:
                 category=FAILURE_IMAGE_UNAVAILABLE,
                 stage="images",
             )
+        if getattr(adapter, "issues_password_on_create", False) and self._credential_store is None:
+            return await self._fail_operation(
+                claimed,
+                server,
+                "encrypted create credential store is not configured",
+                category=FAILURE_INFRASTRUCTURE,
+                stage="credentials",
+            )
         reference = hourly_reference_name(server.id)
         # CAPACITY RECOVERY CANARY: when the pinned account is a recovery
         # candidate, THIS order may become the single real attempt that proves
@@ -2121,6 +2133,31 @@ class HourlyCloudService:
                 server,
                 "hourly provider response identity mismatch: " + ", ".join(response_mismatches),
             )
+        issued = getattr(created, "create_password", None)
+        if issued is not None:
+            # A provider's one-time response cannot be fetched on GET/replay.
+            # Encrypt and persist it before any later I/O can fail; a crash
+            # after this point retains ciphertext behind a provider-identity
+            # gate until reconciliation persists the matching server id.
+            if self._credential_store is None:
+                return await self._mark_outcome_unknown(
+                    claimed, server, "encrypted create credential store is not configured"
+                )
+            try:
+                password = issued.reveal()
+                if password:
+                    await self._credential_store.save_issued(
+                        server_id=server.id,
+                        provider_server_id=created_id,
+                        password=password,
+                        username=getattr(created, "ssh_username", None),
+                    )
+            except Exception:
+                # Never log exception details or the returned password. The
+                # POST cannot be replayed to recover a missing credential.
+                return await self._mark_outcome_unknown(
+                    claimed, server, "encrypted create credential could not be saved"
+                )
         # Persist the provider correlation on the server before terminalizing
         # the operation. If this save fails/crashes, the operation remains
         # IN_FLIGHT and reconciliation can find the exact POST outcome; the

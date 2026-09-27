@@ -225,6 +225,7 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
                 # same durable outbox.
                 event_sink=container.business_event_sink(),
                 user_repo=container.user_repository(),
+                customer_sink=container.customer_provisioned_sink(),
             ).reconcile()
             logger.info(
                 "provider resource reconciliation: create=%s state=%s",
@@ -1201,21 +1202,15 @@ async def reconcile_tetraminator_payments(ctx: dict[str, object]) -> None:
 
 
 async def deliver_business_log_events(ctx: dict[str, object]) -> None:
-    """Deliver queued operator-channel business events (release hardening).
+    """Deliver queued operator and private customer cards from the durable outbox.
 
-    The ONLY place a business event reaches Telegram. Events were enqueued
-    durably by the application services, so this job can fail, retry or lag
-    without ever affecting checkout, settlement, ordering or reconciliation.
-    Claiming is atomic and retries are bounded, so a re-run cannot flood the
-    channel. Skipped entirely when the logger channel is not configured.
+    Customer success notices do not depend on the optional operator logger.
+    Claiming remains atomic and retries are bounded.
     """
     del ctx
     async with metrics.job("deliver_business_log_events"):
-        from cloud_platform.core.config import get_settings
-
-        settings = get_settings()
-        if not settings.telegram_logger_enabled or not settings.telegram_logger_chat_id:
-            return
+        # The same outbox delivers private customer cards even with the
+        # optional private operator channel switched off.
         token = _telegram_bot_token()
         if token is None:
             return

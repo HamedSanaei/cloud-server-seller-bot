@@ -249,6 +249,20 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
    remain unavailable: both can incur separate charges, and customer price books,
    wallet settlement, and safe reconciliation for those resources are not yet wired.
    The management screen never allocates or replaces an IP implicitly.
+   Once the provider confirms an hourly server is running, the worker persists
+   its assigned IP and sends the owner a private Telegram success notification.
+   New Hetzner system-image servers created without an SSH key can expose their
+   provider-issued root username and initial password once through the private
+   `سرورهای من` management menu. The password is encrypted at rest, sent as a
+   protected Telegram message, then removed from storage after delivery; passwords
+   from servers created before this feature cannot be recovered from Hetzner.
+   Configure a stable URL-safe base64-encoded 32-byte key in the server-owned
+   `security.provider_credential_encryption_key` before creating servers that
+   return initial passwords. Keep it across deployments: losing or rotating the
+   key without re-encrypting stored secrets makes pending passwords unreadable.
+   A failed creation displays a safe failure category in the server list; a failed
+   attempt without a provider resource disappears from that list after one hour
+   (its operation history remains available for investigation).
 7. **Wallet funding** — manual for the MVP:
    `uv run python -m cloud_platform.cli users find <telegram_id>` then
    `uv run python -m cloud_platform.cli wallet credit <user_id> <minor> "<reason>"`

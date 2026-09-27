@@ -31,7 +31,7 @@ never a plan with a guessed price, and never another location's price.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
@@ -140,6 +140,24 @@ class HourlyPlansRead:
     rejected: tuple[HetznerHourlyRejection, ...]
 
 
+class HetznerCreatePassword:
+    """In-memory one-time provider response value, never serialized or logged."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value: str | None = value
+
+    def reveal(self) -> str | None:
+        value, self._value = self._value, None
+        return value
+
+    def __repr__(self) -> str:
+        return "HetznerCreatePassword(<redacted>)"
+
+    __str__ = __repr__
+
+
 @dataclass(frozen=True, slots=True)
 class HetznerHourlyInstance:
     """One Hetzner Cloud server, normalized (raw JSON never leaves this layer).
@@ -165,6 +183,11 @@ class HetznerHourlyInstance:
     ipv4: str | None = None
     ipv6: str | None = None
     account_id: str | None = None
+    # Set only by the immediate POST response. GET /servers cannot retrieve
+    # this provider-issued one-time secret. Never include it in persistence.
+    create_password: HetznerCreatePassword | None = None
+    # Only a verified system-image POST establishes the documented login.
+    ssh_username: str | None = None
 
     @property
     def id(self) -> str:
@@ -516,6 +539,7 @@ class HetznerHourlyCloudProvider:
     """
 
     key = "hetzner"
+    issues_password_on_create = True
 
     def __init__(self, token: str, base_url: str = "https://api.hetzner.cloud/v1") -> None:
         # Deferred import avoids the legacy client -> sync -> hourly import cycle.
@@ -785,6 +809,20 @@ class HetznerHourlyCloudProvider:
             or instance.image_id != image_id
         ):
             raise ProviderOutcomeUnknown("Hetzner create response identity not proven")
+        if ssh_key_id is None:
+            # Hetzner returns root_password at the ENVELOPE level, never in
+            # `server`; it is absent/null with SSH keys. Do not infer or reset
+            # passwords if absent, or trust a response with unproven identity.
+            raw_password = payload.get("root_password")
+            if isinstance(raw_password, str) and raw_password:
+                # list_images accepts Hetzner system images only; the selected
+                # image was revalidated above. Hetzner's own connecting guide
+                # documents root for these images and calls this root_password.
+                instance = replace(
+                    instance,
+                    create_password=HetznerCreatePassword(raw_password),
+                    ssh_username="root",
+                )
         return instance
 
     async def delete_instance(

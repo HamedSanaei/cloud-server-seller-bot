@@ -13,6 +13,7 @@ lifecycle branches of :class:`~cloud_platform.modules.hourly.service.HourlyCloud
 from __future__ import annotations
 
 import dataclasses
+import secrets
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -32,6 +33,7 @@ from cloud_platform.providers.errors import (
     ProviderNotFound,
     ProviderOutcomeUnknown,
 )
+from cloud_platform.providers.hetzner.hourly import HetznerCreatePassword
 from cloud_platform.providers.leaseweb.cloud import (
     CloudRootDisk,
     HourlyCheckoutFacts,
@@ -354,6 +356,7 @@ def _service(
     capacity_ttl_seconds: int = 3600,
     canary_lease_seconds: int = 900,
     canary_backoff_seconds: tuple[int, ...] = (900, 1800, 3600, 7200, 21600),
+    credential_store: Any | None = None,
 ) -> tuple[HourlyCloudService, FakeServerRepo, FakeSnapshots, FakeOpsRepo]:
     servers = servers or FakeServerRepo()
     snapshots = snapshots or FakeSnapshots()
@@ -373,6 +376,7 @@ def _service(
         canary_lease_seconds=canary_lease_seconds,
         canary_backoff_seconds=canary_backoff_seconds,
         cloud_resolver=resolver,
+        credential_store=credential_store,
     )
     return service, servers, snapshots, ops
 
@@ -1116,6 +1120,55 @@ def _accepted_response(server: Any) -> Any:
         instance_type="lsw.mini",
         image_id="UBUNTU",
     )
+
+
+class TestCreateCredentialCapture:
+    async def test_password_issuing_adapter_never_posts_without_encrypted_store(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
+        cloud = FakeHourlyAdapter()
+        cloud.issues_password_on_create = True
+        service, _servers, _snapshots, _ops = _service(offers, cloud)
+        server = await _requested_server(service, offers)
+
+        assert await service.process_server(server.id) == "failed"
+        assert cloud.posts == 0
+
+    async def test_provider_password_is_saved_before_server_correlation_not_operation(self) -> None:
+        offers = FakeOffersRepo([await _usd_offer()])
+        cloud = FakeHourlyAdapter()
+        cloud.issues_password_on_create = True
+        saved: list[tuple[Any, Any, Any]] = []
+        servers = FakeServerRepo()
+
+        class EncryptedStore:
+            async def save_issued(
+                self,
+                *,
+                server_id: Any,
+                provider_server_id: str,
+                password: str,
+                username: str | None = None,
+            ) -> None:
+                assert servers.servers[server_id].provider_server_id is None
+                saved.append((server_id, provider_server_id, password))
+
+        service, _servers, _snapshots, ops = _service(
+            offers, cloud, servers=servers, credential_store=EncryptedStore()
+        )
+        server = await _requested_server(service, offers)
+        issued = secrets.token_urlsafe(32)
+        cloud.create_result = SimpleNamespace(
+            **vars(_accepted_response(server)),
+            create_password=HetznerCreatePassword(issued),
+        )
+
+        assert await service.process_server(server.id) == "provisioned"
+        assert saved == [(server.id, "lsw-created", issued)]
+        operation = ops.ops[f"server-create:{server.id}"]
+        assert issued not in repr(operation.provider_response)
+        assert issued not in repr(operation)
+        assert await service.process_server(server.id) == "skipped"
+        assert len(saved) == 1
 
 
 class TestPinnedLaunchRootDisk:

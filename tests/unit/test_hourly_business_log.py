@@ -30,24 +30,27 @@ from cloud_platform.modules.businesslog.domain import (
     BusinessEventType,
     BusinessLogDispatcher,
     BusinessLogPolicy,
+    CustomerProvisionedSink,
     NullBusinessEventSink,
     format_minor,
     render_event,
 )
 from cloud_platform.modules.businesslog.events import purchase_failed_event
+from cloud_platform.modules.businesslog.telegram import TelegramBusinessLogChannel
 from cloud_platform.modules.compute.domain import BILLING_MODEL_HOURLY, ServerLifecycleState
 from cloud_platform.modules.hourly.service import HourlyCloudService
 from cloud_platform.modules.operations.service import (
     ServerStateReconciler,
     StateReconciliationOutcome,
 )
+from cloud_platform.providers.base import ProviderServer
 from cloud_platform.providers.errors import (
     ProviderCapacityError,
     ProviderError,
     ProviderOutcomeUnknown,
 )
 from cloud_platform.providers.registry import ProviderRegistry
-from tests.unit.test_business_log import FakeRecord, _policy
+from tests.unit.test_business_log import FakeRecord, FakeRepo, _policy
 from tests.unit.test_hourly_cloud_flow import (
     PROVIDER,
     USER,
@@ -434,6 +437,119 @@ class TestRecoveryAndActivation:
         # A later pass finds the server consistent: still exactly one card.
         assert await reconciler.reconcile() == {StateReconciliationOutcome.CONSISTENT: 1}
         assert len(sink.of_type(BusinessEventType.VPS_PROVISIONED)) == 1
+
+
+class _CustomerOutbox(FakeRepo):
+    async def claim_due(
+        self,
+        *,
+        limit: int,
+        now: datetime,
+        stale_after_seconds: int,
+        customer_only: bool = False,
+    ) -> list[FakeRecord]:
+        records = [
+            row
+            for row in self.rows.values()
+            if row.status == "PENDING"
+            and (
+                not customer_only or row.event_type == BusinessEventType.CUSTOMER_PROVISIONED.value
+            )
+        ]
+        for row in records[:limit]:
+            row.attempts += 1
+            row.status = "SENDING"
+        return records[:limit]
+
+
+class _ProviderWithIp(_HourlyCloudProvider):
+    async def get_server(self, provider_server_id: str) -> ProviderServer | None:
+        return ProviderServer(
+            id=provider_server_id,
+            name="srv",
+            status=self.status or "running",
+            ipv4="198.51.100.24",
+            ipv6="2001:db8::24",
+        )
+
+
+class _TelegramBotStub:
+    def __init__(self) -> None:
+        self.deliveries: list[tuple[int, str]] = []
+
+    async def send_message(
+        self, *, chat_id: int, text: str, disable_web_page_preview: bool
+    ) -> None:
+        self.deliveries.append((chat_id, text))
+
+
+class TestCustomerProvisioned:
+    async def test_confirmed_running_only_once_and_with_persisted_ip(self) -> None:
+        server = dataclasses.replace(
+            _reconciler_server(ServerLifecycleState.PROVISIONING, provider_key=PROVIDER),
+            user_id=USER.id,
+            billing_model=BILLING_MODEL_HOURLY,
+        )
+        repo = ReconcilerServerRepo([server])
+        outbox = _CustomerOutbox()
+        registry = ProviderRegistry()
+        registry.register(_ProviderWithIp("running"))  # type: ignore[arg-type]
+        reconciler = ServerStateReconciler(
+            server_repo=repo,  # type: ignore[arg-type]
+            provider_registry=registry,
+            audit_repo=_AuditStub(),  # type: ignore[arg-type]
+            customer_sink=CustomerProvisionedSink(outbox),
+        )
+        assert await reconciler.reconcile() == {StateReconciliationOutcome.REPAIRED: 1}
+        assert server.state is ServerLifecycleState.RUNNING
+        assert server.ipv4 == "198.51.100.24"
+        assert server.ipv6 == "2001:db8::24"
+        assert len(repo.saved) == 1
+        assert await reconciler.reconcile() == {StateReconciliationOutcome.CONSISTENT: 1}
+        assert outbox.rows[f"customer.server_provisioned:{server.id}"].payload == {
+            "user_id": str(USER.id),
+            "server_id": str(server.id),
+            "ipv4": "198.51.100.24",
+            "ipv6": "2001:db8::24",
+        }
+        assert list(outbox.rows) == [f"customer.server_provisioned:{server.id}"]
+        outbox.rows["operator:pending"] = FakeRecord(
+            event_key="operator:pending",
+            event_type=BusinessEventType.PURCHASE_REQUESTED.value,
+        )
+        bot = _TelegramBotStub()
+        channel = TelegramBusinessLogChannel(bot)
+        dispatcher = BusinessLogDispatcher(
+            outbox,
+            channel,
+            BusinessLogPolicy(enabled=False),
+            user_repo=FakeUserRepo(),
+        )
+        assert (await dispatcher.deliver()).sent == 1
+        assert len(bot.deliveries) == 1
+        assert bot.deliveries[0][0] == USER.telegram_user_id
+        assert "IPv4: 198.51.100.24" in bot.deliveries[0][1]
+        assert "IPv6: 2001:db8::24" in bot.deliveries[0][1]
+        assert outbox.rows["operator:pending"].status == "PENDING"
+        assert (await dispatcher.deliver()).sent == 0
+
+    async def test_provider_acceptance_and_unknown_outcomes_never_send_success(self) -> None:
+        for status in ("creating", "unknown"):
+            server = dataclasses.replace(
+                _reconciler_server(ServerLifecycleState.PROVISIONING, provider_key=PROVIDER),
+                billing_model=BILLING_MODEL_HOURLY,
+            )
+            outbox = _CustomerOutbox()
+            registry = ProviderRegistry()
+            registry.register(_HourlyCloudProvider(status))  # type: ignore[arg-type]
+            reconciler = ServerStateReconciler(
+                server_repo=ReconcilerServerRepo([server]),  # type: ignore[arg-type]
+                provider_registry=registry,
+                audit_repo=_AuditStub(),  # type: ignore[arg-type]
+                customer_sink=CustomerProvisionedSink(outbox),
+            )
+            await reconciler.reconcile()
+            assert not outbox.rows
 
 
 class TestCardContent:
