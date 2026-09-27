@@ -563,7 +563,11 @@ class CatalogAutoSyncCoordinator:
         currencies: set[str] = set()
         for account_id, product_id, location_id in _verified_offer_keys(report):
             row = await self._offers.get_by_ref(
-                provider_key, product_id, location_id, provider_account_id=account_id
+                provider_key,
+                product_id,
+                location_id,
+                provider_account_id=account_id,
+                billing_model=report.billing_model,
             )
             if row is None or not row.provider_available:
                 continue
@@ -843,7 +847,11 @@ class CatalogAutoSyncCoordinator:
         published = 0
         for account_id, product_id, location_id in _verified_offer_keys(report):
             row = await self._offers.get_by_ref(
-                provider_key, product_id, location_id, provider_account_id=account_id
+                provider_key,
+                product_id,
+                location_id,
+                provider_account_id=account_id,
+                billing_model=report.billing_model,
             )
             if row is None:
                 continue

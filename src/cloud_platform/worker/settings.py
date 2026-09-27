@@ -895,6 +895,7 @@ async def run_catalog_auto_sync_once() -> Any:
                     )
                     owned_resources.append(hetzner_syncer)
                     sources.append(HetznerCatalogSyncSource(hetzner_syncer))
+                    sources.append(HetznerCatalogSyncSource(hetzner_syncer, billing_model="hourly"))
                 else:
                     logger.info(
                         "catalog auto-sync: hetzner credential missing; skipping provider "

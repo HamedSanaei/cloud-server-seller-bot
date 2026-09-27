@@ -413,10 +413,10 @@ class Server(Base):
 
 
 class SellableOffer(Base):
-    """One explicitly sellable fixed-price monthly offer (LEASEWEB-MVP).
+    """One explicitly sellable monthly or hourly offer at a location.
 
     The row is the SINGLE gate for selling a provider product: a product/
-    location combination is sellable only when the provider currently
+    location/billing-model combination is sellable only when the provider currently
     reports it (``provider_available``), the operator enabled it
     (``enabled``), and it has an explicit customer selling price
     (``selling_price_minor > 0``). Provider cost and customer selling price
@@ -430,9 +430,9 @@ class SellableOffer(Base):
         location_id: Provider location code (e.g. "AMS-01")
         name: Product display name
         vcpu / ram_gb / disk_gb / traffic: Product specs (refresh on sync)
-        provider_cost_minor: Provider price per month (minor units)
+        provider_cost_minor: Provider price per billing unit (minor units)
         provider_cost_currency: Provider price currency
-        selling_price_minor: Admin-configured customer price per month (0 = not priced)
+        selling_price_minor: Customer price per billing unit (0 = not priced)
         selling_currency: Customer price currency
         billing_parameters: Contract/billing params (JSONB, e.g. contractTerm/billingCycle)
         provider_available: Whether the provider currently reports the product
@@ -444,8 +444,8 @@ class SellableOffer(Base):
             (provider_account_id, location_id, product_id); the per-account
             product list is durable in ``provider_routes``, while this row is
             the single operator-priced, customer-visible offer for one
-            (provider, location, product). NULL for providers without
-            credential accounts and for pre-multi-account leaseweb rows.
+            (provider, location, product, billing model). NULL for providers
+            without credential accounts and for pre-multi-account leaseweb rows.
     """
 
     __tablename__ = "sellable_offers"
@@ -454,7 +454,8 @@ class SellableOffer(Base):
             "provider_key",
             "product_id",
             "location_id",
-            name="uq_sellable_offers_provider_product_location",
+            "billing_model",
+            name="uq_sellable_offers_provider_product_location_billing",
         ),
     )
 

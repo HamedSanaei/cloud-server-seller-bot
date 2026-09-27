@@ -78,7 +78,7 @@ class _RecordingOfferRepo:
 
     def __init__(self) -> None:
         self.writes: list[dict[str, Any]] = []
-        self.marked: tuple[str, set[tuple[str, str]]] | None = None
+        self.marked: tuple[str, set[tuple[str, str]], str | None] | None = None
 
     async def upsert_from_provider(
         self,
@@ -98,8 +98,13 @@ class _RecordingOfferRepo:
             }
         )
 
-    async def mark_unavailable(self, provider_key: str, available: set[tuple[str, str]]) -> int:
-        self.marked = (provider_key, available)
+    async def mark_unavailable(
+        self,
+        provider_key: str,
+        available: set[tuple[str, str]],
+        billing_model: str | None = None,
+    ) -> int:
+        self.marked = (provider_key, available, billing_model)
         return 3
 
     def by_location(self, location_id: str) -> list[dict[str, Any]]:
@@ -127,8 +132,8 @@ def _server_type(
         "prices": [
             {
                 "location": location,
-                "monthly": {"gross": monthly},
-                "hourly": {"gross": "0.0070"},
+                "price_monthly": {"gross": monthly},
+                "price_hourly": {"gross": "0.0070"},
             }
         ],
     }
@@ -196,6 +201,7 @@ async def test_one_offer_per_location_with_provider_cost_only(
     assert offer_repo.marked is not None
     assert offer_repo.marked[0] == PROVIDER_KEY
     assert offer_repo.marked[1] == refs
+    assert offer_repo.marked[2] == "prepaid_monthly_fixed"
 
 
 @pytest.mark.asyncio
@@ -306,6 +312,88 @@ async def test_catalog_membership_comes_from_the_list_endpoint(
     for call in syncer._request.await_args_list:
         if call.args[1] == "/server_types":
             assert call.kwargs["params"]["location"] == "region-a1"
+
+
+@pytest.mark.asyncio
+async def test_monthly_and_hourly_same_plan_location_keep_independent_cost_and_cap(
+    syncer: HetznerCatalogSyncer, offer_repo: _RecordingOfferRepo
+) -> None:
+    item = _server_type("cx22", location="fsn1", monthly="3.92", type_id=22)
+    item["locations"] = [{"name": "fsn1", "available": True}]
+    item["prices"] = [
+        {
+            "location": "fsn1",
+            "price_monthly": {"gross": "3.9200000000000"},
+            "price_hourly": {"gross": "0.0075000000000"},
+            "included_traffic": 20 * 2**40,
+        }
+    ]
+    responses = _responses({"fsn1": [item]}) * 2
+    responses[0]["locations"] = responses[2]["locations"] = [{"id": 1, "name": "fsn1"}]
+    syncer._request = AsyncMock(side_effect=responses)
+
+    monthly = await syncer.sync_offers()
+    hourly = await syncer.sync_offers("hourly")
+
+    assert monthly.verified == hourly.verified == frozenset({("cx22", "fsn1")})
+    assert len(offer_repo.writes) == 2
+    monthly_spec, hourly_spec = [entry["update"] for entry in offer_repo.writes]
+    assert (monthly_spec.billing_model, monthly_spec.provider_cost_minor) == (
+        "prepaid_monthly_fixed",
+        392,
+    )
+    assert (hourly_spec.billing_model, hourly_spec.provider_cost_minor) == ("hourly", 1)
+    assert hourly_spec.billing_parameters["provider_hourly_rate"] == "0.0075"
+    assert hourly_spec.billing_parameters["provider_monthly_rate"] == "3.92"
+    assert hourly_spec.billing_parameters["provider_monthly_cost_minor"] == 392
+    assert monthly_spec.billing_parameters["provider_monthly_rate"] == "3.9200000000000"
+    assert hourly_spec.traffic == "20 TB"
+    assert offer_repo.marked == ("hetzner", {("cx22", "fsn1")}, "hourly")
+    for call in syncer._request.await_args_list:
+        if call.args[1] == "/server_types":
+            assert call.kwargs["params"]["location"] == "fsn1"
+
+
+@pytest.mark.asyncio
+async def test_hourly_rejections_keep_uncertain_existing_offers(
+    syncer: HetznerCatalogSyncer, offer_repo: _RecordingOfferRepo
+) -> None:
+    valid = _server_type("cx22", location="fsn1", monthly="3.92")
+    valid["locations"] = [{"name": "fsn1", "available": True}]
+    valid["prices"] = [
+        {
+            "location": "fsn1",
+            "price_monthly": {"gross": "3.92"},
+            "price_hourly": {"gross": "0.0075"},
+        }
+    ]
+    unavailable = {
+        **valid,
+        "name": "unavailable",
+        "locations": [{"name": "fsn1", "available": False}],
+    }
+    deprecated = {**valid, "name": "deprecated", "deprecated": True}
+    missing_rate = {
+        **valid,
+        "name": "missing-rate",
+        "prices": [{"location": "fsn1", "price_monthly": {"gross": "3.92"}}],
+    }
+    syncer._request = AsyncMock(
+        side_effect=_responses(
+            {
+                "fsn1": [valid, unavailable, deprecated, missing_rate],
+            }
+        )
+    )
+
+    result = await syncer.sync_offers("hourly")
+
+    assert result.verified == frozenset({("cx22", "fsn1")})
+    assert {entry["product_id"] for entry in offer_repo.writes} == {"cx22"}
+    for reason in ("unavailable-at-location", "deprecated", "missing-hourly"):
+        assert any(reason in warning for warning in result.warnings)
+    assert result.locations[0].error == "incomplete observation"
+    assert offer_repo.marked is None
 
 
 # ---------------------------------------------------------------------------

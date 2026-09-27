@@ -16,6 +16,7 @@ from cloud_platform.db.base import SellableOffer as _SellableOfferModel
 from cloud_platform.modules.fx.domain import SUPPORTED_CURRENCIES
 from cloud_platform.modules.offers.domain import (
     BILLING_MODEL_HOURLY,
+    BILLING_MODEL_MONTHLY,
     DOMESTIC_PROVIDER_COST_CURRENCIES,
     CatalogSyncState,
     OfferNotFoundError,
@@ -157,12 +158,14 @@ class SqlAlchemySellableOfferRepository:
         product_id: str,
         location_id: str,
         provider_account_id: str | None = None,
+        billing_model: str = BILLING_MODEL_MONTHLY,
     ) -> SellableOffer | None:
         async with self._session_factory() as session:
             statement = select(_SellableOfferModel).where(
                 _SellableOfferModel.provider_key == provider_key,
                 _SellableOfferModel.product_id == product_id,
                 _SellableOfferModel.location_id == location_id,
+                _SellableOfferModel.billing_model == billing_model,
             )
             if provider_account_id is not None:
                 statement = statement.where(
@@ -257,7 +260,7 @@ class SqlAlchemySellableOfferRepository:
         update: OfferSpecUpdate,
         provider_account_id: str | None = None,
     ) -> SellableOffer:
-        """Refresh one provider observation (idempotent per product+location).
+        """Refresh one provider observation (idempotent per billing model/product/location).
 
         ``provider_account_id`` records WHICH credential account supplied this
         observation; omitting it leaves the existing provenance untouched so a
@@ -285,6 +288,7 @@ class SqlAlchemySellableOfferRepository:
         if len({str(value).strip().casefold() for value in supplied_accounts}) > 1:
             raise ValueError("provider account arguments disagree")
         account_id = str(supplied_accounts[0]).strip().casefold() if supplied_accounts else None
+        billing_model = update.billing_model or BILLING_MODEL_MONTHLY
         async with self._session_factory() as session:
             candidates = (
                 (
@@ -294,6 +298,7 @@ class SqlAlchemySellableOfferRepository:
                             _SellableOfferModel.provider_key == provider_key,
                             _SellableOfferModel.product_id == product_id,
                             _SellableOfferModel.location_id == location_id,
+                            _SellableOfferModel.billing_model == billing_model,
                         )
                         .with_for_update()
                     )
@@ -359,7 +364,7 @@ class SqlAlchemySellableOfferRepository:
                     billing_parameters=update.billing_parameters,
                     technical_metadata=dict(update.technical_metadata or {}),
                     pricing_metadata={},
-                    billing_model=update.billing_model or "prepaid_monthly_fixed",
+                    billing_model=billing_model,
                     provider_available=(
                         False
                         if update.provider_observation_inconclusive

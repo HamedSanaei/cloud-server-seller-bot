@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import logging
 
-from cloud_platform.modules.offers.domain import CatalogSyncReport
+from cloud_platform.modules.offers.domain import (
+    BILLING_MODEL_HOURLY,
+    BILLING_MODEL_MONTHLY,
+    CatalogSyncReport,
+)
 from cloud_platform.providers.hetzner.sync import PROVIDER_KEY, HetznerCatalogSyncer
 
 logger = logging.getLogger(__name__)
@@ -21,8 +25,13 @@ logger = logging.getLogger(__name__)
 class HetznerCatalogSyncSource:
     """Coordinator source backed by the Hetzner catalog syncer."""
 
-    def __init__(self, syncer: HetznerCatalogSyncer) -> None:
+    def __init__(
+        self, syncer: HetznerCatalogSyncer, *, billing_model: str = BILLING_MODEL_MONTHLY
+    ) -> None:
+        if billing_model not in (BILLING_MODEL_MONTHLY, BILLING_MODEL_HOURLY):
+            raise ValueError("unsupported Hetzner billing model")
         self._syncer = syncer
+        self._billing_model = billing_model
 
     @property
     def provider_key(self) -> str:
@@ -38,17 +47,19 @@ class HetznerCatalogSyncSource:
                 provider_key=PROVIDER_KEY,
                 ok=False,
                 complete=False,
+                billing_model=self._billing_model,
                 errors=(f"locations: {type(exc).__name__}: {exc}",),
             )
         warnings.extend(f"locations: {error}" for error in locations_result.errors)
         try:
-            offers_result = await self._syncer.sync_offers()
+            offers_result = await self._syncer.sync_offers(self._billing_model)
         except Exception as exc:
             logger.warning("hetzner offer sync failed: %s", exc)
             return CatalogSyncReport(
                 provider_key=PROVIDER_KEY,
                 ok=False,
                 complete=False,
+                billing_model=self._billing_model,
                 warnings=tuple(warnings),
                 errors=(f"offers: {type(exc).__name__}: {exc}",),
             )
@@ -74,7 +85,7 @@ class HetznerCatalogSyncSource:
             provider_key=PROVIDER_KEY,
             ok=ok,
             complete=complete,
-            billing_model="prepaid_monthly_fixed",
+            billing_model=self._billing_model,
             discovered=offers_result.offers_written,
             persisted=offers_result.offers_written,
             retired=offers_result.marked_unavailable,
