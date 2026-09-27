@@ -8,6 +8,7 @@ from typing import Protocol
 from uuid import UUID
 
 from cloud_platform.core.money import Money
+from cloud_platform.modules.fx.domain import ConversionSnapshot, FxPurpose
 
 
 class LedgerEntryType(StrEnum):
@@ -17,6 +18,8 @@ class LedgerEntryType(StrEnum):
     CHARGE = "charge"
     REFUND = "refund"
     ADJUSTMENT = "adjustment"
+    CURRENCY_CLOSE = "currency_close"
+    CURRENCY_OPEN = "currency_open"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,17 +43,13 @@ class LedgerEntry:
 # Wallet aggregate & repository port
 # ---------------------------------------------------------------------------
 
-#: Canonical customer billing currency for the storefront.
-#:
-#: A foreign provider cost is converted to the configured catalog currency
-#: (``fx.catalog_pricing_currency``, USD) *before* the operator markup, so the
-#: amount a customer accepts is a USD amount and the hourly/monthly charge
-#: snapshot is USD. A wallet denominated in another unit could only settle that
-#: contract by relabelling money, so new wallets are created in this canonical
-#: unit and a domestic (IRT/IRR) recharge converts through the audited FX
-#: boundary at credit time. Existing non-USD balances are never silently
-#: rewritten: an operator migrates them explicitly (docs/fx/CURRENCY_FX.md).
-DEFAULT_WALLET_CURRENCY: str = "USD"
+#: Customer billing currency for new IRT-denominated storefront contracts.
+#: Foreign provider costs are converted through the audited FX boundary before
+#: the operator markup; prepaid and hourly customer amounts are billed in IRT.
+#: Existing USD wallets and historical USD ledger/charges remain USD until an
+#: explicit operator-reviewed USD liquidation and atomic migration completes.
+#: Never relabel an existing balance or silently reinterpret a legacy contract.
+DEFAULT_WALLET_CURRENCY: str = "IRT"
 
 
 class WalletError(Exception):
@@ -59,6 +58,101 @@ class WalletError(Exception):
 
 class InsufficientBalanceError(WalletError):
     """Raised when a debit would overdraw."""
+
+
+class WalletCurrencyMigrationError(WalletError):
+    """An operator cutover cannot be proved safe against the persisted state."""
+
+
+def validate_wallet_migration_snapshot(snapshot: ConversionSnapshot) -> None:
+    """Require the audited AbanTether USD/USDT liquidation route."""
+    if (
+        not isinstance(snapshot, ConversionSnapshot)
+        or snapshot.source_currency != "USD"
+        or snapshot.target_currency != "IRT"
+        or snapshot.purpose is not FxPurpose.LIQUIDATION
+        or snapshot.source != "abantether"
+        or snapshot.path != "USDTIRT.sell (proxy USDT for USD)"
+        or not snapshot.proxy
+        or snapshot.proxy_asset != "USDT"
+        or snapshot.stale
+        or (snapshot.source_amount_minor > 0 and snapshot.target_amount_minor == 0)
+    ):
+        raise WalletCurrencyMigrationError(
+            "migration requires the AbanTether USDT/IRT liquidation quote"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class WalletCurrencyMigrationPlan:
+    """Operator-approved exact FX and wallet balance snapshot; no mutation."""
+
+    id: UUID
+    user_id: UUID
+    wallet_id: UUID
+    source_balance_minor: int
+    snapshot: ConversionSnapshot
+    operator_id: UUID
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(value, UUID)
+            for value in (self.id, self.user_id, self.wallet_id, self.operator_id)
+        ):
+            raise WalletCurrencyMigrationError("migration requires UUID identities")
+        if not isinstance(self.source_balance_minor, int) or isinstance(
+            self.source_balance_minor, bool
+        ):
+            raise WalletCurrencyMigrationError("migration balance must be integer minor units")
+        if not isinstance(self.snapshot, ConversionSnapshot):
+            raise WalletCurrencyMigrationError("migration requires an audited FX snapshot")
+        if (
+            self.source_balance_minor < 0
+            or self.source_balance_minor != self.snapshot.source_amount_minor
+        ):
+            raise WalletCurrencyMigrationError(
+                "migration snapshot does not match the wallet balance"
+            )
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise WalletCurrencyMigrationError("migration requires an operator reason")
+        validate_wallet_migration_snapshot(self.snapshot)
+
+
+@dataclass(frozen=True, slots=True)
+class WalletCurrencyMigration:
+    """Durable audit boundary between immutable USD and IRT ledger epochs."""
+
+    id: UUID
+    user_id: UUID
+    wallet_id: UUID
+    source_balance_minor: int
+    snapshot: ConversionSnapshot
+    operator_id: UUID
+    reason: str
+    close_entry_id: UUID | None
+    open_entry_id: UUID | None
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        WalletCurrencyMigrationPlan(
+            id=self.id,
+            user_id=self.user_id,
+            wallet_id=self.wallet_id,
+            source_balance_minor=self.source_balance_minor,
+            snapshot=self.snapshot,
+            operator_id=self.operator_id,
+            reason=self.reason,
+        )
+        if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
+            raise WalletCurrencyMigrationError("migration boundary requires aware timestamp")
+        if self.source_balance_minor == 0:
+            if self.close_entry_id is not None or self.open_entry_id is not None:
+                raise WalletCurrencyMigrationError(
+                    "zero balance migration has no ledger cash movement"
+                )
+        elif not isinstance(self.close_entry_id, UUID) or not isinstance(self.open_entry_id, UUID):
+            raise WalletCurrencyMigrationError("migration requires both ledger boundary entries")
 
 
 class WalletStatus(StrEnum):
@@ -143,7 +237,7 @@ class WalletRepository(Protocol):
         ...
 
     async def get_or_create(self, user_id: UUID, currency: str = DEFAULT_WALLET_CURRENCY) -> Wallet:
-        """Return the wallet; create it if absent (canonical USD by default)."""
+        """Return the wallet; create it if absent (canonical IRT by default)."""
         ...
 
     async def debit(self, user_id: UUID, amount: int, idempotency_key: str) -> Wallet:
@@ -179,6 +273,7 @@ class WalletRepository(Protocol):
         idempotency_key: str,
         *,
         reference: str = "",
+        expected_currency: str | None = None,
     ) -> tuple[Wallet, bool]:
         """Apply a gateway deposit EXACTLY once, atomically.
 
@@ -187,6 +282,21 @@ class WalletRepository(Protocol):
         The check and the balance increment happen in ONE transaction against
         a row-locked wallet, so two concurrent callbacks for the same payment
         can never both increment the balance."""
+        ...
+
+    async def apply_currency_migration(
+        self, plan: WalletCurrencyMigrationPlan
+    ) -> tuple[Wallet, bool]:
+        """Commit guarded wallet conversion, two ledger facts and audit in one transaction.
+
+        Must lock the wallet, reject outstanding USD holds/payments/servers,
+        enforce a unique wallet migration and compare complete immutable facts
+        for idempotent replay (even when the original FX quote has expired).
+        """
+        ...
+
+    async def list_currency_migrations(self, wallet_id: UUID) -> list[WalletCurrencyMigration]:
+        """Durable cutover boundaries for reconciliation."""
         ...
 
 

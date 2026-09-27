@@ -74,9 +74,20 @@ class _MemPayments:
 class _Wallet:
     def __init__(self) -> None:
         self.credits: list[int] = []
+        self.currency = "EUR"
+
+    async def get(self, user_id: Any) -> Any:
+        del user_id
+        return self
 
     async def credit_deposit(
-        self, user_id: Any, amount: int, key: str, *, reference: str = ""
+        self,
+        user_id: Any,
+        amount: int,
+        key: str,
+        *,
+        reference: str = "",
+        expected_currency: str | None = None,
     ) -> tuple[Any, bool]:
         self.credits.append(amount)
         return type("W", (), {"balance": sum(self.credits)})(), True

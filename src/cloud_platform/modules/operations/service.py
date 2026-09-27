@@ -24,7 +24,7 @@ no funds stay reserved for a server that will never be provisioned.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -45,6 +45,7 @@ from cloud_platform.modules.businesslog.domain import (
 from cloud_platform.modules.businesslog.events import vps_provisioned_event
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_HOURLY,
+    BILLING_MODEL_PREPAID_HOURLY_IRT,
     CloudServer,
     ServerLifecycleState,
     ServerRepository,
@@ -1007,6 +1008,7 @@ class ServerStateReconciler:
         #: identity (Telegram id / username).
         user_repo: Any | None = None,
         customer_sink: CustomerProvisionedSink | None = None,
+        prepaid_capture: Callable[[UUID], Awaitable[object]] | None = None,
     ) -> None:
         self._servers = server_repo
         self._registry = provider_registry
@@ -1014,6 +1016,7 @@ class ServerStateReconciler:
         self._events = event_sink
         self._users = user_repo
         self._customer_sink = customer_sink
+        self._prepaid_capture = prepaid_capture
 
     async def reconcile(self) -> dict[StateReconciliationOutcome, int]:
         """Reconcile all provider-backed servers; returns a count per outcome."""
@@ -1052,6 +1055,33 @@ class ServerStateReconciler:
             else normalize_provider_status(remote.status)
         )
         plan = plan_state_repair(server.state, remote_state)
+        # A remote boot is not evidence that the upcoming hour was paid. In
+        # particular, a stopped zero-balance server must not be resurrected
+        # by this provider-status repair.
+        if (
+            server.billing_model == BILLING_MODEL_PREPAID_HOURLY_IRT
+            and remote_state is ProviderServerState.RUNNING
+        ):
+            if server.state is ServerLifecycleState.PROVISIONING:
+                if self._prepaid_capture is None:
+                    return StateReconciliationOutcome.INCONCLUSIVE
+                try:
+                    await self._prepaid_capture(server.id)
+                    # Capture commits independently; refresh the stale snapshot.
+                    server = await self._servers.get(server.id) or server
+                except Exception:
+                    logger.exception("prepaid first-hour capture failed for server %s", server.id)
+                    return StateReconciliationOutcome.INCONCLUSIVE
+            if (
+                server.state is ServerLifecycleState.STOPPED
+                and server.prepaid_zero_since is not None
+            ):
+                return StateReconciliationOutcome.INCONCLUSIVE
+            paid_until = server.prepaid_paid_until
+            if paid_until is None or (
+                paid_until.replace(tzinfo=UTC) if paid_until.tzinfo is None else paid_until
+            ) <= datetime.now(UTC):
+                return StateReconciliationOutcome.INCONCLUSIVE
 
         if plan.action is StateAction.NONE:
             if server.state is ServerLifecycleState.RUNNING and remote is not None:
@@ -2154,9 +2184,10 @@ class MissingResourceDetector:
 #   3. billing final: once absence is confirmed the server gets its deletion
 #      timestamp and transitions DELETING -> DELETED, and the final usage
 #      segment is settled by FinalChargeService (M06-006; idempotent under
-#      its own ledger keys, so a crash-replay settles nothing twice). A
-#      server that never had a provider resource (failed before
-#      provisioning) has no usage: any still-reserved creation hold is
+#      its own ledger keys, so a crash-replay settles nothing twice).
+#      Prepaid hourly IRT rows skip this final charge: coverage was captured
+#      before the hour began. A server that never had a provider resource
+#      (failed before provisioning) has no usage: any still-reserved creation hold is
 #      released back to the wallet and no charge is made;
 #   4. deleted: the operation completes with the correlation (deletion time,
 #      charge amount) and the server row is DELETED (freeing quota).
@@ -2510,7 +2541,7 @@ class DeleteOperationExecutor:
 
         charged_minor = 0
         charge_capped = False
-        if server.provider_server_id:
+        if server.provider_server_id and not server.is_prepaid_hourly_irt:
             # A server that had a provider resource carries its final usage
             # segment (idempotent: a crash-replay settles nothing twice). A
             # server that never had one (failed before provisioning) has no
@@ -2566,7 +2597,11 @@ class DeleteOperationExecutor:
             action="server.deleted",
             resource_type=RESOURCE_TYPE_SERVER,
             resource_id=str(server.id),
-            reason="deletion confirmed at the provider; final usage settled",
+            reason=(
+                "deletion confirmed at the provider; prepaid coverage already settled"
+                if server.is_prepaid_hourly_irt
+                else "deletion confirmed at the provider; final usage settled"
+            ),
             metadata={
                 "operation_id": str(operation.id),
                 "provider_server_id": server.provider_server_id or "",
@@ -2812,6 +2847,126 @@ class DeleteCommandService:
             replayed=False,
             requeued=result is DeleteExecutionResult.REQUEUED,
         )
+
+
+class PrepaidProviderLifecycleOutcome(StrEnum):
+    SKIPPED = "skipped"
+    INCONCLUSIVE = "inconclusive"
+    STOP_REQUESTED = "stop_requested"
+    STOPPED = "stopped"
+    DELETE_REQUESTED = "delete_requested"
+
+
+class PrepaidProviderLifecycleService:
+    """Enforce zero-IRT policy using observed provider status and owner-checked commands."""
+
+    def __init__(
+        self,
+        *,
+        server_repo: ServerRepository,
+        wallet_repo: WalletRepository,
+        provider_registry: ProviderRegistry,
+        power_commands: PowerCommandService,
+        delete_commands: DeleteCommandService,
+    ) -> None:
+        self._servers = server_repo
+        self._wallets = wallet_repo
+        self._registry = provider_registry
+        self._power = power_commands
+        self._delete = delete_commands
+
+    async def enforce(
+        self, server_id: UUID, *, now: datetime | None = None
+    ) -> PrepaidProviderLifecycleOutcome:
+        return await self._enforce(server_id, now=now, unpaid=False)
+
+    async def enforce_unpaid(
+        self, server_id: UUID, *, now: datetime | None = None
+    ) -> PrepaidProviderLifecycleOutcome:
+        """Stop when the next hour cannot be paid, even if the wallet is positive."""
+        return await self._enforce(server_id, now=now, unpaid=True)
+
+    async def _enforce(
+        self, server_id: UUID, *, now: datetime | None, unpaid: bool
+    ) -> PrepaidProviderLifecycleOutcome:
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        server = await self._servers.get(server_id)
+        if server is None or not server.is_prepaid_hourly_irt:
+            return PrepaidProviderLifecycleOutcome.SKIPPED
+        zero_since = server.prepaid_zero_since
+        if zero_since is None and not unpaid:
+            return PrepaidProviderLifecycleOutcome.SKIPPED
+        if zero_since is not None:
+            if zero_since.tzinfo is None:
+                zero_since = zero_since.replace(tzinfo=UTC)
+            if zero_since > moment:
+                raise ValueError("zero watermark cannot be in the future")
+        if not unpaid:
+            wallet = await self._wallets.get(server.user_id)
+            if wallet is None or wallet.currency != "IRT" or wallet.balance != 0:
+                return PrepaidProviderLifecycleOutcome.SKIPPED
+        if not server.provider_server_id or server.state not in (
+            ServerLifecycleState.RUNNING,
+            ServerLifecycleState.STOPPED,
+        ):
+            return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+        try:
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
+            remote = await provider.get_server(server.provider_server_id)
+        except (KeyError, ProviderError):
+            return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+        remote_state = (
+            ProviderServerState.NOT_FOUND
+            if remote is None
+            else normalize_provider_status(remote.status)
+        )
+        if remote_state is ProviderServerState.RUNNING:
+            if Capability.POWER not in provider.capabilities:
+                return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+            if server.state is ServerLifecycleState.STOPPED:
+                # A completed stop can precede an out-of-band boot. Replaying
+                # its ledger key cannot stop the revived resource; do not send
+                # an untracked provider mutation.
+                return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+            key = (
+                f"prepaid-zero:{zero_since.isoformat()}"
+                if not unpaid and zero_since is not None
+                else f"prepaid-unpaid:{server.prepaid_paid_until or 'uncovered'}"
+            )
+            await self._power.power_off(server.user_id, server.id, key)
+            return PrepaidProviderLifecycleOutcome.STOP_REQUESTED
+        if remote_state is not ProviderServerState.STOPPED:
+            return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+        if server.state is ServerLifecycleState.RUNNING:
+            # This transition is based on provider proof, not a failed stop.
+            server.transition_to(ServerLifecycleState.STOPPED)
+            await self._servers.save(server)
+        if unpaid or zero_since is None or moment - zero_since < timedelta(hours=24):
+            return PrepaidProviderLifecycleOutcome.STOPPED
+        current = await self._servers.get(server_id)
+        current_wallet = await self._wallets.get(server.user_id)
+        if (
+            current is None
+            or current.user_id != server.user_id
+            or not current.is_prepaid_hourly_irt
+            or current.prepaid_zero_since != server.prepaid_zero_since
+            or current.state is not ServerLifecycleState.STOPPED
+            or current_wallet is None
+            or current_wallet.currency != "IRT"
+            or current_wallet.balance != 0
+        ):
+            return PrepaidProviderLifecycleOutcome.SKIPPED
+        await self._delete.request(
+            server.user_id,
+            server.id,
+            f"prepaid-zero:{zero_since.isoformat()}",
+            execute_inline=True,
+        )
+        return PrepaidProviderLifecycleOutcome.DELETE_REQUESTED
 
 
 class DeleteWorker:

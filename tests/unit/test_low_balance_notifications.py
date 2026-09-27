@@ -34,6 +34,11 @@ class FakeLog:
     def __init__(self) -> None:
         self.records: list[tuple[UUID, UUID, LowBalanceNotificationKind, datetime]] = []
 
+    async def was_sent(
+        self, server_id: UUID, kind: LowBalanceNotificationKind, episode: datetime
+    ) -> bool:
+        return any(s == server_id and k == kind and e == episode for _, s, k, e in self.records)
+
     async def record(
         self,
         user_id: UUID,

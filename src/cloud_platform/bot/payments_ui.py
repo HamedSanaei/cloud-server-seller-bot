@@ -66,6 +66,8 @@ def render_payment_status(
                 keyboard=_check_keyboard(t, check_callback),
             )
         return PaymentScreen(text=t.t("payment.success", amount=amount_text))
+    if session.status is PaymentSessionStatus.MANUAL_REVIEW:
+        return PaymentScreen(text=t.t("payment.manual_review"))
     return PaymentScreen(text=t.t("payment.failed"))
 
 

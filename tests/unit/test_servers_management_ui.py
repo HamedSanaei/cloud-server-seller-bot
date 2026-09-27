@@ -576,6 +576,16 @@ class TestDetails:
                 for entity in screen.entities
             ] == ["88.1.2.3", "22"]
 
+    async def test_hetzner_missing_image_never_claims_an_os(self) -> None:
+        ui, _, _ = make_ui(
+            FakeManagement(view=_view(provider_key="hetzner", operating_system=None))
+        )
+        detail = await ui.handle(Callback("servers", "view", (await _ref(ui),)), _user())
+        listing = await ui.list_screen(_user())
+        assert TRANSLATOR.t("servers.spec_os_unknown") in detail.text
+        assert TRANSLATOR.t("servers.list_os_unknown") in listing.text
+        assert "Ubuntu" not in detail.text
+
     async def test_manage_menu_hides_the_impossible_power_actions(self) -> None:
         ui, _m, _s = make_ui()
         screen = await ui.handle(Callback("servers", "manage", (await _ref(ui),)), _user())

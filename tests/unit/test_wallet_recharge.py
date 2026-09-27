@@ -337,11 +337,14 @@ class TestTelegramChannel:
         with pytest.raises(RuntimeError):
             await TelegramBusinessLogChannel(_Bot(), -100).send("x")
 
-    def test_a_chat_id_is_required(self) -> None:
+    async def test_a_chat_id_is_required(self) -> None:
         from cloud_platform.modules.businesslog.telegram import TelegramBusinessLogChannel
 
+        # The operator channel is optional at construction; only an actual
+        # operator send without a chat_id must fail (for the outbox retry).
+        channel = TelegramBusinessLogChannel(bot=object(), chat_id=0)
         with pytest.raises(ValueError):
-            TelegramBusinessLogChannel(bot=object(), chat_id=0)
+            await channel.send("x")
 
 
 class FakeRecharge:

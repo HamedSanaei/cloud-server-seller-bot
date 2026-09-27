@@ -35,7 +35,7 @@ from cloud_platform.modules.catalog.repository import (
     PostgresAdvisoryCatalogSyncLock,
     SqlAlchemyLocationRepository,
 )
-from cloud_platform.modules.offers.domain import BILLING_MODEL_MONTHLY
+from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY, BILLING_MODEL_MONTHLY
 from cloud_platform.modules.offers.repository import (
     SqlAlchemyCatalogSyncStateRepository,
     SqlAlchemySellableOfferRepository,
@@ -510,7 +510,11 @@ class TestLiveHourlySyncAcceptance:
             assert report.ran is True
             offers_repo = SqlAlchemySellableOfferRepository(session_factory)
             stored = await offers_repo.get_by_ref(
-                "leaseweb", "lsw.c3.large", "eu-west-3", provider_account_id="north"
+                "leaseweb",
+                "lsw.c3.large",
+                "eu-west-3",
+                provider_account_id="north",
+                billing_model=BILLING_MODEL_HOURLY,
             )
             assert stored is not None
             assert stored.provider_account_id == "north"

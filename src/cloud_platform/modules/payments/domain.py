@@ -15,7 +15,7 @@ state can be reconciled to wallet deposits safely:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
@@ -40,6 +40,7 @@ class PaymentSessionStatus(StrEnum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    MANUAL_REVIEW = "manual_review"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,8 @@ class PaymentSession:
     idempotency_key: str
     id: UUID | None = None
     gateway_payment_id: str | None = None
+    redirect_url: str | None = None
+    tracking_code: str | None = None
     status: PaymentSessionStatus = PaymentSessionStatus.PENDING
     credited_at: datetime | None = None
     credit_amount_minor: int | None = None
@@ -147,6 +150,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=self.status,
             credited_at=self.credited_at,
             credit_amount_minor=self.credit_amount_minor,
@@ -172,6 +177,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=PaymentSessionStatus.SUCCEEDED,
             credited_at=self.credited_at,
             credit_amount_minor=self.credit_amount_minor,
@@ -197,6 +204,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=PaymentSessionStatus.FAILED,
             credited_at=self.credited_at,
             credit_amount_minor=self.credit_amount_minor,
@@ -210,6 +219,11 @@ class PaymentSession:
             created_at=self.created_at,
             updated_at=self.updated_at,
         )
+
+    def mark_manual_review(self) -> PaymentSession:
+        """Hold a provider-confirmed underpayment for operator resolution."""
+        self._require_pending()
+        return replace(self, status=PaymentSessionStatus.MANUAL_REVIEW)
 
     def mark_credited(self, *, at: datetime) -> PaymentSession:
         """Record that the ledger deposit was posted for this session."""
@@ -226,6 +240,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=self.gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=self.status,
             credited_at=at,
             credit_amount_minor=self.credit_amount_minor,

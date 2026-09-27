@@ -199,6 +199,8 @@ class FakeProvider:
         self.calls: list[str] = []
         self.failures: dict[str, Exception] = {}
         self.state = "RUNNING"
+        self.image_name: str | None = "Ubuntu 24.04"
+        self.inventory_ids: list[str] = [PROVIDER_ID]
         self.snapshots: list[VpsSnapshotRecord] = [
             VpsSnapshotRecord(id="snap-1", name="before-upgrade", state="AVAILABLE")
         ]
@@ -228,13 +230,21 @@ class FakeProvider:
             id=provider_server_id,
             state=self.state,
             reference="customer-ref",
-            image_name="Ubuntu 24.04",
+            image_name=self.image_name,
             datacenter="FRA-01",
         )
 
     async def list_vps_info(self) -> list[VpsInfo]:
         self._call("list_vps_info")
-        return []
+        return [
+            VpsInfo(
+                id=provider_server_id,
+                state=self.state,
+                reference="customer-ref",
+                image_name=self.image_name,
+            )
+            for provider_server_id in self.inventory_ids
+        ]
 
     async def rename_vps(self, provider_server_id: str, reference: str) -> VpsInfo:
         self._call("rename_vps")
@@ -371,7 +381,7 @@ class FakeRegistry:
         self.provider = provider
 
     def get(self, key: str) -> Any:
-        if key != "leaseweb":
+        if key not in ("leaseweb", "hetzner"):
             raise KeyError(f"unknown provider: {key}")
         return self.provider
 
@@ -763,15 +773,19 @@ class TestConfirmations:
         assert second.replayed is True
         assert provider.count("reinstall_vps") == 1
 
-    async def test_reinstall_updates_customer_os_only_after_provider_acceptance(self) -> None:
+    async def test_reinstall_does_not_claim_desired_os_before_provider_reports_it(self) -> None:
         service, provider, *_ = make_service()
+        server = service._servers.rows[SERVER_ID]
+        server.os = "Ubuntu 24.04"
         token = await service.issue_confirmation(
             CUSTOMER, SERVER_ID, ServerOperation.REINSTALL, arguments={"image": "img-debian"}
         )
         await service.reinstall(
             CUSTOMER, SERVER_ID, image_ref="img-debian", confirmation_token=token
         )
-        view = await service.get_server(CUSTOMER, SERVER_ID)
+        assert server.os is None
+        provider.image_name = "Debian 13"
+        view = await service.refresh_server(CUSTOMER, SERVER_ID)
         assert view.operating_system == "Debian 13"
         assert provider.count("reinstall_vps") == 1
 
@@ -882,6 +896,7 @@ class TestProviderFailures:
         provider = FakeProvider()
         provider.failures["reinstall_vps"] = ProviderOutcomeUnknown("5xx after transmission")
         service, _p, _power, audit, sink = make_service(provider=provider)
+        service._servers.rows[SERVER_ID].os = "Ubuntu 24.04"
         token = await service.issue_confirmation(
             CUSTOMER, SERVER_ID, ServerOperation.REINSTALL, arguments={"image": "img-ubuntu"}
         )
@@ -893,6 +908,7 @@ class TestProviderFailures:
 
         assert provider.count("reinstall_vps") == 1
         assert "server.reinstall_outcome_unknown" in audit.names
+        assert service._servers.rows[SERVER_ID].os is None
         assert BusinessEventType.SERVER_OPERATION_FAILED in sink.types
 
     async def test_definitive_rejection_maps_to_provider_error(self) -> None:
@@ -1010,6 +1026,66 @@ class TestReads:
         view = await service.refresh_server(CUSTOMER, SERVER_ID)
         assert view.operating_system == "Ubuntu 24.04"
         assert server.os == "Ubuntu 24.04"
+
+    async def test_hetzner_list_and_detail_correct_stale_os_from_live_image(self) -> None:
+        server = make_server()
+        server.provider_key = "hetzner"
+        server.os = "ubuntu-26.04"
+        server.image_id = "387894171"  # immutable checkout image, not observed OS
+        provider = FakeProvider()
+        provider.image_name = "CentOS Stream 10"
+        service, *_ = make_service(server=server, provider=provider)
+
+        page = await service.list_servers(CUSTOMER)
+        assert page.items[0].operating_system == "CentOS Stream 10"
+        assert server.os == "CentOS Stream 10"
+        assert server.image_id == "387894171"
+        server.os = "ubuntu-26.04"
+        detail = await service.get_server(CUSTOMER, SERVER_ID)
+        assert detail.operating_system == "CentOS Stream 10"
+        assert provider.count("list_vps_info") == 1
+        assert provider.count("get_vps_info") == 1
+
+    async def test_hetzner_list_batches_servers_on_same_credential_account(self) -> None:
+        server = make_server()
+        server.provider_key = "hetzner"
+        second = make_server(provider_server_id="lsw-vps-2")
+        second.id = uuid4()
+        second.provider_key = "hetzner"
+        second.provider_account_id = server.provider_account_id
+        provider = FakeProvider()
+        provider.image_name = "CentOS Stream 10"
+        provider.inventory_ids.append("lsw-vps-2")
+        service, *_ = make_service(server=server, provider=provider)
+        service._servers.rows[second.id] = second
+
+        page = await service.list_servers(CUSTOMER)
+        assert {item.operating_system for item in page.items} == {"CentOS Stream 10"}
+        assert provider.count("list_vps_info") == 1
+        assert provider.count("get_vps_info") == 0
+
+    async def test_hetzner_does_not_display_stale_os_without_image_proof(self) -> None:
+        server = make_server()
+        server.provider_key = "hetzner"
+        server.os = "ubuntu-26.04"
+        provider = FakeProvider()
+        provider.failures["get_vps_info"] = ProviderError("unavailable")
+        service, *_ = make_service(server=server, provider=provider)
+
+        detail = await service.get_server(CUSTOMER, SERVER_ID)
+        assert detail.operating_system is None
+        assert detail.display_name is None
+        assert detail.refresh_error == "unavailable"
+        assert server.os == "ubuntu-26.04"
+        provider.failures["list_vps_info"] = ProviderError("unavailable")
+        page = await service.list_servers(CUSTOMER)
+        assert page.items[0].operating_system is None
+        assert server.os == "ubuntu-26.04"
+
+        provider.image_name = None
+        page = await service.list_servers(CUSTOMER)
+        assert page.items[0].operating_system is None
+        assert server.os is None
 
     async def test_snapshots_and_images_are_listed(self) -> None:
         service, *_ = make_service()

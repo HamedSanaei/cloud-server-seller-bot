@@ -28,6 +28,7 @@ from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
+from cloud_platform.bot.admin_ui import AdminUi
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.ui import BotScreen, BotUi, code_entities
 from cloud_platform.core.config import get_settings
@@ -65,18 +66,24 @@ async def _show_main_menu(
     *,
     container: Container,
     monthly_ui: MonthlyBotUi,
+    admin_ui: AdminUi | None = None,
     include_greeting: bool = False,
 ) -> None:
-    """Resolve the user, then render the canonical storefront main menu.
-
-    The single shared helper behind /start, /menu and every fallback, so
-    the customer always lands on the same InlineKeyboard menu and no
-    parallel navigation system can drift from it.
-    """
+    """Resolve the user and retain the canonical storefront menu for everyone."""
     await _resolve_user(container, message.from_user)
     screen = monthly_ui.menu_screen()
+    if admin_ui is not None and _admin_allowed(admin_ui, message):
+        screen = admin_ui.with_menu_button(screen)
     text = f"{_t.t('greeting.start')}\n\n{screen.text}" if include_greeting else screen.text
     await message.answer(text, reply_markup=screen.keyboard)
+
+
+def _admin_allowed(admin_ui: AdminUi, message: Message) -> bool:
+    return admin_ui.allowed(
+        message.from_user.id if message.from_user else None,
+        message.chat.id,
+        message.chat.type,
+    )
 
 
 def _is_foreign_callback(data: str) -> bool:
@@ -154,29 +161,43 @@ async def _send_ssh_password(
 
 
 def register_handlers(
-    dp: Dispatcher, ui: BotUi, monthly_ui: MonthlyBotUi, container: Container
+    dp: Dispatcher,
+    ui: BotUi,
+    monthly_ui: MonthlyBotUi,
+    container: Container,
+    admin_ui: AdminUi | None = None,
 ) -> None:
-    """Attach the menu and callback handlers to ``dp``.
-
-    Handler order is the priority order (aiogram stops at the first match):
-    specific commands first, then the active text flow, then the generic
-    fallback that lands every unmatched update on the main menu.
-    """
+    """Attach specific commands, active text prompts and the generic fallback."""
 
     @dp.message(CommandStart())
     async def _start(message: Message) -> None:
-        await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard())
+        keyboard = monthly_ui.reply_keyboard()
+        if admin_ui is not None and _admin_allowed(admin_ui, message):
+            await admin_ui.clear_prompt(message.from_user.id)
+            keyboard = admin_ui.with_reply_button(keyboard)
+        await message.answer(_t.t("greeting.start"), reply_markup=keyboard)
         await _show_main_menu(
-            message, container=container, monthly_ui=monthly_ui, include_greeting=False
+            message,
+            container=container,
+            monthly_ui=monthly_ui,
+            admin_ui=admin_ui,
+            include_greeting=False,
         )
 
     @dp.message(Command("menu"))
     async def _menu(message: Message) -> None:
-        await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
+        if admin_ui is not None and _admin_allowed(admin_ui, message):
+            await admin_ui.clear_prompt(message.from_user.id)
+        await _show_main_menu(
+            message, container=container, monthly_ui=monthly_ui, admin_ui=admin_ui
+        )
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
-        await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard())
+        keyboard = monthly_ui.reply_keyboard()
+        if admin_ui is not None and _admin_allowed(admin_ui, message):
+            keyboard = admin_ui.with_reply_button(keyboard)
+        await message.answer(_t.t("greeting.help"), reply_markup=keyboard)
 
     @dp.message()
     async def _fallback(message: Message) -> None:
@@ -189,6 +210,32 @@ def register_handlers(
         if message.text and not message.text.startswith("/"):
             user = await _resolve_user(container, message.from_user)
             try:
+                if admin_ui is not None and _admin_allowed(admin_ui, message):
+                    if _button_matches(message.text, "admin.menu"):
+                        await admin_ui.clear_prompt(message.from_user.id)
+                        admin_screen = admin_ui.menu_screen()
+                        await message.answer(admin_screen.text, reply_markup=admin_screen.keyboard)
+                        return
+                    if _button_matches(message.text, "nav.menu") or any(
+                        _button_matches(message.text, key)
+                        for key in (
+                            "menu.buy",
+                            "menu.servers",
+                            "menu.wallet",
+                            "menu.recharge",
+                            "menu.support",
+                        )
+                    ):
+                        await admin_ui.clear_prompt(message.from_user.id)
+                    else:
+                        admin_screen = await admin_ui.handle_text(
+                            message.from_user.id, message.text
+                        )
+                        if admin_screen is not None:
+                            await message.answer(
+                                admin_screen.text, reply_markup=admin_screen.keyboard
+                            )
+                            return
                 screen = await monthly_ui.handle_text(message.text, user)
             except SessionStoreUnavailable:
                 logger.error("telegram session store unavailable; refusing text input")
@@ -198,7 +245,6 @@ def register_handlers(
                     screen.text, reply_markup=screen.keyboard, entities=screen.entities
                 )
                 return
-
             if _button_matches(message.text, "menu.buy"):
                 screen = await monthly_ui.markets_screen()
                 await message.answer(
@@ -230,9 +276,13 @@ def register_handlers(
                 )
                 return
             if _button_matches(message.text, "nav.menu"):
-                await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
+                await _show_main_menu(
+                    message, container=container, monthly_ui=monthly_ui, admin_ui=admin_ui
+                )
                 return
-        await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
+        await _show_main_menu(
+            message, container=container, monthly_ui=monthly_ui, admin_ui=admin_ui
+        )
 
     @dp.callback_query()
     async def _callback(query: CallbackQuery) -> None:
@@ -247,6 +297,36 @@ def register_handlers(
                 pass
         if cb is not None and cb.flow == "servers" and cb.screen == "ssh" and len(cb.args) == 1:
             await _send_ssh_password(query, monthly_ui, user, cb.args[0])
+            return
+        if cb is not None and cb.flow == "admin":
+            if (
+                admin_ui is None
+                or query.from_user is None
+                or not isinstance(query.message, Message)
+                or not admin_ui.allowed(
+                    query.from_user.id, query.message.chat.id, query.message.chat.type
+                )
+            ):
+                await query.answer(_t.t("admin.denied"), show_alert=True)
+                return
+            try:
+                if cb.screen == "cancel" and len(cb.args) <= 1:
+                    if cb.args:
+                        await admin_ui.cancel_action(query.from_user.id, cb.args[0])
+                    await admin_ui.clear_prompt(query.from_user.id)
+                    screen = admin_ui.with_menu_button(monthly_ui.menu_screen())
+                else:
+                    screen = await admin_ui.handle_callback(query.from_user.id, cb.screen, cb.args)
+            except SessionStoreUnavailable:
+                logger.error("telegram session store unavailable; refusing admin callback")
+                screen = BotScreen(_t.t("admin.failed"), InlineKeyboardMarkup(inline_keyboard=[]))
+            try:
+                await query.message.edit_text(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
+            except Exception:
+                logger.warning("failed to edit admin callback message", exc_info=True)
+            await query.answer()
             return
         # Monthly flows first (LEASEWEB-MVP), everything else -> legacy UI.
         # Undecodable (tampered/foreign) button data is still rejected — it
@@ -263,6 +343,17 @@ def register_handlers(
                     )
                 else:
                     screen = await ui.handle(data, user=user, chat_id=chat_id)
+            if (
+                admin_ui is not None
+                and cb is not None
+                and cb.flow == "main"
+                and cb.screen == "menu"
+                and isinstance(query.message, Message)
+                and admin_ui.allowed(
+                    query.from_user.id, query.message.chat.id, query.message.chat.type
+                )
+            ):
+                screen = admin_ui.with_menu_button(screen)
         except SessionStoreUnavailable:
             # Defence in depth: the shared session store is unreachable. Refuse
             # with a safe message; nothing is executed and nothing is queued.
@@ -328,7 +419,13 @@ async def main() -> None:
         fx_resolver=fx_resolver,
         fx_display_currency=settings.fx_default_display_currency,
     )
-    register_handlers(dp, ui, monthly_ui, container)
+    admin_ui = AdminUi(
+        settings.callback_signing_key,
+        sessions=container.session_store(),
+        users=container.user_repository(),
+        credit=container.admin_wallet_service(),
+    )
+    register_handlers(dp, ui, monthly_ui, container, admin_ui)
 
     logger.info("starting Telegram bot polling")
     try:

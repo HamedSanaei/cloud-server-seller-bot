@@ -446,6 +446,8 @@ class ServerManagementUi:
             lines.append(self._t.t("servers.list_ram", ram=ram))
         if view.operating_system:
             lines.append(self._t.t("servers.list_os", os=view.operating_system))
+        elif view.provider_key == "hetzner":
+            lines.append(self._t.t("servers.list_os_unknown"))
         lines.append(self._t.t("servers.list_state", state=self._state(view.state)))
         if view.failure_reason:
             lines.append(
@@ -536,6 +538,8 @@ class ServerManagementUi:
                 lines.append(self._t.t("servers.spec_ssh_port", value="22"))
         if view.operating_system:
             lines.append(self._t.t("servers.spec_os", value=view.operating_system))
+        elif view.provider_key == "hetzner":
+            lines.append(self._t.t("servers.spec_os_unknown"))
         if view.plan:
             lines.append(self._t.t("servers.spec_plan", value=view.plan))
         if view.ram_gb:

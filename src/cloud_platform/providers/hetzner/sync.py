@@ -500,6 +500,7 @@ class HetznerCatalogSyncer:
             counted = 0
             location_failed = False
             for item in items:
+                spec: _OfferSpec | None
                 if billing_model == BILLING_MODEL_HOURLY:
                     parsed = hourly.parse_hourly_plan(item, location_id)
                     if isinstance(parsed, hourly.HetznerHourlyRejection):
@@ -656,7 +657,9 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
     if hourly._location_availability(item, location_id) is False:
         return None
     price_entry, _ = hourly._location_price_entry(item, location_id)
-    monthly_exact = _monthly_value(price_entry) if price_entry is not None else None
+    if price_entry is None:
+        return None
+    monthly_exact = _monthly_value(price_entry)
     if monthly_exact is None:
         return None
     monthly = hourly.minor_units(monthly_exact)

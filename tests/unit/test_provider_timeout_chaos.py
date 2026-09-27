@@ -50,7 +50,7 @@ from cloud_platform.modules.operations.service import (
 )
 from cloud_platform.modules.wallet.domain import Wallet
 from cloud_platform.providers.base import CreateServerRequest, ProviderImage
-from cloud_platform.providers.errors import ProviderOutcomeUnknown, ProviderUnavailable
+from cloud_platform.providers.errors import ProviderOutcomeUnknown
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.registry import ProviderRegistry
 
@@ -452,15 +452,19 @@ class TestCreateTimeoutChaos:
 class TestDeleteTimeoutChaos:
     async def test_delete_timeout_then_resend_is_not_a_double_delete(self) -> None:
         """The delete call times out AFTER the provider applied it; the saga
-        re-sends the same intent. The adapter must treat the resulting 404
-        as success (delete is 404-idempotent), not as a failure."""
+        re-sends the same intent. The adapter reports the unknown outcome, and
+        the resend proves absence first, so the provider never sees a second
+        destructive call.
+        """
         chaos = ChaosHetznerAPI()
         sid = "srv-9001"
         chaos.servers[sid] = {"id": sid, "name": "victim", "labels": {}}
         chaos.delete_timeout_after_call = 1
         provider = make_provider(chaos)
 
-        with pytest.raises(ProviderUnavailable):
+        # A timeout leaves the provider-side truth unknown; the adapter must
+        # say so instead of claiming the delete merely failed.
+        with pytest.raises(ProviderOutcomeUnknown):
             await provider.delete_server(sid, IdempotencyKey("server-delete:1"))
         # the provider applied the deletion before the timeout
         assert sid in chaos.deleted
@@ -468,7 +472,10 @@ class TestDeleteTimeoutChaos:
 
         # the saga re-sends the SAME intent
         await provider.delete_server(sid, IdempotencyKey("server-delete:1"))  # must not raise
-        assert chaos.delete_count == 2
+        # Absence is proven BEFORE any mutation, so the resend never even
+        # re-issues DELETE: the provider saw exactly one, and there is no
+        # double state either way.
+        assert chaos.delete_count == 1
         assert len(chaos.servers) == 0  # still gone, no error, no double state
 
 

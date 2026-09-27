@@ -50,6 +50,8 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
     fx_path_raw = getattr(row, "fx_path", None)
     fx_proxy_asset_raw = getattr(row, "fx_proxy_asset", None)
     fx_observed_raw = getattr(row, "fx_observed_at", None)
+    redirect = getattr(row, "redirect_url", None)
+    tracking = getattr(row, "tracking_code", None)
     session = PaymentSession(
         user_id=_attr(row, "user_id"),
         gateway_key=str(_attr(row, "gateway_key")),
@@ -59,6 +61,8 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
         id=_attr(row, "id"),
         gateway_payment_id=_attr(row, "gateway_payment_id"),
         status=status,
+        redirect_url=redirect if isinstance(redirect, str) else None,
+        tracking_code=tracking if isinstance(tracking, str) else None,
         credit_amount_minor=int(credit_amount)
         if isinstance(credit_amount, int) and not isinstance(credit_amount, bool)
         else None,
@@ -82,6 +86,8 @@ def _to_row(aggregate: PaymentSession) -> _PaymentModel:
         user_id=aggregate.user_id,
         gateway_key=aggregate.gateway_key,
         gateway_payment_id=aggregate.gateway_payment_id,
+        redirect_url=aggregate.redirect_url,
+        tracking_code=aggregate.tracking_code,
         amount_minor=aggregate.amount_minor,
         currency=aggregate.currency,
         status=aggregate.status.value,
@@ -191,7 +197,13 @@ class SqlAlchemyPaymentSessionRepository:
                 raise LookupError(f"payment session {session_id} not found")
             cast_any: Any = row
             cast_any.status = session.status.value
+            if session.gateway_key == "atlaspay":
+                # AtlasPay supplies the final payable Toman amount only after
+                # the persisted base-amount intent has been sent to the API.
+                cast_any.amount_minor = session.amount_minor
             cast_any.gateway_payment_id = session.gateway_payment_id
+            cast_any.redirect_url = session.redirect_url
+            cast_any.tracking_code = session.tracking_code
             cast_any.credited_at = to_db_utc_or_none(session.credited_at)
             cast_any.updated_at = to_db_utc(utc_now())
             # Cross-currency snapshot columns (nullable; legacy rows keep NULL).

@@ -69,7 +69,13 @@ def _info(item: Any) -> VpsInfo:
         image_id=str(image["id"])
         if isinstance(image, dict) and image.get("id") is not None
         else None,
-        image_name=image.get("name") if isinstance(image, dict) else None,
+        image_name=(
+            image.get("description") or image.get("name")
+            if isinstance(image, dict)
+            and image.get("type") == "system"
+            and isinstance(image.get("description") or image.get("name"), str)
+            else None
+        ),
         root_disk_gb=server_type.get("disk")
         if isinstance(server_type, dict) and isinstance(server_type.get("disk"), int)
         else None,
@@ -197,7 +203,7 @@ class HetznerVpsManagement:
                 images.append(
                     VpsReinstallImage(
                         id=str(image["id"]),
-                        name=str(image.get("name") or image.get("description") or image["id"]),
+                        name=str(image.get("description") or image.get("name") or image["id"]),
                         family=image.get("os_flavor"),
                         min_disk_gb=minimum,
                     )

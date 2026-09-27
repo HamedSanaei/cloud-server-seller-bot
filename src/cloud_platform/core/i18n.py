@@ -58,6 +58,21 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "menu.wallet": "💰 کیف پول",
         "menu.recharge": "⬆️ شارژ حساب",
         "menu.support": "🎧 پشتیبانی",
+        "admin.menu": "🔐 مدیریت",
+        "admin.title": "مدیریت — عملیات موردنظر را انتخاب کنید:",
+        "admin.credit": "💰 شارژ کیف پول کاربر",
+        "admin.enter_target": (
+            "شناسه عددی تلگرام کاربر مقصد را وارد کنید. برای خروج /menu را بفرستید."
+        ),
+        "admin.enter_amount": "مبلغ شارژ را به تومان (عدد صحیح مثبت) وارد کنید.",
+        "admin.invalid_number": "لطفاً فقط عدد صحیح مثبت وارد کنید.",
+        "admin.target_missing": "کاربر با این شناسه یافت نشد؛ شناسه عددی معتبر را وارد کنید.",
+        "admin.confirm": "شارژ کیف پول کاربر {target} به مبلغ {amount} تومان را تأیید می‌کنید؟",
+        "admin.confirm_button": "✅ تأیید شارژ",
+        "admin.success": "✅ کیف پول کاربر {target} به مبلغ {amount} تومان شارژ شد.",
+        "admin.failed": "شارژ انجام نشد؛ لطفاً وضعیت کیف پول را بررسی و دوباره تلاش کنید.",
+        "admin.denied": "دسترسی به این عملیات مجاز نیست.",
+        "admin.expired": "درخواست منقضی شده است؛ دوباره از منوی مدیریت شروع کنید.",
         "offers.locations_title": "🌍 انتخاب لوکیشن:",
         "offers.location_row": "{code} ({city})",
         "offers.plans_title": "📋 پلن‌های {location}:",
@@ -134,6 +149,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.spec_ip": "🌐 IP: {value}",
         "servers.spec_ssh_port": "🔌 پورت پیش‌فرض SSH: {value}",
         "servers.spec_os": "💿 سیستم‌عامل: {value}",
+        "servers.spec_os_unknown": "💿 سیستم‌عامل: نامشخص (برای به‌روزرسانی دوباره تلاش کنید)",
         "servers.spec_plan": "⚙️ پلن: {value}",
         "servers.spec_ram": "🧠 RAM: {value}",
         "servers.spec_cpu": "🧮 CPU: {value}",
@@ -298,6 +314,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 IP هنوز اختصاص نیافته",
         "servers.list_os": "💿 {os}",
+        "servers.list_os_unknown": "💿 سیستم‌عامل نامشخص (برای به‌روزرسانی دوباره تلاش کنید)",
         "servers.list_state": "{state}",
         "servers.failure_reason": "❌ دلیل خطای ساخت: {reason}",
         "servers.failure_generic": "ساخت سرور ناموفق بود؛ برای بررسی با پشتیبانی تماس بگیرید.",
@@ -425,6 +442,8 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "recharge.gateway_row": "پرداخت با {name}",
         "payments.gateway.tetraminator": "تترامیناتور",
         "payments.gateway.zarinpal": "زرین‌پال",
+        "payments.gateway.atlaspay": "اطلس‌پی",
+        "recharge.atlaspay_payment": "مبلغ قابل پرداخت: {amount} تومان\nشماره پیگیری: {tracking_code}\nمبلغ دقیق را از طریق دکمه زیر واریز کنید؛ پس از تأیید، مبلغ انتخاب‌شده به کیف پول واریز می‌شود.",  # noqa: E501, RUF001
         # The escaped newline + `{amount}` make this literal mixed-script, which
         # the ambiguous-unicode rule flags even though the Persian text is fine.
         "recharge.created": "🧾 درخواست شارژ به مبلغ {amount} ثبت شد.\nبرای پرداخت روی دکمه زیر بزنید.",  # noqa: E501, RUF001
@@ -479,6 +498,10 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "payment.success": "پرداخت موفق بود! مبلغ {amount} به کیف پول شما اضافه شد.",
         "payment.failed": "پرداخت ناموفق بود. دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
         "payment.still_pending": "پرداخت هنوز تأیید نشده است. چند لحظه دیگر دوباره بررسی کنید.",
+        "payment.manual_review": (
+            "مبلغ پرداخت‌شده در حال بررسی توسط اپراتور است؛ شارژ خودکار انجام نمی‌شود. "
+            "لطفاً با پشتیبانی تماس بگیرید."
+        ),
         "payment.topup_title": "شارژ کیف پول — مبلغ (تومان):",
     }
 )
@@ -493,6 +516,19 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "menu.wallet": "💰 Wallet",
         "menu.recharge": "⬆️ Top up",
         "menu.support": "🎧 Support",
+        "admin.menu": "🔐 Administration",
+        "admin.title": "Administration — choose an action:",
+        "admin.credit": "💰 Credit a user's wallet",
+        "admin.enter_target": "Enter the recipient's numeric Telegram user ID. Send /menu to exit.",
+        "admin.enter_amount": "Enter the credit amount in toman (a positive whole number).",
+        "admin.invalid_number": "Enter a positive whole number only.",
+        "admin.target_missing": "No user with that ID was found. Enter a valid numeric ID.",
+        "admin.confirm": "Credit user {target} with {amount} toman?",
+        "admin.confirm_button": "✅ Confirm credit",
+        "admin.success": "✅ User {target}'s wallet was credited with {amount} toman.",
+        "admin.failed": "Credit was not completed. Check the wallet status before trying again.",
+        "admin.denied": "You are not authorized to perform this action.",
+        "admin.expired": "This request expired. Start again from the administration menu.",
         "offers.locations_title": "🌍 Choose a location:",
         "offers.location_row": "{code} ({city})",
         "offers.plans_title": "📋 Plans at {location}:",
@@ -569,6 +605,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.spec_ip": "🌐 IP: {value}",
         "servers.spec_ssh_port": "🔌 Default SSH port: {value}",
         "servers.spec_os": "💿 OS: {value}",
+        "servers.spec_os_unknown": "💿 OS: unknown (try refreshing later)",
         "servers.spec_plan": "⚙️ Plan: {value}",
         "servers.spec_ram": "🧠 RAM: {value}",
         "servers.spec_cpu": "🧮 CPU: {value}",
@@ -733,6 +770,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 no IP assigned yet",
         "servers.list_os": "💿 {os}",
+        "servers.list_os_unknown": "💿 OS unknown (try refreshing later)",
         "servers.list_state": "{state}",
         "servers.failure_reason": "❌ Creation failed: {reason}",
         "servers.failure_generic": "Server creation failed; contact support for details.",
@@ -858,6 +896,8 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "recharge.gateway_row": "Pay with {name}",
         "payments.gateway.tetraminator": "Tetraminator",
         "payments.gateway.zarinpal": "ZarinPal",
+        "payments.gateway.atlaspay": "AtlasPay",
+        "recharge.atlaspay_payment": "Amount to pay: {amount} toman\nTracking code: {tracking_code}\nTransfer the exact amount using the button below; after confirmation, the selected amount will be credited to your wallet.",  # noqa: E501
         "recharge.created": "🧾 Top-up of {amount} created.\nUse the button below to pay.",
         "recharge.unavailable": "Online top-up is currently disabled. Please contact support.",
         "recharge.invalid_amount": "The selected amount is not valid.",
@@ -914,6 +954,10 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "payment.success": "Payment succeeded! {amount} was added to your wallet.",
         "payment.failed": "Payment failed. Please try again or contact support.",
         "payment.still_pending": "Payment is not confirmed yet. Please check again shortly.",
+        "payment.manual_review": (
+            "The paid amount is under operator review; your wallet will not be "
+            "credited automatically. Please contact support."
+        ),
         "payment.topup_title": "Top up wallet — amount (Toman):",
     }
 )

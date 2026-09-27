@@ -14,7 +14,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import AccrualPeriod as _AccrualPeriodModel
-from cloud_platform.modules.billing.service import AccrualPeriod, AccrualPeriodExistsError
+from cloud_platform.db.base import PrepaidHourlyPeriod as _PrepaidModel
+from cloud_platform.db.base import Server as _ServerModel
+from cloud_platform.modules.billing.service import (
+    AccrualPeriod,
+    AccrualPeriodExistsError,
+    PrepaidHourlyPeriod,
+    PrepaidHourlyPeriodStatus,
+)
+from cloud_platform.modules.fx.domain import ConversionSnapshot
 
 _ACCRUAL_LOCK_KEY = 777_005
 
@@ -336,3 +344,142 @@ class PostgresAdvisoryAccrualLock:
                     await session.execute(
                         text("SELECT pg_advisory_unlock(:key)"), {"key": self._key}
                     )
+
+
+def _prepaid_domain(row: _PrepaidModel) -> PrepaidHourlyPeriod:
+    start = _aware_or_none(row.period_start)
+    end = _aware_or_none(row.period_end)
+    if start is None or end is None:
+        raise ValueError("prepaid period boundaries must be present")
+    return PrepaidHourlyPeriod(
+        id=row.id,
+        server_id=row.server_id,
+        wallet_id=row.wallet_id,
+        period_start=start,
+        period_end=end,
+        usd_minor=int(row.usd_minor),
+        irt_minor=int(row.irt_minor),
+        fx_snapshot=ConversionSnapshot.from_dict(dict(row.fx_snapshot)),
+        idempotency_key=str(row.idempotency_key),
+        status=PrepaidHourlyPeriodStatus(row.status),
+    )
+
+
+def _same_prepaid(a: PrepaidHourlyPeriod, b: PrepaidHourlyPeriod) -> bool:
+    return (
+        a.server_id == b.server_id
+        and a.wallet_id == b.wallet_id
+        and a.period_start == b.period_start
+        and a.period_end == b.period_end
+        and a.usd_minor == b.usd_minor
+        and a.irt_minor == b.irt_minor
+        and a.fx_snapshot == b.fx_snapshot
+        and a.idempotency_key == b.idempotency_key
+    )
+
+
+class SqlAlchemyPrepaidHourlyPeriodRepository:
+    """Immutable per-period FX binding and transactional paid-coverage watermark."""
+
+    def __init__(
+        self, session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]]
+    ) -> None:
+        self._session_factory = session_factory
+
+    async def get(self, server_id: UUID, start: datetime) -> PrepaidHourlyPeriod | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_PrepaidModel).where(
+                        _PrepaidModel.server_id == server_id,
+                        _PrepaidModel.period_start == start.replace(tzinfo=None),
+                    )
+                )
+            ).scalar_one_or_none()
+            return _prepaid_domain(row) if row is not None else None
+
+    async def bind(self, period: PrepaidHourlyPeriod) -> PrepaidHourlyPeriod:
+        existing = await self.get(period.server_id, period.period_start)
+        if existing is not None:
+            if not _same_prepaid(existing, period):
+                # Two workers may fetch distinct fresh FX quotes. The committed
+                # binding wins, but checkout replay with different USD/wallet fails.
+                if (
+                    existing.wallet_id != period.wallet_id
+                    or existing.usd_minor != period.usd_minor
+                    or existing.idempotency_key != period.idempotency_key
+                    or existing.period_end != period.period_end
+                ):
+                    raise ValueError("conflicting prepaid hourly binding")
+            return existing
+        async with self._session_factory() as session:
+            session.add(
+                _PrepaidModel(
+                    server_id=period.server_id,
+                    wallet_id=period.wallet_id,
+                    period_start=period.period_start.replace(tzinfo=None),
+                    period_end=period.period_end.replace(tzinfo=None),
+                    usd_minor=period.usd_minor,
+                    irt_minor=period.irt_minor,
+                    fx_snapshot=period.fx_snapshot.to_dict(),
+                    idempotency_key=period.idempotency_key,
+                    status=PrepaidHourlyPeriodStatus.PENDING.value,
+                )
+            )
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                winner = await self.get(period.server_id, period.period_start)
+                if winner is None:
+                    raise
+                if (
+                    winner.wallet_id != period.wallet_id
+                    or winner.usd_minor != period.usd_minor
+                    or winner.idempotency_key != period.idempotency_key
+                    or winner.period_end != period.period_end
+                ):
+                    raise ValueError("conflicting prepaid hourly binding") from None
+                return winner
+        committed = await self.get(period.server_id, period.period_start)
+        if committed is None:
+            raise RuntimeError("prepaid FX binding was not committed")
+        return committed
+
+    async def mark_paid(self, period: PrepaidHourlyPeriod) -> None:
+        async with self._session_factory() as session:
+            # One lock protects both status and coverage in concurrent workers.
+            server = (
+                await session.execute(
+                    select(_ServerModel)
+                    .where(_ServerModel.id == period.server_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            row = (
+                await session.execute(
+                    select(_PrepaidModel)
+                    .where(
+                        _PrepaidModel.server_id == period.server_id,
+                        _PrepaidModel.period_start == period.period_start.replace(tzinfo=None),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if server is None or row is None or not _same_prepaid(_prepaid_domain(row), period):
+                raise ValueError("prepaid coverage cannot advance against a changed FX binding")
+            current = _aware_or_none(server.prepaid_paid_until)
+            if current is not None and current != period.period_start:
+                if current == period.period_end and row.status == PrepaidHourlyPeriodStatus.PAID:
+                    return
+                raise ValueError("prepaid paid coverage must be contiguous")
+            if current is None and (
+                period.period_start != _aware_or_none(server.created_at)
+                or row.status == PrepaidHourlyPeriodStatus.PAID
+            ):
+                raise ValueError("first paid hour must start at server creation")
+            if current == period.period_start and row.status == PrepaidHourlyPeriodStatus.PAID:
+                raise ValueError("paid period cannot precede its paid coverage watermark")
+            row.status = PrepaidHourlyPeriodStatus.PAID.value
+            server.prepaid_paid_until = period.period_end.replace(tzinfo=None)
+            await session.commit()

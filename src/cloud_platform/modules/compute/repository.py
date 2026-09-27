@@ -71,6 +71,8 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         last_accrued_at=_aware_or_none(_attr(row, "last_accrued_at")),
         deleted_at=_aware_or_none(_attr(row, "deleted_at")),
         low_balance_since=_aware_or_none(_attr(row, "low_balance_since")),
+        prepaid_paid_until=_aware_or_none(getattr(row, "prepaid_paid_until", None)),
+        prepaid_zero_since=_aware_or_none(getattr(row, "prepaid_zero_since", None)),
         quantum_seconds=int(_attr(row, "quantum_seconds") or 3600),
         billing_model=str(_attr(row, "billing_model") or "hourly"),
         os=_attr(row, "os"),
@@ -328,7 +330,10 @@ class SqlAlchemyServerRepository:
             # carries an aware UTC value (last_accrued_at / low_balance_since
             # are real timestamptz columns and stay aware).
             cast_any.deleted_at = to_db_utc_or_none(server.deleted_at)
-            cast_any.low_balance_since = server.low_balance_since
+            # Prepaid warning/zero clocks use a dedicated CAS write; generic
+            # lifecycle saves must not reset a concurrent 24-hour zero episode.
+            if server.billing_model != "hourly_prepaid_irt":
+                cast_any.low_balance_since = server.low_balance_since
             cast_any.os = server.os
             if hasattr(cast_any, "image_id"):
                 cast_any.image_id = server.image_id
@@ -339,6 +344,34 @@ class SqlAlchemyServerRepository:
             await session.commit()
             await session.refresh(server_row)
             return _to_domain(server_row, str(provider_name))
+
+    async def save_prepaid_balance_markers(
+        self,
+        server_id: UUID,
+        *,
+        expected_warning_since: datetime | None,
+        expected_zero_since: datetime | None,
+        warning_since: datetime | None,
+        zero_since: datetime | None,
+    ) -> None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_ServerModel).where(_ServerModel.id == server_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None or row.billing_model != "hourly_prepaid_irt":
+                raise ValueError("prepaid server missing or contract changed")
+            if row.state not in (ServerLifecycleState.RUNNING, ServerLifecycleState.STOPPED):
+                raise ValueError("prepaid server no longer qualifies for balance policy")
+            if (
+                _aware_or_none(row.low_balance_since) != expected_warning_since
+                or _aware_or_none(row.prepaid_zero_since) != expected_zero_since
+            ):
+                raise ValueError("prepaid warning or zero watermark changed concurrently")
+            row.low_balance_since = warning_since
+            row.prepaid_zero_since = to_db_utc_or_none(zero_since)
+            await session.commit()
 
     async def create(self, server: CloudServer, intent: ServerCreateIntent) -> CloudServer:
         """Persist a new REQUESTED server row with its create intent.
@@ -379,6 +412,8 @@ class SqlAlchemyServerRepository:
                     if intent.offer_fingerprint
                     else (dict(server.offer_fingerprint) if server.offer_fingerprint else None)
                 ),
+                prepaid_paid_until=server.prepaid_paid_until,
+                prepaid_zero_since=server.prepaid_zero_since,
                 idempotency_key=intent.idempotency_key,
             )
             session.add(row)

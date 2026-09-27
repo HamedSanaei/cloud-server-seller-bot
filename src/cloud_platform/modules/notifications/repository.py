@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,11 +59,11 @@ class SqlAlchemyProvisioningNotificationLogRepository:
 
 
 class SqlAlchemyLowBalanceNotificationLogRepository:
-    """Dedup log for low-balance notifications (M08-011).
+    """Dedup successful deliveries by unique (server_id, kind, episode).
 
-    ``record`` inserts a row; the unique (server_id, kind, episode)
-    constraint makes a repeat of the same level in the same episode a safe
-    no-op returning False.
+    The notification service sends before recording: a failed Telegram send
+    is never marked sent. This schema cannot prevent a crash-after-send
+    duplicate; durable exactly-once delivery needs an outbox.
     """
 
     def __init__(
@@ -70,6 +71,19 @@ class SqlAlchemyLowBalanceNotificationLogRepository:
         session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
     ) -> None:
         self._session_factory = session_factory
+
+    async def was_sent(
+        self, server_id: object, kind: LowBalanceNotificationKind, episode: datetime
+    ) -> bool:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(_LowBalanceModel.id)
+                .where(_LowBalanceModel.server_id == server_id)
+                .where(_LowBalanceModel.kind == kind.value)
+                .where(_LowBalanceModel.episode == episode)
+                .limit(1)
+            )
+            return result.scalar_one_or_none() is not None
 
     async def record(
         self,

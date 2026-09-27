@@ -92,6 +92,25 @@ class Wallet(Base):
     user = relationship("User", back_populates="wallet")
 
 
+class WalletCurrencyMigration(Base):
+    """Audited one-way USD-to-IRT wallet denomination boundary."""
+
+    __tablename__ = "wallet_currency_migrations"
+
+    id = Column(PG_UUID, primary_key=True)
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    wallet_id = Column(
+        PG_UUID, ForeignKey("wallets.id", ondelete="RESTRICT"), nullable=False, unique=True
+    )
+    source_balance_minor = Column(BigInteger, nullable=False)
+    snapshot = Column(JSONB, nullable=False)
+    operator_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    reason = Column(Text, nullable=False)
+    close_entry_id = Column(PG_UUID, ForeignKey("ledger.id", ondelete="RESTRICT"), nullable=True)
+    open_entry_id = Column(PG_UUID, ForeignKey("ledger.id", ondelete="RESTRICT"), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class Provider(Base):
     """Cloud infrastructure provider (e.g., Hetzner, local Iranian provider).
 
@@ -404,6 +423,10 @@ class Server(Base):
     deleted_at = Column(DateTime, nullable=True)
     last_accrued_at = Column(DateTime(timezone=True), nullable=True)
     low_balance_since = Column(DateTime(timezone=True), nullable=True)
+    # New prepaid hourly contracts keep coverage and the zero-balance clock
+    # separate from legacy arrears accrual and warning episode watermarks.
+    prepaid_paid_until = Column(DateTime, nullable=True)
+    prepaid_zero_since = Column(DateTime, nullable=True)
 
     # Relationships
     user = relationship("User", back_populates="servers")
@@ -1042,13 +1065,22 @@ class PaymentSession(Base):
         gateway_payment_id: External id assigned by the gateway (nullable)
         amount_minor: Gateway settlement amount (positive integer minor units)
         currency: Gateway settlement currency (ISO-4217 3-letter uppercase)
-        status: pending | succeeded | failed
+        status: pending | succeeded | failed | manual_review
         idempotency_key: Key sent to the gateway on creation
         credited_at: When the matching ledger deposit was posted
         created_at / updated_at: Timestamps
     """
 
     __tablename__ = "payment_sessions"
+    __table_args__ = (
+        Index(
+            "uq_atlaspay_intent",
+            "gateway_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=sa.text("gateway_key = 'atlaspay'"),
+        ),
+    )
 
     id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
     user_id = Column(PG_UUID, nullable=False)
@@ -1069,6 +1101,10 @@ class PaymentSession(Base):
     fx_observed_at = Column(DateTime(timezone=True), nullable=True)
     fx_proxy = Column(Boolean, nullable=True)
     fx_proxy_asset = Column(String(16), nullable=True)
+    # AtlasPay returns a signed mini-app URL and an opaque customer tracking
+    # code only on creation; retain them for safe idempotent order replay.
+    redirect_url = Column(Text, nullable=True)
+    tracking_code = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
 
@@ -1331,6 +1367,31 @@ class AccrualPeriod(Base):
     rule_key = Column(String, nullable=True)
     idempotency_key = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
+
+
+class PrepaidHourlyPeriod(Base):
+    """Immutable FX quote and payment status for one upcoming server hour."""
+
+    __tablename__ = "prepaid_hourly_periods"
+    __table_args__ = (
+        UniqueConstraint("server_id", "period_start", name="uq_prepaid_hourly_server_start"),
+        Index("ix_prepaid_hourly_pending", "server_id", "status", "period_start"),
+        sa.CheckConstraint(
+            "usd_minor > 0 AND irt_minor > 0 AND period_end > period_start",
+            name="ck_prepaid_hourly_positive",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
+    wallet_id = Column(PG_UUID, ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False)
+    period_start = Column(DateTime, nullable=False)
+    period_end = Column(DateTime, nullable=False)
+    usd_minor = Column(BigInteger, nullable=False)
+    irt_minor = Column(BigInteger, nullable=False)
+    fx_snapshot = Column(JSONB, nullable=False)
+    idempotency_key = Column(String(255), unique=True, nullable=False)
+    status = Column(String(16), nullable=False)
 
 
 class SshKeyRow(Base):

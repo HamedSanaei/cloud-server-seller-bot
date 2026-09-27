@@ -43,6 +43,7 @@ list is built from configuration, so no handler contains a provider name.
 from __future__ import annotations
 
 import logging
+import secrets
 from datetime import datetime
 from typing import Any, ClassVar, Protocol
 from uuid import UUID
@@ -1085,9 +1086,9 @@ class MonthlyBotUi:
     async def store_cloud_buy_screen(
         self, user: User | None, offer_ref: str, image_index: int, cb_key: str
     ) -> BotScreen:
-        # Hourly creation intent (terminal action): no provider call and no
-        # charge here — the worker POSTs once under the operation ledger and
-        # accrual bills per quantum from the price snapshot.
+        # Hourly creation intent: the worker POSTs only after the first IRT
+        # hour is reserved for prepaid customers; legacy USD contracts retain
+        # their existing usage-based accrual.
         if user is None or user.id is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
         if self._hourly is None:
@@ -1129,6 +1130,10 @@ class MonthlyBotUi:
         except OsUnavailableError as exc:
             logger.warning("hourly create rejected (os unavailable): %s", exc)
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
+        except InsufficientHoldBalanceError:
+            return BotScreen(
+                self._t.t("wallet.insufficient_balance", balance="—"), self._menu_only()
+            )
         except (OfferUnavailableError, HourlyNotAvailableError) as exc:
             logger.warning("hourly create rejected (offer unavailable): %s", exc)
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
@@ -1399,18 +1404,24 @@ class MonthlyBotUi:
             if self._support_contact:
                 lines.append(self._t.t("support.contact", contact=self._support_contact))
             return BotScreen("\n".join(lines), self._market_back_only())
-        rows = [
-            [
-                InlineKeyboardButton(
-                    text=self._t.t(
-                        "recharge.amount_row",
-                        amount=format_minor(amount, view.currency),
-                    ),
-                    callback_data=self._callback("recharge", "start", str(amount)),
-                )
-            ]
-            for amount in presets
-        ]
+        rows = []
+        for amount in presets:
+            args = [str(amount)]
+            if "atlaspay" in getattr(self._recharge, "gateway_keys", ()):
+                # One nonce per rendered button: double taps replay one order,
+                # but visiting this screen again permits a fresh top-up.
+                args.append(f"n-{secrets.token_hex(4)}")
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t(
+                            "recharge.amount_row",
+                            amount=format_minor(amount, view.currency),
+                        ),
+                        callback_data=self._callback("recharge", "start", *args),
+                    )
+                ]
+            )
         rows.append([self._back_button("wallet", "balance"), self._menu_button()])
         return BotScreen(
             self._t.t("recharge.title")
@@ -1437,7 +1448,11 @@ class MonthlyBotUi:
         return tuple(out)
 
     async def recharge_start_screen(
-        self, user: User, amount_text: str, gateway_key: str | None = None
+        self,
+        user: User,
+        amount_text: str,
+        gateway_key: str | None = None,
+        attempt_nonce: str | None = None,
     ) -> BotScreen:
         """recharge.start:{amount}[:{gateway}]: create the pending session, then pay."""
         if user.id is None:
@@ -1460,18 +1475,27 @@ class MonthlyBotUi:
         if not compatible:
             return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
         if gateway_key is None and len(compatible) > 1:
-            return self.recharge_gateway_screen(amount_minor, currency, compatible)
+            return self.recharge_gateway_screen(amount_minor, currency, compatible, attempt_nonce)
         key = gateway_key or compatible[0]
         if key not in compatible:
             return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
+        if key == "atlaspay" and attempt_nonce is None:
+            return self._expired_screen()
+        if attempt_nonce is not None and (
+            len(attempt_nonce) != 10
+            or not attempt_nonce.startswith("n-")
+            or any(c not in "0123456789abcdef" for c in attempt_nonce[2:])
+        ):
+            return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
+        idempotency_key = f"bot-recharge:{user.id}:{amount_minor}"
+        if key == "atlaspay":
+            idempotency_key = f"{idempotency_key}:{attempt_nonce}"
         try:
             start: RechargeStart = await self._recharge.start(
                 user=user,
                 amount_minor=amount_minor,
                 currency=currency,
-                # Deterministic per (user, amount): a double tap replays the
-                # same session instead of creating a second one.
-                idempotency_key=f"bot-recharge:{user.id}:{amount_minor}",
+                idempotency_key=idempotency_key,
                 gateway_key=key,
             )
         except RechargeAmountError:
@@ -1488,6 +1512,23 @@ class MonthlyBotUi:
                 ),
             )
         ]
+        if key == "atlaspay":
+            payable = getattr(start, "payable_amount_minor", None)
+            tracking = getattr(start, "tracking_code", None)
+            if (
+                not isinstance(payable, int)
+                or payable <= 0
+                or not tracking
+                or not start.redirect_url
+            ):
+                return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
+            lines.append(
+                self._t.t(
+                    "recharge.atlaspay_payment",
+                    amount=f"{payable:,}",
+                    tracking_code=tracking,
+                )
+            )
         rows: list[list[InlineKeyboardButton]] = []
         if start.redirect_url:
             rows.append(
@@ -1504,7 +1545,11 @@ class MonthlyBotUi:
             return gateway_key
 
     def recharge_gateway_screen(
-        self, amount_minor: int, currency: str, gateway_keys: list[str]
+        self,
+        amount_minor: int,
+        currency: str,
+        gateway_keys: list[str],
+        attempt_nonce: str | None = None,
     ) -> BotScreen:
         """recharge gateway picker: one button per compatible gateway."""
         del currency
@@ -1512,7 +1557,13 @@ class MonthlyBotUi:
             [
                 InlineKeyboardButton(
                     text=self._t.t("recharge.gateway_row", name=self.gateway_display_name(key)),
-                    callback_data=self._callback("recharge", "start", str(amount_minor), key),
+                    callback_data=self._callback(
+                        "recharge",
+                        "start",
+                        str(amount_minor),
+                        key,
+                        *([attempt_nonce] if attempt_nonce else []),
+                    ),
                 )
             ]
             for key in gateway_keys
@@ -1530,7 +1581,16 @@ class MonthlyBotUi:
         if cb.screen == "start" and len(cb.args) == 1:
             return await self.recharge_start_screen(user, cb.args[0])
         if cb.screen == "start" and len(cb.args) == 2:
+            if cb.args[1].startswith("n-"):
+                return await self.recharge_start_screen(user, cb.args[0], attempt_nonce=cb.args[1])
             return await self.recharge_start_screen(user, cb.args[0], gateway_key=cb.args[1])
+        if cb.screen == "start" and len(cb.args) == 3:
+            return await self.recharge_start_screen(
+                user,
+                cb.args[0],
+                gateway_key=cb.args[1],
+                attempt_nonce=cb.args[2],
+            )
         return self._menu_screen()
 
     # -- offers flow -------------------------------------------------------

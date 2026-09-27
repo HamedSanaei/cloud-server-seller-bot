@@ -44,7 +44,7 @@
 # validation (public https payment callbacks, redis Telegram session backend).
 environment = "development"        # development | staging | production
 log_level = "INFO"
-default_currency = "USD"
+default_currency = "IRT"
 
 [database]
 # Local example has no password; production inserts it after "cloud"
@@ -339,6 +339,14 @@ base_url = "https://api.tetraminator.com/v1"
 callback_url = "https://example.com/webhooks/payments/tetraminator"
 timeout_seconds = 30
 
+[payments.atlaspay]
+# Toman-denominated payment orders; verify through provider GET before credit.
+# Enable only after provisioning a real API key in server-owned configuration.
+enabled = false
+api_key = "CHANGE_ME"  # pragma: allowlist secret
+base_url = "https://api.atlaspay.space/api/v1"
+timeout_seconds = 20
+
 # ---------------------------------------------------------------------------
 # Currency / FX resolution (platform-level, provider-neutral)
 #
@@ -421,6 +429,7 @@ console = true                     # temporary console link
 traffic = true                     # data-traffic usage
 snapshots = true                   # list / create / restore / delete
 reinstall = true                   # OS reinstall (destructive)
+deletion = true                    # idempotent confirmed server deletion
 password_reset = true              # OS password reset (destructive)  # pragma: allowlist secret
 iso = false                        # attach/detach ISO (advanced, off by default)
 ip_management = true               # list IPs, reverse DNS, null route

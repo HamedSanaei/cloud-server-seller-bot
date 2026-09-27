@@ -43,7 +43,13 @@ def _server(**changes: Any) -> dict[str, Any]:
         "location": {"name": "fsn1"},
         "datacenter": None,
         "server_type": {"name": "cx22", "architecture": "x86", "disk": 40},
-        "image": {"id": 11, "name": "Ubuntu"},
+        "image": {
+            "id": 210163284,
+            "name": "centos-stream-10",
+            "description": "CentOS Stream 10",
+            "os_flavor": "centos",
+            "type": "system",
+        },
         "public_net": {"ipv4": {"ip": "192.0.2.3"}, "ipv6": {"ip": "2001:db8::1"}},
     }
     row.update(changes)
@@ -192,9 +198,35 @@ async def test_inventory_maps_location_state_and_ips_and_pages() -> None:
         )
         assert one.metadata["ipv4"] == "192.0.2.3"
         assert one.metadata["ipv6"] == "2001:db8::1"
+        assert one.image_id == "210163284"
+        assert one.image_name == "CentOS Stream 10"
         rows = await provider.vps_management.list_vps_info()
         assert [(row.id, row.state) for row in rows] == [("42", "running"), ("43", "off")]
         assert len(calls) == 3
+    finally:
+        await provider.close()
+
+
+async def test_inventory_does_not_claim_os_from_unknown_or_custom_image() -> None:
+    provider = _provider(lambda request: httpx.Response(200, json={"server": _server(image=None)}))
+    try:
+        unknown = await provider.vps_management.get_vps_info("42")
+        assert unknown is not None
+        assert unknown.image_name is None
+    finally:
+        await provider.close()
+
+    provider = _provider(
+        lambda request: httpx.Response(
+            200,
+            json={"server": _server(image={"id": 999, "name": "old-ubuntu", "type": "snapshot"})},
+        )
+    )
+    try:
+        custom = await provider.vps_management.get_vps_info("42")
+        assert custom is not None
+        assert custom.image_id == "999"
+        assert custom.image_name is None
     finally:
         await provider.close()
 
@@ -304,8 +336,9 @@ async def test_reinstall_lists_compatible_system_images_then_rebuilds() -> None:
                 [
                     {
                         "id": 11,
-                        "name": "Ubuntu",
-                        "os_flavor": "ubuntu",
+                        "name": "centos-stream-10",
+                        "description": "CentOS Stream 10",
+                        "os_flavor": "centos",
                         "architecture": "x86",
                         "type": "system",
                         "status": "available",
@@ -340,6 +373,8 @@ async def test_reinstall_lists_compatible_system_images_then_rebuilds() -> None:
     try:
         images = await provider.vps_management.list_vps_reinstall_images("42")
         assert [row.id for row in images] == ["11"]
+        assert images[0].name == "CentOS Stream 10"
+        assert images[0].family == "centos"
         with pytest.raises(ProviderError, match="not installable"):
             await provider.vps_management.reinstall_vps("42", "12")
         with pytest.raises(ProviderError, match="market apps"):

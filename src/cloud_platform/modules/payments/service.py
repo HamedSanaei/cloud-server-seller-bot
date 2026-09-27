@@ -180,6 +180,9 @@ class PaymentWebhookService:
         """
         assert session.id is not None
         assert session.gateway_payment_id is not None
+        wallet_before = await self._wallet.get(session.user_id)
+        if wallet_before is None or wallet_before.currency != session_credit_currency(session):
+            raise ValueError("wallet currency does not match the frozen payment credit currency")
         deposit_key = f"deposit-{session.gateway_key}-{session.gateway_payment_id}"
 
         wallet, _applied = await self._wallet.credit_deposit(
@@ -187,6 +190,7 @@ class PaymentWebhookService:
             session_credit_amount(session),
             deposit_key,
             reference=f"{session.gateway_key}/{session.gateway_payment_id}",
+            expected_currency=session_credit_currency(session),
         )
         credited = await self._payments.save(session.mark_credited(at=datetime.now(UTC)))
         # Operator channel: emitted only AFTER the wallet was actually

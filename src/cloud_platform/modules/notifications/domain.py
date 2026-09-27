@@ -23,11 +23,17 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
-from cloud_platform.modules.billing.service import LowBalanceDecision
+from cloud_platform.modules.billing.service import LowBalanceDecision, PrepaidBalanceDecision
 from cloud_platform.modules.compute.domain import CloudServer
+from cloud_platform.modules.fx.formatting import format_minor
+
+if TYPE_CHECKING:
+    from aiogram import Bot
+
+    from cloud_platform.modules.users.domain import UserRepository
 
 logger = logging.getLogger(__name__)
 
@@ -166,16 +172,12 @@ class ProvisioningProgressService:
 
 
 class LowBalanceNotificationKind(StrEnum):
-    """The warning levels the user is notified about.
-
-    One level per (server, episode) is delivered: a repeat of the SAME level
-    in the SAME episode is a no-op (the policy job may run twice, and a
-    re-sent delivery must not double-notify). A NEW episode (the watermark
-    was cleared and set again) may re-notify.
-    """
+    """One notice per (server, kind, episode); a new episode may notify again."""
 
     WARN = "warn"
-    AUTO_DELETE = "auto_delete"
+    STOP = "stop"
+    DELETE = "delete"
+    AUTO_DELETE = "auto_delete"  # Existing monthly policy decision.
     RECOVERED = "recovered"
 
 
@@ -203,10 +205,10 @@ class LowBalanceNotificationEvent:
 
 
 class LowBalanceNotifierPort(Protocol):
-    """Port for delivering low-balance notifications (bot/API later)."""
+    """Transport for low-balance notifications."""
 
     async def send(self, event: LowBalanceNotificationEvent) -> None:
-        """Deliver ``event`` to the user (best effort per event)."""
+        """Deliver or raise; failures must not be recorded as deliveries."""
         ...
 
 
@@ -217,13 +219,68 @@ class _LoggingLowBalanceNotifier:
         logger.warning("low-balance %s: %s", event.kind.value, event.render())
 
 
-class LowBalanceNotificationLogRepository(Protocol):
-    """Persistent dedup log for low-balance notifications.
+class TelegramNotificationDeliveryError(RuntimeError):
+    """A prepaid notice could not be sent to the owner's Telegram chat."""
 
-    Unique (server_id, kind, episode): the first delivery attempt of one
-    level in one episode inserts the row; repeats hit the constraint and
-    must not deliver again.
+
+class TelegramLowBalanceNotifier:
+    """Send prepaid balance notices to the owning user's Telegram identity."""
+
+    def __init__(self, bot: Bot, users: UserRepository) -> None:
+        self._bot = bot
+        self._users = users
+
+    async def send(self, event: LowBalanceNotificationEvent) -> None:
+        user = await self._users.get(event.user_id)
+        if user is None or user.telegram_user_id is None:
+            raise TelegramNotificationDeliveryError(
+                f"No Telegram identity for prepaid notice on server {event.server_id}"
+            )
+        balance = format_minor(event.balance_minor, event.currency)
+        server = str(event.server_id)[:8]
+        if event.kind is LowBalanceNotificationKind.WARN:
+            text = (
+                f"هشدار موجودی سرور {server}: موجودی کیف پول شما {balance} است "
+                "و به کمتر از 200,000 تومان رسیده است. لطفاً کیف پول را شارژ کنید."
+            )
+        elif event.kind is LowBalanceNotificationKind.STOP:
+            text = (
+                f"موجودی کیف پول شما صفر شده است. سرور {server} در حال خاموش شدن است. "
+                "برای جلوگیری از حذف، کیف پول را شارژ کنید."
+            )
+        elif event.kind is LowBalanceNotificationKind.DELETE:
+            text = (
+                f"یک روز از صفر شدن موجودی کیف پول شما گذشته است. "
+                f"حذف سرور {server} در حال انجام است."
+            )
+        elif event.kind is LowBalanceNotificationKind.RECOVERED:
+            text = f"موجودی کیف پول شما به {balance} رسیده است؛ وضعیت سرور {server} بازیابی شد."
+        else:
+            raise ValueError(f"Unsupported prepaid notice kind: {event.kind}")
+        try:
+            await self._bot.send_message(chat_id=user.telegram_user_id, text=text)
+        except Exception:
+            # Bot exceptions can embed request URLs (including the bot token)
+            # or chat IDs. Do not log or chain the unredacted exception.
+            raise TelegramNotificationDeliveryError(
+                f"Telegram prepaid notice failed for server {event.server_id}"
+            ) from None
+
+
+class LowBalanceNotificationLogRepository(Protocol):
+    """Durable notices keyed by (server_id, kind, episode).
+
+    The existing schema records successful sends but has no pending/claimed
+    state. Concurrent workers or a crash after Telegram accepts the message
+    but before the log commit may send twice. Strict exactly-once delivery
+    requires a durable outbox with a delivery state and reconciliation.
     """
+
+    async def was_sent(
+        self, server_id: UUID, kind: LowBalanceNotificationKind, episode: datetime
+    ) -> bool:
+        """Whether a successful delivery was previously recorded."""
+        ...
 
     async def record(
         self,
@@ -234,12 +291,16 @@ class LowBalanceNotificationLogRepository(Protocol):
         balance_minor: int,
         currency: str,
     ) -> bool:
-        """Atomically record one notification; True only for the first one."""
+        """Record a successful delivery; False if already recorded."""
         ...
 
 
-_DECISION_TO_KIND: dict[LowBalanceDecision, LowBalanceNotificationKind | None] = {
+_DECISION_TO_KIND: dict[
+    LowBalanceDecision | PrepaidBalanceDecision, LowBalanceNotificationKind | None
+] = {
     LowBalanceDecision.WARN: LowBalanceNotificationKind.WARN,
+    PrepaidBalanceDecision.STOP: LowBalanceNotificationKind.STOP,
+    PrepaidBalanceDecision.DELETE: LowBalanceNotificationKind.DELETE,
     LowBalanceDecision.AUTO_DELETE: LowBalanceNotificationKind.AUTO_DELETE,
     LowBalanceDecision.RECOVERED: LowBalanceNotificationKind.RECOVERED,
     LowBalanceDecision.NONE: None,
@@ -247,24 +308,20 @@ _DECISION_TO_KIND: dict[LowBalanceDecision, LowBalanceNotificationKind | None] =
 }
 
 
-def _decision_kind(decision: LowBalanceDecision) -> LowBalanceNotificationKind | None:
+def _decision_kind(
+    decision: LowBalanceDecision | PrepaidBalanceDecision,
+) -> LowBalanceNotificationKind | None:
     """Map a policy decision onto the user-notification kind (None = silent)."""
     return _DECISION_TO_KIND.get(decision)
 
 
 class LowBalanceNotifier:
-    """User-facing low-balance notifications with per-level dedup (M08-011).
+    """Notify per balance episode, persisting only successful deliveries.
 
-    Acceptance: **deduplicated warning levels.** The policy (M06-007)
-    decides the level (WARN / GRACE / AUTO_DELETE / RECOVERED); this
-    notifier turns it into exactly-once user notifications:
-
-    - GRACE is silent by design (the user was warned when the episode
-      opened) and never touches the log.
-    - WARN / AUTO_DELETE / RECOVERED are recorded in the persistent log
-      keyed by (server, level, episode); only the first record delivers,
-      so a double-run of the policy job cannot notify twice, while a new
-      episode (new watermark) notifies again.
+    Silent policy decisions never send. The existing log has no outbox state:
+    send-before-record allows retries after transport failures, and a later
+    sequential evaluation deduplicates the successful delivery. Atomic
+    exactly-once delivery across Telegram and SQL is not possible here.
     """
 
     def __init__(
@@ -279,28 +336,19 @@ class LowBalanceNotifier:
         self,
         user_id: UUID,
         server_id: UUID,
-        decision: LowBalanceDecision,
+        decision: LowBalanceDecision | PrepaidBalanceDecision,
         balance_minor: int,
         currency: str,
         episode: datetime,
     ) -> bool:
-        """Deliver one notification for ``decision``; True when delivered.
+        """Send once per level and episode; propagate failed deliveries.
 
-        ``episode`` is the server's low-balance watermark (the instant the
-        episode opened): the policy passes the new watermark on WARN, the
-        existing one on AUTO_DELETE, and the cleared one on RECOVERED.
+        ``episode`` is the policy's persisted watermark for this notice.
         """
         kind = _decision_kind(decision)
         if kind is None:
-            return False  # NONE and GRACE are not user notifications
-        first = await self._log.record(user_id, server_id, kind, episode, balance_minor, currency)
-        if not first:
-            logger.info(
-                "low-balance %s for server %s episode %s already recorded; not re-notifying",
-                kind.value,
-                server_id,
-                episode.isoformat(),
-            )
+            return False
+        if await self._log.was_sent(server_id, kind, episode):
             return False
         await self._notifier.send(
             LowBalanceNotificationEvent(
@@ -313,4 +361,4 @@ class LowBalanceNotifier:
                 at=datetime.now(UTC),
             )
         )
-        return True
+        return await self._log.record(user_id, server_id, kind, episode, balance_minor, currency)

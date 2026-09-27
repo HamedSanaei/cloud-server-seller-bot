@@ -218,6 +218,7 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
             state_report = await ServerStateReconciler(
                 server_repo=server_repo,
                 provider_registry=container.provider_registry,
+                prepaid_capture=container.hourly_cloud_service().capture_first_hour,
                 audit_repo=audit_repo,
                 # The reconciler owns the final PROVISIONING -> RUNNING
                 # transition of an hourly cloud instance, so the operator's
@@ -278,6 +279,129 @@ async def accrue_usage(ctx: dict[str, object]) -> None:
             lock=PostgresAdvisoryAccrualLock(SessionFactory),
         )
         await job.run()
+
+
+async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
+    """Renew paid coverage before expiry and enforce zero/expired-hour power state."""
+    del ctx
+    async with metrics.job("reconcile_prepaid_hourly"):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.core.container import create_container
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.billing.service import (
+            PrepaidBalanceDecision,
+            PrepaidBalancePolicyService,
+        )
+        from cloud_platform.modules.notifications.domain import (
+            LowBalanceNotifier,
+            TelegramLowBalanceNotifier,
+        )
+        from cloud_platform.modules.notifications.repository import (
+            SqlAlchemyLowBalanceNotificationLogRepository,
+        )
+        from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+
+        container = create_container()
+        try:
+            await container.initialize()
+            settings = get_settings()
+            billing_enabled = (
+                settings.fx_enabled
+                and settings.fx_domestic_enabled
+                and settings.fx_allow_usdt_proxy_for_settlement
+            )
+            renewal = (
+                await container.prepaid_hourly_billing_service().run() if billing_enabled else None
+            )
+            policy = PrepaidBalancePolicyService(
+                container.server_repository(), container.wallet_repository()
+            )
+            decisions = await policy.evaluate()
+            token = _telegram_bot_token()
+            bot = None
+            if token is not None:
+                from aiogram import Bot
+
+                bot = Bot(token=token)
+            notices = (
+                LowBalanceNotifier(
+                    TelegramLowBalanceNotifier(bot, SqlAlchemyUserRepository(SessionFactory)),
+                    SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
+                )
+                if bot is not None
+                else None
+            )
+            try:
+                for server_id, decision in decisions.decisions.items():
+                    server = await container.server_repository().get(server_id)
+                    if server is None:
+                        continue
+                    wallet = await container.wallet_repository().get(server.user_id)
+                    if wallet is None or wallet.currency != "IRT":
+                        continue
+                    episode = server.prepaid_zero_since
+                    if wallet.balance > 0 and wallet.balance < 200_000:
+                        decision = PrepaidBalanceDecision.WARN
+                        episode = server.low_balance_since
+                    if (
+                        decision
+                        not in (
+                            PrepaidBalanceDecision.WARN,
+                            PrepaidBalanceDecision.STOP,
+                            PrepaidBalanceDecision.DELETE,
+                        )
+                        or episode is None
+                    ):
+                        continue
+                    if notices is None:
+                        logger.error(
+                            "prepaid balance notice unavailable: Telegram bot is unconfigured"
+                        )
+                        continue
+                    try:
+                        await notices.notify(
+                            server.user_id, server_id, decision, wallet.balance, "IRT", episode
+                        )
+                    except Exception:
+                        logger.exception("prepaid Telegram balance notice failed for %s", server_id)
+            finally:
+                if bot is not None:
+                    await bot.session.close()
+            lifecycle = container.prepaid_provider_lifecycle_service()
+            expired = (
+                renewal.stop_requested_server_ids
+                if renewal is not None
+                else [
+                    server.id
+                    for server in await container.server_repository().list_running()
+                    if server.is_prepaid_hourly_irt
+                    and (
+                        server.prepaid_paid_until is None
+                        or server.prepaid_paid_until <= datetime.now(UTC)
+                    )
+                ]
+            )
+            for server_id in expired:
+                try:
+                    await lifecycle.enforce_unpaid(server_id)
+                except Exception:
+                    logger.exception("unpaid prepaid server stop failed for %s", server_id)
+            for server_id in (
+                *decisions.stop_requested_server_ids,
+                *decisions.delete_requested_server_ids,
+            ):
+                try:
+                    await lifecycle.enforce(server_id)
+                except Exception:
+                    logger.exception("prepaid server lifecycle failed for %s", server_id)
+            if (renewal is not None and renewal.errors) or decisions.errors:
+                logger.error(
+                    "prepaid hourly pass: renewal errors=%s balance errors=%s",
+                    len(renewal.errors) if renewal is not None else 0,
+                    len(decisions.errors),
+                )
+        finally:
+            await container.close()
 
 
 async def evaluate_low_balance(ctx: dict[str, object]) -> None:
@@ -1201,6 +1325,46 @@ async def reconcile_tetraminator_payments(ctx: dict[str, object]) -> None:
             await gateway.close()
 
 
+async def reconcile_atlaspay_payments(ctx: dict[str, object]) -> None:
+    """Poll provider-confirmed AtlasPay orders; credit through the atomic deposit path."""
+    del ctx
+    async with metrics.job("reconcile_atlaspay_payments"):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
+        from cloud_platform.modules.payments.atlaspay import reconcile_atlaspay_pending
+        from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
+        from cloud_platform.modules.payments.service import PaymentWebhookService
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyLedgerRepository,
+            SqlAlchemyWalletRepository,
+        )
+        from cloud_platform.providers.atlaspay.client import AtlasPayGateway
+
+        settings = get_settings()
+        if not settings.atlaspay_enabled or not settings.atlaspay_api_key:
+            return
+        gateway = AtlasPayGateway(
+            api_key=settings.atlaspay_api_key,
+            base_url=settings.atlaspay_base_url,
+            timeout_seconds=settings.atlaspay_timeout_seconds,
+        )
+        try:
+            report = await reconcile_atlaspay_pending(
+                payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                webhook_service=PaymentWebhookService(
+                    payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                    wallet_repo=SqlAlchemyWalletRepository(SessionFactory),
+                    ledger_repo=SqlAlchemyLedgerRepository(SessionFactory),
+                ),
+                gateway=gateway,
+                audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+            )
+            logger.info("atlaspay reconcile: %s", report.render())
+        finally:
+            await gateway.close()
+
+
 async def deliver_business_log_events(ctx: dict[str, object]) -> None:
     """Deliver queued operator and private customer cards from the durable outbox.
 
@@ -1272,6 +1436,7 @@ def _cron_jobs() -> list[Any]:
         cron(process_deletes, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_deletes, minute=every_three_minutes, run_at_startup=True),
         cron(accrue_usage, minute={0}, run_at_startup=True),
+        cron(reconcile_prepaid_hourly, minute=every_minute, run_at_startup=True),
         cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
@@ -1279,6 +1444,7 @@ def _cron_jobs() -> list[Any]:
         cron(deliver_business_log_events, minute=every_minute, run_at_startup=True),
         cron(reconcile_tetraminator_payments, minute=every_fifteen_minutes, run_at_startup=True),
         cron(reconcile_payments, minute=every_fifteen_minutes, run_at_startup=True),
+        cron(reconcile_atlaspay_payments, minute=every_three_minutes, run_at_startup=True),
     ]
 
 
@@ -1288,10 +1454,12 @@ class WorkerSettings:
     functions: ClassVar[list[Any]] = [
         reconcile_provider_resources,
         accrue_usage,
+        reconcile_prepaid_hourly,
         evaluate_low_balance,
         process_deletes,
         reconcile_deletes,
         reconcile_payments,
+        reconcile_atlaspay_payments,
         sync_leaseweb_offers,
         catalog_auto_sync,
         reconcile_cloud_capacity,
@@ -1331,9 +1499,11 @@ PROVISIONING_FUNCTIONS: list[Any] = [
 ]
 BILLING_FUNCTIONS: list[Any] = [
     accrue_usage,
+    reconcile_prepaid_hourly,
     evaluate_low_balance,
     reconcile_payments,
     reconcile_tetraminator_payments,
+    reconcile_atlaspay_payments,
     check_renewals,
     deliver_business_log_events,
 ]
@@ -1371,11 +1541,13 @@ def _role_cron_jobs(role: str) -> list[Any]:
     if role == "billing":
         return [
             cron(accrue_usage, minute={0}, run_at_startup=True),
+            cron(reconcile_prepaid_hourly, minute=every_minute, run_at_startup=True),
             cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
             cron(reconcile_payments, minute=every_fifteen_minutes, run_at_startup=True),
             cron(
                 reconcile_tetraminator_payments, minute=every_fifteen_minutes, run_at_startup=True
             ),
+            cron(reconcile_atlaspay_payments, minute=every_three_minutes, run_at_startup=True),
             cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
         ]
     return [

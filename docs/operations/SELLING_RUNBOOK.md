@@ -205,3 +205,40 @@ Every command in this runbook is READ-ONLY at the provider. Billable calls
 (server creation/order placement) happen only through the durable pipeline:
 Telegram checkout -> wallet hold -> operation ledger -> worker. There is no CLI
 or test command that can create a live server.
+
+## IRT wallet, USD hourly offers, and AtlasPay
+
+New wallets use IRT. USD hourly prices remain immutable in the server contract;
+prepaid hourly checkout binds an AbanTether USDT/IRT **settlement** snapshot
+before reserving one hour in IRT. Each next hour has its own persisted FX
+snapshot and atomic IRT ledger debit. No FX quote means no new paid interval;
+an unpaid server must be stopped after its paid coverage expires, not charged
+in USD or allowed to continue unpaid. Below 200,000 IRT, warn the owner; at
+zero, request provider power-off, and after 24 hours of continuous zero
+balance, request deletion through the idempotent deletion saga. A top-up
+clears the zero watermark; it does not silently power a stopped server on.
+Legacy hourly contracts and their accepted USD snapshots are not rewritten.
+
+Before enabling checkouts, configure the **server-owned** domestic FX source
+and `fx.allow_usdt_proxy_for_settlement = true`; the proxy is explicitly
+accepted for USD settlement, not a claim that USD equals USDT. AtlasPay
+requires its server-owned API key and enabled flag; its create-order response
+supplies the customer payment URL. Only a matching provider-verified order
+ID, reference, amount and successful paid state credits the IRT wallet.
+Underpayments require manual review, never a partial or guessed credit.
+An ambiguous AtlasPay create leaves a durable pending intent for operator
+review; do not blindly repeat the external POST.
+
+### Existing USD wallet conversion
+
+No automatic conversion on deploy. Pause checkout, gateway callbacks, billing
+and server workers; settle or delete every active server first and resolve
+holds and pending payments. The migration refuses an account with outstanding
+obligations. Using a single operator process, build a
+`WalletCurrencyMigrationService(container.wallet_repository(),
+container.fx_resolver())` plan with an explicit user UUID, operator UUID,
+stable migration UUID and reason. Review and securely persist the returned
+FX snapshot and exact IRT amount; apply that **same plan** before quote expiry.
+Retry only with the identical plan/UUID, reconcile the wallet's ledger epochs,
+then resume workers. Never convert a live USD contract in place or invent a
+rate if the quote expires. A live USD server blocks its owner's conversion.

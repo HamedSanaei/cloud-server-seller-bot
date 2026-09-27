@@ -102,6 +102,8 @@ BILLING_MODEL_HOURLY = "hourly"
 
 #: Billing model for fixed prepaid monthly products (LEASEWEB-MVP).
 BILLING_MODEL_PREPAID_MONTHLY = "prepaid_monthly_fixed"
+#: New USD-priced, IRT-settled prepaid hourly contract; old hourly rows are unchanged.
+BILLING_MODEL_PREPAID_HOURLY_IRT = "hourly_prepaid_irt"
 
 
 @dataclass(slots=True)
@@ -121,9 +123,12 @@ class CloudServer:
     last_accrued_at: datetime | None = None
     deleted_at: datetime | None = None
     low_balance_since: datetime | None = None
+    #: End of the last paid hourly interval; never use legacy last_accrued_at.
+    prepaid_paid_until: datetime | None = None
+    #: Start of the current zero-IRT episode, independent of warning time.
+    prepaid_zero_since: datetime | None = None
     quantum_seconds: int = 3600
-    #: ``hourly`` or ``prepaid_monthly_fixed`` — the accrual and low-balance
-    #: jobs only ever touch ``hourly`` servers (LEASEWEB-MVP).
+    #: Contract type is immutable after checkout; legacy rows retain their model.
     billing_model: str = BILLING_MODEL_HOURLY
     #: The operating system the server was ordered with (prepaid monthly
     #: path only), e.g. "Ubuntu 24.04".
@@ -144,6 +149,10 @@ class CloudServer:
     def is_prepaid_monthly(self) -> bool:
         """Whether this server is billed as a fixed prepaid monthly product."""
         return self.billing_model == BILLING_MODEL_PREPAID_MONTHLY
+
+    @property
+    def is_prepaid_hourly_irt(self) -> bool:
+        return self.billing_model == BILLING_MODEL_PREPAID_HOURLY_IRT
 
     def transition_to(self, target: ServerLifecycleState) -> None:
         if target not in _ALLOWED[self.state]:
@@ -474,6 +483,18 @@ class ServerRepository(Protocol):
 
     async def save(self, server: CloudServer) -> CloudServer:
         """Persist lifecycle/state changes to an existing server."""
+        ...
+
+    async def save_prepaid_balance_markers(
+        self,
+        server_id: UUID,
+        *,
+        expected_warning_since: datetime | None,
+        expected_zero_since: datetime | None,
+        warning_since: datetime | None,
+        zero_since: datetime | None,
+    ) -> None:
+        """Compare-and-set prepaid warning/zero clocks without rewriting stale server state."""
         ...
 
     async def create(self, server: CloudServer, intent: ServerCreateIntent) -> CloudServer:

@@ -657,6 +657,7 @@ class TestPaymentWebhookReplay:
         payments.create = AsyncMock(side_effect=lambda s: dataclasses.replace(s, id=uuid4()))
         payments.save = AsyncMock(side_effect=lambda s: state.update({"session": s}) or s)
         wallet = AsyncMock()
+        wallet.get = AsyncMock(return_value=types.SimpleNamespace(currency="EUR"))
         # Atomic deposit contract: (wallet_after, applied=True).
         wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
         ledger = AsyncMock()

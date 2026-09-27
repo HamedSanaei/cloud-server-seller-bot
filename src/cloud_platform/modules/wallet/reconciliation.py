@@ -28,6 +28,7 @@ from cloud_platform.modules.wallet.domain import (
     LedgerEntry,
     LedgerEntryType,
     Wallet,
+    WalletCurrencyMigration,
     WalletStatus,
 )
 
@@ -51,6 +52,7 @@ OVERRESERVED = "OVERRESERVED"
 CLOSED_NONZERO_BALANCE = "CLOSED_NONZERO_BALANCE"
 CURRENCY_MISMATCH_HOLD = "CURRENCY_MISMATCH_HOLD"
 CURRENCY_MISMATCH_ENTRY = "CURRENCY_MISMATCH_ENTRY"
+MIGRATION_BOUNDARY_INVALID = "MIGRATION_BOUNDARY_INVALID"
 ZERO_AMOUNT_ENTRY = "ZERO_AMOUNT_ENTRY"
 DUPLICATE_IDEMPOTENCY_KEY = "DUPLICATE_IDEMPOTENCY_KEY"
 CAPTURED_HOLD_MISSING_CHARGE = "CAPTURED_HOLD_MISSING_CHARGE"
@@ -122,7 +124,10 @@ def _resolve_hold(entry: LedgerEntry, holds: list[Hold]) -> Hold | None:
 
 
 def check_wallet(
-    wallet: Wallet, holds: list[Hold], entries: list[LedgerEntry]
+    wallet: Wallet,
+    holds: list[Hold],
+    entries: list[LedgerEntry],
+    migrations: list[WalletCurrencyMigration] | tuple[WalletCurrencyMigration, ...] = (),
 ) -> list[ReconciliationFinding]:
     """Pure per-wallet consistency checks (no I/O)."""
     assert wallet.id is not None
@@ -154,9 +159,141 @@ def check_wallet(
             f"closed wallet has non-zero balance: {wallet.balance}",
         )
 
+    # Migration records, not a coincidental mixture of entry currencies,
+    # authorize the historical USD epoch. UUIDs are never sorted as time.
+    old_entries: list[LedgerEntry] = []
+    new_entries: list[LedgerEntry] = []
+    migration = migrations[0] if len(migrations) == 1 else None
+    valid_boundary = migration is not None
+    if migrations and migration is None:
+        add(MIGRATION_BOUNDARY_INVALID, FindingSeverity.ERROR, "multiple cutovers for one wallet")
+    if migration is not None:
+        snapshot = migration.snapshot
+        if (
+            migration.wallet_id != wallet_id
+            or migration.user_id != wallet.user_id
+            or wallet.currency != "IRT"
+            or migration.source_balance_minor != snapshot.source_amount_minor
+            or snapshot.expires_at is None
+            or not snapshot.observed_at <= migration.created_at < snapshot.expires_at
+        ):
+            valid_boundary = False
+            add(
+                MIGRATION_BOUNDARY_INVALID,
+                FindingSeverity.ERROR,
+                "migration identity or wallet currency is invalid",
+            )
+        by_id = {entry.id: entry for entry in entries}
+        if len(by_id) != len(entries):
+            valid_boundary = False
+            add(
+                MIGRATION_BOUNDARY_INVALID,
+                FindingSeverity.ERROR,
+                "duplicate ledger entry identities",
+            )
+        if migration.source_balance_minor:
+            close = by_id.get(migration.close_entry_id)
+            opened = by_id.get(migration.open_entry_id)
+            if (
+                close is None
+                or opened is None
+                or close.id == opened.id
+                or close.created_at is None
+                or opened.created_at is None
+                or close.created_at.tzinfo is None
+                or opened.created_at.tzinfo is None
+                or close.entry_type is not LedgerEntryType.CURRENCY_CLOSE
+                or opened.entry_type is not LedgerEntryType.CURRENCY_OPEN
+                or close.wallet_id != wallet_id
+                or opened.wallet_id != wallet_id
+                or close.amount.currency != "USD"
+                or opened.amount.currency != "IRT"
+                or _entry_minor(close) != snapshot.source_amount_minor
+                or _entry_minor(opened) != snapshot.target_amount_minor
+                or close.reference_type != "currency_migration"
+                or opened.reference_type != "currency_migration"
+                or close.reference_id != str(migration.id)
+                or opened.reference_id != str(migration.id)
+                or close.idempotency_key != f"currency-close-{migration.id}"
+                or opened.idempotency_key != f"currency-open-{migration.id}"
+                or not close.created_at < migration.created_at < opened.created_at
+            ):
+                valid_boundary = False
+                add(
+                    MIGRATION_BOUNDARY_INVALID,
+                    FindingSeverity.ERROR,
+                    "close/open ledger facts do not prove the cutover",
+                )
+            else:
+                before, after = close.created_at, opened.created_at
+        else:
+            before = after = migration.created_at
+        if valid_boundary:
+            for entry in entries:
+                if entry.id in (migration.close_entry_id, migration.open_entry_id):
+                    continue
+                if entry.entry_type in (
+                    LedgerEntryType.CURRENCY_CLOSE,
+                    LedgerEntryType.CURRENCY_OPEN,
+                ):
+                    valid_boundary = False
+                    add(
+                        MIGRATION_BOUNDARY_INVALID,
+                        FindingSeverity.ERROR,
+                        "orphan or duplicate migration ledger event",
+                    )
+                elif entry.created_at is None or entry.created_at.tzinfo is None:
+                    valid_boundary = False
+                    add(
+                        MIGRATION_BOUNDARY_INVALID,
+                        FindingSeverity.ERROR,
+                        "ledger chronology cannot be proven",
+                    )
+                elif entry.created_at < before:
+                    old_entries.append(entry)
+                elif entry.created_at > after:
+                    new_entries.append(entry)
+                else:
+                    valid_boundary = False
+                    add(
+                        MIGRATION_BOUNDARY_INVALID,
+                        FindingSeverity.ERROR,
+                        "ledger event overlaps migration boundary",
+                    )
+            for hold in holds:
+                if hold.currency == "USD":
+                    settled_at = (
+                        hold.captured_at if hold.status is HoldStatus.CAPTURED else hold.released_at
+                    )
+                    valid = (
+                        hold.status is not HoldStatus.CREATED
+                        and hold.created_at is not None
+                        and hold.created_at.tzinfo is not None
+                        and settled_at is not None
+                        and settled_at.tzinfo is not None
+                        and hold.created_at < before
+                        and settled_at < before
+                    )
+                else:
+                    valid = (
+                        hold.currency == "IRT"
+                        and hold.created_at is not None
+                        and hold.created_at.tzinfo is not None
+                        and hold.created_at > after
+                    )
+                if not valid:
+                    valid_boundary = False
+                    add(
+                        MIGRATION_BOUNDARY_INVALID,
+                        FindingSeverity.ERROR,
+                        "hold epoch cannot be proven",
+                    )
+
     # -- currency consistency ------------------------------------------------
     for hold in holds:
-        if hold.currency != wallet.currency:
+        if hold.currency != wallet.currency and not (
+            valid_boundary and hold.currency == "USD" and hold.status is not HoldStatus.CREATED
+        ):
             add(
                 CURRENCY_MISMATCH_HOLD,
                 FindingSeverity.ERROR,
@@ -164,13 +301,24 @@ def check_wallet(
                 hold_id=str(hold.id) if hold.id else "",
             )
     for entry in entries:
-        if entry.amount.currency != wallet.currency:
+        is_old = valid_boundary and entry.created_at is not None and entry.created_at < before
+        is_close = valid_boundary and entry.id == migration.close_entry_id
+        if entry.amount.currency != ("USD" if is_old or is_close else wallet.currency):
             add(
                 CURRENCY_MISMATCH_ENTRY,
                 FindingSeverity.ERROR,
-                f"entry {entry.idempotency_key} currency {entry.amount.currency} != wallet "
-                f"{wallet.currency}",
+                f"entry {entry.idempotency_key} currency {entry.amount.currency} is outside its "
+                f"audited {'USD' if is_old or is_close else wallet.currency} epoch",
                 entry_type=entry.entry_type.value,
+            )
+        if not migrations and entry.entry_type in (
+            LedgerEntryType.CURRENCY_CLOSE,
+            LedgerEntryType.CURRENCY_OPEN,
+        ):
+            add(
+                MIGRATION_BOUNDARY_INVALID,
+                FindingSeverity.ERROR,
+                "migration ledger event has no audit record",
             )
 
     # -- entry sanity ---------------------------------------------------------
@@ -253,40 +401,46 @@ def check_wallet(
                 )
 
     # -- balance vs ledger derivation ------------------------------------------
-    # HOLD/RELEASE entries move no cash (reservations only); captures are the
-    # CHARGE entries. Admin adjustments carry unsigned amounts, so they explain
-    # a residual of at most their total.
-    expected = 0
-    adjustment_slack = 0
-    for entry in entries:
-        amount = _entry_minor(entry)
-        if entry.entry_type is LedgerEntryType.DEPOSIT:
-            expected += amount
-        elif entry.entry_type is LedgerEntryType.REFUND:
-            expected += amount
-        elif entry.entry_type is LedgerEntryType.CHARGE:
-            expected -= amount
-        elif entry.entry_type is LedgerEntryType.ADJUSTMENT:
-            adjustment_slack += amount
-    residual = wallet.balance - expected
-    if residual != 0:
-        if abs(residual) <= adjustment_slack:
-            add(
-                BALANCE_LEDGER_MISMATCH,
-                FindingSeverity.WARNING,
-                f"balance differs from ledger net by {residual}; within the "
-                f"admin-adjustment total ({adjustment_slack})",
-                residual=str(residual),
-            )
-        else:
-            add(
-                BALANCE_LEDGER_MISMATCH,
-                FindingSeverity.ERROR,
-                f"balance differs from ledger net by {residual} and no admin "
-                f"adjustment total ({adjustment_slack}) explains it",
-                residual=str(residual),
-                expected=str(expected),
-            )
+    # Historical USD cash is reconciled *against* the frozen close amount;
+    # post-cutover IRT cash begins at the audited open amount. Never add USD
+    # and IRT entries into the same integer balance.
+    def check_epoch(cash: list[LedgerEntry], actual: int, *, opening: int = 0) -> None:
+        expected = opening
+        adjustment_slack = 0
+        for entry in cash:
+            amount = _entry_minor(entry)
+            if entry.entry_type in (LedgerEntryType.DEPOSIT, LedgerEntryType.REFUND):
+                expected += amount
+            elif entry.entry_type is LedgerEntryType.CHARGE:
+                expected -= amount
+            elif entry.entry_type is LedgerEntryType.ADJUSTMENT:
+                adjustment_slack += amount
+        residual = actual - expected
+        if residual != 0:
+            if abs(residual) <= adjustment_slack:
+                add(
+                    BALANCE_LEDGER_MISMATCH,
+                    FindingSeverity.WARNING,
+                    f"balance differs from ledger net by {residual}; within the "
+                    f"admin-adjustment total ({adjustment_slack})",
+                    residual=str(residual),
+                )
+            else:
+                add(
+                    BALANCE_LEDGER_MISMATCH,
+                    FindingSeverity.ERROR,
+                    f"balance differs from ledger net by {residual} and no admin "
+                    f"adjustment total ({adjustment_slack}) explains it",
+                    residual=str(residual),
+                    expected=str(expected),
+                )
+
+    if valid_boundary:
+        assert migration is not None
+        check_epoch(old_entries, migration.source_balance_minor)
+        check_epoch(new_entries, wallet.balance, opening=migration.snapshot.target_amount_minor)
+    elif not migrations:
+        check_epoch(entries, wallet.balance)
 
     return findings
 
@@ -312,7 +466,9 @@ class LedgerReconciliationService:
                 continue
             holds: list[Hold] = await self._holds.list_by_wallet(wallet.id)  # type: ignore[attr-defined]
             entries: list[LedgerEntry] = await self._ledger.list_entries(wallet.id)  # type: ignore[attr-defined]
-            findings.extend(check_wallet(wallet, holds, entries))
+            list_migrations = getattr(self._wallets, "list_currency_migrations", None)
+            migrations = await list_migrations(wallet.id) if list_migrations is not None else []
+            findings.extend(check_wallet(wallet, holds, entries, migrations))
         return ReconciliationReport(
             wallets_checked=len(wallets),
             findings=tuple(findings),

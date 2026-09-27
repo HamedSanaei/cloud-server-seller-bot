@@ -256,9 +256,14 @@ class _BookOffersRepo:
         product_id: str,
         location_id: str,
         provider_account_id: str | None = None,
+        billing_model: str | None = None,
     ) -> SellableOffer | None:
         row = self.rows.get((provider_key, product_id, location_id))
-        if row is not None and provider_account_id is not None:
+        if row is None:
+            return None
+        if billing_model is not None and row.billing_model != billing_model:
+            return None
+        if provider_account_id is not None:
             if (row.provider_account_id or "") != provider_account_id:
                 return None
         return row

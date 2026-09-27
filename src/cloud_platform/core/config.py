@@ -104,6 +104,10 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("payments", "tetraminator", "base_url"): "tetraminator_base_url",
     ("payments", "tetraminator", "callback_url"): "tetraminator_callback_url",
     ("payments", "tetraminator", "timeout_seconds"): "tetraminator_timeout_seconds",
+    ("payments", "atlaspay", "enabled"): "atlaspay_enabled",
+    ("payments", "atlaspay", "api_key"): "atlaspay_api_key",
+    ("payments", "atlaspay", "base_url"): "atlaspay_base_url",
+    ("payments", "atlaspay", "timeout_seconds"): "atlaspay_timeout_seconds",
     ("security", "provider_credential_encryption_key"): ("provider_credential_encryption_key"),
     ("security", "backup_encryption_key"): "backup_encryption_key",
     ("billing", "price_book_name"): "price_book_name",
@@ -777,6 +781,10 @@ class Settings(BaseSettings):
     tetraminator_base_url: str = "https://api.tetraminator.com/v1"
     tetraminator_callback_url: str = ""
     tetraminator_timeout_seconds: float = Field(default=30.0, gt=0)
+    atlaspay_enabled: bool = False
+    atlaspay_api_key: str = Field(default="", repr=False)
+    atlaspay_base_url: str = "https://api.atlaspay.space/api/v1"
+    atlaspay_timeout_seconds: float = Field(default=20.0, gt=0)
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
     # --- Currency / FX resolution (`[fx]` + `[fx.abantether]`) ---------------
     # Platform-level financial subsystem (provider-neutral). The first live
@@ -814,7 +822,7 @@ class Settings(BaseSettings):
     fx_frankfurter_max_stale_seconds: int = Field(default=345600, ge=0)
     fx_frankfurter_catalog_max_stale_seconds: int = Field(default=86400, ge=0)
     fx_global_fiat_provider: str = "frankfurter"
-    default_currency: str = "USD"
+    default_currency: str = "IRT"
     # The OPERATOR-declared price book the selling price is derived from
     # (M08-005): confirmation, holds and immutable server price snapshots
     # all read the SAME book. There is no versioned book by default.
@@ -822,6 +830,7 @@ class Settings(BaseSettings):
     customer_billing_quantum_seconds: int = Field(default=3600, ge=60)
     low_balance_threshold_minor: int = Field(default=5000, ge=0)
     low_balance_grace_hours: int = Field(default=24, ge=0)
+
     backup_output_dir: str = "./backups"
     backup_retention_days: int = Field(default=14, ge=1)
     backup_encryption_key: str = ""
@@ -1016,6 +1025,16 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _irt_low_balance_default(self) -> Settings:
+        """IRT operator configuration needs a Toman-sized default threshold."""
+        if (
+            self.default_currency.upper() == "IRT"
+            and "low_balance_threshold_minor" not in self.model_fields_set
+        ):
+            self.low_balance_threshold_minor = 200_000
+        return self
+
+    @model_validator(mode="after")
     def _validate_production_payment_configuration(self) -> Settings:
         """An ENABLED payment gateway must be usable in the resolved environment.
 
@@ -1030,8 +1049,10 @@ class Settings(BaseSettings):
         would have to be rejected at request time anyway. Development and test
         may use http. Secrets are never echoed in the error text.
         """
+        if self.atlaspay_enabled:
+            return self._validate_atlaspay_configuration()
         if not self.tetraminator_enabled:
-            return self._validate_zarinpal_configuration()
+            return self._validate_zarinpal_configuration()._validate_atlaspay_configuration()
         from urllib.parse import urlsplit
 
         if not (self.tetraminator_api_key or "").strip():
@@ -1058,7 +1079,7 @@ class Settings(BaseSettings):
                 "'production' (the callback is unauthenticated and must be publicly "
                 "reachable; use the API's reverse-proxied domain)"
             )
-        return self._validate_zarinpal_configuration()
+        return self._validate_zarinpal_configuration()._validate_atlaspay_configuration()
 
     def _validate_zarinpal_configuration(self) -> Settings:
         """Validate the enabled ZarinPal gateway without exposing secrets."""
@@ -1084,6 +1105,22 @@ class Settings(BaseSettings):
             )
         if (self.app_env or "").strip().lower() == "production" and callback_url.scheme != "https":
             raise ValueError("payments.zarinpal.callback_url must use https:// in production")
+        return self
+
+    def _validate_atlaspay_configuration(self) -> Settings:
+        """AtlasPay requires a real API key and HTTPS for all API traffic."""
+        if not self.atlaspay_enabled:
+            return self
+        from urllib.parse import urlsplit
+
+        if (
+            not (self.atlaspay_api_key or "").strip()
+            or self.atlaspay_api_key.strip() == "CHANGE_ME"
+        ):
+            raise ValueError("payments.atlaspay.api_key is required when AtlasPay is enabled")
+        parsed = urlsplit(self.atlaspay_base_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+            raise ValueError("payments.atlaspay.base_url must be an absolute HTTPS URL")
         return self
 
     @model_validator(mode="after")

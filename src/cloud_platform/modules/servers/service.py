@@ -301,13 +301,48 @@ class ServerManagementService:
                 limit=page_size,
                 hide_failed_before=self._clock() - timedelta(hours=1),
             )
-        items = tuple([await self._with_failure_reason(self._local_view(row)) for row in rows])
+        # List inventory once per credential account; individual GETs would
+        # multiply provider calls by the number of servers on the page.
+        hetzner_rows: dict[str | None, list[CloudServer]] = {}
+        for row in rows:
+            if row.provider_key == "hetzner" and row.provider_server_id:
+                hetzner_rows.setdefault(row.credential_account_id, []).append(row)
+        unverified: set[UUID] = set()
+        for account_rows in hetzner_rows.values():
+            context = await self._context(account_rows[0])
+            snapshots: dict[str, VpsInfo] = {}
+            if context is not None and context.capabilities.inventory:
+                try:
+                    snapshots = {info.id: info for info in await context.provider.list_vps_info()}
+                except ProviderError:
+                    pass
+            for row in account_rows:
+                info = snapshots.get(_provider_id(row))
+                if info is None:
+                    unverified.add(row.id)
+                else:
+                    await self._apply_provider_info(row, info)
+        items = tuple(
+            [
+                await self._with_failure_reason(
+                    replace(self._local_view(row), operating_system=None, display_name=None)
+                    if row.id in unverified
+                    else self._local_view(row)
+                )
+                for row in rows
+            ]
+        )
         return CustomerServerPage(items=items, page=requested, page_size=page_size, total=total)
 
     async def get_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         """The customer-safe view of one owned server (local state)."""
         server = await self._owned(customer_id, server_id)
-        return await self._with_failure_reason(await self._detail_view(server))
+        view = (
+            await self.refresh_server(customer_id, server_id)
+            if server.provider_key == "hetzner" and server.provider_server_id
+            else await self._detail_view(server)
+        )
+        return await self._with_failure_reason(view)
 
     async def _with_failure_reason(self, view: CustomerServerView) -> CustomerServerView:
         if view.state is not CustomerServerState.ERROR or self._operations is None:
@@ -372,6 +407,7 @@ class ServerManagementService:
         unchanged local row plus a ``refresh_error`` on the view.
         """
         server = await self._owned(customer_id, server_id)
+        info: VpsInfo | None = None
         error: str | None = None
         if server.provider_server_id:
             context = await self._context(server)
@@ -385,6 +421,8 @@ class ServerManagementService:
                     await self._apply_provider_info(server, info)
                     await self._apply_provider_ips(server, context)
         view = await self._detail_view(server)
+        if server.provider_key == "hetzner" and server.provider_server_id and info is None:
+            view = replace(view, operating_system=None, display_name=None)
         if error is not None:
             view = _with_refresh_error(view, error)
         return view
@@ -674,14 +712,22 @@ class ServerManagementService:
         selected = next((image for image in images if image.ref == str(image_ref)), None)
         if selected is None:
             raise ServerUnavailableError("selected reinstall image is no longer available")
-        response = await self._call(
-            context.provider.reinstall_vps(_provider_id(server), str(image_ref)),
-            operation=ServerOperation.REINSTALL,
-            server=server,
-            customer_id=customer_id,
-            arguments=arguments,
-        )
-        server.os = selected.name
+        try:
+            response = await self._call(
+                context.provider.reinstall_vps(_provider_id(server), str(image_ref)),
+                operation=ServerOperation.REINSTALL,
+                server=server,
+                customer_id=customer_id,
+                arguments=arguments,
+            )
+        except ServerAmbiguousOutcomeError:
+            # The provider may already be rebuilding; the old image is no
+            # longer evidence of the OS currently installed.
+            server.os = None
+            await self._servers.save(server)
+            raise
+        # Acceptance confirms only an action, not the installed image.
+        server.os = None
         await self._servers.save(server)
         await self._save_provider_password(server, customer_id, response, required=False)
         await self._emit(
@@ -1096,9 +1142,10 @@ class ServerManagementService:
                 await self._record_ambiguous(server, customer_id, ServerOperation.RENAME)
                 raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from exc
             raise ServerProviderError(_safe_reason(exc)) from exc
-        server.os = server.os
         if info.image_name:
-            server.os = info.image_name or server.os
+            server.os = info.image_name
+        elif server.provider_key == "hetzner":
+            server.os = None
         await self._servers.save(server)
         await self._audit.record_mutation(
             actor_type=ActorType.USER,
@@ -1596,6 +1643,7 @@ class ServerManagementService:
 
     async def _apply_provider_info(self, server: CloudServer, info: VpsInfo) -> None:
         """Fold a read-only provider snapshot into the local row (safe only)."""
+        original = (server.state, server.os, server.ipv4, server.ipv6)
         target = _PROVIDER_STATE_TO_LOCAL.get(info.state.strip().upper())
         if target is not None and target is not server.state:
             try:
@@ -1610,7 +1658,9 @@ class ServerManagementService:
                     server.id,
                     server.state,
                 )
-        if info.image_name and info.image_name != server.os:
+        if server.provider_key == "hetzner":
+            server.os = info.image_name or None
+        elif info.image_name and info.image_name != server.os:
             server.os = info.image_name
         ipv4 = info.metadata.get("ipv4")
         ipv6 = info.metadata.get("ipv6")
@@ -1618,7 +1668,8 @@ class ServerManagementService:
             server.ipv4 = ipv4
         if isinstance(ipv6, str) and ipv6:
             server.ipv6 = ipv6
-        await self._servers.save(server)
+        if (server.state, server.os, server.ipv4, server.ipv6) != original:
+            await self._servers.save(server)
 
     async def _apply_provider_ips(self, server: CloudServer, context: _ProviderContext) -> None:
         """Refresh the cached public address from the provider's IP list."""

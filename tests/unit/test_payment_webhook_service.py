@@ -64,6 +64,7 @@ def _repos() -> tuple[AsyncMock, AsyncMock, AsyncMock]:
     payments = AsyncMock()
     wallet = AsyncMock()
     ledger = AsyncMock()
+    wallet.get = AsyncMock(return_value=types.SimpleNamespace(currency="EUR"))
     wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
     payments.save = AsyncMock(side_effect=lambda s: s)
     return payments, wallet, ledger
@@ -92,7 +93,7 @@ class TestFirstSuccess:
         assert outcome.session.status is PaymentSessionStatus.SUCCEEDED
         assert outcome.session.credited_at is not None
         wallet.credit_deposit.assert_awaited_once_with(
-            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}"
+            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}", expected_currency="EUR"
         )
 
         # The deposit key is deterministic from (gateway, external id).
@@ -113,7 +114,7 @@ class TestFirstSuccess:
         assert outcome.action is WebhookAction.CREDITED
         payments.create.assert_not_awaited()
         wallet.credit_deposit.assert_awaited_once_with(
-            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}"
+            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}", expected_currency="EUR"
         )
 
 

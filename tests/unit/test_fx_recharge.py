@@ -167,10 +167,21 @@ class _MemPayments:
 class _Wallet:
     def __init__(self, balance: int = 0) -> None:
         self.balance = balance
+        self.currency = "EUR"
         self.calls: list[tuple[Any, int, str]] = []
 
+    async def get(self, user_id: Any) -> Any:
+        del user_id
+        return self
+
     async def credit_deposit(
-        self, user_id: Any, amount: int, key: str, *, reference: str = ""
+        self,
+        user_id: Any,
+        amount: int,
+        key: str,
+        *,
+        reference: str = "",
+        expected_currency: str | None = None,
     ) -> tuple[Any, bool]:
         self.calls.append((user_id, amount, key))
         self.balance += amount

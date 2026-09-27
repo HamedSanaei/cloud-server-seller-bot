@@ -8,7 +8,7 @@ durable, never before.
 
 Money model (FX-aware): the customer picks a CREDIT amount in the wallet's
 own currency; each gateway settles in its own currency (Tetraminator: IRT,
-ZarinPal: IRR). The service converts credit -> settlement once (CHARGE
+ZarinPal: IRR, AtlasPay: IRT). The service converts credit -> settlement once (CHARGE
 purpose, frozen snapshot) and persists BOTH sides on the session: the
 settlement side is what the provider invoice charges and what inquiry
 verifies EXACTLY; the credit side is what the wallet receives. The callback
@@ -16,13 +16,12 @@ and reconciliation never fetch a new rate.
 
 Safety properties:
 
-- the gateway call happens FIRST and the session row is persisted with the
-  returned authority; a crash between the two leaves an *unpaid* authority
-  (harmless — no wallet effect without a verified callback);
-- a replayed request (same Telegram button, same idempotency key) that the
-  gateway resolves to the same authority collides on the session's unique
-  ``(gateway_key, gateway_payment_id)`` pair and returns the EXISTING session
-  instead of creating a second one;
+- gateway-first adapters persist the returned authority; AtlasPay instead
+  persists an intent BEFORE POST so a response timeout cannot trigger a
+  second order for the same Telegram button. Its final payable amount is
+  stored on the settled side, with the chosen wallet credit frozen separately;
+- replayed AtlasPay orders reuse their persisted original miniapp link;
+  ambiguous orders with no bound authority require operator reconciliation;
 - the amount is the customer's chosen integer minor units — the gateway
   adapter validates currency and amount, and no float ever touches money;
 - a wallet is credited only by :class:`PaymentWebhookService` (verified
@@ -32,7 +31,7 @@ Safety properties:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from cloud_platform.core.idempotency import IdempotencyKey
@@ -93,6 +92,8 @@ class RechargeStart:
     session: PaymentSession
     redirect_url: str
     replayed: bool
+    payable_amount_minor: int | None = None
+    tracking_code: str | None = None
 
 
 def _gateway_minimum_charge(gateway: Any, currency: str) -> int:
@@ -194,6 +195,8 @@ class WalletRechargeService:
         """Sync compatibility: same currency or exact IRT<->IRR (no FX call)."""
         settlement = self._settlement_currency(gateway)
         wallet = (currency or "").upper()
+        if getattr(gateway, "wallet_currency_only", False) and wallet != settlement:
+            return False
         if not settlement or not wallet:
             return False
         if settlement == wallet:
@@ -222,7 +225,7 @@ class WalletRechargeService:
             return False
         for gateway in self._gateways.values():
             settlement = self._settlement_currency(gateway)
-            if not settlement:
+            if not settlement or getattr(gateway, "wallet_currency_only", False):
                 continue
             try:
                 if await self._fx.can_convert(currency, settlement, FxPurpose.CHARGE):
@@ -268,6 +271,11 @@ class WalletRechargeService:
         compatible: list[str] = []
         for key, gateway in self._gateways.items():
             settlement_currency = self._settlement_currency(gateway)
+            if (
+                getattr(gateway, "wallet_currency_only", False)
+                and currency.upper() != settlement_currency
+            ):
+                continue
             if not settlement_currency:
                 continue
             if self._supports_or_exact(gateway, currency):
@@ -345,6 +353,8 @@ class WalletRechargeService:
                 raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             if self._supports_or_exact(gateway, currency):
                 return gateway
+            if getattr(gateway, "wallet_currency_only", False):
+                raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             if self._fx is None:
                 raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             try:
@@ -480,6 +490,15 @@ class WalletRechargeService:
                 f"amount {settlement_amount} is below the {resolved_key} minimum of {minimum}"
             )
 
+        if getattr(gateway, "final_amount_from_gateway", False):
+            return await self._start_atlaspay_order(
+                gateway=gateway,
+                user=user,
+                amount_minor=amount_minor,
+                currency=currency,
+                key=key,
+                snapshot=snapshot,
+            )
         if _gateway_needs_callback_reference(gateway):
             return await self._start_with_callback_reference(
                 gateway=gateway,
@@ -522,6 +541,15 @@ class WalletRechargeService:
             if existing.user_id != user.id:
                 raise RechargeError("this payment authority belongs to another user") from None
             session = existing
+            if (
+                existing.amount_minor != settlement_amount
+                or existing.currency != settlement_currency
+                or session_credit_amount(existing) != amount_minor
+                or session_credit_currency(existing) != currency.upper()
+            ):
+                raise RechargeError(
+                    "payment authority belongs to another amount or currency"
+                ) from None
             replayed = True
 
         session_id = session.id
@@ -552,6 +580,129 @@ class WalletRechargeService:
             replayed,
         )
         return RechargeStart(session=session, redirect_url=redirect, replayed=replayed)
+
+    @staticmethod
+    def _atlaspay_replay(
+        existing: PaymentSession,
+        user: Any,
+        amount_minor: int,
+        currency: str,
+    ) -> RechargeStart:
+        if (
+            existing.user_id != user.id
+            or session_credit_amount(existing) != amount_minor
+            or session_credit_currency(existing) != currency.upper()
+        ):
+            raise RechargeError("recharge idempotency key belongs to another request")
+        if (
+            existing.status is PaymentSessionStatus.PENDING
+            and existing.gateway_payment_id
+            and existing.redirect_url
+            and existing.tracking_code
+        ):
+            return RechargeStart(
+                session=existing,
+                redirect_url=existing.redirect_url,
+                replayed=True,
+                payable_amount_minor=existing.amount_minor,
+                tracking_code=existing.tracking_code,
+            )
+        raise RechargeError("previous atlaspay order requires operator reconciliation")
+
+    async def _start_atlaspay_order(
+        self,
+        *,
+        gateway: RechargeGateway,
+        user: Any,
+        amount_minor: int,
+        currency: str,
+        key: str,
+        snapshot: dict[str, Any] | None,
+    ) -> RechargeStart:
+        """Persist before POST so an ambiguous response is never posted again."""
+        telegram_id = getattr(user, "telegram_user_id", None)
+        if isinstance(telegram_id, bool) or not isinstance(telegram_id, int) or telegram_id <= 0:
+            raise RechargeError("a linked Telegram customer id is required")
+        existing = await self._payments.get_by_idempotency_key(gateway.key, key)
+        if existing is not None:
+            return self._atlaspay_replay(existing, user, amount_minor, currency)
+        try:
+            pending = await self._payments.create(
+                PaymentSession(
+                    user_id=user.id,
+                    gateway_key=gateway.key,
+                    amount_minor=amount_minor,
+                    currency=currency,
+                    idempotency_key=key,
+                    **(snapshot or {}),
+                )
+            )
+        except DuplicateExternalIdError as exc:
+            # Unique (gateway, idempotency_key) guards concurrent button taps.
+            # Fetch the winner if complete; NEVER send a second provider POST.
+            existing = await self._payments.get_by_idempotency_key(gateway.key, key)
+            if existing is None:
+                raise RechargeError("atlaspay order is already being created") from exc
+            return self._atlaspay_replay(existing, user, amount_minor, currency)
+        try:
+            issued = await gateway.create_payment(
+                amount_minor=amount_minor,
+                currency=currency,
+                reference=str(telegram_id),
+                idempotency_key=IdempotencyKey(key),
+            )
+        except Exception as exc:
+            # The POST may already have reached AtlasPay; without an order id
+            # we cannot safely retry or invent a miniapp link.
+            raise RechargeError("atlaspay order creation requires operator reconciliation") from exc
+        authority = str(getattr(issued, "gateway_payment_id", "") or "")
+        redirect = getattr(issued, "redirect_url", None)
+        total = getattr(issued, "amount_minor", None)
+        metadata = getattr(issued, "metadata", {})
+        tracking = metadata.get("tracking_code") if isinstance(metadata, dict) else None
+        if (
+            not authority
+            or not isinstance(redirect, str)
+            or not redirect
+            or not isinstance(total, int)
+            or isinstance(total, bool)
+            or total < amount_minor
+            or getattr(issued, "currency", None) != currency
+            or not isinstance(tracking, str)
+            or not tracking
+            or not isinstance(metadata, dict)
+            or metadata.get("merchant_order_ref") != key
+        ):
+            raise RechargeError("atlaspay returned an invalid order")
+        session = await self._payments.save(
+            replace(
+                pending,
+                amount_minor=total,
+                gateway_payment_id=authority,
+                redirect_url=redirect,
+                tracking_code=tracking,
+            )
+        )
+        if session.id is None:
+            raise RechargeError("payment session has no id")
+        await emit_safe(
+            self._events,
+            recharge_created_event(
+                user=user,
+                payment_session_id=session.id,
+                amount_minor=session_credit_amount(session),
+                currency=session_credit_currency(session),
+                gateway=session.gateway_key,
+            ),
+        )
+        logger.info("atlaspay recharge session %s created for user %s", session.id, user.id)
+        return RechargeStart(
+            session=session,
+            redirect_url=redirect,
+            replayed=False,
+            payable_amount_minor=total,
+            tracking_code=tracking,
+        )
 
     async def _start_with_callback_reference(
         self,

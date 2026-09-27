@@ -52,6 +52,7 @@ from cloud_platform.modules.compute.domain import (
 )
 from cloud_platform.modules.fx.domain import (
     SUPPORTED_CURRENCIES,
+    ConversionSnapshot,
     FxPurpose,
     currency_exponent,
     major_to_minor,
@@ -454,7 +455,7 @@ class AccrualJob:
 
     async def _run_servers(self, now: datetime) -> AccrualRunReport:
         report = AccrualRunReport()
-        servers = [s for s in await self._servers.list_running() if not s.is_prepaid_monthly]
+        servers = [s for s in await self._servers.list_running() if s.billing_model == "hourly"]
         report.servers_checked = len(servers)
         for server in servers:
             try:
@@ -905,6 +906,8 @@ class FinalChargeService:
         self, server: CloudServer, deleted_at: datetime
     ) -> FinalChargeResult:
         """Settle the final usage segment of a confirmed deletion."""
+        if server.is_prepaid_hourly_irt:
+            raise ValueError("prepaid hourly coverage is settled in advance; no final usage charge")
         if server.state is not ServerLifecycleState.DELETED:
             raise ValueError(f"final charge requires a DELETED server (state={server.state.value})")
         deleted = _aware(deleted_at, "deleted_at")
@@ -1317,6 +1320,421 @@ def _final_quanta(start: datetime, end: datetime, quantum_seconds: int) -> int:
         return int((elapsed / Decimal(quantum_seconds)).to_integral_value(rounding=ROUND_CEILING))
 
 
+class PrepaidHourlyPeriodStatus(StrEnum):
+    PENDING = "pending"
+    PAID = "paid"
+
+
+@dataclass(frozen=True, slots=True)
+class PrepaidHourlyPeriod:
+    """Binding quote saved before funds move; payment can be repaired after a crash."""
+
+    server_id: UUID
+    wallet_id: UUID
+    period_start: datetime
+    period_end: datetime
+    usd_minor: int
+    irt_minor: int
+    fx_snapshot: ConversionSnapshot
+    idempotency_key: str
+    status: PrepaidHourlyPeriodStatus = PrepaidHourlyPeriodStatus.PENDING
+    id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if self.period_start.tzinfo is None or self.period_end.tzinfo is None:
+            raise ValueError("prepaid period boundaries must be aware UTC")
+        if self.period_end - self.period_start != timedelta(hours=1):
+            raise ValueError("prepaid billing requires exactly one hour of coverage")
+        if any(
+            isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0
+            for amount in (self.usd_minor, self.irt_minor)
+        ):
+            raise ValueError("prepaid USD and IRT amounts must be positive integers")
+        quote = self.fx_snapshot
+        if (
+            quote.source_currency != "USD"
+            or quote.target_currency != "IRT"
+            or quote.source_amount_minor != self.usd_minor
+            or quote.target_amount_minor != self.irt_minor
+            or quote.purpose is not FxPurpose.CHARGE
+            or quote.source.lower() != "abantether"
+            or not quote.proxy
+            or quote.proxy_asset != "USDT"
+            or not quote.path.startswith("USDTIRT.buy ")
+            or quote.stale
+        ):
+            raise ValueError("prepaid conversion must be fresh AbanTether USDT/IRT CHARGE")
+        if self.idempotency_key != prepaid_hourly_key(self.server_id, self.period_start):
+            raise ValueError("prepaid period idempotency key does not match its boundary")
+
+
+def prepaid_hourly_key(server_id: UUID, start: datetime) -> str:
+    if start.tzinfo is None:
+        raise ValueError("prepaid boundary must be timezone-aware")
+    return f"prepaid-hourly:{server_id}:{start.astimezone(UTC).isoformat()}"
+
+
+class PrepaidHourlyPeriodRepository(Protocol):
+    async def get(self, server_id: UUID, start: datetime) -> PrepaidHourlyPeriod | None: ...
+
+    async def bind(self, period: PrepaidHourlyPeriod) -> PrepaidHourlyPeriod:
+        """Persist binding quote, returning a matching existing row on replay."""
+        ...
+
+    async def mark_paid(self, period: PrepaidHourlyPeriod) -> None:
+        """Atomically mark paid and advance server coverage, checking contiguous boundaries."""
+        ...
+
+
+class PrepaidFxResolver(Protocol):
+    async def snapshot(
+        self, amount_minor: int, source_currency: str, target_currency: str, purpose: FxPurpose
+    ) -> ConversionSnapshot: ...
+
+
+@dataclass(slots=True)
+class PrepaidHourlyRunReport:
+    charged: int = 0
+    replayed: int = 0
+    stop_requested_server_ids: list[UUID] = field(default_factory=list)
+    errors: dict[UUID, str] = field(default_factory=dict)
+
+
+class PrepaidHourlyBillingService:
+    """Charge the upcoming hour, never elapsed usage or an unbound exchange rate."""
+
+    def __init__(
+        self,
+        *,
+        server_repo: ServerRepository,
+        wallet_repo: WalletRepository,
+        ledger_repo: LedgerRepository,
+        snapshot_repo: ServerPriceSnapshotRepository,
+        period_repo: PrepaidHourlyPeriodRepository,
+        fx_resolver: PrepaidFxResolver,
+        lock: JobLock | None = None,
+    ) -> None:
+        self._servers = server_repo
+        self._wallets = wallet_repo
+        self._ledger = ledger_repo
+        self._snapshots = snapshot_repo
+        self._periods = period_repo
+        self._fx = fx_resolver
+        self._lock = lock
+
+    async def prepare_first_hour(
+        self,
+        server: CloudServer,
+        wallet_id: UUID,
+        start: datetime,
+        usd_minor: int,
+        *,
+        hold_repo: HoldRepository | None = None,
+    ) -> PrepaidHourlyPeriod:
+        """Checkout: persist FX evidence BEFORE the exact IRT hold or provider create."""
+        if not server.is_prepaid_hourly_irt or server.idempotency_key is None:
+            raise ValueError("first-hour preparation requires a prepaid hourly checkout")
+        if _aware(start, "period_start") != _aware(server.created_at, "server.created_at"):
+            raise ValueError("first prepaid hour must start at the server creation boundary")
+        snapshot = await self._snapshots.get(server.id)
+        if (
+            snapshot is None
+            or snapshot.selling_currency != "USD"
+            or snapshot.selling_minor != usd_minor
+        ):
+            raise ValueError("first-hour amount must equal the immutable USD price snapshot")
+        period = await self._bind(server, wallet_id, start, usd_minor)
+        if period.fx_snapshot.expires_at is None or period.fx_snapshot.expires_at <= datetime.now(
+            UTC
+        ):
+            hold_key = f"server-create:{server.idempotency_key}"
+            existing_hold = (
+                await hold_repo.get_by_idempotency(wallet_id, hold_key)
+                if hold_repo is not None
+                else None
+            )
+            if (
+                existing_hold is None
+                or existing_hold.id is None
+                or existing_hold.status not in (HoldStatus.CREATED, HoldStatus.CAPTURED)
+                or existing_hold.wallet_id != wallet_id
+                or existing_hold.amount != period.irt_minor
+                or existing_hold.currency != "IRT"
+            ):
+                raise ValueError("expired FX binding cannot create a new checkout reservation")
+        return period
+
+    async def _bind(
+        self, server: CloudServer, wallet_id: UUID, start: datetime, usd_minor: int
+    ) -> PrepaidHourlyPeriod:
+        start = _aware(start, "period_start")
+        key = prepaid_hourly_key(server.id, start)
+        prior = await self._periods.get(server.id, start)
+        if prior is not None:
+            if (
+                prior.wallet_id != wallet_id
+                or prior.usd_minor != usd_minor
+                or prior.idempotency_key != key
+                or prior.period_end != start + timedelta(hours=1)
+            ):
+                raise ValueError("prepaid period replay changed its immutable contract")
+            return prior
+        if isinstance(usd_minor, bool) or not isinstance(usd_minor, int) or usd_minor <= 0:
+            raise ValueError("positive USD cents are required")
+        quote = await self._fx.snapshot(usd_minor, "USD", "IRT", FxPurpose.CHARGE)
+        if quote.expires_at is None or quote.expires_at <= datetime.now(UTC):
+            raise ValueError("prepaid FX quote expired before binding")
+        period = PrepaidHourlyPeriod(
+            server_id=server.id,
+            wallet_id=wallet_id,
+            period_start=start,
+            period_end=start + timedelta(hours=1),
+            usd_minor=usd_minor,
+            irt_minor=quote.target_amount_minor,
+            fx_snapshot=quote,
+            idempotency_key=key,
+        )
+        return await self._periods.bind(period)
+
+    async def capture_first_hour(
+        self, server: CloudServer, hold_repo: HoldRepository, hold_service: HoldService
+    ) -> PrepaidHourlyPeriod:
+        """Post the checkout's reserved IRT once, then durably cover the first hour."""
+        if not server.is_prepaid_hourly_irt or not server.idempotency_key:
+            raise ValueError("server is not a prepaid hourly checkout")
+        start = _aware(server.created_at, "server.created_at")
+        period = await self._periods.get(server.id, start)
+        if period is None:
+            raise ValueError("first-hour FX binding is missing")
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id != period.wallet_id or wallet.currency != "IRT":
+            raise ValueError("first-hour wallet identity or currency changed")
+        hold_key = f"server-create:{server.idempotency_key}"
+        hold = await hold_repo.get_by_idempotency(wallet.id, hold_key)
+        if hold is None or hold.id is None or hold.amount != period.irt_minor:
+            raise ValueError("first-hour IRT reservation is missing or differs from FX binding")
+        if getattr(hold, "currency", "IRT") != "IRT":
+            raise ValueError("first-hour reservation must be IRT")
+        if hold.status not in (HoldStatus.CREATED, HoldStatus.CAPTURED):
+            raise ValueError("first-hour reservation has been released")
+        captured = await hold_service.capture_hold(wallet.id, hold.id, hold_key)
+        if captured is None or captured.status is not HoldStatus.CAPTURED:
+            raise ValueError("first-hour capture was not confirmed")
+        ledger = await self._ledger.get_entry_by_idempotency(wallet.id, f"capture-{hold_key}")
+        if (
+            ledger is None
+            or ledger.amount.amount != Decimal(period.irt_minor)
+            or ledger.amount.currency != "IRT"
+            or ledger.entry_type is not LedgerEntryType.CHARGE
+            or ledger.reference_type != "hold"
+            or ledger.reference_id != str(hold.id)
+            or ledger.description != f"hold captured for {hold_key}"
+        ):
+            raise ValueError("first-hour capture ledger facts differ from the bound charge")
+        await self._periods.mark_paid(period)
+        return period
+
+    async def run(self, now: datetime | None = None) -> PrepaidHourlyRunReport:
+        moment = _aware(now or datetime.now(UTC), "now")
+        if self._lock is None:
+            return await self._run(moment)
+        async with self._lock.guard() as acquired:
+            if not acquired:
+                return PrepaidHourlyRunReport()
+            return await self._run(moment)
+
+    async def _run(self, now: datetime) -> PrepaidHourlyRunReport:
+        result = PrepaidHourlyRunReport()
+        for server in await self._servers.list_running():
+            if not server.is_prepaid_hourly_irt:
+                continue
+            try:
+                await self._renew(server, now, result)
+            except Exception as exc:
+                result.errors[server.id] = str(exc)
+                if server.prepaid_paid_until is None or now >= _aware(
+                    server.prepaid_paid_until, "prepaid_paid_until"
+                ):
+                    result.stop_requested_server_ids.append(server.id)
+                logger.exception("prepaid hourly renewal failed for server %s", server.id)
+        return result
+
+    async def _renew(
+        self, server: CloudServer, now: datetime, report: PrepaidHourlyRunReport
+    ) -> None:
+        paid_until = server.prepaid_paid_until
+        if paid_until is None:
+            raise ValueError("running prepaid server lacks paid first-hour coverage")
+        start = _aware(paid_until, "prepaid_paid_until")
+        # Renew in the last minute to avoid leaving an unpaid gap on a periodic worker.
+        if now < start - timedelta(minutes=1):
+            return
+        if now >= start + timedelta(hours=1):
+            raise ValueError("prepaid coverage has expired by more than one hour")
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id is None or wallet.currency != "IRT":
+            raise ValueError("prepaid renewal requires the owner's IRT wallet")
+        price = await self._snapshots.get(server.id)
+        if price is None or price.selling_currency != "USD":
+            raise ValueError("prepaid renewal requires the immutable USD price snapshot")
+        period = await self._bind(server, wallet.id, start, price.selling_minor)
+        if period.status is PrepaidHourlyPeriodStatus.PAID:
+            await self._verify_charge(period)
+            await self._periods.mark_paid(period)
+            report.replayed += 1
+            return
+        description = (
+            f"prepaid hour {period.period_start.isoformat()} to {period.period_end.isoformat()}"
+        )
+        _, posted = await self._wallets.adjust(
+            server.user_id,
+            -period.irt_minor,
+            period.idempotency_key,
+            entry_type=LedgerEntryType.CHARGE,
+            reference_type="server",
+            reference_id=str(server.id),
+            description=description,
+            expected_currency="IRT",
+        )
+        await self._verify_charge(period)
+        await self._periods.mark_paid(period)
+        if posted:
+            report.charged += 1
+        else:
+            report.replayed += 1
+
+    async def _verify_charge(self, period: PrepaidHourlyPeriod) -> None:
+        charge = await self._ledger.get_entry_by_idempotency(
+            period.wallet_id, period.idempotency_key
+        )
+        if (
+            charge is None
+            or charge.amount.amount != Decimal(period.irt_minor)
+            or charge.amount.currency != "IRT"
+            or charge.entry_type is not LedgerEntryType.CHARGE
+            or charge.reference_type != "server"
+            or charge.reference_id != str(period.server_id)
+            or charge.description
+            != f"prepaid hour {period.period_start.isoformat()} to {period.period_end.isoformat()}"
+        ):
+            raise ValueError("prepaid ledger charge does not match bound FX period")
+
+
+class PrepaidBalanceDecision(StrEnum):
+    NONE = "none"
+    WARN = "warn"
+    STOP = "stop"
+    DELETE = "delete"
+    RECOVERED = "recovered"
+
+
+@dataclass(frozen=True, slots=True)
+class PrepaidBalanceOutcome:
+    decision: PrepaidBalanceDecision
+    warning_since: datetime | None
+    zero_since: datetime | None
+
+
+def decide_prepaid_balance(
+    balance_minor: int,
+    warning_since: datetime | None,
+    zero_since: datetime | None,
+    now: datetime,
+) -> PrepaidBalanceOutcome:
+    """Pure provider-neutral decisions; zero grace never starts at the warning."""
+    moment = _aware(now, "now")
+    if isinstance(balance_minor, bool) or not isinstance(balance_minor, int) or balance_minor < 0:
+        raise ValueError("IRT balance must be a non-negative integer")
+    if balance_minor == 0:
+        since = _aware(zero_since, "zero_since") if zero_since is not None else moment
+        if since > moment:
+            raise ValueError("zero watermark cannot be in the future")
+        return PrepaidBalanceOutcome(
+            PrepaidBalanceDecision.DELETE
+            if moment - since >= timedelta(hours=24)
+            else PrepaidBalanceDecision.STOP,
+            warning_since or moment,
+            since,
+        )
+    if balance_minor < 200_000:
+        return PrepaidBalanceOutcome(
+            PrepaidBalanceDecision.WARN if warning_since is None else PrepaidBalanceDecision.NONE,
+            warning_since or moment,
+            None,
+        )
+    return PrepaidBalanceOutcome(
+        PrepaidBalanceDecision.RECOVERED
+        if warning_since is not None or zero_since is not None
+        else PrepaidBalanceDecision.NONE,
+        None,
+        None,
+    )
+
+
+@dataclass(slots=True)
+class PrepaidBalancePolicyReport:
+    """Provider-neutral requests; orchestrator applies provider stop/delete."""
+
+    decisions: dict[UUID, PrepaidBalanceDecision] = field(default_factory=dict)
+    errors: dict[UUID, str] = field(default_factory=dict)
+
+    @property
+    def stop_requested_server_ids(self) -> list[UUID]:
+        return [
+            server_id
+            for server_id, decision in self.decisions.items()
+            if decision is PrepaidBalanceDecision.STOP
+        ]
+
+    @property
+    def delete_requested_server_ids(self) -> list[UUID]:
+        return [
+            server_id
+            for server_id, decision in self.decisions.items()
+            if decision is PrepaidBalanceDecision.DELETE
+        ]
+
+
+class PrepaidBalancePolicyService:
+    """Persist zero and warning episodes before requesting provider actions."""
+
+    def __init__(self, server_repo: ServerRepository, wallet_repo: WalletRepository) -> None:
+        self._servers = server_repo
+        self._wallets = wallet_repo
+
+    async def evaluate(self, now: datetime | None = None) -> PrepaidBalancePolicyReport:
+        moment = _aware(now or datetime.now(UTC), "now")
+        report = PrepaidBalancePolicyReport()
+        # A stopped zero-balance server still needs its 24-hour deletion decision.
+        servers = [*await self._servers.list_running(), *await self._servers.list_stopped()]
+        for server in servers:
+            if not server.is_prepaid_hourly_irt:
+                continue
+            try:
+                wallet = await self._wallets.get(server.user_id)
+                if wallet is None or wallet.currency != "IRT":
+                    raise ValueError("prepaid policy requires the owner's IRT wallet")
+                outcome = decide_prepaid_balance(
+                    wallet.balance, server.low_balance_since, server.prepaid_zero_since, moment
+                )
+                if (
+                    outcome.warning_since != server.low_balance_since
+                    or outcome.zero_since != server.prepaid_zero_since
+                ):
+                    await self._servers.save_prepaid_balance_markers(
+                        server.id,
+                        expected_warning_since=server.low_balance_since,
+                        expected_zero_since=server.prepaid_zero_since,
+                        warning_since=outcome.warning_since,
+                        zero_since=outcome.zero_since,
+                    )
+                report.decisions[server.id] = outcome.decision
+            except Exception as exc:
+                report.errors[server.id] = str(exc)
+                logger.exception("prepaid balance policy failed for server %s", server.id)
+        return report
+
+
 # ---------------------------------------------------------------------------
 # Low-balance policy (M06-007)
 # ---------------------------------------------------------------------------
@@ -1488,7 +1906,7 @@ class LowBalancePolicyService:
         # Prepaid monthly servers are billed by the renewal checker, never by
         # the hourly low-balance/auto-delete policy (LEASEWEB-MVP).
         for server in await self._servers.list_running():
-            if server.is_prepaid_monthly:
+            if server.billing_model != "hourly":
                 continue
             report.servers_checked += 1
             try:

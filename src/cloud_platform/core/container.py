@@ -720,8 +720,47 @@ class Container:
             )
         return self._server_credentials
 
+    def admin_wallet_service(self) -> Any:
+        """Sole Telegram owner credit path with locked IRT ledger settlement."""
+        from cloud_platform.modules.wallet.admin import AdminWalletService
+
+        return AdminWalletService(
+            user_repo=self.user_repository(),
+            wallet_repo=self.wallet_repository(),
+        )
+
+    def prepaid_hourly_billing_service(self) -> Any:
+        """Shared USD quote to IRT settlement, with no guessed exchange rate."""
+        from cloud_platform.modules.billing.repository import (
+            PostgresAdvisoryAccrualLock,
+            SqlAlchemyPrepaidHourlyPeriodRepository,
+        )
+        from cloud_platform.modules.billing.service import PrepaidHourlyBillingService
+        from cloud_platform.modules.pricing.repository import (
+            SqlAlchemyServerPriceSnapshotRepository,
+        )
+        from cloud_platform.modules.wallet.repository import SqlAlchemyLedgerRepository
+
+        resolver = self.fx_resolver_or_none()
+        if resolver is None or not get_settings().fx_allow_usdt_proxy_for_settlement:
+            raise RuntimeError(
+                "IRT prepaid billing requires explicit domestic USD proxy settlement"
+            )
+        return PrepaidHourlyBillingService(
+            server_repo=self.server_repository(),
+            wallet_repo=self.wallet_repository(),
+            ledger_repo=SqlAlchemyLedgerRepository(self.session_factory),
+            snapshot_repo=SqlAlchemyServerPriceSnapshotRepository(self.session_factory),
+            period_repo=SqlAlchemyPrepaidHourlyPeriodRepository(self.session_factory),
+            fx_resolver=resolver,
+            lock=PostgresAdvisoryAccrualLock(self.session_factory),
+        )
+
     def hourly_cloud_service(self) -> Any:
         """The hourly instance creation command (no provider calls, no charge)."""
+        from cloud_platform.modules.billing.repository import (
+            SqlAlchemyPrepaidHourlyPeriodRepository,
+        )
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
         from cloud_platform.modules.hourly.service import HourlyCloudService
         from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
@@ -735,10 +774,26 @@ class Container:
         from cloud_platform.modules.provider_capacity.repository import (
             SqlAlchemyAccountCapacityRepository,
         )
-        from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyWalletRepository,
+        )
+
+        settings = get_settings()
+        prepaid_billing = (
+            self.prepaid_hourly_billing_service()
+            if settings.fx_enabled
+            and settings.fx_domestic_enabled
+            and settings.fx_allow_usdt_proxy_for_settlement
+            else None
+        )
 
         return HourlyCloudService(
             server_repo=SqlAlchemyServerRepository(self.session_factory),
+            prepaid_billing=prepaid_billing,
+            period_repo=SqlAlchemyPrepaidHourlyPeriodRepository(self.session_factory),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            hold_service=self.hold_service(),
             offers_repo=self.sellable_offer_repository(),
             account_repo=SqlAlchemyProviderAccountRepository(self.session_factory),
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
@@ -1013,11 +1068,19 @@ class Container:
         here — in infrastructure — so domain/application code never branches
         on gateway keys.
         """
+        from cloud_platform.providers.atlaspay.client import AtlasPayGateway
         from cloud_platform.providers.tetraminator.client import TetraminatorGateway
         from cloud_platform.providers.zarinpal.client import ZarinPalGateway
 
         settings = get_settings()
         gateways: dict[str, Any] = {}
+        if settings.atlaspay_enabled:
+            gateways[AtlasPayGateway.key] = AtlasPayGateway(
+                api_key=settings.atlaspay_api_key,
+                base_url=settings.atlaspay_base_url,
+                timeout_seconds=settings.atlaspay_timeout_seconds,
+            )
+            return gateways
         if settings.zarinpal_enabled and settings.zarinpal_merchant_id:
             gateways[ZarinPalGateway.key] = ZarinPalGateway(
                 merchant_id=settings.zarinpal_merchant_id,
@@ -1367,6 +1430,18 @@ class Container:
             hold_service=hold_service,
             wallet_repo=wallets,
             audit_repo=self.audit_repository(),
+        )
+
+    def prepaid_provider_lifecycle_service(self) -> Any:
+        """Provider-observed, owner-authorized stop and deferred delete."""
+        from cloud_platform.modules.operations.service import PrepaidProviderLifecycleService
+
+        return PrepaidProviderLifecycleService(
+            server_repo=self.server_repository(),
+            wallet_repo=self.wallet_repository(),
+            provider_registry=self.provider_registry,
+            power_commands=self.power_command_service(),
+            delete_commands=self.delete_command_service(),
         )
 
     def server_management_service(self) -> Any:
