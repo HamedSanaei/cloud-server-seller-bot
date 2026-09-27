@@ -508,16 +508,15 @@ class MonthlyBotUi:
         family: Any,
         icons: dict[str, str],
     ) -> str:
-        # A configured family is always shown: the row carries its CURRENT
-        # sellable count, or an explicit unavailable marker — never faked
-        # inventory, never a hidden product line.
+        # The commercial selector advertises availability, not an arbitrary
+        # count of offer rows (one physical plan can have two billing modes).
         base = {
             "icon": icons.get(family.billing_model, ""),
             "name": family.display_name,
             "billing": t.t(f"store.billing.{family.billing_model}"),
         }
         if getattr(family, "available", True):
-            return t.t("store.family_row_count", count=getattr(family, "sellable_count", 0), **base)
+            return t.t("store.family_row", **base)
         return t.t("store.family_row_unavailable", **base)
 
     def _family_unavailable_screen(self, provider_key: str) -> BotScreen:

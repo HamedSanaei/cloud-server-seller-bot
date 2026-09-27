@@ -637,6 +637,23 @@ def _int_or_none(value: str | None) -> int | None:
         return None
 
 
+_PLAN_FAMILIES = {
+    "CX": ("cost_optimized", "Cost-optimized / CX & CAX"),
+    "CPX": ("regular_performance", "Regular performance / CPX"),
+    "CCX": ("general_purpose", "General purpose / CCX"),
+    "CAX": ("cost_optimized", "Cost-optimized / CX & CAX"),
+}
+
+
+def _plan_family(plan_id: str) -> tuple[str, str]:
+    """Classify known Hetzner server-type codes; keep other types sellable."""
+    code = plan_id.upper()
+    for prefix in ("CPX", "CCX", "CAX", "CX"):
+        if code.startswith(prefix) and code[len(prefix) :].isdigit():
+            return _PLAN_FAMILIES[prefix]
+    return "other", "Other"
+
+
 @dataclass(frozen=True, slots=True)
 class _OfferSpec:
     """One server type at one location, ready to be written to the price book."""
@@ -706,6 +723,7 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
 
 def _hourly_offer_spec(plan: hourly.HetznerHourlyPlan) -> _OfferSpec:
     """Keep the provider's hourly RATE and independent monthly CAP as cost facts."""
+    family, family_name = _plan_family(plan.plan_id)
     return _OfferSpec(
         product_id=plan.plan_id,
         update=OfferSpecUpdate(
@@ -717,11 +735,15 @@ def _hourly_offer_spec(plan: hourly.HetznerHourlyPlan) -> _OfferSpec:
             provider_cost_minor=plan.hourly_cost_minor,
             provider_cost_currency=plan.currency,
             billing_model=BILLING_MODEL_HOURLY,
-            technical_metadata=TechnicalSpec(
-                architecture=plan.architecture,
-                cpu_type=plan.cpu_type,
-                storage_type=plan.storage_type,
-            ).to_metadata(),
+            technical_metadata={
+                **TechnicalSpec(
+                    architecture=plan.architecture,
+                    cpu_type=plan.cpu_type,
+                    storage_type=plan.storage_type,
+                ).to_metadata(),
+                "plan_family": family,
+                "plan_family_name": family_name,
+            },
             billing_parameters={
                 "provider_hourly_rate": plan.hourly_rate_exact,
                 "provider_monthly_rate": plan.monthly_rate_exact,

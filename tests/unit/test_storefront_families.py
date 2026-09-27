@@ -17,7 +17,7 @@ from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.modules.catalog.domain import LocationRecord
 from cloud_platform.modules.checkout.service import OfferCatalogViewService
 from cloud_platform.modules.markets.domain import ProviderCatalog
-from cloud_platform.modules.navigation.domain import Callback, decode_callback
+from cloud_platform.modules.navigation.domain import Callback, decode_callback, encode_offer_ref
 from cloud_platform.modules.offers.domain import (
     BILLING_MODEL_HOURLY,
     BILLING_MODEL_MONTHLY,
@@ -254,6 +254,16 @@ class FakeView:
 
     async def panel_name_by_index(self, offer: SellableOffer, index: int) -> str | None:
         return await self._service.panel_name_by_index(offer, index)
+
+    async def cloud_plan_families_screen(
+        self, provider_key: str, family_key: str, location_id: str
+    ) -> tuple[list[Any], str, str]:
+        return await self._service.cloud_plan_families_screen(provider_key, family_key, location_id)
+
+    async def cloud_plans_screen(
+        self, provider_key: str, location_id: str, plan_family: str, page: int = 1
+    ) -> Any:
+        return await self._service.cloud_plans_screen(provider_key, location_id, plan_family, page)
 
     async def products_screen(self, provider_key: str) -> tuple[list[Any], str, str]:
         return await self._service.products_screen(provider_key)
@@ -528,6 +538,10 @@ class TestBillingSeparation:
             id=uuid4(),
             billing_model=BILLING_MODEL_HOURLY,
             selling_price_minor=1,
+            technical_metadata={
+                "plan_family": "cost_optimized",
+                "plan_family_name": "Cost-optimized / CX & CAX",
+            },
         )
         catalog = ProviderCatalog(
             markets={"hetzner": "foreign"},
@@ -542,9 +556,164 @@ class TestBillingSeparation:
         )
         view = _service([monthly, cloud], catalog=catalog)
         vps = await view.family_plans_screen("hetzner", "vps", "fsn1")
-        hourly = await view.cloud_plans_screen("hetzner", "fsn1", "other")
+        hourly = await view.cloud_plans_screen("hetzner", "fsn1", "cost_optimized")
         assert [item.offer_id for item in vps.items] == [monthly.id]
         assert [item.offer_id for item in hourly.items] == [cloud.id]
+
+    async def test_hetzner_plan_family_buttons_show_three_codes_and_route(self) -> None:
+        import dataclasses
+
+        plan_facts = (
+            ("cx22", "cost_optimized", "Cost-optimized / CX & CAX"),
+            ("cax11", "cost_optimized", "Cost-optimized / CX & CAX"),
+            ("cax21", "cost_optimized", "Cost-optimized / CX & CAX"),
+            ("cax31", "cost_optimized", "Cost-optimized / CX & CAX"),
+            ("cax41", "cost_optimized", "Cost-optimized / CX & CAX"),
+            ("cpx22", "regular_performance", "Regular performance / CPX"),
+            ("ccx23", "general_purpose", "General purpose / CCX"),
+        )
+        offers = [
+            dataclasses.replace(
+                _cloud_offer(location_id="fsn1"),
+                provider_key="hetzner",
+                product_id=code,
+                technical_metadata={"plan_family": family, "plan_family_name": name},
+            )
+            for code, family, name in plan_facts
+        ]
+        catalog = ProviderCatalog(
+            markets={"hetzner": "foreign"},
+            display_names={"hetzner": "Hetzner"},
+            enabled={"hetzner": True},
+        )
+        bot = _ui(_service(offers, catalog=catalog))
+        screen = await bot.store_cloud_families_screen("hetzner", "hourly", "fsn1")
+        buttons = [b for b in _buttons(screen) if _decode(b.callback_data).screen == "cloud_plans"]
+        assert [b.text for b in buttons] == [
+            "Cost-optimized / CX & CAX",
+            "General purpose / CCX",
+            "Regular performance / CPX",
+        ]
+        assert not any(b.text.lower() == "other" for b in buttons)
+        expected_products = {
+            "cost_optimized": {"cx22", "cax11", "cax21", "cax31", "cax41"},
+            "regular_performance": {"cpx22"},
+            "general_purpose": {"ccx23"},
+        }
+        for button in buttons:
+            plans = await _press(bot, button.callback_data)
+            product_refs = [
+                _decode(b.callback_data).args[0]
+                for b in _buttons(plans)
+                if _decode(b.callback_data).screen == "cloud_images"
+            ]
+            family = _decode(button.callback_data).args[2]
+            offered_products = {
+                offer.product_id for offer in offers if encode_offer_ref(offer.id) in product_refs
+            }
+            assert offered_products == expected_products[family]
+            assert len(product_refs) == len(offered_products)
+
+    async def test_hetzner_persisted_families_route_to_matching_hourly_plans(self) -> None:
+        import dataclasses
+
+        offers = [
+            dataclasses.replace(
+                _cloud_offer(location_id="fsn1"),
+                provider_key="hetzner",
+                product_id=code,
+                technical_metadata=metadata,
+            )
+            for code, metadata in (
+                (
+                    "cx22",
+                    {
+                        "plan_family": "cost_optimized",
+                        "plan_family_name": "Cost-optimized / CX & CAX",
+                    },
+                ),
+                (
+                    "CPX22",
+                    {
+                        "plan_family": "regular_performance",
+                        "plan_family_name": "Regular performance / CPX",
+                    },
+                ),
+                (
+                    "ccx23",
+                    {
+                        "plan_family": "general_purpose",
+                        "plan_family_name": "General purpose / CCX",
+                    },
+                ),
+                (
+                    "cax11",
+                    {
+                        "plan_family": "cost_optimized",
+                        "plan_family_name": "Cost-optimized / CX & CAX",
+                    },
+                ),
+                (
+                    "cax21",
+                    {
+                        "plan_family": "cost_optimized",
+                        "plan_family_name": "Cost-optimized / CX & CAX",
+                    },
+                ),
+                ("abc11", {"plan_family": "other", "plan_family_name": "Other"}),
+            )
+        ]
+        catalog = ProviderCatalog(
+            markets={"hetzner": "foreign"},
+            display_names={"hetzner": "Hetzner"},
+            enabled={"hetzner": True},
+        )
+        service = _service(offers, catalog=catalog)
+        families, _, _ = await service.cloud_plan_families_screen("hetzner", "hourly", "fsn1")
+        assert {f.family_key: f.display_name for f in families} == {
+            "cost_optimized": "Cost-optimized / CX & CAX",
+            "regular_performance": "Regular performance / CPX",
+            "general_purpose": "General purpose / CCX",
+            "other": "Other",
+        }
+        products = {
+            "cost_optimized": {"cx22", "cax11", "cax21"},
+            "regular_performance": {"CPX22"},
+            "general_purpose": {"ccx23"},
+            "other": {"abc11"},
+        }
+        for family in families:
+            callback = _decode(family.select_callback)
+            assert callback.screen == "cloud_plans"
+            assert callback.args == ("hetzner", "fsn1", family.family_key, "1")
+            plans = await service.cloud_plans_screen("hetzner", "fsn1", family.family_key)
+            assert {p.product_id for p in plans.items} == products[family.family_key]
+            assert _size(family.select_callback) <= 64
+
+    async def test_market_counts_distinct_physical_skus_per_provider_and_location(self) -> None:
+        import dataclasses
+
+        cx = dataclasses.replace(
+            _offer(location_id="fsn1", product_id="cx22"), provider_key="hetzner"
+        )
+        offers = [
+            cx,
+            dataclasses.replace(cx, id=uuid4(), billing_model=BILLING_MODEL_HOURLY),
+            dataclasses.replace(cx, id=uuid4(), location_id="nbg1"),
+            dataclasses.replace(_offer(location_id="FRA-01"), id=uuid4()),
+            dataclasses.replace(_offer(location_id="FRA-01"), id=uuid4()),
+        ]
+        catalog = ProviderCatalog(
+            markets={"hetzner": "foreign", PROVIDER: "foreign"},
+            display_names={"hetzner": "Hetzner", PROVIDER: "Leaseweb"},
+            enabled={"hetzner": True, PROVIDER: True},
+        )
+        view = _service(offers, catalog=catalog)
+        providers, _ = await view.providers_screen("foreign")
+        assert {p.provider_key: p.offer_count for p in providers} == {
+            "hetzner": 2,
+            PROVIDER: 1,
+        }
 
     async def test_monthly_checkout_rejects_hourly_offer(self) -> None:
         from cloud_platform.modules.checkout.service import (

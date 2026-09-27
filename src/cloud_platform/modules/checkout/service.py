@@ -949,6 +949,7 @@ class OfferCatalogViewService:
         except UnknownMarketError as exc:
             raise OfferUnavailableError(str(exc)) from exc
         counts: dict[str, int] = {}
+        distinct_products: set[tuple[str, str, str]] = set()
         order: list[str] = []
         for offer in await self._offers.list_sellable():
             provider_key = offer.provider_key
@@ -958,6 +959,10 @@ class OfferCatalogViewService:
                 continue
             if not self._markets.is_enabled(provider_key):
                 continue
+            product_location = (provider_key, offer.product_id, offer.location_id)
+            if product_location in distinct_products:
+                continue
+            distinct_products.add(product_location)
             counts[provider_key] = counts.get(provider_key, 0) + 1
             order.append(provider_key)
         views: list[ProviderOptionView] = []
@@ -1740,12 +1745,10 @@ class OfferCatalogViewService:
             ) from None
 
     def _plan_family_of(self, offer: SellableOffer) -> tuple[str, str]:
-        # Normalized instance family from the synced technical metadata
-        # (adapter-classified, never invented by the storefront).
+        # The adapter supplies the normalized family in persisted metadata.
         meta = offer.technical_metadata or {}
         key = str(meta.get("plan_family") or "other")
-        name = str(meta.get("plan_family_name") or key)
-        return key, name
+        return key, str(meta.get("plan_family_name") or key)
 
     async def cloud_locations_screen(
         self, provider_key: str, family_key: str, page: int = 1, page_size: int = 6

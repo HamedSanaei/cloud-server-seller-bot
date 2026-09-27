@@ -291,6 +291,23 @@ def test_a_plan_carries_the_provider_hardware_and_traffic_facts() -> None:
     assert plan.location_id == "fsn1"
 
 
+def test_synced_hourly_metadata_classifies_official_codes_without_losing_other_types() -> None:
+    from cloud_platform.providers.hetzner.sync import _hourly_offer_spec
+
+    for code, category, family, label in (
+        ("cx22", "cost_optimized", "cost_optimized", "Cost-optimized / CX & CAX"),
+        ("cpx22", "regular_performance", "regular_performance", "Regular performance / CPX"),
+        ("ccx23", "general_purpose", "general_purpose", "General purpose / CCX"),
+        ("cax11", "cost_optimized", "cost_optimized", "Cost-optimized / CX & CAX"),
+        ("abc11", "unknown", "other", "Other"),
+    ):
+        plan = _plan(_server_type(name=code, category=category), "fsn1")
+        spec = _hourly_offer_spec(plan)
+        assert spec.product_id == code
+        assert spec.update.technical_metadata["plan_family"] == family
+        assert spec.update.technical_metadata["plan_family_name"] == label
+
+
 def test_an_unknown_architecture_is_dropped_not_displayed() -> None:
     assert _plan(_server_type(architecture="unknown"), "fsn1").architecture is None
 
