@@ -52,6 +52,15 @@ main IP (or «IP هنوز اختصاص نیافته» while provisioning), the O
 Each row has its own «⚙️ مدیریت» button; the list is paginated
 (`⬅️ قبلی  1 / 4  بعدی ➡️`) with a stable newest-first ordering.
 
+After an accepted reinstall, the selected provider image name replaces the
+cached OS shown on the list and details screens. A later provider refresh
+reconciles that name with the provider's reported image. IP addresses on the
+list, details and IP inventory screens, and the default Hetzner SSH port (22)
+where a public IP exists, use Telegram code entities for tap-to-copy. The
+one-time SSH username and password are likewise copyable in their protected
+private-chat message. The port is a default, not a claim about user-modified
+SSH configuration.
+
 ## Capability matrix
 
 | Operation            | Customer | Confirmation | Notes |

@@ -481,6 +481,25 @@ class TestList:
         assert "8 گیگابایت" in screen.text
         offers.get.assert_awaited_once_with(offer_id)
 
+    async def test_hetzner_list_exposes_os_and_copyable_connection_values(self) -> None:
+        management = FakeManagement(
+            view=_view(
+                provider_key="hetzner",
+                display_name="Debian 13",
+                operating_system="Debian 13",
+                ip="192.0.2.22",
+            )
+        )
+        ui, _, _ = make_ui(management)
+        screen = await ui.list_screen(_user())
+        assert TRANSLATOR.t("servers.list_os", os="Debian 13") in screen.text
+        assert TRANSLATOR.t("servers.spec_ssh_port", value="22") in screen.text
+        raw = screen.text.encode("utf-16-le")
+        assert [
+            raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
+            for entity in screen.entities
+        ] == ["192.0.2.22", "22"]
+
     async def test_failed_create_shows_reason_without_raw_error(self) -> None:
         management = FakeManagement(
             view=_view(
@@ -544,6 +563,18 @@ class TestDetails:
         # The provider returned no RAM/window figure, so none is invented.
         assert "RAM" not in screen.text
         assert "🧠" not in screen.text
+
+    async def test_hetzner_details_and_refresh_keep_copyable_ip_and_port(self) -> None:
+        ui, _, _ = make_ui(FakeManagement(view=_view(provider_key="hetzner")))
+        ref = await _ref(ui)
+        for action in ("view", "refresh"):
+            screen = await ui.handle(Callback("servers", action, (ref,)), _user())
+            assert TRANSLATOR.t("servers.spec_ssh_port", value="22") in screen.text
+            raw = screen.text.encode("utf-16-le")
+            assert [
+                raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
+                for entity in screen.entities
+            ] == ["88.1.2.3", "22"]
 
     async def test_manage_menu_hides_the_impossible_power_actions(self) -> None:
         ui, _m, _s = make_ui()

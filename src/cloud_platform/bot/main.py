@@ -29,7 +29,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
-from cloud_platform.bot.ui import BotScreen, BotUi
+from cloud_platform.bot.ui import BotScreen, BotUi, code_entities
 from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import Container, close_container, get_container
 from cloud_platform.core.i18n import Locale, Translator, get_catalog
@@ -137,8 +137,10 @@ async def _send_ssh_password(
         await query.answer(_t.t("servers.ssh_unavailable"), show_alert=True)
         return
     try:
+        text = _t.t("servers.ssh_secret", username=secret.username, password=password)
         await message.answer(
-            _t.t("servers.ssh_secret", username=secret.username, password=password),
+            text,
+            entities=code_entities(text, (secret.username, password)),
             protect_content=True,
         )
     except Exception:
@@ -192,28 +194,40 @@ def register_handlers(
                 logger.error("telegram session store unavailable; refusing text input")
                 return
             if screen is not None:
-                await message.answer(screen.text, reply_markup=screen.keyboard)
+                await message.answer(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
                 return
 
             if _button_matches(message.text, "menu.buy"):
                 screen = await monthly_ui.markets_screen()
-                await message.answer(screen.text, reply_markup=screen.keyboard)
+                await message.answer(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
                 return
             if _button_matches(message.text, "menu.servers"):
                 screen = await monthly_ui.servers_screen(user)
-                await message.answer(screen.text, reply_markup=screen.keyboard)
+                await message.answer(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
                 return
             if _button_matches(message.text, "menu.wallet"):
                 screen = await monthly_ui.wallet_screen(user)
-                await message.answer(screen.text, reply_markup=screen.keyboard)
+                await message.answer(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
                 return
             if _button_matches(message.text, "menu.recharge"):
                 screen = await monthly_ui.recharge_screen(user)
-                await message.answer(screen.text, reply_markup=screen.keyboard)
+                await message.answer(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
                 return
             if _button_matches(message.text, "menu.support"):
                 screen = monthly_ui.support_screen()
-                await message.answer(screen.text, reply_markup=screen.keyboard)
+                await message.answer(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
                 return
             if _button_matches(message.text, "nav.menu"):
                 await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
@@ -256,7 +270,9 @@ def register_handlers(
             screen = BotScreen(_t.t("servers.err_retry"), InlineKeyboardMarkup(inline_keyboard=[]))
         if isinstance(query.message, Message):
             try:
-                await query.message.edit_text(screen.text, reply_markup=screen.keyboard)
+                await query.message.edit_text(
+                    screen.text, reply_markup=screen.keyboard, entities=screen.entities
+                )
             except Exception:
                 logger.warning("failed to edit callback message", exc_info=True)
         await query.answer()

@@ -670,6 +670,10 @@ class ServerManagementService:
         )
         if consumed is not None:
             return consumed
+        images = await self.reinstall_images(customer_id, server_id)
+        selected = next((image for image in images if image.ref == str(image_ref)), None)
+        if selected is None:
+            raise ServerUnavailableError("selected reinstall image is no longer available")
         response = await self._call(
             context.provider.reinstall_vps(_provider_id(server), str(image_ref)),
             operation=ServerOperation.REINSTALL,
@@ -677,6 +681,8 @@ class ServerManagementService:
             customer_id=customer_id,
             arguments=arguments,
         )
+        server.os = selected.name
+        await self._servers.save(server)
         await self._save_provider_password(server, customer_id, response, required=False)
         await self._emit(
             BusinessEventType.SERVER_REINSTALL_REQUESTED,

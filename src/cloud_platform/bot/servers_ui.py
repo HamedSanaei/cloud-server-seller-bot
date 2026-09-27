@@ -42,7 +42,7 @@ from cloud_platform.bot.sessions import (
     PendingInput,
     ServerSessions,
 )
-from cloud_platform.bot.ui import BotScreen
+from cloud_platform.bot.ui import BotScreen, code_entities
 from cloud_platform.core.i18n import Translator
 from cloud_platform.core.session_store import SessionStoreUnavailable
 from cloud_platform.modules.navigation.domain import Callback
@@ -403,7 +403,18 @@ class ServerManagementUi:
         rows.append(self._pager(page))
         rows.append([self._menu_button()])
         blocks.append(self._t.t("servers.list_header"))
-        return BotScreen("\n".join(blocks).strip(), InlineKeyboardMarkup(inline_keyboard=rows))
+        text = "\n".join(blocks).strip()
+        ips = tuple(view.ip for view in page.items if view.ip)
+        ports = (
+            ("22",)
+            if any(view.provider_key == "hetzner" and view.ip for view in page.items)
+            else ()
+        )
+        return BotScreen(
+            text,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            code_entities(text, ips, line_values=ports),
+        )
 
     async def _list_block(self, index: int, view: CustomerServerView) -> str:
         """One readable server card; omit facts unavailable from the purchase."""
@@ -415,6 +426,8 @@ class ServerManagementUi:
             lines.append(self._t.t("servers.list_provider", provider=view.provider_key.title()))
         if view.ip:
             lines.append(self._t.t("servers.list_ip", ip=view.ip))
+            if view.provider_key == "hetzner":
+                lines.append(self._t.t("servers.spec_ssh_port", value="22"))
         elif view.state is CustomerServerState.PROVISIONING:
             lines.append(self._t.t("servers.list_ip_pending"))
         cpu, ram = view.cpu, view.ram_gb
@@ -431,7 +444,7 @@ class ServerManagementUi:
             lines.append(self._t.t("servers.list_cpu", cpu=cpu))
         if ram:
             lines.append(self._t.t("servers.list_ram", ram=ram))
-        if view.operating_system and view.operating_system != title:
+        if view.operating_system:
             lines.append(self._t.t("servers.list_os", os=view.operating_system))
         lines.append(self._t.t("servers.list_state", state=self._state(view.state)))
         if view.failure_reason:
@@ -503,7 +516,14 @@ class ServerManagementUi:
             ],
             [self._menu_button()],
         ]
-        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+        text = "\n".join(lines)
+        values = (view.ip,) if view.ip else ()
+        ports = ("22",) if view.ip and view.provider_key == "hetzner" else ()
+        return BotScreen(
+            text,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            code_entities(text, values, line_values=ports),
+        )
 
     def _spec_lines(self, view: CustomerServerView) -> list[str]:
         """Only the fields the provider genuinely returned (§6/§7)."""
@@ -512,6 +532,8 @@ class ServerManagementUi:
             lines.append(self._t.t("servers.spec_location", value=view.location_label))
         if view.ip:
             lines.append(self._t.t("servers.spec_ip", value=view.ip))
+            if view.provider_key == "hetzner":
+                lines.append(self._t.t("servers.spec_ssh_port", value="22"))
         if view.operating_system:
             lines.append(self._t.t("servers.spec_os", value=view.operating_system))
         if view.plan:
@@ -667,7 +689,16 @@ class ServerManagementUi:
             if view.refresh_error
             else self._t.t("servers.refresh_done")
         )
-        return BotScreen(f"{banner}\n\n{screen.text}", screen.keyboard)
+        text = f"{banner}\n\n{screen.text}"
+        offset = len(f"{banner}\n\n".encode("utf-16-le")) // 2
+        return BotScreen(
+            text,
+            screen.keyboard,
+            tuple(
+                entity.model_copy(update={"offset": entity.offset + offset})
+                for entity in screen.entities
+            ),
+        )
 
     # -- power ------------------------------------------------------------
 
@@ -1238,7 +1269,12 @@ class ServerManagementUi:
                 ]
             )
         rows.append([self._back_button("servers", "manage", ref), self._menu_button()])
-        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+        text = "\n".join(lines)
+        return BotScreen(
+            text,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            code_entities(text, tuple(ip.ip for ip in rows_data)),
+        )
 
     def _ip_line(self, ip: IpAddressView) -> str:
         kind = self._t.t("servers.ip_main" if ip.main_ip else "servers.ip_secondary")

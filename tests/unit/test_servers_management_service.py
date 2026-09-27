@@ -763,6 +763,18 @@ class TestConfirmations:
         assert second.replayed is True
         assert provider.count("reinstall_vps") == 1
 
+    async def test_reinstall_updates_customer_os_only_after_provider_acceptance(self) -> None:
+        service, provider, *_ = make_service()
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.REINSTALL, arguments={"image": "img-debian"}
+        )
+        await service.reinstall(
+            CUSTOMER, SERVER_ID, image_ref="img-debian", confirmation_token=token
+        )
+        view = await service.get_server(CUSTOMER, SERVER_ID)
+        assert view.operating_system == "Debian 13"
+        assert provider.count("reinstall_vps") == 1
+
     async def test_password_reset_stores_issued_password_and_never_replays_provider(self) -> None:
         service, provider, *_ = make_service()
         provider.reset_vps_password = AsyncMock(

@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 
 from cloud_platform.core.i18n import Translator
 from cloud_platform.modules.catalog.domain import CatalogRepository, OfferNotFoundError, OfferRef
@@ -60,6 +60,36 @@ class BotScreen:
 
     text: str
     keyboard: InlineKeyboardMarkup
+    entities: tuple[MessageEntity, ...] = ()
+
+
+def code_entities(
+    text: str, values: tuple[str, ...], *, line_values: tuple[str, ...] = ()
+) -> tuple[MessageEntity, ...]:
+    """Mark literal values as Telegram code using UTF-16 offsets."""
+    spans: list[tuple[int, int]] = []
+    for value in sorted(set(values + line_values), key=len, reverse=True):
+        if not value:
+            continue
+        start = 0
+        while (index := text.find(value, start)) != -1:
+            end = index + len(value)
+            start = end
+            if value in line_values and (
+                not text[:index].endswith(": ") or (end < len(text) and text[end] != "\n")
+            ):
+                continue
+            if any(index < other_end and end > other_start for other_start, other_end in spans):
+                continue
+            spans.append((index, end))
+    return tuple(
+        MessageEntity(
+            type="code",
+            offset=len(text[:start].encode("utf-16-le")) // 2,
+            length=len(text[start:end].encode("utf-16-le")) // 2,
+        )
+        for start, end in sorted(spans)
+    )
 
 
 class _CreateCommand(Protocol):
