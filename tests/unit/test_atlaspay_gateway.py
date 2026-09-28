@@ -466,3 +466,27 @@ async def test_atlaspay_only_offered_to_toman_wallet(gateway):
     assert service.compatible_gateways("USD", 500000) == []
     assert await service.compatible_gateways_async("USD", 500000) == []
     assert api.created == 0
+
+
+async def test_enabled_atlaspay_and_tetraminator_both_offer_toman_recharge(monkeypatch):
+    from cloud_platform.core.config import Settings
+    from cloud_platform.core.container import Container
+
+    settings = Settings(
+        atlaspay_enabled=True,
+        atlaspay_api_key="atlaspay-test-key",
+        tetraminator_enabled=True,
+        tetraminator_api_key="tetraminator-test-key",
+        tetraminator_callback_url="https://pay.example.test/webhooks/payments/tetraminator",
+    )
+    monkeypatch.setattr("cloud_platform.core.container.get_settings", lambda: settings)
+    container = object.__new__(Container)
+    gateways = container.payment_gateways()
+    try:
+        service = WalletRechargeService(payments_repo=Repo(), gateways=gateways)
+        assert await service.compatible_gateways_async("IRT", 500_000) == [
+            "atlaspay",
+            "tetraminator",
+        ]
+    finally:
+        await container.aclose_gateways(gateways)

@@ -1049,8 +1049,6 @@ class Settings(BaseSettings):
         would have to be rejected at request time anyway. Development and test
         may use http. Secrets are never echoed in the error text.
         """
-        if self.atlaspay_enabled:
-            return self._validate_atlaspay_configuration()
         if not self.tetraminator_enabled:
             return self._validate_zarinpal_configuration()._validate_atlaspay_configuration()
         from urllib.parse import urlsplit

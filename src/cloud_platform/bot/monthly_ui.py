@@ -22,6 +22,7 @@ provider-neutral path; the older ``offers`` flow is kept for compatibility:
 - ``store.confirm:{offer_id}:{os_index}`` — exact price + wallet balance
 - ``store.buy:{offer_id}:{os_index}`` — terminal: idempotent checkout
 - ``recharge.amounts`` — top-up amount selector
+- ``recharge.custom`` — request a one-time, owner-scoped Toman amount
 - ``recharge.start:{amount_minor}`` — create the pending gateway session
 - ``servers.list:{page}`` — My Servers; every further screen lives in
   :mod:`cloud_platform.bot.servers_ui` and carries a short server REFERENCE
@@ -59,6 +60,7 @@ from cloud_platform.bot.servers_ui import ServerManagementUi
 from cloud_platform.bot.sessions import ServerSessions
 from cloud_platform.bot.ui import BotScreen
 from cloud_platform.core.i18n import Translator
+from cloud_platform.core.session_store import NS_PROMPT
 from cloud_platform.modules.checkout.service import (
     CheckoutError,
     MarketOptionView,
@@ -123,6 +125,9 @@ POWER_ACTIONS = ("power_on", "power_off", "reboot")
 #: currencies get 10/25/50, zero-decimal ones get 5,000/10,000/20,000 units.
 RECHARGE_PRESETS_MINOR: tuple[int, ...] = (1_000, 2_500, 5_000)
 RECHARGE_PRESETS_ZERO_DECIMAL_MINOR: tuple[int, ...] = (500_000, 1_000_000, 2_000_000)
+_CUSTOM_AMOUNT_PROMPT = "wallet_recharge_amount"
+_CUSTOM_AMOUNT_TTL_SECONDS = 900
+
 ZERO_DECIMAL_CURRENCIES = frozenset({"IRR", "IRT", "JPY", "KRW"})
 
 
@@ -241,6 +246,7 @@ class MonthlyBotUi:
         self._support_contact = support_contact
         self._recharge = recharge
         self._t = translator or Translator()
+        self._sessions = sessions or ServerSessions()
         # Platform FX resolver for DISPLAY conversions (catalog equivalents,
         # never a repricing: the DB selling price is authoritative and is
         # always shown; the converted figure is supplementary). Owned by the
@@ -253,7 +259,7 @@ class MonthlyBotUi:
             ServerManagementUi(
                 signing_key,
                 server_management,
-                sessions=sessions,
+                sessions=self._sessions,
                 orders=orders,
                 renewals=renewals,
                 offers_repo=offers_repo,
@@ -1398,11 +1404,6 @@ class MonthlyBotUi:
         # Filter presets below every gateway's (converted) minimum so the UI
         # never offers an amount the gateway will reject.
         presets = await self._available_presets(view.currency)
-        if not presets:
-            lines = [self._t.t("recharge.unavailable")]
-            if self._support_contact:
-                lines.append(self._t.t("support.contact", contact=self._support_contact))
-            return BotScreen("\n".join(lines), self._market_back_only())
         rows = []
         for amount in presets:
             args = [str(amount)]
@@ -1421,6 +1422,14 @@ class MonthlyBotUi:
                     )
                 ]
             )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("recharge.custom_button"),
+                    callback_data=self._callback("recharge", "custom"),
+                )
+            ]
+        )
         rows.append([self._back_button("wallet", "balance"), self._menu_button()])
         return BotScreen(
             self._t.t("recharge.title")
@@ -1428,6 +1437,110 @@ class MonthlyBotUi:
             + f"{self._t.t('wallet.balance_row', balance=view.formatted)}",
             InlineKeyboardMarkup(inline_keyboard=rows),
         )
+
+    async def cancel_custom_amount(self, user: User | None) -> None:
+        """Leave the wallet prompt without disturbing a server prompt."""
+        if user is None or user.id is None:
+            return
+        store = self._sessions._store
+        record = await store.get(NS_PROMPT, str(user.id))
+        if record is not None and record.get("kind") == _CUSTOM_AMOUNT_PROMPT:
+            await store.delete(NS_PROMPT, str(user.id))
+
+    async def custom_amount_screen(self, user: User | None) -> BotScreen:
+        """Ask for a wallet-currency amount only after an explicit button click."""
+        if user is None or user.id is None:
+            return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
+        screen = await self.recharge_screen(user)
+        if not any(
+            button.callback_data == self._callback("recharge", "custom")
+            for row in screen.keyboard.inline_keyboard
+            for button in row
+        ):
+            return screen
+        view: WalletBalanceView = await self._wallet.balance(user.id)
+        if not view.has_wallet or not view.currency:
+            return BotScreen(self._t.t("wallet.no_wallet"), self._menu_only())
+        await self._sessions._store.put(
+            NS_PROMPT,
+            str(user.id),
+            {"kind": _CUSTOM_AMOUNT_PROMPT, "currency": view.currency.upper()},
+            ttl_seconds=_CUSTOM_AMOUNT_TTL_SECONDS,
+        )
+        return self._custom_amount_prompt(view.currency.upper())
+
+    def _custom_amount_prompt(self, currency: str, error_key: str | None = None) -> BotScreen:
+        rows = [[self._back_button("recharge", "amounts"), self._menu_button()]]
+        if error_key is not None:
+            rows.insert(
+                0,
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t("recharge.retry_button"),
+                        callback_data=self._callback("recharge", "custom"),
+                    )
+                ],
+            )
+        prompt_key = (
+            "recharge.custom_prompt_irt"
+            if currency == "IRT"
+            else "recharge.custom_prompt_integer"
+            if currency in ZERO_DECIMAL_CURRENCIES
+            else "recharge.custom_prompt"
+        )
+        text = self._t.t(prompt_key, currency=currency)
+        if error_key is not None:
+            text = self._t.t(error_key) + "\n" + text
+        return BotScreen(text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    async def _handle_custom_amount(self, text: str, user: User) -> BotScreen | None:
+        if user.id is None:
+            return None
+        store = self._sessions._store
+        record = await store.get(NS_PROMPT, str(user.id))
+        if record is None or record.get("kind") != _CUSTOM_AMOUNT_PROMPT:
+            return None
+        taken = await store.take(NS_PROMPT, str(user.id))
+        if taken is None or taken.get("kind") != _CUSTOM_AMOUNT_PROMPT:
+            return None
+        currency = taken.get("currency")
+        if (
+            not isinstance(currency, str)
+            or len(currency) != 3
+            or not currency.isascii()
+            or not currency.isalpha()
+        ):
+            return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
+        currency = currency.upper()
+        amount_text = text.strip()
+        # Decimal major units are converted to integer minor units exactly.
+        # No float arithmetic or locale-dependent separators reach the gateway.
+        parts = amount_text.split(".")
+        if (
+            len(amount_text) > 24
+            or len(parts) > (1 if currency in ZERO_DECIMAL_CURRENCIES else 2)
+            or any(not part or not part.isascii() or not part.isdecimal() for part in parts)
+            or (len(parts) == 2 and len(parts[1]) > 2)
+        ):
+            return self._custom_amount_prompt(currency, "recharge.invalid_amount")
+        amount = int(parts[0])
+        if currency not in ZERO_DECIMAL_CURRENCIES:
+            amount = amount * 100 + (int(parts[1].ljust(2, "0")) if len(parts) == 2 else 0)
+        if amount <= 0 or amount > 9_223_372_036_854_775_807:
+            return self._custom_amount_prompt(currency, "recharge.invalid_amount")
+        view: WalletBalanceView = await self._wallet.balance(user.id)
+        if not view.has_wallet or (view.currency or "").upper() != currency:
+            return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
+        if self._recharge is None:
+            return self._custom_amount_prompt(currency, "recharge.unavailable")
+        try:
+            compatible = await self._recharge.compatible_gateways_async(currency, amount)
+        except Exception:
+            return self._custom_amount_prompt(currency, "recharge.unavailable")
+        if not compatible:
+            return self._custom_amount_prompt(currency, "recharge.invalid_amount")
+        nonce = f"n-{secrets.token_hex(4)}" if "atlaspay" in compatible else None
+        return await self.recharge_start_screen(user, str(amount), attempt_nonce=nonce)
 
     async def _available_presets(self, currency: str) -> tuple[int, ...]:
         """Preset amounts that at least one gateway can settle (converted min)."""
@@ -1575,6 +1688,8 @@ class MonthlyBotUi:
     async def _recharge_cb(self, cb: Callback, user: User | None) -> BotScreen:
         if user is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
+        if cb.screen == "custom" and not cb.args:
+            return await self.custom_amount_screen(user)
         if cb.screen == "amounts":
             return await self.recharge_screen(user)
         if cb.screen == "start" and len(cb.args) == 1:
@@ -1940,6 +2055,9 @@ class MonthlyBotUi:
         if cb.flow not in MONTHLY_FLOWS:
             return None
 
+        if not (cb.flow == "recharge" and cb.screen == "custom"):
+            await self.cancel_custom_amount(user)
+
         if cb.flow == "main":
             return self.menu_screen()
         if cb.flow == "store":
@@ -2151,11 +2269,11 @@ class MonthlyBotUi:
         )
 
     async def handle_text(self, text: str, user: User | None) -> BotScreen | None:
-        """Route a free-text message to the My Servers prompts (rename, rDNS).
-
-        Returns None when nothing was waiting for an answer, so the caller can
-        keep ignoring ordinary chat messages.
-        """
+        """Consume an explicit wallet amount or delegate server input."""
+        if user is not None:
+            screen = await self._handle_custom_amount(text, user)
+            if screen is not None:
+                return screen
         if self._servers_ui is None:
             return None
         return await self._servers_ui.handle_text(text, user)

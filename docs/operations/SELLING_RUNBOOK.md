@@ -229,6 +229,20 @@ Underpayments require manual review, never a partial or guessed credit.
 An ambiguous AtlasPay create leaves a durable pending intent for operator
 review; do not blindly repeat the external POST.
 
+AtlasPay and Tetraminator can be enabled together in the server-owned
+`[payments.atlaspay]` and `[payments.tetraminator]` sections. Customers with IRT
+wallets can pick either gateway for an eligible preset or enter a positive
+integer Toman amount. Other supported wallets can enter an arbitrary positive
+amount in their wallet currency (up to two decimal places where applicable);
+the live FX route and each gateway's minimum are checked before invoice
+creation. AtlasPay is deliberately restricted to IRT wallets. Existing USD
+wallets remain USD until the safe conversion below; they can recharge via
+Tetraminator only when a current settlement FX quote is available. The AtlasPay
+account's webhook may already belong to another application: never replace
+that registration to enable this storefront. The worker verifies pending
+AtlasPay orders by authoritative authenticated order inquiry; wallet credit
+requires the verified full-payment result, not a redirect or webhook.
+
 ### Existing USD wallet conversion
 
 No automatic conversion on deploy. Pause checkout, gateway callbacks, billing

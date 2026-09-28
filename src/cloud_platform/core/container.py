@@ -1080,7 +1080,6 @@ class Container:
                 base_url=settings.atlaspay_base_url,
                 timeout_seconds=settings.atlaspay_timeout_seconds,
             )
-            return gateways
         if settings.zarinpal_enabled and settings.zarinpal_merchant_id:
             gateways[ZarinPalGateway.key] = ZarinPalGateway(
                 merchant_id=settings.zarinpal_merchant_id,

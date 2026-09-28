@@ -70,7 +70,8 @@ async def _show_main_menu(
     include_greeting: bool = False,
 ) -> None:
     """Resolve the user and retain the canonical storefront menu for everyone."""
-    await _resolve_user(container, message.from_user)
+    user = await _resolve_user(container, message.from_user)
+    await monthly_ui.cancel_custom_amount(user)
     screen = monthly_ui.menu_screen()
     if admin_ui is not None and _admin_allowed(admin_ui, message):
         screen = admin_ui.with_menu_button(screen)
@@ -194,6 +195,8 @@ def register_handlers(
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
+        user = await _resolve_user(container, message.from_user)
+        await monthly_ui.cancel_custom_amount(user)
         keyboard = monthly_ui.reply_keyboard()
         if admin_ui is not None and _admin_allowed(admin_ui, message):
             keyboard = admin_ui.with_reply_button(keyboard)
@@ -210,6 +213,19 @@ def register_handlers(
         if message.text and not message.text.startswith("/"):
             user = await _resolve_user(container, message.from_user)
             try:
+                if any(
+                    _button_matches(message.text, key)
+                    for key in (
+                        "nav.menu",
+                        "menu.buy",
+                        "menu.servers",
+                        "menu.wallet",
+                        "menu.recharge",
+                        "menu.support",
+                        "admin.menu",
+                    )
+                ):
+                    await monthly_ui.cancel_custom_amount(user)
                 if admin_ui is not None and _admin_allowed(admin_ui, message):
                     if _button_matches(message.text, "admin.menu"):
                         await admin_ui.clear_prompt(message.from_user.id)
@@ -310,6 +326,7 @@ def register_handlers(
                 await query.answer(_t.t("admin.denied"), show_alert=True)
                 return
             try:
+                await monthly_ui.cancel_custom_amount(user)
                 if cb.screen == "cancel" and len(cb.args) <= 1:
                     if cb.args:
                         await admin_ui.cancel_action(query.from_user.id, cb.args[0])
@@ -333,6 +350,18 @@ def register_handlers(
         # is only rendered as the main menu plus a safe notice instead of a
         # dead end.
         try:
+            if (
+                cb is not None
+                and cb.flow == "recharge"
+                and cb.screen == "custom"
+                and admin_ui is not None
+                and query.from_user is not None
+                and isinstance(query.message, Message)
+                and admin_ui.allowed(
+                    query.from_user.id, query.message.chat.id, query.message.chat.type
+                )
+            ):
+                await admin_ui.clear_prompt(query.from_user.id)
             screen = await monthly_ui.handle(data, user=user, chat_id=chat_id)
             if screen is None:
                 if _is_foreign_callback(data):

@@ -76,6 +76,18 @@ def test_production_enabled_gateway_must_be_usable(
     assert expected in str(excinfo.value)
 
 
+def test_atlaspay_enabled_does_not_mask_invalid_tetraminator_configuration() -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(
+            **_PRODUCTION,
+            **_enabled(tetraminator_callback_url="http://pay.example.test/hook"),
+            atlaspay_enabled=True,
+            atlaspay_api_key="atlaspay-test-key",
+        )
+
+    assert "tetraminator.callback_url must use https://" in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

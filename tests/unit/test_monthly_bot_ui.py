@@ -10,10 +10,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
+from cloud_platform.bot.sessions import ServerSessions
 from cloud_platform.core.i18n import Locale, Translator
+from cloud_platform.core.session_store import NS_PROMPT, InMemoryBotSessionStore
 from cloud_platform.modules.checkout.service import (
     MonthlyCheckoutResult,
     OfferCatalogView,
@@ -27,6 +30,8 @@ from cloud_platform.modules.compute.domain import (
 )
 from cloud_platform.modules.navigation.domain import Callback, decode_callback, encode_callback
 from cloud_platform.modules.offers.domain import SellableOffer
+from cloud_platform.modules.payments.domain import PaymentSession, PaymentSessionStatus
+from cloud_platform.modules.payments.recharge import RechargeStart
 from cloud_platform.modules.renewals.domain import RenewalRecord, RenewalStatus
 from cloud_platform.modules.servers.confirmations import ConfirmationStatus
 from cloud_platform.modules.servers.models import (
@@ -378,6 +383,9 @@ def _ui(
     power: FakePower | None = None,
     offers: FakeOffersRepo | None = None,
     management: FakeManagement | None = None,
+    recharge: Any | None = None,
+    wallet_history: Any | None = None,
+    sessions: ServerSessions | None = None,
 ) -> tuple[MonthlyBotUi, dict[str, Any]]:
     checkout = checkout or FakeCheckout()
     servers = servers or FakeServers()
@@ -391,9 +399,11 @@ def _ui(
         orders=FakeOrders(),
         renewals=FakeRenewals(),
         offers_repo=offers,
-        wallet_history=FakeWalletHistory(),
+        wallet_history=wallet_history or FakeWalletHistory(),
         power=power,
         translator=Translator(Locale.EN),
+        recharge=recharge,
+        sessions=sessions,
         server_management=management,  # type: ignore[arg-type]
     )
     deps = {
@@ -558,3 +568,229 @@ class TestWalletAndSupport:
         screen = await ui.handle(cb, user=USER_A)
         assert "Support" in screen.text
         assert "@support" in screen.text
+
+
+class TomanWallet(FakeWalletHistory):
+    async def balance(self, user_id: UUID) -> Any:
+        return type(
+            "Balance",
+            (),
+            {"has_wallet": True, "currency": "IRT", "formatted": "0 IRT"},
+        )()
+
+
+class TomanRecharge:
+    gateway_keys = ("tetraminator", "atlaspay")
+
+    def __init__(self) -> None:
+        self.starts: list[tuple[UUID | None, int, str, str, str]] = []
+
+    def supports_currency(self, currency: str) -> bool:
+        return currency == "IRT"
+
+    async def compatible_gateways_async(self, currency: str, amount: int) -> list[str]:
+        if currency != "IRT" or amount < 100_000:
+            return []
+        return list(self.gateway_keys) if amount >= 250_000 else ["tetraminator"]
+
+    async def start(
+        self,
+        *,
+        user: User,
+        amount_minor: int,
+        currency: str,
+        idempotency_key: str,
+        gateway_key: str,
+    ) -> RechargeStart:
+        self.starts.append((user.id, amount_minor, currency, gateway_key, idempotency_key))
+        session = PaymentSession(
+            user_id=user.id,
+            gateway_key=gateway_key,
+            amount_minor=amount_minor,
+            currency=currency,
+            idempotency_key=idempotency_key,
+            status=PaymentSessionStatus.PENDING,
+        )
+        return RechargeStart(
+            session=session,
+            redirect_url="https://payment.example/checkout/123",
+            replayed=False,
+            payable_amount_minor=amount_minor,
+            tracking_code="track-123",
+        )
+
+
+class DollarWallet(FakeWalletHistory):
+    async def balance(self, user_id: UUID) -> Any:
+        return type("Balance", (), {"has_wallet": True, "currency": "USD", "formatted": "$0.00"})()
+
+
+class DollarFxRecharge(TomanRecharge):
+    gateway_keys = ("tetraminator",)
+
+    def supports_currency(self, currency: str) -> bool:
+        return False  # A live FX route, not a same-currency gateway.
+
+    async def supports_currency_async(self, currency: str) -> bool:
+        return currency == "USD"
+
+    async def compatible_gateways_async(self, currency: str, amount: int) -> list[str]:
+        return ["tetraminator"] if currency == "USD" and amount >= 275_025 else []
+
+    async def start(
+        self,
+        *,
+        user: User,
+        amount_minor: int,
+        currency: str,
+        idempotency_key: str,
+        gateway_key: str,
+    ) -> RechargeStart:
+        self.starts.append((user.id, amount_minor, currency, gateway_key, idempotency_key))
+        settlement_minor = amount_minor * 500
+        session = PaymentSession(
+            user_id=user.id,
+            gateway_key=gateway_key,
+            amount_minor=settlement_minor,
+            currency="IRT",
+            credit_amount_minor=amount_minor,
+            credit_currency=currency,
+            idempotency_key=idempotency_key,
+            status=PaymentSessionStatus.PENDING,
+        )
+        return RechargeStart(
+            session=session, redirect_url="https://payment.example/fx/456", replayed=False
+        )
+
+
+class TestCustomRechargeAmount:
+    @staticmethod
+    def setup() -> tuple[MonthlyBotUi, TomanRecharge, InMemoryBotSessionStore]:
+        store = InMemoryBotSessionStore()
+        recharge = TomanRecharge()
+        ui, _ = _ui(recharge=recharge, wallet_history=TomanWallet(), sessions=ServerSessions(store))
+        return ui, recharge, store
+
+    @patch(
+        "cloud_platform.bot.monthly_ui.secrets.token_hex",
+        side_effect=(f"{n:08x}" for n in range(1, 100)),
+    )
+    async def test_custom_amount_selects_compatible_gateway_and_pending_link(
+        self, _token_hex: Any
+    ) -> None:
+        ui, recharge, store = self.setup()
+        assert await ui.handle_text("275000", USER_A) is None
+        assert recharge.starts == []
+        amounts = await ui.recharge_screen(USER_A)
+        custom = next(
+            button
+            for row in amounts.keyboard.inline_keyboard
+            for button in row
+            if "Custom amount" in button.text
+        )
+        prompt = await ui.handle(custom.callback_data, user=USER_A)
+        assert "whole number of toman" in prompt.text
+        assert await store.get(NS_PROMPT, str(USER_A.id)) == {
+            "kind": "wallet_recharge_amount",
+            "currency": "IRT",
+        }
+        assert await ui.handle_text("275000", USER_B) is None
+        assert await store.get(NS_PROMPT, str(USER_A.id)) is not None
+        picker = await ui.handle_text("275000", USER_A)
+        assert recharge.starts == []
+        buttons = {button.text: button for row in picker.keyboard.inline_keyboard for button in row}
+        assert "Pay with Tetraminator" in buttons
+        assert "Pay with AtlasPay" in buttons
+        atlas = decode_callback(buttons["Pay with AtlasPay"].callback_data, KEY)
+        assert atlas.args[:2] == ("275000", "atlaspay")
+        assert atlas.args[2].startswith("n-")
+        payment = await ui.handle(buttons["Pay with AtlasPay"].callback_data, user=USER_A)
+        assert "Tracking code: track-123" in payment.text
+        assert payment.keyboard.inline_keyboard[0][0].url == "https://payment.example/checkout/123"
+        assert recharge.starts == [
+            (
+                USER_A.id,
+                275_000,
+                "IRT",
+                "atlaspay",
+                f"bot-recharge:{USER_A.id}:275000:{atlas.args[2]}",
+            )
+        ]
+        assert await store.get(NS_PROMPT, str(USER_A.id)) is None
+        await ui.handle(custom.callback_data, user=USER_A)
+        another_picker = await ui.handle_text("275000", USER_A)
+        another_atlas = next(
+            button
+            for row in another_picker.keyboard.inline_keyboard
+            for button in row
+            if "Pay with AtlasPay" in button.text
+        )
+        another_nonce = decode_callback(another_atlas.callback_data, KEY).args[2]
+        assert another_nonce != atlas.args[2]
+        await ui.handle(another_atlas.callback_data, user=USER_A)
+        assert recharge.starts[1][4] != recharge.starts[0][4]
+
+    async def test_invalid_unsupported_retry_and_back_cancel(self) -> None:
+        ui, recharge, store = self.setup()
+        custom = ui._callback("recharge", "custom")
+        await ui.handle(custom, user=USER_A)
+        error = await ui.handle_text("0", USER_A)
+        assert "not valid" in error.text
+        assert recharge.starts == []
+        assert await ui.handle_text("275000", USER_A) is None
+        retry = error.keyboard.inline_keyboard[0][0]
+        await ui.handle(retry.callback_data, user=USER_A)
+        unsupported = await ui.handle_text("99999", USER_A)
+        assert "not valid" in unsupported.text
+        assert recharge.starts == []
+        await ui.handle(unsupported.keyboard.inline_keyboard[0][0].callback_data, user=USER_A)
+        await ui.handle(ui._callback("recharge", "amounts"), user=USER_A)
+        assert await store.get(NS_PROMPT, str(USER_A.id)) is None
+        assert await ui.handle_text("275000", USER_A) is None
+        await ui.handle(custom, user=USER_A)
+        await ui.handle(ui._callback("main", "menu"), user=USER_A)
+        assert await store.get(NS_PROMPT, str(USER_A.id)) is None
+
+    async def test_tetraminator_link_does_not_require_atlaspay_nonce(self) -> None:
+        ui, recharge, _ = self.setup()
+        await ui.handle(ui._callback("recharge", "custom"), user=USER_A)
+        picker = await ui.handle_text("275000", USER_A)
+        tetra = picker.keyboard.inline_keyboard[0][0]
+        assert "Tetraminator" in tetra.text
+        payment = await ui.handle(tetra.callback_data, user=USER_A)
+        assert payment.keyboard.inline_keyboard[0][0].url == "https://payment.example/checkout/123"
+        assert recharge.starts[0][3:] == ("tetraminator", f"bot-recharge:{USER_A.id}:275000")
+
+    async def test_expired_prompt_cannot_create_payment(self) -> None:
+        ui, recharge, store = self.setup()
+        with patch("cloud_platform.core.session_store.time.monotonic", return_value=100.0):
+            await ui.handle(ui._callback("recharge", "custom"), user=USER_A)
+        with patch("cloud_platform.core.session_store.time.monotonic", return_value=1001.0):
+            assert await ui.handle_text("275000", USER_A) is None
+            assert await store.get(NS_PROMPT, str(USER_A.id)) is None
+        assert recharge.starts == []
+
+    async def test_usd_major_amount_uses_live_fx_gateway_and_exact_minor_units(self) -> None:
+        recharge = DollarFxRecharge()
+        ui, _ = _ui(recharge=recharge, wallet_history=DollarWallet())
+        amounts = await ui.recharge_screen(USER_A)
+        buttons = [button for row in amounts.keyboard.inline_keyboard for button in row]
+        assert not any(decode_callback(b.callback_data, KEY).screen == "start" for b in buttons)
+        custom = next(b for b in buttons if "Custom amount" in b.text)
+        prompt = await ui.handle(custom.callback_data, user=USER_A)
+        assert "USD" in prompt.text
+        assert "two decimal places" in prompt.text
+
+        error = await ui.handle_text("2750.251", USER_A)
+        assert "not valid" in error.text
+        assert recharge.starts == []
+        await ui.handle(error.keyboard.inline_keyboard[0][0].callback_data, user=USER_A)
+        unsupported = await ui.handle_text("2750.24", USER_A)
+        assert "not valid" in unsupported.text
+        assert recharge.starts == []
+        await ui.handle(unsupported.keyboard.inline_keyboard[0][0].callback_data, user=USER_A)
+        payment = await ui.handle_text("2750.25", USER_A)
+        assert payment.keyboard.inline_keyboard[0][0].url == "https://payment.example/fx/456"
+        assert recharge.starts == [
+            (USER_A.id, 275_025, "USD", "tetraminator", f"bot-recharge:{USER_A.id}:275025")
+        ]
