@@ -24,6 +24,7 @@ import dataclasses
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
 from cloud_platform.modules.businesslog.domain import (
@@ -50,6 +51,7 @@ from cloud_platform.providers.errors import (
     ProviderOutcomeUnknown,
 )
 from cloud_platform.providers.registry import ProviderRegistry
+from tests.unit.hourly_money import hourly_money
 from tests.unit.test_business_log import FakeRecord, FakeRepo, _policy
 from tests.unit.test_hourly_cloud_flow import (
     PROVIDER,
@@ -123,8 +125,7 @@ class _CapacityRefusal(ProviderCapacityError):
     """The provider's account-limit refusal, with its documented evidence."""
 
     def __init__(self, message: str, *, error_code: str, correlation_id: str) -> None:
-        super().__init__(message)
-        self.error_code = error_code
+        super().__init__(message, error_code=error_code)
         self.correlation_id = correlation_id
 
 
@@ -173,6 +174,7 @@ def _hourly(
         capacity_repo=capacity,
         event_sink=sink,
         user_repo=users,
+        **hourly_money(),
     )
     return service, operations
 
@@ -419,6 +421,7 @@ class TestRecoveryAndActivation:
             audit_repo=_AuditStub(),  # type: ignore[arg-type]
             event_sink=sink,
             user_repo=FakeUserRepo(),
+            prepay_server=AsyncMock(),
         )
 
         counts = await reconciler.reconcile()
@@ -499,6 +502,7 @@ class TestCustomerProvisioned:
             provider_registry=registry,
             audit_repo=_AuditStub(),  # type: ignore[arg-type]
             customer_sink=CustomerProvisionedSink(outbox),
+            prepay_server=AsyncMock(),
         )
         assert await reconciler.reconcile() == {StateReconciliationOutcome.REPAIRED: 1}
         assert server.state is ServerLifecycleState.RUNNING
@@ -547,6 +551,7 @@ class TestCustomerProvisioned:
                 provider_registry=registry,
                 audit_repo=_AuditStub(),  # type: ignore[arg-type]
                 customer_sink=CustomerProvisionedSink(outbox),
+                prepay_server=AsyncMock(),
             )
             await reconciler.reconcile()
             assert not outbox.rows

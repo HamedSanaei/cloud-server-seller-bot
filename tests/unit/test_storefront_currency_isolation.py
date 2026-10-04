@@ -34,7 +34,6 @@ from cloud_platform.modules.markets.domain import ProviderCatalog
 from cloud_platform.modules.navigation.domain import (
     Callback,
     decode_callback,
-    resolve_offer_id_arg,
 )
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.users.domain import Role, User, UserStatus
@@ -464,8 +463,6 @@ class TestCurrencyCardIdentity:
             assert view.offer.offer_id == offer.id
             assert view.currency == offer.selling_currency
             assert view.offer.monthly_price_minor == offer.selling_price_minor
-            confirm = _decode(view.confirm_callback)
-            assert offer.id == resolve_offer_id_arg(confirm.args[0])
 
     async def test_isolation_is_provider_neutral(self) -> None:
         """Same shape with another provider and other currencies stays apart."""

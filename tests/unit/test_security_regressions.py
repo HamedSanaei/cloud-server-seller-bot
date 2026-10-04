@@ -100,6 +100,10 @@ def _owner() -> User:
         email="o@example.com",
         role=Role.USER,
         status=UserStatus.ACTIVE,
+        telegram_user_id=12345,
+        phone_number="+989123456789",
+        phone_verified_at=NOW,
+        national_id="1234567891",
     )
 
 
@@ -110,6 +114,10 @@ def _attacker() -> User:
         email="a@example.com",
         role=Role.USER,
         status=UserStatus.ACTIVE,
+        telegram_user_id=67890,
+        phone_number="+989123456789",
+        phone_verified_at=NOW,
+        national_id="1234567891",
     )
 
 
@@ -261,6 +269,7 @@ class TestPowerCommandOwnership:
             operation_repo=_OpRepo(),  # type: ignore[arg-type]
             provider_registry=MagicMock(),  # type: ignore[arg-type]
             audit_repo=AsyncMock(),
+            prepay_server=AsyncMock(),
         )
 
     async def test_foreign_and_missing_raise_the_same_error(self) -> None:

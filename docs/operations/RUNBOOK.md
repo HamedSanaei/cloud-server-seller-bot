@@ -28,6 +28,35 @@ steady-state signals, kill switches and drills that apply on top of it.
 ## Incident priority
 Financial integrity and accidental resource creation/deletion outrank feature availability. Prefer a controlled stop with clear status over ambiguous retries.
 
+## Super-admin Telegram commands
+
+Super-admin actions require an active, persisted `admin` role and a private
+Telegram chat. `telegram.admin_chat_id` is an alert destination, not the role
+authority or a restriction to one administrator.
+
+- `/admin` opens gateway switches and manual customer credit. Gateway switches
+  persist across restarts and stop new invoices, not settlement of old ones.
+- Manual credit accepts a registered customer's Telegram numeric ID or platform
+  UUID, an amount in that wallet's **major units**, and an audit reason.
+  Confirmation is required; cancellation has no financial effect. Duplicate
+  confirmation or a bot restart cannot credit twice.
+- `/admin_credit <Telegram user ID or UUID> <positive minor units> <reason>`
+  uses the same atomic wallet/ledger/audit/outbox transaction. Redelivery of
+  the same Telegram message reuses its idempotency key. For USD, 100 minor
+  units means USD 1. Super-admin wallets cannot be selected for credit.
+- CLI wallet credit/debit requires `--admin-user-id <active admin UUID>`;
+  anonymous operator identity is no longer accepted. Reusing a key with a
+  changed amount, direction or reason fails closed.
+- Super-admin menus do not offer self top-up; direct recharge actions are
+  rejected by the application service too.
+- `/admin_dump` creates a fresh encrypted PostgreSQL dump and sends its
+  `.dump.enc` file in the private chat. The bot needs `pg_dump` and the
+  configured backup encryption key; retain that key separately to restore.
+  The temporary local copy is removed after Telegram finishes the upload.
+  Treat the Telegram document as sensitive even though encrypted; Telegram
+  upload limits apply. Restore by placing the file in `BACKUP_OUTPUT_DIR`
+  and using the restore command below against a clean database.
+
 ## Restore drill (M11-008)
 
 The verified restore path. Backups are encrypted pg_dump files
@@ -145,12 +174,13 @@ screens; provider account linking so orders can actually provision.
 Both EU providers sell through the same bot/API surfaces. The launch
 sequence on any environment (local, staging, VPS via `./platform.sh`):
 
-1. **Keys in `.env`** — `HETZNER_API_TOKEN` and/or `LEASEWEB_API_KEY`
-   (plus `ARVANCLOUD_*` for the Iranian track, `ZARINPAL_*` for payments).
-   Never commit `.env`; staging keeps its own (see
-   `deploy/staging/.env.example`).
-2. **Schema** — `uv run alembic upgrade head` (or `migrate` in compose;
-   single head `0029`, hot-path indexes included).
+1. **Secrets** — configure provider and payment credentials in the server-owned
+   `configuration.toml`/encrypted credential store. `.env` is local-development
+   only; never create a second staging stack or poller for the shared bot token.
+2. **Schema** — deploy the immutable image through the existing pipeline; its
+   `migrate` service applies the image's alembic head and schema parity gates.
+   Revision `0050` adds checkout identity, payment settings/details and the
+   hourly prepaid activation anchor.
 3. **Catalog sync** — `uv run python scripts/sync_catalog.py` (all
    providers) or `--provider hetzner|leaseweb|arvancloud`. Idempotent;
    LeaseWeb needs its API key, otherwise that step fails loudly while the
@@ -165,12 +195,15 @@ sequence on any environment (local, staging, VPS via `./platform.sh`):
    ever hard-coded.
 5. **Offers** — enable exactly the plan/location rows to sell (offer
    visibility; disabled rows never appear in the bot or REST).
-6. **Bot** — `/menu` → buy flow (datacenter → plans → OS → exact price +
-   wallet impact → idempotent order), My Servers (power/rebuild), wallet
-   + ZarinPal top-up (pending/success/failure screens; stuck sessions are
-   rechecked by the `reconcile_payments` worker job).
-7. **Smoke** — `uv run python scripts/post_deploy_smoke.py`, then a real
-   1-quantum order and delete (final charge posts exactly once).
+6. **Bot** — `/menu` → buy flow → own Iranian Telegram contact and national ID
+   if not verified → OS/price confirmation → idempotent order. Customer wallets
+   support configured ZarinPal/AtlasPay invoices, exact payable totals and
+   authoritative status checks. Pending invoices continue reconciliation when
+   their gateway is disabled.
+7. **Smoke** — `uv run python scripts/post_deploy_smoke.py`; after an authorized
+   deploy, use one real customer invoice and the smallest approved server order.
+   Verify wallet/ledger, provider readiness, prepaid renewal and deletion.
+   Local fixture-based validation does not prove real payment or delivery.
 
 **Kill switches before launch:** maintenance block per provider/location
 (M10-005), cost circuit breaker (M10-004), per-user freeze with resource

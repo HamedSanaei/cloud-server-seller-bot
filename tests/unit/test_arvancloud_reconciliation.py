@@ -86,6 +86,7 @@ class _Fakes:
             server_repo=self.servers,
             provider_registry=self.registry,
             audit_repo=self.audit,
+            prepay_server=AsyncMock(),
         )
 
 

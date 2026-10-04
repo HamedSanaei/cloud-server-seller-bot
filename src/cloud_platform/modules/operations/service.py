@@ -1,30 +1,17 @@
-"""Provisioning worker (M07-002).
+"""Legacy catalog provisioning and resource operations.
 
-Executes server-create intents: for each ``REQUESTED`` server the worker
-resolves the operation intent, claims it, calls the provider **once per
-operation intent**, and records the correlation between the intent and the
-provider-side result.
-
-Exactly-once semantics (the acceptance property):
-- One operation row per server create intent, keyed by the deterministic
-  ``server-create:{server_id}`` (unique in the ledger).
-- The operation key is **also** the ``IdempotencyKey`` sent to the provider,
-  so the provider applies the mutation at most once per intent — a re-send
-  after an unresolved failure returns the same resource, never a duplicate.
-- Claims are conditional DB updates (PENDING -> IN_FLIGHT), so two workers
-  cannot execute the same operation concurrently.
-- The correlation (provider server id + status + the key used) is persisted
-  on the operation before the server state advances.
-
-Retryable provider failures re-queue the operation (same key); permanent
-failures fail it, move the server to ERROR, and release the wallet hold so
-no funds stay reserved for a server that will never be provisioned.
+Native-idempotent providers retain their same-key retry behavior. Capacity-aware
+creates persist a fenced account receipt and frozen request before every POST;
+only a documented pre-acceptance capacity refusal permits another credential.
+Hetzner uncertain creates are recovered read-only on their original account,
+never by replaying a same-key POST. Monthly and versioned hourly create intents
+belong exclusively to their dedicated workers.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -51,6 +38,15 @@ from cloud_platform.modules.compute.domain import (
 )
 from cloud_platform.modules.navigation.domain import Callback, encode_callback
 from cloud_platform.modules.notifications.domain import ProvisioningProgressService
+from cloud_platform.modules.operations.create_attempts import (
+    CreateAccountAttemptRepository,
+    CreateAttemptConflict,
+    create_routing,
+    current_account,
+    last_attempt,
+    refused_accounts,
+    safe_pre_post,
+)
 from cloud_platform.modules.operations.domain import (
     Operation,
     OperationRepository,
@@ -61,9 +57,11 @@ from cloud_platform.modules.operations.domain import (
     normalize_provider_status,
     plan_state_repair,
 )
+from cloud_platform.modules.provider_routes.service import ProviderRouteSelector
 from cloud_platform.modules.wallet.domain import (
     HoldRepository,
     HoldStatus,
+    InsufficientBalanceError,
     WalletRepository,
 )
 from cloud_platform.modules.wallet.repository import HoldService
@@ -72,13 +70,16 @@ from cloud_platform.providers.base import (
     Capability,
     CloudProvider,
     CreateServerRequest,
+    OrderRecoveryVerdict,
     ProviderImage,
     ProviderServer,
     power_probe_of,
     rebuild_support_of,
     rescue_support_of,
+    server_recovery_support_of,
 )
 from cloud_platform.providers.errors import (
+    ProviderCapacityError,
     ProviderError,
     ProviderNotFound,
     ProviderOutcomeUnknown,
@@ -146,6 +147,52 @@ def build_create_request(server_id: UUID, spec: Any, image: ProviderImage) -> Cr
     )
 
 
+def _is_legacy_create(server: CloudServer) -> bool:
+    """Monthly and versioned hourly intents belong to their dedicated workers."""
+    fingerprint = server.offer_fingerprint
+    return not server.is_prepaid_monthly and not (
+        isinstance(fingerprint, dict) and "fingerprint_version" in fingerprint
+    )
+
+
+def _needs_read_only_create_recovery(registry: ProviderRegistry, server: CloudServer) -> bool:
+    try:
+        provider = provider_for(registry, server.provider_key, server.credential_account_id)
+    except KeyError:
+        # An unresolved owner is not permission to repeat a historical POST.
+        return True
+    return server_recovery_support_of(provider) is not None
+
+
+async def _read_legacy_create_identity(
+    provider: CloudProvider,
+    server: CloudServer,
+    operation: Operation,
+    *,
+    receipt: bool,
+) -> str | None:
+    """Read only the exact pinned intent; absence never authorizes another POST."""
+    if server.provider_server_id:
+        remote = await provider.get_server(server.provider_server_id)
+        return remote.id if remote is not None and remote.id == server.provider_server_id else None
+    recovery = server_recovery_support_of(provider)
+    if recovery is None:
+        return None
+    result = await recovery.recover_server_by_operation(
+        operation.operation_key,
+        legacy_label=not receipt,
+        platform_server_id=str(server.id),
+    )
+    identity = result.provider_order_id
+    if (
+        result.verdict is OrderRecoveryVerdict.MATCHED
+        and isinstance(identity, str)
+        and identity.strip()
+    ):
+        return identity
+    return None
+
+
 class ProvisioningOutcome(StrEnum):
     PROVISIONED = "provisioned"
     ALREADY_PROVISIONED = "already_provisioned"
@@ -173,6 +220,9 @@ class ProvisioningWorker:
         concurrency_limit: int = 3,
         waiter: ActionWaiter | None = None,
         progress: ProvisioningProgressService | None = None,
+        create_attempts: CreateAccountAttemptRepository | None = None,
+        fulfillment_routes: ProviderRouteSelector | None = None,
+        prepay_server: Callable[[CloudServer], Awaitable[CloudServer]] | None = None,
     ) -> None:
         if concurrency_limit < 1:
             raise ValueError("concurrency_limit must be at least 1")
@@ -186,11 +236,15 @@ class ProvisioningWorker:
         self._concurrency_limit = concurrency_limit
         self._waiter = waiter
         self._progress = progress
+        self._create_attempts = create_attempts
+        self._fulfillment_routes = fulfillment_routes
+        self._prepay_server = prepay_server
         self._power = power_executor or PowerOperationExecutor(
             operation_repo=operation_repo,
             server_repo=server_repo,
             provider_registry=provider_registry,
             audit_repo=audit_repo,
+            prepay_server=prepay_server,
         )
 
     @staticmethod
@@ -228,9 +282,7 @@ class ProvisioningWorker:
         server = await self._servers.get(server_id)
         if server is None:
             return ProvisioningOutcome.SKIPPED_STATE
-        if server.is_prepaid_monthly:
-            # Prepaid monthly servers are provisioned by the ordering worker
-            # (order-based async provisioning), never by this hourly worker.
+        if not _is_legacy_create(server):
             return ProvisioningOutcome.SKIPPED_STATE
         if server.state is not ServerLifecycleState.REQUESTED and (
             server.state is not ServerLifecycleState.PROVISIONING
@@ -245,6 +297,34 @@ class ProvisioningWorker:
             resource_id=server_id,
             provider_key=server.provider_key,
         )
+
+        pooled = (
+            self._fulfillment_routes is not None
+            and self._fulfillment_routes.supports_capacity_failover(server.provider_key)
+        )
+        try:
+            receipt = create_routing(operation)
+        except CreateAttemptConflict:
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        if (
+            receipt is None
+            and _needs_read_only_create_recovery(self._registry, server)
+            and operation.status is OperationStatus.PENDING
+            and operation.attempts > 0
+        ):
+            # Historical workers requeued ambiguous POSTs without receipts.
+            # Their PENDING status is not proof that another POST is safe.
+            return await self._recover_historical_pending(server, operation)
+        if pooled and receipt is None and operation.status is OperationStatus.COMPLETED:
+            # Old proven acceptances remain on the original credential and may
+            # repair their local correlation, never enter a new pool attempt.
+            try:
+                provider_for(self._registry, server.provider_key, server.credential_account_id)
+            except KeyError:
+                return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+            return await self._recover_from_correlation(server, operation)
+        if receipt is not None or pooled:
+            return await self._process_pooled(server, operation)
 
         # Terminal operations are idempotent no-ops (or recorded failures).
         if operation.is_terminal:
@@ -284,12 +364,6 @@ class ProvisioningWorker:
                 request, IdempotencyKey(claimed.operation_key)
             )
         except ProviderOutcomeUnknown as exc:
-            # The POST may have landed. This worker re-sends the SAME operation
-            # key (the ``platform-operation`` label), which is the platform's
-            # idempotency identity for a participating provider (M07-003): the
-            # retry carries the same intent, so a provider that deduplicates on
-            # it can only ever yield ONE resource. The marketplace checkout
-            # path is stricter still (it never re-POSTs; see OrderWorker).
             claimed.requeue(str(exc))
             await self._ops.save(claimed)
             await self._audit.record_mutation(
@@ -327,7 +401,7 @@ class ProvisioningWorker:
         server.provider_server_id = created.id
         if server.state is ServerLifecycleState.REQUESTED:
             server.transition_to(ServerLifecycleState.PROVISIONING)
-        await self._servers.save(server)
+        server = await self._servers.save(server)
 
         await self._audit.record_mutation(
             actor_type=ActorType.SYSTEM,
@@ -348,6 +422,319 @@ class ProvisioningWorker:
         await self._watch_creation(server, provider, created)
         return ProvisioningOutcome.PROVISIONED
 
+    async def _recover_historical_pending(
+        self,
+        server: CloudServer,
+        operation: Operation,
+    ) -> ProvisioningOutcome:
+        """Claim only for exact, same-account read-only historical recovery."""
+        try:
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
+        except KeyError:
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        claimed = await self._ops.claim(operation.id)
+        if claimed is None:
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        try:
+            identity = await _read_legacy_create_identity(provider, server, claimed, receipt=False)
+        except ProviderError:
+            identity = None
+        if identity is None:
+            claimed.mark_outcome_unknown("historical create requires read-only recovery")
+            await self._ops.save(claimed)
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        claimed.complete(
+            {
+                "provider_server_id": identity,
+                "idempotency_key": claimed.operation_key,
+                "recovered": True,
+            }
+        )
+        await self._ops.save(claimed)
+        await self._recover_from_correlation(server, claimed)
+        return ProvisioningOutcome.PROVISIONED
+
+    async def _process_pooled(
+        self,
+        server: CloudServer,
+        operation: Operation,
+    ) -> ProvisioningOutcome:
+        attempts = self._create_attempts
+        routes = self._fulfillment_routes
+        if attempts is None:
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        if operation.status is OperationStatus.COMPLETED:
+            # Accepted identity/state are attached transactionally; do not
+            # repair receipt-backed rows with an unfenced generic save.
+            try:
+                completed_account = current_account(operation, server.credential_account_id)
+                provider_for(self._registry, server.provider_key, completed_account)
+            except (CreateAttemptConflict, KeyError):
+                return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+            return ProvisioningOutcome.ALREADY_PROVISIONED
+        if operation.status is OperationStatus.FAILED:
+            return ProvisioningOutcome.FAILED
+        if (
+            operation.status in (OperationStatus.IN_FLIGHT, OperationStatus.OUTCOME_UNKNOWN)
+            and (attempt := last_attempt(operation)) is not None
+            and attempt["phase"] == "refused"
+        ):
+            try:
+                refused_claim = await attempts.resume_safe_claim(operation.id, operation.attempts)
+                return await self._fail_pooled(
+                    server, refused_claim, "provider definitively refused the create request"
+                )
+            except CreateAttemptConflict:
+                return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        if operation.status is not OperationStatus.PENDING:
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        if routes is None or not routes.supports_capacity_failover(server.provider_key):
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+        try:
+            receipt = create_routing(operation)
+            catalog_account = (
+                receipt.get("catalog_account_id")
+                if receipt is not None
+                else (server.offer_fingerprint or {}).get("provider_account_id")
+            )
+            if catalog_account is not None and not isinstance(catalog_account, str):
+                raise CreateAttemptConflict("invalid catalog provenance")
+            claimed = await attempts.claim(
+                operation.id,
+                server.id,
+                catalog_account_id=catalog_account,
+            )
+            if claimed is None:
+                return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+            spec = await self._servers.get_provisioning_spec(server.id)
+            if spec is None:
+                return await self._fail_pooled(server, claimed, "catalog offer missing for server")
+            frozen = (server.offer_fingerprint or {}).get("legacy_create_request")
+            request: CreateServerRequest | None = None
+            if frozen is not None:
+                if (
+                    not isinstance(frozen, dict)
+                    or set(frozen) != {"name", "plan_id", "location_id", "image_id"}
+                    or any(
+                        not isinstance(value, str) or not value.strip() for value in frozen.values()
+                    )
+                    or frozen["plan_id"] != spec.plan_id
+                    or frozen["location_id"] != spec.location_id
+                ):
+                    return await self._fail_pooled(
+                        server, claimed, "frozen create request mismatch"
+                    )
+                request = CreateServerRequest(
+                    **frozen,
+                    labels={PLATFORM_SERVER_ID_LABEL: str(server.id)},
+                )
+            excluded = set(refused_accounts(claimed))
+            incompatible: set[str] = set()
+            while True:
+                try:
+                    account = await routes.account_for(
+                        server.provider_key,
+                        spec.location_id,
+                        spec.plan_id,
+                        exclude=excluded,
+                    )
+                except ProviderCapacityError as exc:
+                    reason = "original request unavailable" if incompatible else str(exc)
+                    return await self._fail_pooled(server, claimed, reason)
+                except ProviderError as exc:
+                    if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                        await attempts.save_outcome(
+                            claimed.id,
+                            claimed.attempts,
+                            OperationStatus.PENDING,
+                            error=str(exc),
+                        )
+                        return ProvisioningOutcome.REQUEUED
+                    return await self._fail_pooled(server, claimed, str(exc))
+                if account is None or account in excluded:
+                    return await self._fail_pooled(server, claimed, "no proven fulfillment account")
+                try:
+                    provider = provider_for(self._registry, server.provider_key, account)
+                except KeyError:
+                    # A missing credential is not proof that another credential
+                    # owns this intent or that this Project is at capacity.
+                    return await self._fail_pooled(
+                        server, claimed, "fulfillment credential unavailable"
+                    )
+                try:
+                    if request is None:
+                        if server.image_id is not None:
+                            images = await provider.list_images()
+                            image = next(
+                                (image for image in images if image.id == server.image_id),
+                                None,
+                            )
+                        else:
+                            image = await self._images.select_image(provider)
+                        if image is None:
+                            raise ProviderNotFound("no usable image for original request")
+                        request = build_create_request(server.id, spec, image)
+                    await self._validate_pooled_request(provider, request)
+                except ProviderError as exc:
+                    if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                        await attempts.save_outcome(
+                            claimed.id,
+                            claimed.attempts,
+                            OperationStatus.PENDING,
+                            error=str(exc),
+                        )
+                        return ProvisioningOutcome.REQUEUED
+                    incompatible.add(account)
+                    excluded.add(account)
+                    continue
+                facts = {
+                    "name": request.name,
+                    "plan_id": request.plan_id,
+                    "location_id": request.location_id,
+                    "image_id": request.image_id,
+                }
+                claimed = await attempts.start_attempt(
+                    claimed.id,
+                    claimed.attempts,
+                    account,
+                    request_facts=facts,
+                )
+                try:
+                    created = await provider.create_server(
+                        request,
+                        IdempotencyKey(claimed.operation_key),
+                    )
+                    if (
+                        not isinstance(created, ProviderServer)
+                        or not isinstance(created.id, str)
+                        or not created.id.strip()
+                        or created.name != request.name
+                    ):
+                        raise ProviderOutcomeUnknown("create response identity not proven")
+                except ProviderCapacityError as exc:
+                    if not exc.definitive_refusal:
+                        await attempts.record_unknown(claimed.id, claimed.attempts, account)
+                        return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+                    documented = exc.allows_account_failover
+                    claimed = await attempts.record_refusal(
+                        claimed.id,
+                        claimed.attempts,
+                        account,
+                        capacity=documented,
+                        error_code=exc.error_code,
+                        quota_names=exc.quota_names,
+                    )
+                    if not documented:
+                        return await self._fail_pooled(server, claimed, str(exc))
+                    excluded.add(account)
+                    continue
+                except ProviderOutcomeUnknown:
+                    await attempts.record_unknown(claimed.id, claimed.attempts, account)
+                    return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+                except ProviderError as exc:
+                    if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                        # Once SENT, a transient mutation failure is uncertain,
+                        # never a pre-POST requeue or capacity refusal.
+                        await attempts.record_unknown(claimed.id, claimed.attempts, account)
+                        return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+                    claimed = await attempts.record_refusal(
+                        claimed.id,
+                        claimed.attempts,
+                        account,
+                        capacity=False,
+                    )
+                    return await self._fail_pooled(server, claimed, str(exc))
+                except Exception:
+                    # Unexpected adapter failures after SENT cannot establish
+                    # that the provider rejected the mutation.
+                    await attempts.record_unknown(claimed.id, claimed.attempts, account)
+                    return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+                claimed = await attempts.record_acceptance(
+                    claimed.id,
+                    claimed.attempts,
+                    account,
+                    created.id,
+                    ipv4=created.ipv4,
+                    ipv6=created.ipv6,
+                )
+                await attempts.save_outcome(
+                    claimed.id,
+                    claimed.attempts,
+                    OperationStatus.COMPLETED,
+                    correlation={
+                        "provider_server_id": created.id,
+                        "provider_status": created.status,
+                        "idempotency_key": claimed.operation_key,
+                    },
+                )
+                await self._audit.record_mutation(
+                    actor_type=ActorType.SYSTEM,
+                    action="server.provisioning_started",
+                    resource_type=RESOURCE_TYPE_SERVER,
+                    resource_id=str(server.id),
+                    reason=f"provider created server {created.id}",
+                    metadata={
+                        "operation_id": str(claimed.id),
+                        "provider_server_id": created.id,
+                        "provider_status": created.status,
+                        "idempotency_key": claimed.operation_key,
+                    },
+                )
+                fresh = await self._servers.get(server.id)
+                if (
+                    fresh is not None
+                    and normalize_provider_status(created.status) is ProviderServerState.RUNNING
+                ):
+                    await _require_hourly_prepayment(fresh, self._prepay_server)
+                if fresh is not None and self._progress is not None:
+                    await self._progress.started(fresh, f"provider server {created.id}")
+                # State reconciliation owns polling of accepted pooled resources;
+                # the legacy waiter saves are not claim-generation fenced.
+                return ProvisioningOutcome.PROVISIONED
+        except CreateAttemptConflict:
+            return ProvisioningOutcome.SKIPPED_IN_FLIGHT
+
+    @staticmethod
+    async def _validate_pooled_request(
+        provider: CloudProvider,
+        request: CreateServerRequest,
+    ) -> None:
+        """Reprove concrete facts on this credential, never on a sibling adapter."""
+        validate = getattr(provider, "validate_create_request", None)
+        if not callable(validate):
+            raise ProviderNotFound("account-native create request proof unavailable")
+        await validate(request)
+
+    async def _fail_pooled(
+        self,
+        server: CloudServer,
+        claimed: Operation,
+        reason: str,
+    ) -> ProvisioningOutcome:
+        assert self._create_attempts is not None
+        await self._create_attempts.save_outcome(
+            claimed.id,
+            claimed.attempts,
+            OperationStatus.FAILED,
+            error=reason,
+        )
+        # Only a successful fenced finalization permits releasing the hold.
+        await self._release_hold(server)
+        metrics.record_provisioning_failure("worker")
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            action="server.provisioning_failed",
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=str(server.id),
+            reason=reason,
+            metadata={"operation_id": str(claimed.id)},
+        )
+        if self._progress is not None:
+            await self._progress.failed(server, reason)
+        return ProvisioningOutcome.FAILED
+
     async def _watch_creation(
         self, server: CloudServer, provider: CloudProvider, created: ProviderServer
     ) -> None:
@@ -359,6 +746,8 @@ class ProvisioningWorker:
         polling are logged, not raised — the reconciler contains them.
         """
         waiter = self._waiter
+        if normalize_provider_status(created.status) is ProviderServerState.RUNNING:
+            await _require_hourly_prepayment(server, self._prepay_server)
         if waiter is None or not created.id:
             return
 
@@ -386,6 +775,7 @@ class ProvisioningWorker:
 
         if result.outcome is WaitOutcome.COMPLETED:
             if server.state is ServerLifecycleState.PROVISIONING:
+                await _require_hourly_prepayment(server, self._prepay_server)
                 server.transition_to(ServerLifecycleState.RUNNING)
                 await self._servers.save(server)
             await self._audit.record_mutation(
@@ -444,9 +834,9 @@ class ProvisioningWorker:
         if limit <= 0:
             return {}
         counts: dict[ProvisioningOutcome, int] = {}
-        candidates = [s for s in await self._servers.list_requested() if not s.is_prepaid_monthly][
-            :limit
-        ]
+        candidates = [
+            server for server in await self._servers.list_requested() if _is_legacy_create(server)
+        ][:limit]
         if not candidates:
             return counts
         in_flight_counts = await self._in_flight_counts_by_account()
@@ -467,8 +857,8 @@ class ProvisioningWorker:
         counts: dict[tuple[str, UUID], int] = {}
         for op in in_flight:
             server = await self._servers.get(op.resource_id)
-            if server is None:
-                continue  # row gone (deletion); not occupying provider quota
+            if server is None or not _is_legacy_create(server):
+                continue
             account = (server.provider_key, server.provider_account_id)
             counts[account] = counts.get(account, 0) + 1
         return counts
@@ -578,23 +968,12 @@ class ReconciliationOutcome(StrEnum):
 
 
 class CreateTimeoutReconciler:
-    """Resolves timed-out create intents **without ever duplicating a server**.
+    """Recover stale legacy creates without moving uncertain resource ownership.
 
-    This is the safety net for the ambiguous window M07-002 leaves open: an
-    operation that was IN_FLIGHT when the worker crashed, or a server stuck in
-    PROVISIONING. Its two hard rules make a duplicate impossible:
-
-    1. It **never issues a new idempotency key**. An ambiguous create is
-       re-resolved by calling the provider again with the SAME operation key
-       (the provider deduplicates and returns the same resource) or by
-       verifying the already-recorded provider server id.
-    2. It **never deletes a provider resource**. Any state it cannot resolve
-       safely is contained to MANUAL_REVIEW for a human.
-
-    A missing operation row for a REQUESTED server is recreated with the
-    deterministic key (a PENDING operation has never called the provider), and
-    a PROVISIONING server whose provider resource has vanished is failed with
-    its hold released.
+    Receipt-backed recovery fences the stale generation before safely requeuing
+    a pre-POST/refused claim or performing same-account read-only recovery.
+    Historical Hetzner attempts use only their exact previous operation label.
+    Other providers retain native-idempotent same-key recovery behavior.
     """
 
     def __init__(
@@ -611,6 +990,7 @@ class CreateTimeoutReconciler:
         provisioning_timeout: timedelta = timedelta(hours=1),
         clock: Callable[[], datetime] | None = None,
         progress: ProvisioningProgressService | None = None,
+        create_attempts: CreateAccountAttemptRepository | None = None,
     ) -> None:
         if in_flight_timeout <= timedelta(0) or provisioning_timeout <= timedelta(0):
             raise ValueError("timeouts must be positive")
@@ -625,6 +1005,7 @@ class CreateTimeoutReconciler:
         self._provisioning_timeout = provisioning_timeout
         self._now = clock or (lambda: datetime.now(UTC))
         self._progress = progress
+        self._create_attempts = create_attempts
 
     async def reconcile(self) -> dict[ReconciliationOutcome, int]:
         """Scan for timed-out create intents and resolve each safely.
@@ -645,8 +1026,33 @@ class CreateTimeoutReconciler:
         in_flight_ops = await self._ops.list_in_flight(OperationType.SERVER_CREATE)
         requested_servers = await self._servers.list_requested()
         provisioning_servers = await self._servers.list_provisioning()
+        # Unknown receipts and receipt-less historical direct retries may be
+        # absent from the in-flight queue. PENDING after an old attempted POST
+        # never proves non-creation; include it only for pinned read-only recovery.
+        known_ids = {op.id for op in in_flight_ops}
+        for server in (*requested_servers, *provisioning_servers):
+            if not _is_legacy_create(server):
+                continue
+            operation = await self._ops.get_by_key(server_operation_key(server.id))
+            try:
+                historical_pending = (
+                    operation is not None
+                    and _needs_read_only_create_recovery(self._registry, server)
+                    and operation.status is OperationStatus.PENDING
+                    and operation.attempts > 0
+                    and create_routing(operation) is None
+                )
+            except CreateAttemptConflict:
+                continue
+            if (
+                operation is not None
+                and (operation.status is OperationStatus.OUTCOME_UNKNOWN or historical_pending)
+                and operation.id not in known_ids
+            ):
+                in_flight_ops.append(operation)
+                known_ids.add(operation.id)
 
-        # 1) IN_FLIGHT create operations past the timeout (the ambiguous case).
+        # 1) Ambiguous create operations past the timeout.
         for op in in_flight_ops:
             age = self._age(op)
             if age is not None and age < self._in_flight_timeout:
@@ -655,11 +1061,11 @@ class CreateTimeoutReconciler:
             bump(await self._reconcile_in_flight(op))
 
         # 2) REQUESTED servers whose operation row is missing (crash before the
-        #    worker created it). Recreating it is safe: a PENDING operation has
-        #    never called the provider, and the key is deterministic. Prepaid
-        #    monthly servers are owned by the ordering reconciler instead.
+        #    worker created it). A missing operation has no attempted POST;
+        #    its deterministic key is safe to recreate. Prepaid monthly
+        #    servers are owned by the ordering reconciler instead.
         for server in requested_servers:
-            if server.is_prepaid_monthly:
+            if not _is_legacy_create(server):
                 continue
             existing = await self._ops.get_by_key(server_operation_key(server.id))
             if existing is None:
@@ -676,9 +1082,30 @@ class CreateTimeoutReconciler:
         #    never finished). Prepaid monthly servers are owned by the ordering
         #    reconciler instead.
         for server in provisioning_servers:
-            if server.is_prepaid_monthly:
+            if not _is_legacy_create(server):
                 continue
             prov_op = await self._ops.get_by_key(server_operation_key(server.id))
+            try:
+                if prov_op is not None and create_routing(prov_op) is not None:
+                    # Receipt recovery already owns this generation; generic
+                    # timeout containment/refunds may not interfere with it.
+                    continue
+            except CreateAttemptConflict:
+                continue
+            if (
+                prov_op is not None
+                and _needs_read_only_create_recovery(self._registry, server)
+                and prov_op.attempts > 0
+                and prov_op.status
+                in (
+                    OperationStatus.PENDING,
+                    OperationStatus.IN_FLIGHT,
+                    OperationStatus.OUTCOME_UNKNOWN,
+                )
+            ):
+                # Exact historical recovery owns these uncertain intents too;
+                # do not contain them out of the next read-only scan.
+                continue
             if prov_op is None or prov_op.status is not OperationStatus.COMPLETED:
                 # Row/operation mismatch we cannot safely infer; contain it.
                 await self._contain(
@@ -714,6 +1141,27 @@ class CreateTimeoutReconciler:
     async def _reconcile_in_flight(self, op: Operation) -> ReconciliationOutcome:
         """Re-resolve an ambiguous IN_FLIGHT create with the SAME idempotency key."""
         server = await self._servers.get(op.resource_id)
+        if server is not None and not _is_legacy_create(server):
+            return ReconciliationOutcome.SKIPPED
+        try:
+            receipt = create_routing(op)
+        except CreateAttemptConflict:
+            return ReconciliationOutcome.LEFT_UNCHANGED
+        if receipt is not None:
+            return await self._reconcile_receipt(server, op)
+        if server is not None:
+            try:
+                provider = provider_for(
+                    self._registry,
+                    server.provider_key,
+                    server.credential_account_id,
+                )
+            except KeyError:
+                # Uncertain resources must never borrow another credential or
+                # release a reservation merely because their owner was removed.
+                return ReconciliationOutcome.LEFT_UNCHANGED
+            if server_recovery_support_of(provider) is not None:
+                return await self._reconcile_historical_direct(server, op)
         if server is None:
             # Server row gone; the intent can never be satisfied.
             op.fail("server row missing during create-timeout reconciliation")
@@ -747,7 +1195,11 @@ class CreateTimeoutReconciler:
             return ReconciliationOutcome.FAILED
 
         try:
-            provider: CloudProvider = self._registry.get(op.provider_key)
+            provider = provider_for(
+                self._registry,
+                op.provider_key,
+                server.credential_account_id,
+            )
         except KeyError:
             return await self._fail_intent(server, op, f"unknown provider {op.provider_key!r}")
         spec = await self._servers.get_provisioning_spec(op.resource_id)
@@ -821,10 +1273,117 @@ class CreateTimeoutReconciler:
         )
         return ReconciliationOutcome.RECOVERED
 
+    async def _reconcile_receipt(
+        self,
+        server: CloudServer | None,
+        op: Operation,
+    ) -> ReconciliationOutcome:
+        attempts = self._create_attempts
+        if server is None or attempts is None:
+            return ReconciliationOutcome.LEFT_UNCHANGED
+        try:
+            # This transaction invalidates any still-running original worker
+            # before it can append SENT, rebind, finalize, or release funds.
+            op = await attempts.resume_safe_claim(op.id, op.attempts)
+            attempt = last_attempt(op)
+            if attempt is not None and attempt["phase"] == "refused":
+                reason = "provider definitively refused the create request"
+                await attempts.save_outcome(
+                    op.id, op.attempts, OperationStatus.FAILED, error=reason
+                )
+                # The fenced commit also marks the server ERROR. Neither a
+                # provider lookup nor a reservation release may precede it.
+                await self._release_hold(server)
+                metrics.record_provisioning_failure("intent")
+                await self._audit.record_mutation(
+                    actor_type=ActorType.SYSTEM,
+                    action="server.provisioning_failed",
+                    resource_type=RESOURCE_TYPE_SERVER,
+                    resource_id=str(server.id),
+                    reason=reason,
+                    metadata={"operation_id": str(op.id)},
+                )
+                if self._progress is not None:
+                    await self._progress.failed(server, reason)
+                return ReconciliationOutcome.FAILED
+            if safe_pre_post(op):
+                return ReconciliationOutcome.REQUEUED
+            server = await self._servers.get(server.id)
+            if server is None:
+                return ReconciliationOutcome.LEFT_UNCHANGED
+            account = current_account(op, server.credential_account_id)
+            provider = provider_for(self._registry, server.provider_key, account)
+            identity = await _read_legacy_create_identity(provider, server, op, receipt=True)
+            if identity is None:
+                return ReconciliationOutcome.LEFT_UNCHANGED
+            op = await attempts.record_acceptance(op.id, op.attempts, account, identity)
+            await attempts.save_outcome(
+                op.id,
+                op.attempts,
+                OperationStatus.COMPLETED,
+                correlation={
+                    "provider_server_id": identity,
+                    "idempotency_key": op.operation_key,
+                    "recovered": True,
+                },
+            )
+            return ReconciliationOutcome.RECOVERED
+        except (CreateAttemptConflict, KeyError, ProviderError):
+            return ReconciliationOutcome.LEFT_UNCHANGED
+
+    async def _reconcile_historical_direct(
+        self,
+        server: CloudServer,
+        op: Operation,
+    ) -> ReconciliationOutcome:
+        """Old attempted intents stay pinned and never acquire pool authorization."""
+        try:
+            provider = provider_for(
+                self._registry,
+                server.provider_key,
+                server.credential_account_id,
+            )
+            if op.status is OperationStatus.PENDING:
+                claimed = await self._ops.claim(op.id)
+                if claimed is None:
+                    return ReconciliationOutcome.LEFT_UNCHANGED
+                op = claimed
+            identity = await _read_legacy_create_identity(provider, server, op, receipt=False)
+        except (KeyError, ProviderError):
+            return ReconciliationOutcome.LEFT_UNCHANGED
+        if identity is None:
+            if op.status is OperationStatus.IN_FLIGHT:
+                op.mark_outcome_unknown("historical create requires read-only recovery")
+                await self._ops.save(op)
+            return ReconciliationOutcome.LEFT_UNCHANGED
+        op.complete(
+            {
+                "provider_server_id": identity,
+                "idempotency_key": op.operation_key,
+                "recovered": True,
+            }
+        )
+        await self._ops.save(op)
+        server.provider_server_id = identity
+        if server.state is ServerLifecycleState.REQUESTED:
+            server.transition_to(ServerLifecycleState.PROVISIONING)
+        await self._servers.save(server)
+        return ReconciliationOutcome.RECOVERED
+
     async def _reconcile_provisioning(
         self, server: CloudServer, op: Operation
     ) -> ReconciliationOutcome:
         """A PROVISIONING server whose create already completed but never finished."""
+        if not _is_legacy_create(server):
+            return ReconciliationOutcome.SKIPPED
+        try:
+            if create_routing(op) is not None:
+                # Accepted pooled resources are watched by state reconciliation.
+                # This legacy timeout path must not refund accepted work or
+                # mutate receipt-backed rows with an unfenced generic save.
+                return ReconciliationOutcome.LEFT_UNCHANGED
+        except CreateAttemptConflict:
+            return ReconciliationOutcome.LEFT_UNCHANGED
         if not server.provider_server_id:
             await self._contain(server, "provisioning timeout with no recorded provider server id")
             return ReconciliationOutcome.MARKED_FOR_REVIEW
@@ -945,6 +1504,17 @@ class CreateTimeoutReconciler:
             logger.exception("failed to release hold for server %s", server.id)
 
 
+async def _require_hourly_prepayment(
+    server: CloudServer,
+    prepay: Callable[[CloudServer], Awaitable[CloudServer]] | None,
+) -> None:
+    if server.is_prepaid_monthly:
+        return
+    if prepay is None:
+        raise RuntimeError("hourly activation prepayment is not configured")
+    await prepay(server)
+
+
 def _fingerprint_text(fingerprint: Any, key: str) -> str | None:
     """A safe text fact of an immutable contract fingerprint (never a secret).
 
@@ -973,23 +1543,14 @@ class StateReconciliationOutcome(StrEnum):
 
 
 class ServerStateReconciler:
-    """Maps drift between the local server row and provider reality (M07-005).
+    """Repair provider drift without delivering unpaid hourly service.
 
-    For every server in a provider-backed state (PROVISIONING, RUNNING,
-    STOPPED) the reconciler asks the provider for the live state and applies
-    the pure plan from :func:`plan_state_repair`:
-
-    - matching states -> left alone (CONSISTENT);
-    - provider still creating -> left alone (IN_PROGRESS; the waiter watches it);
-    - local/remote power mismatch (RUNNING<->STOPPED) or a finished
-      PROVISIONING -> the row is transitioned to match reality (REPAIRED,
-      audited ``server.state_reconciled``);
-    - anything unexpected (provider deleting/unknown, resource vanished,
-      rejected transition) -> contained to MANUAL_REVIEW (CONTAINED, audited
-      ``server.state_review``).
-
-    It **never deletes or destroys a provider resource** from reconciliation;
-    deletion is only ever driven by an explicit user command.
+    Provider readiness/power-on observations first purchase prepaid coverage;
+    only then may the row become RUNNING or customer success be delivered.
+    Creating resources remain PROVISIONING. Unexpected state or missing
+    identity is contained for review, never interpreted as deletion permission.
+    Insufficient hourly prepayment requests the existing stop/delete saga;
+    reconciliation itself never calls a destructive provider operation.
     """
 
     def __init__(
@@ -1007,6 +1568,7 @@ class ServerStateReconciler:
         #: identity (Telegram id / username).
         user_repo: Any | None = None,
         customer_sink: CustomerProvisionedSink | None = None,
+        prepay_server: Callable[[CloudServer], Awaitable[CloudServer]] | None = None,
     ) -> None:
         self._servers = server_repo
         self._registry = provider_registry
@@ -1014,6 +1576,7 @@ class ServerStateReconciler:
         self._events = event_sink
         self._users = user_repo
         self._customer_sink = customer_sink
+        self._prepay_server = prepay_server
 
     async def reconcile(self) -> dict[StateReconciliationOutcome, int]:
         """Reconcile all provider-backed servers; returns a count per outcome."""
@@ -1055,6 +1618,11 @@ class ServerStateReconciler:
 
         if plan.action is StateAction.NONE:
             if server.state is ServerLifecycleState.RUNNING and remote is not None:
+                try:
+                    await _require_hourly_prepayment(server, self._prepay_server)
+                except Exception:
+                    logger.exception("hourly prepayment blocked delivery for server %s", server.id)
+                    return StateReconciliationOutcome.INCONCLUSIVE
                 if self._sync_remote_ips(server, remote):
                     await self._servers.save(server)
                 await self._notify_hourly_customer(server)
@@ -1064,6 +1632,14 @@ class ServerStateReconciler:
 
         if plan.action is StateAction.REPAIR and plan.target is not None:
             old = server.state
+            if plan.target is ServerLifecycleState.RUNNING:
+                try:
+                    await _require_hourly_prepayment(server, self._prepay_server)
+                except Exception:
+                    logger.exception(
+                        "hourly prepayment blocked activation for server %s", server.id
+                    )
+                    return StateReconciliationOutcome.INCONCLUSIVE
             try:
                 server.transition_to(plan.target)
                 if plan.target is ServerLifecycleState.RUNNING and remote is not None:
@@ -1378,11 +1954,13 @@ class PowerOperationExecutor:
         server_repo: ServerRepository,
         provider_registry: ProviderRegistry,
         audit_repo: AuditRepository,
+        prepay_server: Callable[[CloudServer], Awaitable[CloudServer]] | None = None,
     ) -> None:
         self._ops = operation_repo
         self._servers = server_repo
         self._registry = provider_registry
         self._audit = AuditTrail(audit_repo)
+        self._prepay_server = prepay_server
 
     async def execute(
         self,
@@ -1451,6 +2029,17 @@ class PowerOperationExecutor:
             )
         if Capability.POWER not in provider.capabilities:
             await self._fail(operation, actor_type, actor_id, "provider lacks POWER capability")
+        if action in {PowerAction.POWER_ON, PowerAction.REBOOT}:
+            try:
+                await _require_hourly_prepayment(server, self._prepay_server)
+            except InsufficientBalanceError:
+                await self._fail(
+                    operation, actor_type, actor_id, "insufficient balance for next hour"
+                )
+            except Exception:
+                operation.requeue("hourly prepayment unavailable; provider action not sent")
+                await self._ops.save(operation)
+                raise
 
         # Ambiguous-mutation guard (M15-004): on a RE-SEND (an earlier attempt
         # exists) against a provider that can prove its power effects (no
@@ -1683,6 +2272,7 @@ class PowerCommandService:
         provider_registry: ProviderRegistry,
         audit_repo: AuditRepository,
         executor: PowerOperationExecutor | None = None,
+        prepay_server: Callable[[CloudServer], Awaitable[CloudServer]] | None = None,
     ) -> None:
         self._servers = server_repo
         self._ops = operation_repo
@@ -1691,6 +2281,7 @@ class PowerCommandService:
             server_repo=server_repo,
             provider_registry=provider_registry,
             audit_repo=audit_repo,
+            prepay_server=prepay_server,
         )
 
     async def power_on(

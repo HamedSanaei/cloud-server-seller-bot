@@ -111,9 +111,10 @@ def _hetzner_syncer(
             else OfferSyncResult(
                 locations=(LocationOfferReport("fsn1", 2),),
                 offers_written=2,
-                marked_unavailable=0,
+                marked_unavailable=1,
                 warnings=(),
-                verified=frozenset({("cx22", "fsn1")}),
+                verified=frozenset({("cx22", "fsn1"), ("cx32", "fsn1")}),
+                availability_reconciled=True,
             )
         )
     return syncer
@@ -127,7 +128,29 @@ class TestHetznerSource:
         assert report.complete is True
         assert report.discovered == 2
         assert report.persisted == 2
-        assert report.verified == frozenset({("cx22", "fsn1")})
+        assert report.retired == 1
+        assert report.verified == frozenset({("cx22", "fsn1"), ("cx32", "fsn1")})
+
+    async def test_unreconciled_usable_catalog_is_incomplete(self) -> None:
+        offers = OfferSyncResult(
+            locations=(LocationOfferReport("fsn1", 1),),
+            offers_written=1,
+            marked_unavailable=0,
+            warnings=(
+                "locations page 2: ProviderUnavailable",
+                "skipped mark_unavailable: current availability unreadable",
+            ),
+            verified=frozenset({("cx22", "fsn1")}),
+            availability_reconciled=False,
+        )
+        report = await HetznerCatalogSyncSource(_hetzner_syncer(offers=offers)).sync_catalog()
+        assert report.ok is True
+        assert report.complete is False
+        assert report.persisted == 1
+        assert report.retired == 0
+        assert report.verified == offers.verified
+        assert report.errors == ()
+        assert report.warnings == offers.warnings
 
     async def test_hourly_failure_does_not_change_monthly_success(self) -> None:
         syncer = _hetzner_syncer()
@@ -138,14 +161,17 @@ class TestHetznerSource:
                 marked_unavailable=0,
                 warnings=(),
                 verified=frozenset({("cx22", "fsn1")}),
+                availability_reconciled=True,
             ),
             RuntimeError("hourly endpoint unreadable"),
         ]
         monthly = await HetznerCatalogSyncSource(syncer).sync_catalog()
         hourly = await HetznerCatalogSyncSource(syncer, billing_model="hourly").sync_catalog()
         assert monthly.ok and monthly.billing_model == "prepaid_monthly_fixed"
+        assert monthly.complete is True
         assert monthly.verified == frozenset({("cx22", "fsn1")})
         assert not hourly.ok and hourly.billing_model == "hourly"
+        assert hourly.complete is False
         assert any("hourly endpoint unreadable" in error for error in hourly.errors)
 
     async def test_location_sync_failure_fails_the_run(self) -> None:
@@ -168,6 +194,7 @@ class TestHetznerSource:
         offers = OfferSyncResult(locations=(), offers_written=0, marked_unavailable=0, warnings=())
         report = await HetznerCatalogSyncSource(_hetzner_syncer(offers=offers)).sync_catalog()
         assert report.ok is False
+        assert report.complete is False
         assert report.errors
 
     async def test_partial_location_errors_stay_usable(self) -> None:
@@ -179,9 +206,10 @@ class TestHetznerSource:
             offers_written=2,
             marked_unavailable=0,
             warnings=("nbg1: ProviderUnavailable",),
-            verified=frozenset({("cx22", "fsn1")}),
+            verified=frozenset({("cx22", "fsn1"), ("cx32", "fsn1")}),
+            availability_reconciled=False,
         )
         report = await HetznerCatalogSyncSource(_hetzner_syncer(offers=offers)).sync_catalog()
         assert report.ok is True
         assert report.complete is False
-        assert report.verified == frozenset({("cx22", "fsn1")})
+        assert report.verified == frozenset({("cx22", "fsn1"), ("cx32", "fsn1")})

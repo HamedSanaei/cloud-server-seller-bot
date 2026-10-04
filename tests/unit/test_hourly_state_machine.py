@@ -40,6 +40,7 @@ from cloud_platform.providers.leaseweb.cloud import (
     resolve_root_disk,
     validate_root_disk,
 )
+from tests.unit.hourly_money import hourly_money
 from tests.unit.test_hourly_cloud_flow import (
     PROVIDER,
     USER,
@@ -377,6 +378,7 @@ def _service(
         canary_backoff_seconds=canary_backoff_seconds,
         cloud_resolver=resolver,
         credential_store=credential_store,
+        **hourly_money(),
     )
     return service, servers, snapshots, ops
 
@@ -631,39 +633,6 @@ class TestQueueSelection:
         queued = await service.servers_requested()
         assert [s.id for s in queued] == [hourly.id]
 
-    async def test_reconcile_queue_excludes_attached_servers(self) -> None:
-        from cloud_platform.modules.compute.domain import (
-            BILLING_MODEL_HOURLY,
-            CloudServer,
-            ServerLifecycleState,
-        )
-
-        offers = FakeOffersRepo([_offer()])
-        service, servers, _, _ = _service(offers, FakeHourlyAdapter())
-        unattached = CloudServer(
-            id=uuid4(),
-            user_id=USER.id,
-            provider_key=PROVIDER,
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.PROVISIONING,
-            billing_model=BILLING_MODEL_HOURLY,
-            quantum_seconds=3600,
-        )
-        attached = CloudServer(
-            id=uuid4(),
-            user_id=USER.id,
-            provider_key=PROVIDER,
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.PROVISIONING,
-            billing_model=BILLING_MODEL_HOURLY,
-            quantum_seconds=3600,
-            provider_server_id="lsw-123",
-        )
-        servers.servers[unattached.id] = unattached
-        servers.servers[attached.id] = attached
-        queued = await service.servers_for_reconcile()
-        assert [s.id for s in queued] == [unattached.id]
-
 
 # ---------------------------------------------------------------------------
 # misc helpers
@@ -820,6 +789,7 @@ class TestCreateIntentGuards:
             operation_repo=FakeOpsRepo(),  # type: ignore[arg-type]
             audit_repo=FakeAuditRepo(),
             cloud_providers={PROVIDER: cloud},
+            **hourly_money(),
         )
         with pytest.raises(HourlyError):
             await _create(service, offers)

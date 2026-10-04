@@ -269,6 +269,10 @@ def _user(status: UserStatus = UserStatus.ACTIVE) -> User:
         username="customer",
         email="customer@t.me",
         status=status,
+        telegram_user_id=123,
+        phone_number="+989123456789",
+        phone_verified_at=datetime(2026, 10, 4, tzinfo=UTC),
+        national_id="1234567891",
     )
 
 
@@ -433,7 +437,8 @@ class TestCheckoutSafety:
         await service.create_order(
             user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="mine"
         )
-        other = User(id=uuid4(), username="other", email="other@t.me")
+        other = _user()
+        other.id = uuid4()
         with pytest.raises(CheckoutReplayError):
             await service.create_order(
                 user=other, offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="mine"
@@ -803,7 +808,6 @@ class TestOfferCatalogViews:
         assert view.offer.monthly_price_minor == 1299
         assert view.balance_minor == 10_000
         assert view.sufficient is True
-        assert view.confirm_callback and view.back_callback and view.cancel_callback
 
         poor = _view_service(offers=[_offer(price=1299)])
         poor._wallets = FakeWalletRepo(500)  # type: ignore[assignment]

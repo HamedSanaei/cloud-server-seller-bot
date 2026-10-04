@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -52,16 +52,12 @@ from cloud_platform.providers.errors import (
     ProviderUnavailable,
 )
 from cloud_platform.providers.hetzner import hourly
+from cloud_platform.providers.hetzner.accounts import HetznerAccountRouter
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_KEY = "hetzner"
 
-#: Hetzner's identity and billing currency. Provider metadata, not prices —
-#: all price values are ingested from the API payload (M04-005). Defined with
-#: the hourly parser so there is ONE currency constant, re-exported here for
-#: the existing importers (``client``).
-CURRENCY = hourly.CURRENCY
+PROVIDER_KEY = "hetzner"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +102,9 @@ class OfferSyncResult:
     #: Durable-write failures (never provider-data advisories). Any entry
     #: here means the run is NOT a successful sync.
     persistence_failures: tuple[str, ...] = ()
+    verified_accounts: frozenset[tuple[str, str, str]] = frozenset()
+    account_aware: bool = False
+    availability_reconciled: bool = False
 
 
 class HetznerCatalogSyncer:
@@ -123,21 +122,28 @@ class HetznerCatalogSyncer:
         *,
         catalog_currency: str = "USD",
         catalog_stale_limit_seconds: int | None = None,
+        account_router: HetznerAccountRouter | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._catalog_currency = catalog_currency
         self._catalog_stale_limit_seconds = catalog_stale_limit_seconds
-        self._token = token or get_settings().hetzner_api_token
+        self._account_router = account_router
+        self._token = "" if account_router else token or get_settings().hetzner_api_token
         self._base_url = base_url.rstrip("/")
         self._per_page = per_page
-        self._client = httpx.AsyncClient(
-            base_url=self._base_url,
-            headers={"Authorization": f"Bearer {self._token}"},
-            timeout=httpx.Timeout(30.0),
+        self._client = (
+            httpx.AsyncClient(
+                base_url=self._base_url,
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=httpx.Timeout(30.0),
+            )
+            if account_router is None
+            else None
         )
 
     async def close(self) -> None:
-        await self._client.aclose()
+        if self._client is not None:
+            await self._client.aclose()
 
     async def _request(
         self,
@@ -146,6 +152,12 @@ class HetznerCatalogSyncer:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Make an API request with rate limit tracking and error mapping."""
+        if self._account_router is not None:
+            clients = self._account_router.new_order_clients()
+            if not clients:
+                raise ProviderNotFound("no active Hetzner catalog account")
+            return await clients[0][1]._request(method, path, params=params)
+        assert self._client is not None
         try:
             response = await self._client.request(method, path, params=params)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -180,10 +192,23 @@ class HetznerCatalogSyncer:
 
     async def sync_locations(self) -> SyncResult:
         """Sync all locations from Hetzner with pagination."""
+        errors: list[str] = []
+        if self._account_router is not None:
+            locations: dict[str, dict[str, Any]] = {}
+            for account_id, provider in self._account_router.new_order_clients():
+                try:
+                    for item in await provider._pages("/locations", "locations"):
+                        name = item.get("name")
+                        if not isinstance(name, str) or not name.strip():
+                            raise ProviderError("location has no documented name")
+                        locations.setdefault(name, item)
+                except ProviderError as exc:
+                    errors.append(f"account {account_id}: {type(exc).__name__}")
+            upserted, skipped = await self._upsert_locations(list(locations.values()))
+            return SyncResult(len(locations), upserted, skipped, errors)
         total_fetched = 0
         total_upserted = 0
         total_skipped = 0
-        errors: list[str] = []
 
         page = 1
         while True:
@@ -293,6 +318,10 @@ class HetznerCatalogSyncer:
         total_upserted = 0
         total_skipped = 0
         errors: list[str] = []
+        try:
+            currency = hourly.pricing_currency(await self._request("GET", "/pricing"))
+        except ProviderError as exc:
+            return SyncResult(0, 0, 0, [f"Pricing currency: {type(exc).__name__}"])
 
         page = 1
         while True:
@@ -304,7 +333,7 @@ class HetznerCatalogSyncer:
                 if not plans_data:
                     break
 
-                upserted, skipped = await self._upsert_plans(plans_data)
+                upserted, skipped = await self._upsert_plans(plans_data, currency=currency)
                 total_fetched += len(plans_data)
                 total_upserted += upserted
                 total_skipped += skipped
@@ -328,7 +357,9 @@ class HetznerCatalogSyncer:
             errors=errors,
         )
 
-    async def _upsert_plans(self, plans_data: list[dict[str, Any]]) -> tuple[int, int]:
+    async def _upsert_plans(
+        self, plans_data: list[dict[str, Any]], *, currency: str
+    ) -> tuple[int, int]:
         """Upsert server types via location-aware pricing ingestion (M04-005).
 
         Every per-location price reported by Hetzner is persisted as its own
@@ -344,7 +375,7 @@ class HetznerCatalogSyncer:
         skipped = 0
         for item in plans_data:
             try:
-                plan = _plan_pricing_from_hetzner(item)
+                plan = _plan_pricing_from_hetzner(item, currency=currency)
             except (KeyError, ValueError) as exc:
                 logger.error("Skipping plan %s: %s", item.get("id"), exc)
                 continue
@@ -470,6 +501,17 @@ class HetznerCatalogSyncer:
         """
         if billing_model not in (BILLING_MODEL_MONTHLY, BILLING_MODEL_HOURLY):
             raise ValueError("unsupported Hetzner billing model")
+        if self._account_router is not None:
+            return await self._sync_account_offers(billing_model)
+        try:
+            currency = hourly.pricing_currency(await self._request("GET", "/pricing"))
+        except ProviderError as exc:
+            return OfferSyncResult(
+                locations=(),
+                offers_written=0,
+                marked_unavailable=0,
+                warnings=(f"pricing currency: {type(exc).__name__}",),
+            )
         repo = SqlAlchemySellableOfferRepository(
             self._session_factory,
             catalog_currency=self._catalog_currency,
@@ -500,8 +542,9 @@ class HetznerCatalogSyncer:
             counted = 0
             location_failed = False
             for item in items:
+                spec: _OfferSpec | None
                 if billing_model == BILLING_MODEL_HOURLY:
-                    parsed = hourly.parse_hourly_plan(item, location_id)
+                    parsed = hourly.parse_hourly_plan(item, location_id, currency=currency)
                     if isinstance(parsed, hourly.HetznerHourlyRejection):
                         warnings.append(
                             f"{location_id}: server type {parsed.plan_id}: {parsed.reason}"
@@ -514,7 +557,7 @@ class HetznerCatalogSyncer:
                         continue
                     spec = _hourly_offer_spec(parsed)
                 else:
-                    spec = _offer_spec_from_hetzner(item, location_id)
+                    spec = _offer_spec_from_hetzner(item, location_id, currency=currency)
                     if spec is None:
                         warnings.append(
                             f"{location_id}: server type {item.get('name')} has no monthly price"
@@ -555,7 +598,10 @@ class HetznerCatalogSyncer:
         # partial view of the catalog must not retire offers we simply could
         # not look at this round.
         marked = 0
-        if not any(report.error for report in reports) and not location_errors and locations:
+        reconciled = (
+            not any(report.error for report in reports) and not location_errors and bool(locations)
+        )
+        if reconciled:
             marked = await repo.mark_unavailable(
                 PROVIDER_KEY, available, billing_model=billing_model
             )
@@ -569,6 +615,259 @@ class HetznerCatalogSyncer:
             warnings=tuple(warnings),
             verified=frozenset(verified),
             persistence_failures=tuple(persistence_failures),
+            availability_reconciled=reconciled,
+        )
+
+    async def _sync_account_offers(self, billing_model: str) -> OfferSyncResult:
+        """Independent proofs; one customer row, never a copied cross-account observation."""
+        from cloud_platform.modules.catalog.image_compatibility import image_compatible
+        from cloud_platform.modules.provider_routes.domain import RouteObservation, RouteState
+        from cloud_platform.modules.provider_routes.repository import (
+            SqlAlchemyProviderRouteRepository,
+        )
+        from cloud_platform.providers.routing import CredentialAccountState
+
+        assert self._account_router is not None
+        router = self._account_router
+        repo = SqlAlchemySellableOfferRepository(
+            self._session_factory,
+            catalog_currency=self._catalog_currency,
+            catalog_stale_limit_seconds=self._catalog_stale_limit_seconds,
+        )
+        routes = SqlAlchemyProviderRouteRepository(self._session_factory)
+        observations: dict[tuple[str, str], list[tuple[str, OfferSpecUpdate]]] = {}
+        route_observations: list[RouteObservation] = []
+        unreadable_accounts: dict[str, str] = {}
+        known_headroom: set[str] = set()
+        reports: list[LocationOfferReport] = []
+        warnings: list[str] = []
+        failures: list[str] = []
+        complete = True
+        previous = await routes.list_for_provider(PROVIDER_KEY)
+        for account_id, provider in router.new_order_clients():
+            account_locations: set[str] = set()
+            locations_proven = False
+            currency = None
+            try:
+                currency = await provider.get_pricing_currency()
+            except ProviderError as exc:
+                complete = False
+                warnings.append(f"account {account_id} pricing currency: {type(exc).__name__}")
+            try:
+                usage = await router.server_usage(account_id)
+                if not usage.full:
+                    known_headroom.add(account_id)
+            except ProviderError as exc:
+                warnings.append(f"account {account_id} usage: {type(exc).__name__}")
+                complete = False
+            try:
+                locations = await provider._pages("/locations", "locations")
+                locations_proven = True
+            except ProviderError as exc:
+                complete = False
+                warnings.append(f"account {account_id} locations: {type(exc).__name__}")
+                locations = []
+                unreadable_accounts[account_id] = type(exc).__name__
+            for location in locations:
+                location_id = location.get("name")
+                if not isinstance(location_id, str) or not location_id.strip():
+                    complete = False
+                    locations_proven = False
+                    unreadable_accounts[account_id] = "ProviderError"
+                    warnings.append(f"account {account_id}: invalid location name")
+                    continue
+                account_locations.add(location_id)
+                observations_here: list[tuple[str, OfferSpecUpdate]] = []
+                try:
+                    items = await provider._pages(
+                        "/server_types", "server_types", {"location": location_id}
+                    )
+                    products: list[str] = []
+                    for item in items:
+                        available = hourly._location_availability(item, location_id)
+                        if available is False or item.get("deprecated") or item.get("deprecation"):
+                            continue
+                        name = item.get("name")
+                        if available is not True or not isinstance(name, str) or not name:
+                            raise ProviderError("product/location membership is unproven")
+                        if name in products:
+                            raise ProviderError("duplicate provider product identity")
+                        products.append(name)
+                except (ProviderError, KeyError, ValueError) as exc:
+                    complete = False
+                    reports.append(LocationOfferReport(location_id, 0, type(exc).__name__))
+                    route_observations.append(
+                        RouteObservation(
+                            account_id,
+                            location_id,
+                            RouteState.AUTH_FAILED
+                            if isinstance(exc, ProviderAuthError)
+                            else RouteState.TRANSIENT_UNKNOWN,
+                            error_class=type(exc).__name__,
+                        )
+                    )
+                    continue
+                # This shared route describes actual SKU membership, not one
+                # billing family's price/image proof. Every execution re-proves
+                # its immutable contract before SENT; publication below proves
+                # each family's native price and mandatory inputs separately.
+                route_observations.append(
+                    RouteObservation(
+                        account_id,
+                        location_id,
+                        RouteState.ELIGIBLE_AVAILABLE if products else RouteState.ELIGIBLE_EMPTY,
+                        product_ids=tuple(sorted(products)),
+                        succeeded=True,
+                    )
+                )
+                try:
+                    if currency is None:
+                        raise ProviderError("account pricing currency is unproven")
+                    images = (
+                        await router.hourly_for(account_id).installable_images(location_id)
+                        if billing_model == BILLING_MODEL_HOURLY
+                        else []
+                    )
+                    for item in items:
+                        if item.get("name") not in products:
+                            continue
+                        plan = None
+                        spec: _OfferSpec | None
+                        if billing_model == BILLING_MODEL_HOURLY:
+                            parsed = hourly.parse_hourly_plan(item, location_id, currency=currency)
+                            if isinstance(parsed, hourly.HetznerHourlyRejection):
+                                raise ProviderError("hourly price or mandatory facts are unproven")
+                            plan = parsed
+                            spec = _hourly_offer_spec(plan)
+                        else:
+                            spec = _offer_spec_from_hetzner(item, location_id, currency=currency)
+                        if spec is None:
+                            raise ProviderError("monthly price is unproven")
+                        if plan is not None and (
+                            plan.disk_gb <= 0
+                            or not plan.storage_type
+                            or not any(
+                                image_compatible(
+                                    image,
+                                    plan_id=spec.product_id,
+                                    architecture=plan.architecture,
+                                    location_id=location_id,
+                                    account_id=account_id,
+                                )
+                                for image in images
+                            )
+                        ):
+                            continue
+                        observations_here.append(
+                            (
+                                spec.product_id,
+                                replace(spec.update, provider_account_id=account_id),
+                            )
+                        )
+                except (ProviderError, KeyError, ValueError) as exc:
+                    complete = False
+                    reports.append(LocationOfferReport(location_id, 0, type(exc).__name__))
+                    continue
+                reports.append(LocationOfferReport(location_id, len(observations_here)))
+                for product_id, update in observations_here:
+                    observations.setdefault((product_id, location_id), []).append(
+                        (account_id, update)
+                    )
+            if locations_proven:
+                for old in previous:
+                    if (
+                        old.credential_account_id == account_id
+                        and old.location_id not in account_locations
+                    ):
+                        route_observations.append(
+                            RouteObservation(
+                                account_id,
+                                old.location_id,
+                                RouteState.INELIGIBLE,
+                                succeeded=True,
+                            )
+                        )
+        known_locations = {report.location_id for report in reports}
+        known_locations.update(old.location_id for old in previous)
+        observed_routes = {
+            (observation.credential_account_id, observation.location_id)
+            for observation in route_observations
+        }
+        for account_id, error_class in unreadable_accounts.items():
+            for location_id in known_locations:
+                if (account_id, location_id) not in observed_routes:
+                    route_observations.append(
+                        RouteObservation(
+                            account_id,
+                            location_id,
+                            RouteState.AUTH_FAILED
+                            if error_class == "ProviderAuthError"
+                            else RouteState.TRANSIENT_UNKNOWN,
+                            error_class=error_class,
+                        )
+                    )
+        for old in previous:
+            if not router.accepts_new_orders(old.credential_account_id):
+                route_observations.append(
+                    RouteObservation(
+                        old.credential_account_id,
+                        old.location_id,
+                        RouteState.DISABLED,
+                        succeeded=True,
+                    )
+                )
+        await routes.upsert_observations(
+            provider_key=PROVIDER_KEY,
+            observations=route_observations,
+            priority_of=lambda account: router.priorities.get(account, 100),
+            account_state_of=lambda account: router.account_states.get(
+                account, CredentialAccountState.DISABLED
+            ),
+        )
+        verified: set[tuple[str, str]] = set()
+        qualified: set[tuple[str, str, str]] = set()
+        for (product_id, location_id), candidates in observations.items():
+            account_id, update = next(
+                (candidate for candidate in candidates if candidate[0] in known_headroom),
+                candidates[0],
+            )
+            try:
+                await repo.upsert_from_provider(
+                    provider_key=PROVIDER_KEY,
+                    product_id=product_id,
+                    location_id=location_id,
+                    update=update,
+                    provider_account_id=account_id,
+                    adopt_legacy_catalog_row=True,
+                )
+            except Exception as exc:
+                failures.append(f"{product_id}@{location_id}: {type(exc).__name__}")
+                complete = False
+                continue
+            verified.add((product_id, location_id))
+            qualified.add((account_id, product_id, location_id))
+        # A full/unknown pool still has a catalog. Never turn quota/read failures
+        # into disappearance, nor overwrite customer prices with another account.
+        marked = 0
+        reconciled = complete and bool(known_headroom) and bool(reports)
+        if reconciled:
+            marked = await repo.mark_unavailable(
+                PROVIDER_KEY,
+                qualified,
+                billing_model=billing_model,
+            )
+        else:
+            warnings.append("skipped mark_unavailable: pool full or observation incomplete")
+        return OfferSyncResult(
+            locations=tuple(reports),
+            offers_written=len(verified),
+            marked_unavailable=marked,
+            warnings=tuple(warnings),
+            verified=frozenset(verified),
+            persistence_failures=tuple(failures),
+            verified_accounts=frozenset(qualified),
+            account_aware=True,
+            availability_reconciled=reconciled,
         )
 
     async def probe_locations(self) -> tuple[list[str], list[str]]:
@@ -644,7 +943,9 @@ class _OfferSpec:
     update: OfferSpecUpdate
 
 
-def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSpec | None:
+def _offer_spec_from_hetzner(
+    item: dict[str, Any], location_id: str, *, currency: str
+) -> _OfferSpec | None:
     """Map one ``/server_types`` LIST entry to a sellable-offer observation.
 
     Returns None when the provider reports no monthly price for this location:
@@ -656,10 +957,12 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
     if hourly._location_availability(item, location_id) is False:
         return None
     price_entry, _ = hourly._location_price_entry(item, location_id)
-    monthly_exact = _monthly_value(price_entry) if price_entry is not None else None
+    if price_entry is None:
+        return None
+    monthly_exact = _monthly_value(price_entry)
     if monthly_exact is None:
         return None
-    monthly = hourly.minor_units(monthly_exact)
+    monthly = hourly.minor_units(monthly_exact, currency)
     # The server type NAME is the stable, human-meaningful provider reference
     # an operator can match against the Hetzner console (and the provider
     # accepts it wherever an id is accepted).
@@ -679,7 +982,7 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
                 price_entry.get("included_traffic", item.get("included_traffic"))
             ),
             provider_cost_minor=monthly,
-            provider_cost_currency=CURRENCY,
+            provider_cost_currency=currency,
             technical_metadata=TechnicalSpec(
                 architecture=architecture or None,
                 cpu_type=str(cpu_type) if cpu_type else None,
@@ -699,6 +1002,13 @@ def _offer_spec_from_hetzner(item: dict[str, Any], location_id: str) -> _OfferSp
             provider_available=True,
         ),
     )
+
+
+def _hourly_offer_spec_from_hetzner(
+    item: dict[str, Any], location_id: str, *, currency: str
+) -> _OfferSpec | None:
+    parsed = hourly.parse_hourly_plan(item, location_id, currency=currency)
+    return _hourly_offer_spec(parsed) if isinstance(parsed, hourly.HetznerHourlyPlan) else None
 
 
 def _hourly_offer_spec(plan: hourly.HetznerHourlyPlan) -> _OfferSpec:
@@ -750,7 +1060,7 @@ def _normalize_country(value: Any) -> str | None:
     return code
 
 
-def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:
+def _plan_pricing_from_hetzner(item: dict[str, Any], *, currency: str) -> PlanPricing:
     """Map one Hetzner /server_types entry to provider-neutral PlanPricing.
 
     Every per-location price entry is preserved (location-aware, M04-005).
@@ -768,7 +1078,7 @@ def _plan_pricing_from_hetzner(item: dict[str, Any]) -> PlanPricing:
         prices.append(
             ProviderPriceEntry(
                 location_id=location_id,
-                currency=CURRENCY,
+                currency=currency,
                 hourly=hourly_cost,
                 monthly=monthly_cost,
             )

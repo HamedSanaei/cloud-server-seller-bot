@@ -1,34 +1,10 @@
-"""Periodic usage accrual job (M06-005).
+"""Prepaid hourly usage, final deletion settlement and balance policy.
 
-While a server is RUNNING, its usage is settled in quantum-sized periods
-anchored at the server's creation instant. Every run settles all COMPLETE
-periods that have elapsed since the server's accrual watermark
-(``CloudServer.last_accrued_at``); the trailing partial quantum is never
-settled here - it is billed as the final segment when the server is deleted
-(M06-006), so a customer is never charged twice for the same slice.
-
-Idempotency ("no duplicate charges on retry"):
-
-- Every settled period moves money under a DETERMINISTIC idempotency key:
-  ``accrual:{server_id}:{period_start_epoch}`` - or, for the very first
-  period, by CAPTURING the creation-time hold (ledger entry key
-  ``capture-server-create:{idempotency_key}``), which was reserved for
-  exactly this charge.
-- Before moving money the job looks the key up in the append-only ledger; a
-  hit means the period was already settled and is replayed as a no-op that
-  only advances the watermark.
-- The ledger's unique idempotency-key constraint and the unique key on
-  ``accrual_periods`` are the durable backstops; the job itself is
-  serialized across processes by an advisory lock (same pattern as the
-  catalog sync).
-
-The first period is settled by capturing the creation hold instead of a
-fresh debit: the hold reserved the first quantum's funds at creation time,
-so capturing consumes exactly what was reserved (no balance race). If the
-hold is gone (released by the failed-create path) or missing, the period is
-charged like any later period and may hit insufficient balance - the job
-then stops for that server and reports it, leaving the period unsettled for
-the next run (the low-balance policy, M06-007, acts on the report).
+The first quantum is reserved before provider creation and captured at the
+first proven running observation. ``billing_started_at`` is that durable
+activation anchor; ``last_accrued_at`` is the exclusive paid-through instant.
+At each boundary the upcoming full quantum is purchased under a deterministic
+ledger key. Monthly prepaid contracts never enter this lifecycle.
 """
 
 from __future__ import annotations
@@ -38,7 +14,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_CEILING, Decimal, localcontext
+from decimal import Decimal, localcontext
 from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import UUID
@@ -383,8 +359,12 @@ class MissingSnapshotError(Exception):
     """Raised when a server has no pinned price snapshot to price a period."""
 
 
+class BillingLockBusyError(RuntimeError):
+    """Another billing transaction owns the shared settlement lock."""
+
+
 class AccrualJob:
-    """Settles complete usage periods for RUNNING servers."""
+    """Purchases upcoming hourly periods before paid service is delivered."""
 
     def __init__(
         self,
@@ -410,6 +390,81 @@ class AccrualJob:
         self._audit = AuditTrail(audit_repo)
         self._lock = lock
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    async def prepay_server(
+        self, server: CloudServer, now: datetime | None = None, *, renew_ahead_seconds: int = 0
+    ) -> CloudServer:
+        """Buy the current/upcoming hour before activation or power resume.
+
+        Call only after proving initial provider readiness, or before a user
+        power-on/reboot. The shared billing lock serializes cap checks with
+        periodic billing. The supplied domain object receives the new version.
+        """
+        if server.is_prepaid_monthly:
+            return server
+        moment = _aware(now or self._clock(), "now")
+        if not 0 <= renew_ahead_seconds <= 5:
+            raise ValueError("renewal lead time must be between zero and five seconds")
+        coverage_at = moment + timedelta(seconds=renew_ahead_seconds)
+        if self._lock is not None:
+            async with self._lock.guard() as acquired:
+                if not acquired:
+                    raise BillingLockBusyError("billing lock is busy; retry prepayment")
+                return await self._prepay_locked(server, moment, coverage_at)
+        return await self._prepay_locked(server, moment, coverage_at)
+
+    async def _prepay_locked(
+        self, server: CloudServer, now: datetime, coverage_at: datetime
+    ) -> CloudServer:
+        # Callers may have loaded this aggregate before another activation
+        # acquired the lock. Never overwrite a durable anchor or paid coverage
+        # using that stale copy.
+        current = await self._servers.get(server.id)
+        if current is None or current.provider_server_id != server.provider_server_id:
+            raise ValueError("hourly prepayment requires the persisted provider resource")
+        server.billing_started_at = current.billing_started_at
+        server.last_accrued_at = current.last_accrued_at
+        server.state = current.state
+        server.low_balance_since = current.low_balance_since
+        server.updated_at = current.updated_at
+        if server.state not in {
+            ServerLifecycleState.PROVISIONING,
+            ServerLifecycleState.RUNNING,
+            ServerLifecycleState.STOPPED,
+        }:
+            raise ValueError("hourly prepayment requires a provider-backed active server")
+        if not server.provider_server_id:
+            raise ValueError("hourly prepayment requires a provider resource")
+        if server.billing_started_at is None:
+            server.billing_started_at = now
+            refreshed = await self._servers.save(server)
+            server.updated_at = refreshed.updated_at
+        try:
+            await self._accrue_server(server, coverage_at, AccrualRunReport())
+        except InsufficientBalanceError:
+            await self._request_unpaid_deletion(server, now)
+            raise
+        return server
+
+    async def _request_unpaid_deletion(self, server: CloudServer, now: datetime) -> None:
+        """Use the existing stop/delete saga, never a grace period of free usage."""
+        if (
+            server.last_accrued_at is not None
+            and _aware(server.last_accrued_at, "paid through") > now
+        ):
+            return
+        server.low_balance_since = server.low_balance_since or now
+        server.transition_to(ServerLifecycleState.DELETE_REQUESTED)
+        refreshed = await self._servers.save(server)
+        server.updated_at = refreshed.updated_at
+        await self._audit.record_mutation(
+            actor_type=ActorType.SYSTEM,
+            actor_id=None,
+            action="billing.prepayment_failed",
+            resource_type="server",
+            resource_id=str(server.id),
+            reason="insufficient balance for the upcoming hour; stop/delete requested",
+        )
 
     async def _assert_capture_ledger(
         self,
@@ -438,10 +493,9 @@ class AccrualJob:
             raise ValueError(f"hold capture {capture_key!r} has different CHARGE facts")
 
     async def run(self, now: datetime | None = None) -> AccrualRunReport:
-        """One accrual pass over all RUNNING servers.
+        """Purchase due hours for running and stopped provider-backed servers.
 
-        Per-server problems never break the run: they are counted in the
-        report so one bad server cannot stop billing for the rest.
+        Per-server failures are counted without stopping the other accounts.
         """
         moment = _aware(now or self._clock(), "now")
         if self._lock is not None:
@@ -454,13 +508,31 @@ class AccrualJob:
 
     async def _run_servers(self, now: datetime) -> AccrualRunReport:
         report = AccrualRunReport()
-        servers = [s for s in await self._servers.list_running() if not s.is_prepaid_monthly]
+        active = (
+            await self._servers.list_running()
+            + await self._servers.list_stopped()
+            + await self._servers.list_provisioning()
+        )
+        servers = [
+            s
+            for s in active
+            if not s.is_prepaid_monthly
+            and s.provider_server_id
+            and (
+                s.state is not ServerLifecycleState.PROVISIONING or s.billing_started_at is not None
+            )
+        ]
         report.servers_checked = len(servers)
         for server in servers:
             try:
-                report.periods_posted += await self._accrue_server(server, now, report)
+                await self._accrue_server(server, now, report)
             except InsufficientBalanceError:
                 report.insufficient_balance += 1
+                try:
+                    await self._request_unpaid_deletion(server, now)
+                except Exception:
+                    report.errors += 1
+                    logger.exception("unpaid server %s stop/delete request failed", server.id)
                 logger.warning("server %s: insufficient balance for accrual", server.id)
             except Exception:
                 report.errors += 1
@@ -489,27 +561,28 @@ class AccrualJob:
     async def _accrue_server(
         self, server: CloudServer, now: datetime, report: AccrualRunReport
     ) -> int:
-        """Settle all complete periods for one server; return periods posted."""
-        start = _aware(server.created_at, "server.created_at")
+        """Purchase every due period, including the hour starting exactly now."""
+        if server.is_prepaid_monthly:
+            return 0
+        if server.billing_started_at is None:
+            raise ValueError("hourly server has no provider-running billing anchor")
+        start = _aware(server.billing_started_at, "billing_started_at")
         quantum_seconds = server.quantum_seconds
-        last = _aware(server.last_accrued_at or start, "watermark")
+        last = _aware(server.last_accrued_at or start, "paid through")
         if last < start:
-            last = start  # corrupted/legacy watermark: rebase to the billing start
-
-        elapsed = _elapsed_seconds(last, now)
-        quantum = Decimal(quantum_seconds)
-        if elapsed < quantum:
-            return 0  # no complete period has elapsed yet
-
-        completed = int(elapsed // quantum)
+            raise ValueError("paid-through watermark precedes billing activation")
+        if now < last:
+            return 0
+        due = int(_elapsed_seconds(last, now) // Decimal(quantum_seconds)) + 1
         posted = 0
-        for k in range(completed):
+        for k in range(due):
             period_start = last + timedelta(seconds=quantum_seconds * k)
             period_end = period_start + timedelta(seconds=quantum_seconds)
             did_post, stop = await self._settle_period(server, period_start, period_end, report)
             posted += did_post
+            report.periods_posted += did_post
             if stop:
-                break
+                raise ValueError("hourly prepayment could not establish paid coverage")
         return posted
 
     async def _settle_period(
@@ -522,9 +595,7 @@ class AccrualJob:
         """Settle one period. Returns (posted: 0/1, stop: bool)."""
         wallet = await self._wallets.get(server.user_id)
         if wallet is None or wallet.id is None:
-            report.errors += 1
-            logger.error("server %s: no wallet for user %s", server.id, server.user_id)
-            return 0, True
+            raise ValueError(f"server {server.id}: no persisted wallet")
 
         snapshot = await self._snapshots.get(server.id)
         if snapshot is None:
@@ -543,17 +614,14 @@ class AccrualJob:
         # First period: the creation hold was reserved for exactly this charge.
         hold = None
         captured_this_period = False
-        is_first_period = period_start == _aware(server.created_at, "server.created_at")
+        is_first_period = period_start == _aware(server.billing_started_at, "billing_started_at")
         if is_first_period and server.idempotency_key:
             hold = await self._hold_repo.get_by_idempotency(
                 wallet.id, f"server-create:{server.idempotency_key}"
             )
 
-        # The charge key must be deterministic independent of the hold's
-        # current status: period 0 may have been settled by capturing the
-        # hold (entry key "capture-server-create:{ik}") OR, when the hold was
-        # released by the failed-create path, by a plain debit under the
-        # period key. A replay is a hit under EITHER key.
+        # Ledger keys remain deterministic across capture and direct-debit
+        # recovery; a released reservation never permits a new activation.
         candidate_keys: list[str] = []
         if is_first_period and server.idempotency_key:
             candidate_keys.append(f"capture-server-create:{server.idempotency_key}")
@@ -720,6 +788,9 @@ class AccrualJob:
                 server = await self._advance(server, period_end)
                 return 0, False
 
+        if is_first_period and hold is not None and hold.status is HoldStatus.RELEASED:
+            raise ValueError("first-hour reservation was released; refusing activation charge")
+
         if hold is not None and hold.status in (HoldStatus.CREATED, HoldStatus.CAPTURED):
             # A hold reserves funds in its own currency. Capturing a hold from
             # a different currency would silently charge the wrong unit. A
@@ -806,7 +877,9 @@ class AccrualJob:
         return 1, False
 
     async def _advance(self, server: CloudServer, period_end: datetime) -> CloudServer:
-        """Move the server's accrual watermark and return the refreshed row."""
+        """Move paid-through monotonically and return the refreshed row."""
+        if server.last_accrued_at is not None:
+            period_end = max(_aware(server.last_accrued_at, "paid through"), period_end)
         server.last_accrued_at = period_end
         refreshed = await self._servers.save(server)
         # Keep the loop's object on the same optimistic version.  SQLAlchemy
@@ -838,32 +911,7 @@ class FinalChargeResult:
 
 
 class FinalChargeService:
-    """Posts the final usage segment once, after confirmed deletion.
-
-    When a server is deleted, the trailing PARTIAL quantum between its last
-    accrual watermark and the deletion instant has not been settled by the
-    periodic job (it only settles complete periods). This service bills it,
-    and only it:
-
-    - The window is ``[last_accrued_at or created_at, deleted_at]``. A
-      zero-length window (deleted exactly on a grid boundary) charges
-      nothing.
-    - If the creation hold is still CREATED and the window covers the first
-      quantum, the hold is CAPTURED first: it reserved exactly that quantum's
-      funds, and the capture carries its own deterministic key
-      (``capture-server-create:{ik}``). Any remaining window is then billed
-      flat.
-    - The flat remainder is one debit plus one CHARGE entry under the
-      deterministic key ``final:{server_id}`` (a partial quantum bills as a
-      full one, per the billing policy).
-    - Every money movement is idempotent under its key: a full replay
-      (crash before persistence) re-derives both legs and moves nothing;
-      a partial replay (crash between the two legs) settles exactly the
-      missing leg. The final segment is therefore posted exactly once.
-
-    Called by the deletion flow (M07-007) when deletion is confirmed; it
-    requires the server to be in DELETED state with a deletion timestamp.
-    """
+    """Close prepaid hourly usage without charging a trailing deletion slice."""
 
     def __init__(
         self,
@@ -878,443 +926,57 @@ class FinalChargeService:
         audit_repo: AuditRepository,
         lock: JobLock | None = None,
     ) -> None:
-        self._servers = server_repo
         self._wallets = wallet_repo
         self._hold_repo = hold_repo
         self._holds = hold_service
-        self._ledger = ledger_repo
-        self._accruals = accrual_repo
-        self._snapshots = snapshot_repo
-        self._audit = AuditTrail(audit_repo)
         self._lock = lock
-
-    @staticmethod
-    def final_charge_key(server_id: UUID) -> str:
-        return f"final:{server_id}"
+        self._prepayment = AccrualJob(
+            server_repo=server_repo,
+            wallet_repo=wallet_repo,
+            hold_repo=hold_repo,
+            hold_service=hold_service,
+            ledger_repo=ledger_repo,
+            accrual_repo=accrual_repo,
+            snapshot_repo=snapshot_repo,
+            audit_repo=audit_repo,
+        )
 
     async def charge_final(self, server: CloudServer, deleted_at: datetime) -> FinalChargeResult:
-        """Serialize cap-sensitive final charging with periodic accrual."""
         if self._lock is None:
-            return await self._charge_final_locked(server, deleted_at)
+            return await self._close_contract(server, deleted_at)
         async with self._lock.guard() as acquired:
             if not acquired:
-                raise RuntimeError("billing cap lock is busy; retry final charge")
-            return await self._charge_final_locked(server, deleted_at)
+                raise RuntimeError("billing lock is busy; retry final settlement")
+            return await self._close_contract(server, deleted_at)
 
-    async def _charge_final_locked(
-        self, server: CloudServer, deleted_at: datetime
-    ) -> FinalChargeResult:
-        """Settle the final usage segment of a confirmed deletion."""
+    async def _close_contract(self, server: CloudServer, deleted_at: datetime) -> FinalChargeResult:
         if server.state is not ServerLifecycleState.DELETED:
-            raise ValueError(f"final charge requires a DELETED server (state={server.state.value})")
+            raise ValueError("final settlement requires a DELETED server")
         deleted = _aware(deleted_at, "deleted_at")
-        created = _aware(server.created_at, "server.created_at")
-        if deleted < created:
-            raise ValueError("deleted_at cannot be before the server was created")
-
+        if deleted < _aware(server.created_at, "created_at"):
+            raise ValueError("deleted_at cannot precede creation")
+        if server.is_prepaid_monthly:
+            return FinalChargeResult(0, False, None, False, False)
         wallet = await self._wallets.get(server.user_id)
         if wallet is None or wallet.id is None:
-            raise ValueError(f"server {server.id}: no wallet for user {server.user_id}")
-        wallet_id: UUID = wallet.id
-
-        snapshot = await self._snapshots.get(server.id)
-        if snapshot is None:
-            raise MissingSnapshotError(f"server {server.id} has no price snapshot")
-        cost_currency, selling_currency = _snapshot_currencies(snapshot)
-        # A wallet has one balance unit.  Never debit it and then label the
-        # resulting ledger entry with a different selling currency.
-        _require_wallet_currency(wallet, selling_currency)
-        selling_minor = int(Decimal(snapshot.selling_minor))
-        cost_minor = int(Decimal(snapshot.offer.cost_minor))
-        exact_base_cost = _exact_cost_amount(snapshot, 1)
-
-        window_start = _aware(server.last_accrued_at or created, "window start")
-        if window_start < created:
-            window_start = created
-
-        charged = 0
-        charged_by_month: dict[datetime, int] = {}
-        remainder_periods: list[tuple[datetime, datetime, int, str]] = []
-        charged_quanta = 0
-        first_leg_charged = False
-        remainder_charged = False
-        captured = False
-        capped = False
-        posted_key: str | None = None
-        replayed = False
-        first_leg_key = (
-            f"capture-server-create:{server.idempotency_key}" if server.idempotency_key else None
-        )
-        if first_leg_key is not None and window_start == created:
-            getter = getattr(self._accruals, "get_by_key", None)
-            if callable(getter):
-                first_record = await getter(first_leg_key)
-                if first_record is not None:
-                    hold = await self._hold_repo.get_by_idempotency(
-                        wallet.id, f"server-create:{server.idempotency_key}"
-                    )
-                if first_record is not None:
-                    if first_record.quanta != 1 or first_record.selling_minor != selling_minor:
-                        raise ValueError("first-period accrual facts do not match the final charge")
-                    capture_entry = await self._ledger.get_entry_by_idempotency(
-                        wallet.id, first_leg_key
-                    )
-                    if (
-                        capture_entry is None
-                        or capture_entry.amount.amount != Decimal(selling_minor)
-                        or capture_entry.amount.currency.upper() != selling_currency.upper()
-                        or capture_entry.entry_type is not LedgerEntryType.CHARGE
-                        or hold is None
-                        or hold.id is None
-                        or hold.status is not HoldStatus.CAPTURED
-                        or capture_entry.reference_type != "hold"
-                        or capture_entry.reference_id != str(hold.id)
-                        or capture_entry.description
-                        != f"hold captured for server-create:{server.idempotency_key}"
-                    ):
-                        raise ValueError(
-                            "first-period accrual exists without its CHARGE ledger fact"
-                        )
-                    first_leg_charged = True
-                    charged_quanta += 1
-                    # The accrual and its CHARGE were created by an earlier
-                    # periodic pass. This final-charge replay must not debit
-                    # again, but it must still advance the durable watermark.
-                    replayed = True
-                    posted_key = first_leg_key
-        start = window_start
-
-        # Optional monthly cap.  Each leg is settled in the UTC month that
-        # contains its period start, and each month has its own durable total.
-        cap = snapshot.rule.monthly_cap_minor
-
-        remainder_period_start = window_start
-        if first_leg_charged and window_start == created and server.idempotency_key:
-            # The capture ledger and business record already prove this leg.
-            # Do not include it again in the final-remainder calculation.
-            remainder_period_start = created + timedelta(seconds=server.quantum_seconds)
-            start = remainder_period_start
-
-        # Leg 1: the still-reserved first quantum, if the window covers it.
-        if start == created and server.idempotency_key:
-            hold_key = f"server-create:{server.idempotency_key}"
-            hold = await self._hold_repo.get_by_idempotency(wallet.id, hold_key)
-            if hold is not None and hold.status is HoldStatus.CREATED:
-                hold_currency = getattr(hold, "currency", selling_currency)
-                if hold_currency != selling_currency:
-                    raise ValueError(
-                        f"hold currency {hold_currency} does not match selling currency "
-                        f"{selling_currency}"
-                    )
-                assert hold.id is not None
-                first_month = month_start_utc(start)
-                if cap is not None:
-                    first_month_billed = await self._accruals.month_total(
-                        wallet.id,
-                        first_month,
-                        currency=selling_currency,
-                        rule_key=_rule_key(snapshot.rule),
-                    )
-                    first_month_billed += charged_by_month.get(first_month, 0)
-                else:
-                    first_month_billed = 0
-                if cap is not None and first_month_billed + selling_minor > cap:
-                    # The cap protects the user: return the reserved funds
-                    # instead of overcharging (the platform absorbs the loss).
-                    released_hold = await self._holds.release_hold(wallet.id, hold.id, hold_key)
-                    if released_hold is None or released_hold.status is not HoldStatus.RELEASED:
-                        raise ValueError("hold release was not durably confirmed")
-                    capped = True
-                    remainder_period_start = start + timedelta(seconds=server.quantum_seconds)
-                    start = remainder_period_start
-                    await self._cap_audit(
-                        server, wallet, cap, first_month_billed, selling_minor, "capture leg"
-                    )
-                else:
-                    captured_hold = await self._holds.capture_hold(wallet.id, hold.id, hold_key)
-                    if captured_hold is None or captured_hold.status is not HoldStatus.CAPTURED:
-                        raise ValueError("hold capture was not durably confirmed")
-                    await self._assert_capture_ledger(
-                        wallet_id=wallet.id,
-                        hold=captured_hold,
-                        capture_key=f"capture-{hold_key}",
-                        amount_minor=selling_minor,
-                        currency=selling_currency,
-                        idempotency_key=hold_key,
-                    )
-                    captured = True
-                    charged += selling_minor
-                    charged_by_month[first_month] = (
-                        charged_by_month.get(first_month, 0) + selling_minor
-                    )
-                    charged_quanta += 1
-                    first_leg_charged = True
-                    posted_key = f"capture-{hold_key}"
-                    remainder_period_start = start + timedelta(seconds=server.quantum_seconds)
-                    start = remainder_period_start
-            elif hold is not None and hold.status is HoldStatus.CAPTURED:
-                hold_currency = getattr(hold, "currency", selling_currency)
-                hold_amount = getattr(hold, "amount", selling_minor)
-                if hold_currency != selling_currency or hold_amount != selling_minor:
-                    raise ValueError("captured hold facts do not match final charge snapshot")
-                # Re-run the idempotent atomic capture to prove/repair CHARGE;
-                # it never debits a second time when the hold is already CAPTURED.
-                assert hold.id is not None
-                captured_hold = await self._holds.capture_hold(wallet.id, hold.id, hold_key)
-                if captured_hold is None or captured_hold.status is not HoldStatus.CAPTURED:
-                    raise ValueError("existing hold capture was not durably confirmed")
-                await self._assert_capture_ledger(
-                    wallet_id=wallet.id,
-                    hold=captured_hold,
-                    capture_key=f"capture-{hold_key}",
-                    amount_minor=selling_minor,
-                    currency=selling_currency,
-                    idempotency_key=hold_key,
-                )
-                posted_key = f"capture-{hold_key}"
-                if not first_leg_charged:
-                    # The capture is already a durable financial movement;
-                    # repair its accrual record but do not report a second
-                    # charge or add it to the cap budget on replay.
-                    charged_quanta += 1
-                first_leg_charged = True
-                remainder_period_start = start + timedelta(seconds=server.quantum_seconds)
-                start = remainder_period_start
-
-        # Leg 2: split the flat remainder at UTC month boundaries.  A single
-        # month retains the historical ``final:{server}`` key; multi-month
-        # windows use a deterministic start-epoch suffix.
-        if deleted > start:
-            segments: list[tuple[datetime, datetime]] = []
-            cursor = start
-            while cursor < deleted:
-                month = month_start_utc(cursor)
-                next_month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
-                segment_end = min(deleted, next_month)
-                if segment_end <= cursor:
-                    raise ValueError("final-charge month segmentation made no progress")
-                segments.append((cursor, segment_end))
-                cursor = segment_end
-            remaining_quanta = _final_quanta(start, deleted, server.quantum_seconds)
-            for segment_index, (segment_start, segment_end) in enumerate(segments):
-                segment_quanta = _final_quanta(segment_start, segment_end, server.quantum_seconds)
-                if segment_index < len(segments) - 1:
-                    segment_quanta = min(segment_quanta, remaining_quanta)
-                else:
-                    segment_quanta = remaining_quanta
-                remaining_quanta -= segment_quanta
-                if segment_quanta <= 0:
-                    continue
-                segment_amount = _minor_product(segment_quanta, selling_minor)
-                final_key = (
-                    self.final_charge_key(server.id)
-                    if len(segments) == 1
-                    else f"{self.final_charge_key(server.id)}:{int(segment_start.timestamp())}"
-                )
-                description = (
-                    f"final usage {segment_start.strftime('%Y-%m-%d %H:%M')} to "
-                    f"{segment_end.strftime('%Y-%m-%d %H:%M')} UTC"
-                )
-                remainder = await self._ledger.get_entry_by_idempotency(wallet.id, final_key)
-                month = month_start_utc(segment_start)
-                newly_charged = False
-                if remainder is not None:
-                    if (
-                        remainder.amount.amount != Decimal(segment_amount)
-                        or remainder.amount.currency.upper() != selling_currency.upper()
-                        or remainder.entry_type is not LedgerEntryType.CHARGE
-                        or remainder.reference_type != "server"
-                        or remainder.reference_id != str(server.id)
-                        or remainder.description != description
-                    ):
-                        raise ValueError(
-                            f"ledger idempotency key {final_key!r} has different final-charge facts"
-                        )
-                    replayed = True
-                else:
-                    month_billed = 0
-                    if cap is not None:
-                        month_billed = await self._accruals.month_total(
-                            wallet.id,
-                            month,
-                            currency=selling_currency,
-                            rule_key=_rule_key(snapshot.rule),
-                        )
-                        month_billed += charged_by_month.get(month, 0)
-                    if cap is not None and month_billed + segment_amount > cap:
-                        capped = True
-                        await self._cap_audit(
-                            server, wallet, cap, month_billed, segment_amount, "flat leg"
-                        )
-                        continue
-                    atomic_adjust = getattr(self._wallets, "adjust", None)
-                    if not callable(atomic_adjust):
-                        raise RuntimeError("atomic wallet/ledger adjustment capability is required")
-                    await atomic_adjust(
-                        server.user_id,
-                        -segment_amount,
-                        final_key,
-                        entry_type=LedgerEntryType.CHARGE,
-                        reference_type="server",
-                        reference_id=str(server.id),
-                        description=description,
-                    )
-                    newly_charged = True
-                if newly_charged:
-                    charged += segment_amount
-                    charged_by_month[month] = charged_by_month.get(month, 0) + segment_amount
-                charged_quanta += segment_quanta
-                remainder_periods.append((segment_start, segment_end, segment_quanta, final_key))
-                remainder_charged = True
-                posted_key = final_key
-
-        # Repair the business records independently for the final legs.
-        # A capture-key record must never be rewritten with a different period
-        # or quanta when a later retry also settles the flat remainder.
-        async def persist_period(
-            period_start: datetime, period_end: datetime, quanta: int, key: str
-        ) -> None:
-            if quanta <= 0:
-                return
-            with localcontext() as context:
-                context.prec = max(
-                    50,
-                    len(str(exact_base_cost)) + len(str(quanta)) + 20,
-                )
-                record_cost_amount = exact_base_cost * Decimal(quanta)
-            await _persist_accrual_record(
-                self._accruals,
-                AccrualPeriod(
-                    server_id=server.id,
-                    wallet_id=wallet_id,
-                    period_start=period_start,
-                    period_end=period_end,
-                    selling_minor=_minor_product(quanta, selling_minor),
-                    cost_minor=_minor_product(quanta, cost_minor),
-                    currency=selling_currency,
-                    cost_currency=cost_currency,
-                    selling_currency=selling_currency,
-                    cost_amount=record_cost_amount,
-                    rule_key=_rule_key(snapshot.rule),
-                    idempotency_key=key,
-                    quanta=quanta,
-                ),
+            raise ValueError(f"server {server.id}: no persisted wallet")
+        if not server.idempotency_key:
+            return FinalChargeResult(0, False, None, False, False)
+        hold_key = f"server-create:{server.idempotency_key}"
+        hold = await self._hold_repo.get_by_idempotency(wallet.id, hold_key)
+        if hold is not None and hold.status is HoldStatus.CREATED:
+            assert hold.id is not None
+            released = await self._holds.release_hold(wallet.id, hold.id, hold_key)
+            if released.status is not HoldStatus.RELEASED:
+                raise ValueError("unused creation reservation was not durably released")
+        elif hold is not None and hold.status is HoldStatus.CAPTURED:
+            start = _aware(server.billing_started_at, "billing_started_at")
+            report = AccrualRunReport()
+            await self._prepayment._settle_period(
+                server, start, start + timedelta(seconds=server.quantum_seconds), report
             )
-
-        if first_leg_charged and window_start == created and server.idempotency_key:
-            await persist_period(
-                created,
-                created + timedelta(seconds=server.quantum_seconds),
-                1,
-                first_leg_key or f"capture-server-create:{server.idempotency_key}",
-            )
-        if remainder_charged:
-            for period_start, period_end, quanta, key in remainder_periods:
-                await persist_period(period_start, period_end, quanta, key)
-
-        if charged > 0 or replayed or posted_key is not None or capped or first_leg_charged:
-            await self._audit.record_mutation(
-                actor_type=ActorType.SYSTEM,
-                actor_id=None,
-                action="billing.final_charge",
-                resource_type="billing",
-                resource_id=str(server.id),
-                reason=(
-                    f"final charge {charged}{selling_currency} "
-                    f"(replayed={replayed}, hold captured={captured}, "
-                    f"cap-capped={capped})"
-                ),
-                metadata={
-                    "server_id": str(server.id),
-                    "charged_minor": str(charged),
-                    "captured_hold": str(captured).lower(),
-                    "replayed": str(replayed).lower(),
-                    "capped": str(capped).lower(),
-                    "entry_key": posted_key or "",
-                },
-            )
-
-            server.last_accrued_at = deleted
-            await self._servers.save(server)
-
-        return FinalChargeResult(
-            charged_minor=charged,
-            captured_hold=captured,
-            posted_entry_key=posted_key,
-            replayed=replayed,
-            capped=capped,
-        )
-
-    async def _assert_capture_ledger(
-        self,
-        *,
-        wallet_id: UUID,
-        hold: Any,
-        capture_key: str,
-        amount_minor: int,
-        currency: str,
-        idempotency_key: str,
-    ) -> None:
-        if hold is None or getattr(hold, "id", None) is None:
-            raise ValueError("hold capture returned no persisted hold")
-        entry = await self._ledger.get_entry_by_idempotency(wallet_id, capture_key)
-        if entry is None:
-            raise ValueError(f"hold capture {capture_key!r} has no CHARGE ledger fact")
-        if (
-            entry.amount.amount != Decimal(amount_minor)
-            or entry.amount.currency.upper() != currency.upper()
-            or entry.entry_type is not LedgerEntryType.CHARGE
-            or entry.reference_type != "hold"
-            or entry.reference_id != str(hold.id)
-            or entry.description != f"hold captured for {idempotency_key}"
-        ):
-            raise ValueError(f"hold capture {capture_key!r} has different CHARGE facts")
-
-    async def _cap_audit(
-        self,
-        server: CloudServer,
-        wallet: Wallet,
-        cap: int,
-        month_billed: int,
-        skipped: int,
-        leg: str,
-    ) -> None:
-        """Audit one cap-capped final-charge leg (the money never moves)."""
-        logger.warning(
-            "server %s: final charge %s capped: month cap %d, billed %d, skipped %d",
-            server.id,
-            leg,
-            cap,
-            month_billed,
-            skipped,
-        )
-        await self._audit.record_mutation(
-            actor_type=ActorType.SYSTEM,
-            actor_id=None,
-            action="billing.cap_reached",
-            resource_type="server",
-            resource_id=str(server.id),
-            reason=(
-                f"monthly cap {cap} reached at deletion ({leg}): "
-                f"billed {month_billed}, skipped {skipped}"
-            ),
-            metadata={
-                "server_id": str(server.id),
-                "cap": str(cap),
-                "billed": str(month_billed),
-                "skipped_charge": str(skipped),
-                "leg": leg,
-                "currency": wallet.currency,
-            },
-        )
-
-
-def _final_quanta(start: datetime, end: datetime, quantum_seconds: int) -> int:
-    """Ceiling of the remainder window in quanta (a partial quantum bills full)."""
-    elapsed = _elapsed_seconds(start, end)
-    with localcontext() as context:
-        context.prec = max(50, len(elapsed.as_tuple().digits) + len(str(quantum_seconds)) + 20)
-        return int((elapsed / Decimal(quantum_seconds)).to_integral_value(rounding=ROUND_CEILING))
+            return FinalChargeResult(0, False, f"capture-{hold_key}", True, False)
+        return FinalChargeResult(0, False, None, False, False)
 
 
 # ---------------------------------------------------------------------------
@@ -1447,24 +1109,12 @@ class LowBalancePolicyReport:
 
 
 class LowBalancePolicyService:
-    """Evaluates the low-balance policy for all RUNNING servers.
+    """Warn once below the advisory threshold and notify on recovery.
 
-    Deterministic state machine per server:
-
-    - balance >= threshold -> healthy; a stale ``low_balance_since`` watermark
-      is cleared (RECOVERED, audited).
-    - balance < threshold, no watermark -> WARN: the watermark is started at
-      ``now`` and the user is notified.
-    - balance < threshold, watermark within the grace window -> GRACE: the
-      user is notified again; the server keeps running.
-    - balance < threshold, watermark at/older than the grace window ->
-      AUTO_DELETE: the server is transitioned to DELETE_REQUESTED (the
-      deletion saga, M07-007, owns the stop + provider deletion + final
-      charge) and the user is notified.
-
-    The policy itself never stops or deletes resources and never moves
-    money; it only records the watermark, notifies, and requests deletion
-    through the lifecycle state.
+    A low wallet balance after buying an hour does not revoke that paid hour.
+    Threshold/grace settings do not authorize unpaid service or deletion:
+    AccrualJob purchases the actual snapshot price at the boundary and alone
+    requests the existing stop/delete saga on insufficient funds.
     """
 
     def __init__(
@@ -1523,6 +1173,10 @@ class LowBalancePolicyService:
             return LowBalanceDecision.NONE
         balance = wallet.balance
         decision = decide_low_balance(balance, config, server.low_balance_since, now)
+        # Thresholds are advisory, not the immutable next-hour price. Only
+        # prepayment failure may request deletion, including at a boundary.
+        if decision is LowBalanceDecision.AUTO_DELETE:
+            decision = LowBalanceDecision.GRACE
 
         if decision is LowBalanceDecision.NONE:
             return decision
@@ -1539,23 +1193,9 @@ class LowBalancePolicyService:
                 await self._notifier.notify(
                     server.user_id, server.id, decision, balance, episode=episode
                 )
-        elif decision is LowBalanceDecision.AUTO_DELETE:
-            server.transition_to(ServerLifecycleState.DELETE_REQUESTED)
-            await self._notifier.notify(
-                server.user_id,
-                server.id,
-                decision,
-                balance,
-                episode=server.low_balance_since,
-            )
-        # GRACE: silent - the user was already warned when the window opened;
-        # the server keeps running until the window exhausts.
+        # GRACE stays silent; an actual failed prepayment owns suspension.
 
-        if decision in (
-            LowBalanceDecision.WARN,
-            LowBalanceDecision.RECOVERED,
-            LowBalanceDecision.AUTO_DELETE,
-        ):
+        if decision in (LowBalanceDecision.WARN, LowBalanceDecision.RECOVERED):
             await self._servers.save(server)
 
         await self._audit.record_mutation(

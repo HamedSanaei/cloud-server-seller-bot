@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -8,6 +9,7 @@ from typing import Protocol
 from uuid import UUID
 
 from cloud_platform.core.money import Money
+from cloud_platform.modules.businesslog.domain import BusinessEvent
 
 
 class LedgerEntryType(StrEnum):
@@ -164,6 +166,8 @@ class WalletRepository(Protocol):
         reference_type: str = "",
         reference_id: str = "",
         description: str = "",
+        audit_actor_id: UUID | None = None,
+        business_event_factory: Callable[[Wallet], BusinessEvent | None] | None = None,
     ) -> tuple[Wallet, bool]:
         """Atomically apply a signed balance delta and append its ledger fact.
 

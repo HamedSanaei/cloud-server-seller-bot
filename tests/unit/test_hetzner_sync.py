@@ -135,7 +135,7 @@ class TestHetznerCatalogSyncer:
             "meta": {"pagination": {}},
         }
 
-        syncer._request = AsyncMock(return_value=page1_response)
+        syncer._request = AsyncMock(side_effect=[{"pricing": {"currency": "EUR"}}, page1_response])
 
         provider_row = MagicMock()
         provider_row.id = uuid4()
@@ -183,7 +183,7 @@ class TestHetznerCatalogSyncer:
         old = {"location": "fsn1", "hourly": {"gross": "0.0063"}, "monthly": {"gross": "3.92"}}
         assert _monthly_value(old) is None
         with pytest.raises(ValueError, match="at least one price"):
-            _plan_pricing_from_hetzner({"id": 1, "name": "cx22", "prices": [old]})
+            _plan_pricing_from_hetzner({"id": 1, "name": "cx22", "prices": [old]}, currency="EUR")
 
     @pytest.mark.asyncio
     async def test_sync_images_success(self, syncer):
@@ -221,3 +221,19 @@ class TestHetznerCatalogSyncer:
         assert results["locations"].total_fetched == 10
         assert results["plans"].total_fetched == 20
         assert results["images"].total_fetched == 30
+
+
+@pytest.mark.asyncio
+async def test_unproven_currency_cannot_publish_or_retire_token_catalog() -> None:
+    syncer = HetznerCatalogSyncer(session_factory=MagicMock(), token="test-token")
+    syncer._request = AsyncMock(return_value={"pricing": {}})
+    try:
+        result = await syncer.sync_offers()
+        assert result.offers_written == 0
+        assert result.marked_unavailable == 0
+        assert not result.availability_reconciled
+        assert not result.verified
+        assert result.warnings
+        syncer._request.assert_awaited_once_with("GET", "/pricing")
+    finally:
+        await syncer.close()

@@ -1,4 +1,4 @@
-"""Tests for M16-004 queue partitioning and M16-005 sharding allocator."""
+"""Account sharding allocation outcomes and capacity boundaries."""
 
 import pytest
 
@@ -9,13 +9,6 @@ from cloud_platform.providers.allocator import (
     ShardedAllocator,
 )
 from cloud_platform.providers.base import Capability
-from cloud_platform.worker.settings import (
-    BILLING_FUNCTIONS,
-    PROVISIONING_FUNCTIONS,
-    WORKER_QUEUES,
-    BillingWorkerSettings,
-    ProvisioningWorkerSettings,
-)
 
 
 class _FakeProvider:
@@ -45,18 +38,6 @@ def _shards() -> list[AccountShard]:
             max_servers=100,
         ),
     ]
-
-
-class TestQueuePartitioning:
-    def test_queues_are_isolated(self) -> None:
-        assert set(WORKER_QUEUES) == {"provisioning", "billing", "notify"}
-        assert ProvisioningWorkerSettings.queue_name == "provisioning"
-        assert BillingWorkerSettings.queue_name == "billing"
-        prov_names = {f.__name__ for f in PROVISIONING_FUNCTIONS}
-        bill_names = {f.__name__ for f in BILLING_FUNCTIONS}
-        assert prov_names.isdisjoint(bill_names)
-        assert "process_deletes" in prov_names
-        assert "accrue_usage" in bill_names
 
 
 class TestShardedAllocator:

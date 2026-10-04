@@ -16,9 +16,9 @@ Telegram's API. This module removes every long identifier from the wire:
   is resolved against the very list the customer saw, which is what lets the
   confirmation token bind the resolved provider argument rather than the index.
 
-Everything here is presentation state: it holds no provider secret, no
-credential and no billing fact, and losing it only means the customer sees the
-"that button expired" screen.
+Everything here is presentation state: it holds no provider secret or
+credential. Checkout selections include the public selling price shown to the
+customer, not a reservation or ledger entry; losing state only expires a button.
 
 Storage. State lives behind the :class:`~cloud_platform.core.session_store.
 BotSessionStore` port — Redis in production — so a button still works after a
@@ -31,10 +31,16 @@ namespaced, TTL-bounded key:
 ``selection``                ``<customer>:<ref>:<key>`` -> rendered list
 ``action``                   ``<customer>:<ref>:<nonce>`` -> pending action
 ``prompt``                   ``<customer>`` -> outstanding free-text prompt
+``checkout``                 ``<nonce>`` -> owner-bound exact purchase selection
 ===========================  =============================================
 
 The reference is only ever resolved back for the **same customer**, so one
 customer can never address another customer's server.
+
+Checkout nonces freeze the shown image/OS, panel and selling price. They remain
+readable until the reference TTL expires so repeated clicks and restarted
+replicas submit the same application idempotency key, without consuming the
+selection before an application command commits.
 
 Failure policy. When the store is unreachable every method raises
 :class:`~cloud_platform.core.session_store.SessionStoreUnavailable`. Callers
@@ -48,6 +54,7 @@ from __future__ import annotations
 import dataclasses
 import secrets
 from dataclasses import dataclass, field
+from string import ascii_letters, digits
 from typing import Any
 from uuid import UUID
 
@@ -59,7 +66,9 @@ from cloud_platform.core.session_store import (
     NS_SERVER,
     BotSessionStore,
     InMemoryBotSessionStore,
+    SessionStoreUnavailable,
 )
+from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY, BILLING_MODEL_MONTHLY
 from cloud_platform.modules.servers.models import (
     IpAddressView,
     ReinstallImageView,
@@ -76,6 +85,8 @@ _SELECTION_TYPES: dict[str, type[Any]] = {
 
 __all__ = [
     "REF_LENGTH",
+    "CheckoutSelection",
+    "CheckoutSessions",
     "PendingAction",
     "PendingInput",
     "ServerSessions",
@@ -84,6 +95,7 @@ __all__ = [
 #: Length of every opaque reference handed to Telegram (URL-safe alphabet, so it
 #: always satisfies the callback field pattern ``[A-Za-z0-9._-]+``).
 REF_LENGTH = 8
+_REFERENCE_ALPHABET = ascii_letters + digits + "_-"
 
 #: How many distinct servers one customer may keep references for.
 _MAX_SERVERS_PER_CUSTOMER = 200
@@ -91,6 +103,111 @@ _MAX_SERVERS_PER_CUSTOMER = 200
 #: How many rendered selections a customer/server pair keeps before the oldest
 #: are dropped (Redis TTLs do the rest).
 _MAX_SELECTIONS = 32
+
+
+@dataclass(frozen=True, slots=True)
+class CheckoutSelection:
+    """The exact public purchase facts shown to one customer."""
+
+    user_id: UUID
+    offer_id: UUID
+    billing_model: str
+    selling_price_minor: int
+    currency: str
+    image_id: str | None = None
+    image_label: str | None = None
+    os_name: str | None = None
+    panel_name: str | None = None
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "user_id": str(self.user_id),
+            "offer_id": str(self.offer_id),
+            "billing_model": self.billing_model,
+            "selling_price_minor": self.selling_price_minor,
+            "currency": self.currency,
+            "image_id": self.image_id,
+            "image_label": self.image_label,
+            "os_name": self.os_name,
+            "panel_name": self.panel_name,
+        }
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> CheckoutSelection | None:
+        try:
+            user_id = UUID(record["user_id"])
+            offer_id = UUID(record["offer_id"])
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return None
+        price = record.get("selling_price_minor")
+        currency = record.get("currency")
+        model = record.get("billing_model")
+        if (
+            isinstance(price, bool)
+            or not isinstance(price, int)
+            or price <= 0
+            or not isinstance(currency, str)
+            or not currency
+            or model not in (BILLING_MODEL_MONTHLY, BILLING_MODEL_HOURLY)
+        ):
+            return None
+        for key in ("image_id", "image_label", "os_name", "panel_name"):
+            if record.get(key) is not None and not isinstance(record[key], str):
+                return None
+        if model == BILLING_MODEL_HOURLY:
+            if not record.get("image_id") or not record.get("image_label"):
+                return None
+            if record.get("os_name") is not None or record.get("panel_name") is not None:
+                return None
+        elif (
+            not record.get("os_name")
+            or record.get("image_id") is not None
+            or record.get("image_label") is not None
+        ):
+            return None
+        return cls(
+            user_id=user_id,
+            offer_id=offer_id,
+            billing_model=model,
+            selling_price_minor=price,
+            currency=currency,
+            image_id=record.get("image_id"),
+            image_label=record.get("image_label"),
+            os_name=record.get("os_name"),
+            panel_name=record.get("panel_name"),
+        )
+
+
+_NS_CHECKOUT = "checkout"
+
+
+class CheckoutSessions:
+    """Owner-bound confirmations, readable again for application replay."""
+
+    def __init__(self, store: BotSessionStore, *, reference_ttl_seconds: int = 1800) -> None:
+        if reference_ttl_seconds < 30:
+            raise ValueError("reference_ttl_seconds must be >= 30")
+        self._store = store
+        self._reference_ttl = reference_ttl_seconds
+
+    async def remember(self, selection: CheckoutSelection) -> str:
+        record = selection.to_record()
+        if CheckoutSelection.from_record(record) is None:
+            raise ValueError("invalid checkout selection")
+        for _ in range(6):
+            nonce = _mint_ref()
+            if await self._store.claim(
+                _NS_CHECKOUT, nonce, record, ttl_seconds=self._reference_ttl
+            ):
+                return nonce
+        raise SessionStoreUnavailable("checkout reference collision")
+
+    async def resolve(self, user_id: UUID, nonce: str) -> CheckoutSelection | None:
+        if len(nonce) != REF_LENGTH or any(char not in _REFERENCE_ALPHABET for char in nonce):
+            return None
+        record = await self._store.get(_NS_CHECKOUT, nonce)
+        selection = CheckoutSelection.from_record(record) if record is not None else None
+        return selection if selection is not None and selection.user_id == user_id else None
 
 
 @dataclass(frozen=True, slots=True)

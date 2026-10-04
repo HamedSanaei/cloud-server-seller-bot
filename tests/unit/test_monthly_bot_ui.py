@@ -8,24 +8,43 @@ ownership on servers, explicit power confirmation, wallet screens.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
+import pytest
+from aiogram import Bot, Dispatcher
+from aiogram.types import CallbackQuery, Chat, Message, Update
+from aiogram.types import User as TelegramUser
+
+from cloud_platform.bot.main import register_handlers
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
+from cloud_platform.bot.sessions import CheckoutSessions
 from cloud_platform.core.i18n import Locale, Translator
+from cloud_platform.core.session_store import InMemoryBotSessionStore, SessionStoreUnavailable
 from cloud_platform.modules.checkout.service import (
+    CheckoutProviderUnavailableError,
     MonthlyCheckoutResult,
     OfferCatalogView,
     OfferConfirmView,
     OfferOsOptionView,
+    OfferUnavailableError,
+    ProviderAccountCapacityError,
 )
 from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_PREPAID_MONTHLY,
     CloudServer,
     ServerLifecycleState,
 )
-from cloud_platform.modules.navigation.domain import Callback, decode_callback, encode_callback
+from cloud_platform.modules.navigation.domain import (
+    Callback,
+    decode_callback,
+    encode_callback,
+    encode_offer_ref,
+)
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.renewals.domain import RenewalRecord, RenewalStatus
 from cloud_platform.modules.servers.confirmations import ConfirmationStatus
@@ -41,7 +60,7 @@ from cloud_platform.modules.servers.service import (
     ServerConfirmationError,
     ServerNotFoundError,
 )
-from cloud_platform.modules.users.domain import User
+from cloud_platform.modules.users.domain import Role, User, UserStatus
 from cloud_platform.modules.wallet.domain import Hold, Wallet
 
 KEY = "test-signing-key"
@@ -91,6 +110,9 @@ def _server(owner: UUID | None = None) -> CloudServer:
 class FakeOffersView:
     def __init__(self) -> None:
         self.confirm_views: list[OfferConfirmView] = []
+        self.os_names = ["Ubuntu 24.04", "Debian 12"]
+        self.panel_names = ["Webmin", "cPanel"]
+        self.selling_price_minor = 1299
 
     @staticmethod
     def _cb(flow: str, screen: str, *args: str) -> str:
@@ -132,15 +154,9 @@ class FakeOffersView:
             name="Ubuntu 24.04",
             price_minor=0,
             index=0,
-            select_callback=self._cb("offers", "confirm", str(offer_id), "0"),
+            select_callback=self._cb("offers", "confirm", encode_offer_ref(offer_id), "0"),
         )
         return view, [option], self._cb("offers", "plans", "AMS-01"), self._cb("main", "menu")
-
-    async def os_by_index(self, offer: SellableOffer, index: int) -> str:
-        return "Ubuntu 24.04"
-
-    async def panel_name_by_index(self, offer: SellableOffer, index: int) -> str | None:
-        return None
 
     async def confirmation(
         self,
@@ -161,16 +177,16 @@ class FakeOffersView:
                 ram_gb=4,
                 disk_gb=100,
                 traffic="10 TB",
-                monthly_price_minor=1299,
+                monthly_price_minor=self.selling_price_minor,
                 currency="EUR",
             ),
-            os_name="Ubuntu 24.04",
+            os_name=self.os_names[os_index],
             balance_minor=10_000,
             currency="EUR",
             sufficient=True,
-            confirm_callback=self._cb("offers", "buy", str(offer_id), str(os_index)),
-            back_callback=self._cb("offers", "os", str(offer_id)),
+            back_callback=self._cb("offers", "os", encode_offer_ref(offer_id)),
             cancel_callback=self._cb("main", "menu"),
+            panel_name=self.panel_names[panel_index] if panel_index is not None else None,
         )
         self.confirm_views.append(view)
         return view
@@ -180,6 +196,7 @@ class FakeCheckout:
     def __init__(self, *, replay: bool = False) -> None:
         self.replay = replay
         self.calls: list[tuple[User, UUID, str, str]] = []
+        self.contracts: list[dict[str, Any]] = []
 
     async def create_order(
         self,
@@ -189,8 +206,17 @@ class FakeCheckout:
         os_name: str,
         idempotency_key: str,
         panel_name: str | None = None,
+        expected_selling_price_minor: int | None = None,
+        expected_selling_currency: str | None = None,
     ) -> MonthlyCheckoutResult:
         self.calls.append((user, offer_id, os_name, idempotency_key))
+        self.contracts.append(
+            {
+                "panel_name": panel_name,
+                "price": expected_selling_price_minor,
+                "currency": expected_selling_currency,
+            }
+        )
         server = _server(user.id or uuid4())
         order = type("Order", (), {"id": uuid4()})()
         hold = Hold(wallet_id=uuid4(), amount=1299, currency="EUR", idempotency_key="k")
@@ -378,14 +404,17 @@ def _ui(
     power: FakePower | None = None,
     offers: FakeOffersRepo | None = None,
     management: FakeManagement | None = None,
+    checkout_sessions: CheckoutSessions | None = None,
+    recharge: Any = None,
 ) -> tuple[MonthlyBotUi, dict[str, Any]]:
     checkout = checkout or FakeCheckout()
     servers = servers or FakeServers()
     power = power or FakePower()
     offers = offers or FakeOffersRepo()
+    view = FakeOffersView()
     ui = MonthlyBotUi(
         KEY,
-        offers_view=FakeOffersView(),
+        offers_view=view,
         checkout=checkout,
         servers=servers,
         orders=FakeOrders(),
@@ -395,12 +424,15 @@ def _ui(
         power=power,
         translator=Translator(Locale.EN),
         server_management=management,  # type: ignore[arg-type]
+        checkout_sessions=checkout_sessions,
+        recharge=recharge,
     )
     deps = {
         "checkout": checkout,
         "servers": servers,
         "power": power,
         "offers": offers,
+        "view": view,
         "management": management,
     }
     return ui, deps
@@ -432,19 +464,19 @@ class TestBuyFlow:
         screen = await ui.handle(confirm_button.callback_data, user=USER_A)
         assert "€12.99" in screen.text
         buy_button = screen.keyboard.inline_keyboard[0][0]
-        _assert_callback_target(buy_button.callback_data, "offers", "buy")
+        _assert_callback_target(buy_button.callback_data, "store", "buy")
         # buy -> order created
         screen = await ui.handle(buy_button.callback_data, user=USER_A)
         assert "Your order is registered" in screen.text
         assert len(deps["checkout"].calls) == 1
-        _, offer_id, os_name, ik = deps["checkout"].calls[0]
+        _, offer_id, os_name, _ = deps["checkout"].calls[0]
         assert offer_id == OFFER_ID
         assert os_name == "Ubuntu 24.04"
-        assert ik.startswith("bot-monthly:")
 
     async def test_replay_shows_replayed_notice(self) -> None:
         ui, _deps = _ui(checkout=FakeCheckout(replay=True))
-        cb = ui._callback("offers", "buy", str(OFFER_ID), "0")
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        cb = confirm.keyboard.inline_keyboard[0][0].callback_data
         screen = await ui.handle(cb, user=USER_A)
         assert "not charged twice" in screen.text
 
@@ -452,6 +484,132 @@ class TestBuyFlow:
         ui, _ = _ui()
         screen = await ui.handle("v1|offers:locations|deadbeef", user=USER_A)
         assert screen is None  # caller renders the tamper notice
+
+    async def test_confirmed_os_and_price_survive_list_changes_and_double_taps(self) -> None:
+        ui, deps = _ui()
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0, 1)
+        callback = confirm.keyboard.inline_keyboard[0][0].callback_data
+        selection_args = decode_callback(callback, KEY).args
+        assert len(selection_args) == 1
+        assert str(OFFER_ID) not in callback
+        assert len(callback.encode("utf-8")) <= 64
+
+        deps["offers"].offers[0] = replace(deps["offers"].offers[0], selling_price_minor=9999)
+        deps["view"].os_names.reverse()
+        deps["view"].panel_names.reverse()
+        deps["view"].selling_price_minor = 9999
+        await ui.handle(callback, user=USER_A)
+        await ui.handle(callback, user=USER_A)
+        assert [call[2] for call in deps["checkout"].calls] == ["Ubuntu 24.04"] * 2
+        assert deps["checkout"].calls[0][3] == deps["checkout"].calls[1][3]
+        assert (
+            deps["checkout"].contracts
+            == [{"panel_name": "cPanel", "price": 1299, "currency": "EUR"}] * 2
+        )
+
+    async def test_foreign_user_and_old_terminal_buttons_cannot_create(self) -> None:
+        ui, deps = _ui()
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        callback = confirm.keyboard.inline_keyboard[0][0].callback_data
+        callbacks = [
+            (callback, USER_B),
+            (ui._callback("offers", "buy", str(OFFER_ID), "0"), USER_A),
+            (ui._callback("store", "buy", str(OFFER_ID), "0"), USER_A),
+            (ui._callback("store", "buy", "expired_"), USER_A),
+        ]
+        for terminal, user in callbacks:
+            screen = await ui.handle(terminal, user=user)
+            assert screen.text == Translator(Locale.EN).t("nav.expired")
+        assert deps["checkout"].calls == []
+
+    async def test_shared_store_reconstruction_replays_the_same_confirmation(self) -> None:
+        from tests.unit.test_session_store import FakeRedis, make_redis_store
+
+        store = make_redis_store(FakeRedis())
+        ui, _ = _ui(checkout_sessions=CheckoutSessions(store))
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        callback = confirm.keyboard.inline_keyboard[0][0].callback_data
+        restarted, deps = _ui(checkout_sessions=CheckoutSessions(store))
+        await restarted.handle(callback, user=USER_A)
+        assert deps["checkout"].calls[0][2] == "Ubuntu 24.04"
+
+    async def test_confirmation_back_and_cancel_remain_navigable(self) -> None:
+        ui, deps = _ui()
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        for button in confirm.keyboard.inline_keyboard[1]:
+            assert await ui.handle(button.callback_data, user=USER_A) is not None
+        assert deps["checkout"].calls == []
+
+    async def test_store_failures_never_create_or_offer_a_terminal_button(self) -> None:
+        class UnavailableStore(InMemoryBotSessionStore):
+            async def claim(self, *args: Any, **kwargs: Any) -> bool:
+                raise SessionStoreUnavailable("unavailable")
+
+            async def get(self, *args: Any, **kwargs: Any) -> Any:
+                raise SessionStoreUnavailable("unavailable")
+
+        ui, deps = _ui(checkout_sessions=CheckoutSessions(UnavailableStore()))
+        screen = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        assert screen.text == Translator(Locale.EN).t("store.cloud_retry_later")
+        screen = await ui.buy_screen(USER_A, "abcdefgh")
+        assert screen.text == Translator(Locale.EN).t("store.cloud_retry_later")
+        assert deps["checkout"].calls == []
+
+    @pytest.mark.parametrize(
+        ("error", "message"),
+        [
+            (ProviderAccountCapacityError, "store.provider_account_capacity"),
+            (CheckoutProviderUnavailableError, "store.cloud_retry_later"),
+            (OfferUnavailableError, "offers.unavailable"),
+        ],
+    )
+    async def test_safe_checkout_error_messages(self, error: type[Exception], message: str) -> None:
+        class RejectCheckout(FakeCheckout):
+            async def create_order(self, **kwargs: Any) -> Any:
+                assert kwargs["expected_selling_price_minor"] == 1299
+                assert kwargs["expected_selling_currency"] == "EUR"
+                raise error("hz-private resource_limit_exceeded credential-secret")
+
+        ui, _ = _ui(checkout=RejectCheckout())
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        screen = await ui.handle(confirm.keyboard.inline_keyboard[0][0].callback_data, user=USER_A)
+        assert screen.text == Translator(Locale.EN).t(message)
+        assert all(
+            secret not in screen.text for secret in ("hz-private", "resource_limit", "secret")
+        )
+
+    async def test_expired_rendered_confirmation_never_submits_checkout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [100.0]
+        monkeypatch.setattr("cloud_platform.core.session_store.time.monotonic", lambda: now[0])
+        sessions = CheckoutSessions(InMemoryBotSessionStore(), reference_ttl_seconds=30)
+        ui, deps = _ui(checkout_sessions=sessions)
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        callback = confirm.keyboard.inline_keyboard[0][0].callback_data
+        now[0] += 31
+        screen = await ui.handle(callback, user=USER_A)
+        assert screen.text == Translator(Locale.EN).t("nav.expired")
+        assert deps["checkout"].calls == []
+
+    async def test_tampering_with_rendered_confirmation_never_submits_checkout(self) -> None:
+        ui, deps = _ui()
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        callback = confirm.keyboard.inline_keyboard[0][0].callback_data
+        tampered = callback[:-1] + ("0" if callback[-1] != "0" else "1")
+        assert await ui.handle(tampered, user=USER_A) is None
+        assert deps["checkout"].calls == []
+
+    async def test_redis_outage_after_confirmation_never_submits_checkout(self) -> None:
+        from tests.unit.test_session_store import FakeRedis, UnreachableRedis, make_redis_store
+
+        ui, deps = _ui(checkout_sessions=CheckoutSessions(make_redis_store(FakeRedis())))
+        confirm = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+        callback = confirm.keyboard.inline_keyboard[0][0].callback_data
+        ui._checkout_sessions = CheckoutSessions(make_redis_store(UnreachableRedis()))
+        screen = await ui.handle(callback, user=USER_A)
+        assert screen.text == Translator(Locale.EN).t("store.cloud_retry_later")
+        assert deps["checkout"].calls == []
 
 
 class TestServersFlowDelegation:
@@ -558,3 +716,97 @@ class TestWalletAndSupport:
         screen = await ui.handle(cb, user=USER_A)
         assert "Support" in screen.text
         assert "@support" in screen.text
+
+
+@pytest.mark.parametrize("method", ["amounts", "start"])
+@pytest.mark.parametrize("status", list(UserStatus))
+async def test_administrator_self_recharge_is_rejected_by_ui_before_payment_service(
+    method: str,
+    status: UserStatus,
+) -> None:
+    recharge = SimpleNamespace(
+        supports_currency_async=AsyncMock(return_value=True),
+        compatible_gateways_async=AsyncMock(return_value=["atlaspay"]),
+        start=AsyncMock(),
+    )
+    ui, _ = _ui(recharge=recharge)
+    admin = replace(USER_A, role=Role.ADMIN, status=status)
+    if method == "amounts":
+        screen = await ui.recharge_screen(admin)
+    else:
+        screen = await ui.recharge_start_screen(admin, "1000", "atlaspay", nonce="old-customer-tap")
+    callbacks = [
+        decode_callback(button.callback_data, KEY)
+        for row in screen.keyboard.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert all(callback.flow != "recharge" for callback in callbacks)
+    recharge.start.assert_not_awaited()
+    recharge.supports_currency_async.assert_not_awaited()
+    recharge.compatible_gateways_async.assert_not_awaited()
+
+
+@pytest.mark.parametrize("entrypoint", ["reply_button", "amounts_callback", "old_customer_invoice"])
+async def test_dispatcher_uses_current_admin_role_to_block_customer_recharge_entrypoints(
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    recharge = SimpleNamespace(
+        supports_currency_async=AsyncMock(return_value=True),
+        compatible_gateways_async=AsyncMock(return_value=["atlaspay"]),
+        start=AsyncMock(),
+    )
+    ui, _ = _ui(recharge=recharge)
+    # Existing customer buttons remain signed after promotion to administrator.
+    admin = replace(USER_A, role=Role.ADMIN, telegram_user_id=42)
+    container = MagicMock()
+    container.user_repository.return_value.get_by_telegram_user_id = AsyncMock(return_value=admin)
+    answer, edit = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(Message, "answer", answer)
+    monkeypatch.setattr(Message, "edit_text", edit)
+    monkeypatch.setattr(CallbackQuery, "answer", AsyncMock())
+    monkeypatch.setattr(
+        "cloud_platform.bot.main.get_settings", lambda: SimpleNamespace(callback_signing_key=KEY)
+    )
+    dp = Dispatcher()
+    register_handlers(dp, MagicMock(), ui, container)
+    actor = TelegramUser(id=42, is_bot=False, first_name="Admin")
+    message = Message(
+        message_id=9,
+        date=1,
+        chat=Chat(id=42, type="private"),
+        from_user=actor,
+        text=Translator(Locale.EN).t("menu.recharge"),
+    )
+    if entrypoint == "reply_button":
+        update = Update(update_id=1, message=message)
+    else:
+        data = (
+            ui._callback("recharge", "amounts")
+            if entrypoint == "amounts_callback"
+            else ui._callback("recharge", "go", "1000", "old-customer-tap")
+        )
+        update = Update(
+            update_id=1,
+            callback_query=CallbackQuery(
+                id="promoted-admin",
+                from_user=actor,
+                chat_instance="private",
+                message=message,
+                data=data,
+            ),
+        )
+    await dp.feed_update(MagicMock(spec=Bot), update)
+    outgoing = answer if entrypoint == "reply_button" else edit
+    keyboard = outgoing.await_args.kwargs["reply_markup"]
+    callbacks = [
+        decode_callback(button.callback_data, KEY)
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert all(callback.flow != "recharge" for callback in callbacks)
+    recharge.start.assert_not_awaited()
+    recharge.supports_currency_async.assert_not_awaited()
+    recharge.compatible_gateways_async.assert_not_awaited()

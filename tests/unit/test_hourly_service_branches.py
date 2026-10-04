@@ -41,6 +41,7 @@ from cloud_platform.providers.leaseweb.cloud import (
     CloudRootDisk,
     HourlyCheckoutFacts,
 )
+from tests.unit.hourly_money import hourly_money
 
 PROVIDER = "leaseweb"
 
@@ -51,6 +52,9 @@ USER = User(
     status=UserStatus.ACTIVE,
     role=Role.USER,
     telegram_user_id=12345,
+    phone_number="+989123456789",
+    phone_verified_at=datetime.now(UTC),
+    national_id="1234567891",
 )
 
 
@@ -163,7 +167,14 @@ class FakeAccountRepo:
 
 class FakeWalletRepo:
     async def get(self, user_id: UUID) -> Any:
-        return SimpleNamespace(id=uuid4(), balance=50_000, currency="USD")
+        from cloud_platform.modules.wallet.domain import WalletStatus
+
+        return SimpleNamespace(
+            id=uuid4(),
+            balance=50_000,
+            currency="USD",
+            status=WalletStatus.ACTIVE,
+        )
 
 
 class FakeSnapshots:
@@ -305,6 +316,7 @@ def _service(
         operation_repo=ops,  # type: ignore[arg-type]
         audit_repo=FakeAuditRepo(),  # type: ignore[arg-type]
         cloud_providers={PROVIDER: cloud},
+        **hourly_money(),
     )
     return service, servers, snapshots, ops
 
@@ -473,50 +485,6 @@ class TestQuarantineBranches:
         assert servers.servers[server.id].state is ServerLifecycleState.ERROR
         assert cloud.posts == 0
 
-    async def test_queue_selects_only_unattached_hourly_servers(self) -> None:
-        offers = FakeOffersRepo([await _usd_offer()])
-        cloud = FakeCloud()
-        servers = FakeServerRepo()
-        service, _, _, _ = _service(offers, cloud, servers=servers)
-        user_id = USER.id
-        assert user_id is not None
-        hourly = CloudServer(
-            id=uuid4(),
-            user_id=user_id,
-            provider_key=PROVIDER,
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.REQUESTED,
-        )
-        prepaid = CloudServer(
-            id=uuid4(),
-            user_id=user_id,
-            provider_key=PROVIDER,
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.REQUESTED,
-            billing_model="prepaid_monthly_fixed",
-        )
-        attached = CloudServer(
-            id=uuid4(),
-            user_id=user_id,
-            provider_key=PROVIDER,
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.PROVISIONING,
-            provider_server_id="i-1",
-        )
-        free = CloudServer(
-            id=uuid4(),
-            user_id=user_id,
-            provider_key=PROVIDER,
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.PROVISIONING,
-        )
-        for server in (hourly, prepaid, attached, free):
-            servers.servers[server.id] = server
-
-        queued = await service.servers_for_reconcile()
-
-        assert {s.id for s in queued} == {hourly.id, free.id}
-
 
 _UNSET: Any = object()
 
@@ -601,6 +569,9 @@ class TestReplayAndRepairContracts:
             status=UserStatus.ACTIVE,
             role=Role.USER,
             telegram_user_id=999,
+            phone_number="+989123456789",
+            phone_verified_at=datetime.now(UTC),
+            national_id="1234567891",
         )
 
         with pytest.raises(HourlyError, match="another user"):

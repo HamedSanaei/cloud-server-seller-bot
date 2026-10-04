@@ -69,6 +69,7 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
         created_at=_aware_or_none(_attr(row, "created_at")),
         updated_at=_aware_or_none(_attr(row, "updated_at")),
         last_accrued_at=_aware_or_none(_attr(row, "last_accrued_at")),
+        billing_started_at=_aware_or_none(getattr(row, "billing_started_at", None)),
         deleted_at=_aware_or_none(_attr(row, "deleted_at")),
         low_balance_since=_aware_or_none(_attr(row, "low_balance_since")),
         quantum_seconds=int(_attr(row, "quantum_seconds") or 3600),
@@ -324,6 +325,7 @@ class SqlAlchemyServerRepository:
             cast_any.ipv4 = server.ipv4
             cast_any.ipv6 = server.ipv6
             cast_any.last_accrued_at = server.last_accrued_at
+            cast_any.billing_started_at = server.billing_started_at
             # servers.deleted_at is a legacy naive-UTC column while the domain
             # carries an aware UTC value (last_accrued_at / low_balance_since
             # are real timestamptz columns and stay aware).
@@ -371,6 +373,7 @@ class SqlAlchemyServerRepository:
                 price_per_quantum=intent.cost_minor,
                 currency=intent.currency,
                 billing_model=server.billing_model,
+                billing_started_at=server.billing_started_at,
                 os=server.os,
                 credential_account_id=server.credential_account_id,
                 image_id=intent.image_id or server.image_id,

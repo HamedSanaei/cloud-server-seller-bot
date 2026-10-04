@@ -259,6 +259,8 @@ def _server(
         state=state,
         idempotency_key=ik,
         created_at=T0,
+        billing_started_at=T0,
+        provider_server_id=f"provider-{server_id}",
         quantum_seconds=quantum,
     )
 
@@ -310,8 +312,17 @@ class ParityHarness:
         )
 
     # -- ServerRepository ------------------------------------------------------
+    async def get(self, server_id) -> CloudServer | None:
+        return next((s for s in self.servers if s.id == server_id), None)
+
     async def list_running(self) -> list[CloudServer]:
         return [s for s in self.servers if s.state is ServerLifecycleState.RUNNING]
+
+    async def list_stopped(self) -> list[CloudServer]:
+        return [s for s in self.servers if s.state is ServerLifecycleState.STOPPED]
+
+    async def list_provisioning(self) -> list[CloudServer]:
+        return [s for s in self.servers if s.state is ServerLifecycleState.PROVISIONING]
 
     async def save(self, server: CloudServer) -> CloudServer:
         self.saved.append(server)
@@ -678,11 +689,11 @@ class TestAccrualParity:
         h = _parity_setup()
         hz_wallet = h.wallets[EUR_USER]
         ac_wallet = h.wallets[IRR_USER]
-        report = await h.make_accrual_job().run(now=T0 + timedelta(hours=2, minutes=30))
+        report = await h.make_accrual_job().run(now=T0 + timedelta(hours=1, minutes=30))
 
         assert report.servers_checked == 2
         assert report.errors == 0
-        # 2 complete 1h periods for EACH provider (2h30m window)
+        # Two hours bought: activation plus the hour starting at T0+1h.
         assert report.periods_posted == 4
         # Hetzner: 1000 USD (hold capture) + 1000 USD (debit);
         # ArvanCloud: 2_500_000 IRR (hold capture) + 2_500_000 IRR (debit)
@@ -721,14 +732,14 @@ class TestAccrualParity:
     async def test_replay_is_idempotent_for_every_provider(self) -> None:
         h = _parity_setup()
         job = h.make_accrual_job()
-        first = await job.run(now=T0 + timedelta(hours=2, minutes=30))
+        first = await job.run(now=T0 + timedelta(hours=1, minutes=30))
         assert first.periods_posted == 4
         balances = {u: w.balance for u, w in h.wallets.items()}
         # crash-replay: the watermarks never advanced (crash before save),
         # so the next run re-derives every period from the ledger
         for server in h.servers:
             server.last_accrued_at = None
-        second = await job.run(now=T0 + timedelta(hours=2, minutes=30))
+        second = await job.run(now=T0 + timedelta(hours=1, minutes=30))
         assert second.periods_posted == 0
         assert second.periods_replayed == 4
         assert second.errors == 0
@@ -740,7 +751,7 @@ class TestAccrualParity:
         # IRR wallet cannot cover even one period (and no hold was reserved).
         h = _parity_setup(ac_balance=100_000)
         h.holds.pop(f"server-create:{AC_IK}")
-        report = await h.make_accrual_job().run(now=T0 + timedelta(hours=2, minutes=30))
+        report = await h.make_accrual_job().run(now=T0 + timedelta(hours=1, minutes=30))
         # hetzner settles fully; arvancloud is the only unsettled server
         assert report.insufficient_balance == 1
         assert report.periods_posted == 2
@@ -749,140 +760,51 @@ class TestAccrualParity:
         ac_debits = [d for d in h.debits if d[0] == IRR_USER]
         assert ac_debits == []
 
-    async def test_partial_period_unequal_across_quantums(self) -> None:
-        """The trailing 30m is an incomplete quantum for BOTH hourly providers:
-        neither bills it in the periodic run (the final charge owns it)."""
+    async def test_first_hour_is_purchased_before_quantum_completes(self) -> None:
         h = _parity_setup()
-        report = await h.make_accrual_job().run(now=T0 + timedelta(hours=1, minutes=30))
-        assert report.periods_posted == 2  # one complete 1h period each
+        report = await h.make_accrual_job().run(now=T0 + timedelta(minutes=30))
+        assert report.periods_posted == 2
         assert h.servers[0].last_accrued_at == T0 + timedelta(hours=1)
         assert h.servers[1].last_accrued_at == T0 + timedelta(hours=1)
 
 
 class TestFinalChargeParity:
-    async def test_hourly_final_charge_parity(self) -> None:
-        """Both hourly providers: hold-capture + ceiling remainder settle in
-        their own currency, each exactly once."""
+    async def test_deletion_of_both_prepaid_providers_never_debits_again(self) -> None:
         h = _parity_setup()
-        deleted_at = T0 + timedelta(hours=2, minutes=30)
-        # settle the first complete period for each via the job
-        await h.make_accrual_job().run(now=deleted_at)
-        # now delete both (same window end)
-        h.servers[0].state = ServerLifecycleState.DELETED
-        h.servers[1].state = ServerLifecycleState.DELETED
-
-        result_hz = await h.make_final_charge_service().charge_final(h.servers[0], deleted_at)
-        result_ac = await h.make_final_charge_service().charge_final(h.servers[1], deleted_at)
-
-        # hetzner: the 30m remainder bills ONE full hourly quantum
-        assert result_hz.charged_minor == HZ_SELLING
-        assert result_hz.captured_hold is False  # hold captured by the first period
-        # arvancloud: same policy, same math, its own currency
-        assert result_ac.charged_minor == AC_SELLING
-        assert result_ac.captured_hold is False
-        # wallet math per currency
-        assert h.wallets[EUR_USER].balance == 100_000 - HZ_SELLING * 3
-        assert h.wallets[IRR_USER].balance == 100_000_000 - AC_SELLING * 3
-        # each final entry under its deterministic key
-        assert h.ledger_get_sync(hz_wallet_id(h), f"final:{HZ_SERVER}") is not None
-        assert h.ledger_get_sync(ac_wallet_id(h), f"final:{AC_SERVER}") is not None
-
-        # replay: nothing moves again for either provider (the first charge
-        # advanced the watermark to the deletion instant, so the replayed
-        # window is zero-length - the ledger keys are the backstop)
-        entry_count = len(h.entries)
-        replay_hz = await h.make_final_charge_service().charge_final(h.servers[0], deleted_at)
-        replay_ac = await h.make_final_charge_service().charge_final(h.servers[1], deleted_at)
-        assert replay_hz.charged_minor == 0
-        assert replay_ac.charged_minor == 0
-        assert len(h.entries) == entry_count
+        deleted = T0 + timedelta(hours=2, minutes=30)
+        report = await h.make_accrual_job().run(now=deleted)
+        assert report.periods_posted == 6
+        balances = {u: w.balance for u, w in h.wallets.items()}
+        entries = len(h.entries)
+        for server in h.servers:
+            server.state = ServerLifecycleState.DELETED
+            for _ in range(2):
+                result = await h.make_final_charge_service().charge_final(server, deleted)
+                assert result.charged_minor == 0
+        assert len(h.entries) == entries
+        assert {u: w.balance for u, w in h.wallets.items()} == balances
         assert h.wallets[EUR_USER].balance == 100_000 - HZ_SELLING * 3
         assert h.wallets[IRR_USER].balance == 100_000_000 - AC_SELLING * 3
 
-    async def test_daily_quantum_policy_settles_correctly(self) -> None:
-        """An ArvanCloud offer sold at a DAILY quantum: a 2h30m life bills
-        exactly ONE quantum (the hold capture), while the hourly Hetzner
-        parity server bills THREE (one per hour). Both correct per policy."""
+    async def test_nonmonthly_daily_quantum_is_also_prepaid(self) -> None:
         h = _parity_setup(ac_quantum=86400)
-        hz_wallet = h.wallets[EUR_USER]
-        ac_wallet = h.wallets[IRR_USER]
-        deleted_at = T0 + timedelta(hours=2, minutes=30)
-
-        # periodic run: the daily-quantum server has NO complete period yet
-        report = await h.make_accrual_job().run(now=deleted_at)
-        assert report.periods_posted == 2  # only hetzner's two hourly periods
-        assert h.servers[1].last_accrued_at is None  # arvancloud untouched
-        assert ac_wallet.balance == 100_000_000  # no arvancloud debit yet
-
-        # delete both at the same instant
-        h.servers[0].state = ServerLifecycleState.DELETED
+        deleted = T0 + timedelta(hours=2, minutes=30)
+        report = await h.make_accrual_job().run(now=deleted)
+        assert report.periods_posted == 4
+        assert h.servers[1].last_accrued_at == T0 + timedelta(days=1)
+        assert h.wallets[IRR_USER].balance == 100_000_000 - AC_SELLING
         h.servers[1].state = ServerLifecycleState.DELETED
-        await h.make_final_charge_service().charge_final(h.servers[0], deleted_at)
+        result = await h.make_final_charge_service().charge_final(h.servers[1], deleted)
+        assert result.charged_minor == 0
+        assert h.wallets[IRR_USER].balance == 100_000_000 - AC_SELLING
 
-        result_ac = await h.make_final_charge_service().charge_final(h.servers[1], deleted_at)
-        # the daily hold was still CREATED (no period settled it) -> captured,
-        # covering the FIRST (partial) day: exactly one quantum, no flat leg
-        assert result_ac.captured_hold is True
-        assert result_ac.charged_minor == AC_SELLING
-        assert ac_wallet.balance == 100_000_000 - AC_SELLING
-        # hetzner billed its three hourly quanta instead
-        assert hz_wallet.balance == 100_000 - HZ_SELLING * 3
-        # margin record for the daily window: cost + selling of ONE daily quantum
-        ac_records = [p for p in h.accrual_rows.values() if p.server_id == AC_SERVER]
-        assert len(ac_records) == 1
-        assert ac_records[0].selling_minor == AC_SELLING
-        assert ac_records[0].cost_minor == AC_COST
-        assert ac_records[0].currency == "IRR"
+    async def test_wallet_currency_mismatch_blocks_activation(self) -> None:
+        from dataclasses import replace
 
-    async def test_daily_quantum_replay_idempotent(self) -> None:
-        h = _parity_setup(ac_quantum=86400)
-        deleted_at = T0 + timedelta(hours=2, minutes=30)
-        h.servers[1].state = ServerLifecycleState.DELETED
-        first = await h.make_final_charge_service().charge_final(h.servers[1], deleted_at)
-        assert first.captured_hold is True
-        assert first.charged_minor == AC_SELLING
-        balance = h.wallets[IRR_USER].balance
-        entry_count = len(h.entries)
-        second = await h.make_final_charge_service().charge_final(h.servers[1], deleted_at)
-        assert second.charged_minor == 0
-        assert len(h.entries) == entry_count
-        assert h.wallets[IRR_USER].balance == balance
-
-    async def test_wallet_currency_mismatch_fails_closed(self) -> None:
-        """A USD wallet must never settle a EUR-selling snapshot (fail closed)."""
         h = _parity_setup()
-        h.snapshots[HZ_SERVER] = ServerPriceSnapshot(
-            server_id=HZ_SERVER,
-            offer=OfferCost(
-                provider_key="hetzner",
-                plan_id="cx22",
-                location_id="fsn1",
-                cost_minor=HZ_COST,
-                currency="EUR",
-            ),
-            selling_minor=HZ_SELLING,
-            book_name="retail-eur",
-            book_version=1,
-            rule=MarginRule(
-                provider="hetzner",
-                plan="cx22",
-                location="fsn1",
-                margin_factor=Decimal("1.43"),
-            ),
-            priced_at=T0,
-        )
-        h.servers[0].state = ServerLifecycleState.DELETED
-        balance_before = h.wallets[EUR_USER].balance
-        entries_before = len(h.entries)
+        h.snapshots[HZ_SERVER] = replace(h.snapshots[HZ_SERVER], selling_currency="EUR")
+        balance = h.wallets[EUR_USER].balance
         with pytest.raises(ValueError, match="wallet currency"):
-            await h.make_final_charge_service().charge_final(h.servers[0], T0 + timedelta(hours=1))
-        assert h.wallets[EUR_USER].balance == balance_before
-        assert len(h.entries) == entries_before
-
-
-def hz_wallet_id(h: ParityHarness) -> UUID:
-    return h.wallets[EUR_USER].id  # type: ignore[return-value]
-
-
-def ac_wallet_id(h: ParityHarness) -> UUID:
-    return h.wallets[IRR_USER].id  # type: ignore[return-value]
+            await h.make_accrual_job().prepay_server(h.servers[0], T0)
+        assert h.wallets[EUR_USER].balance == balance
+        assert h.entries == {}

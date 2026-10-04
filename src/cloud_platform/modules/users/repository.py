@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -44,6 +45,9 @@ def _to_domain(row: SQLAlchemyUser) -> User:
         # columns: rehydrate them as aware UTC for the domain.
         terms_accepted_at=from_db_utc_or_none(_attr(row, "terms_accepted_at")),
         telegram_user_id=_attr(row, "telegram_user_id"),
+        phone_number=_attr(row, "phone_number"),
+        phone_verified_at=from_db_utc_or_none(_attr(row, "phone_verified_at")),
+        national_id=_attr(row, "national_id"),
         created_at=from_db_utc_or_none(_attr(row, "created_at")),
         updated_at=from_db_utc_or_none(_attr(row, "updated_at")),
     )
@@ -58,6 +62,9 @@ def _to_row(domain: User) -> SQLAlchemyUser:
             status=domain.status.value,
             role=domain.role.value,
             telegram_user_id=domain.telegram_user_id,
+            phone_number=domain.phone_number,
+            phone_verified_at=domain.phone_verified_at,
+            national_id=domain.national_id,
         )
     else:
         row = SQLAlchemyUser(
@@ -69,6 +76,9 @@ def _to_row(domain: User) -> SQLAlchemyUser:
             terms_version=domain.terms_version,
             terms_accepted_at=to_db_utc_or_none(domain.terms_accepted_at),
             telegram_user_id=domain.telegram_user_id,
+            phone_number=domain.phone_number,
+            phone_verified_at=domain.phone_verified_at,
+            national_id=domain.national_id,
             created_at=to_db_utc_or_none(domain.created_at),
             updated_at=to_db_utc(utc_now()),
         )
@@ -185,6 +195,31 @@ class SqlAlchemyUserRepository:
             if row is None:
                 raise UserNotFound(f"User with id {user_id} not found")
             cast(Any, row).telegram_user_id = telegram_user_id
+            await session.commit()
+            await session.refresh(row)
+            return _to_domain(row)
+
+    async def update_verified_phone(
+        self, user_id: UUID, phone_number: str, verified_at: datetime
+    ) -> User:
+        """Persist verified contact facts without exposing them in logs."""
+        async with self._session_factory() as session:
+            row = await session.get(SQLAlchemyUser, user_id)
+            if row is None:
+                raise UserNotFound(f"User with id {user_id} not found")
+            cast(Any, row).phone_number = phone_number
+            cast(Any, row).phone_verified_at = verified_at
+            await session.commit()
+            await session.refresh(row)
+            return _to_domain(row)
+
+    async def update_national_id(self, user_id: UUID, national_id: str) -> User:
+        """Store a validated national ID without claiming ownership matching."""
+        async with self._session_factory() as session:
+            row = await session.get(SQLAlchemyUser, user_id)
+            if row is None:
+                raise UserNotFound(f"User with id {user_id} not found")
+            cast(Any, row).national_id = national_id
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)

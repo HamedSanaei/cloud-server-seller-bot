@@ -466,6 +466,22 @@ class _StubCloudTransport:
             }
         if path == "/publicCloud/v1/instanceTypes":
             return _official_types_payload()
+        if path == "/publicCloud/v1/images":
+            assert params == {"region": "eu-west-3"}
+            return {
+                "images": [
+                    {
+                        "id": "ubuntu-24.04",
+                        "name": "Ubuntu 24.04",
+                        "displayName": "Ubuntu 24.04 LTS",
+                        "os": "Linux",
+                        "architecture": "x86_64",
+                        "region": None,
+                        "minDiskSize": 5,
+                        "storageTypes": ["CENTRAL"],
+                    }
+                ]
+            }
         raise AssertionError(f"unexpected provider read: {path}")
 
     async def aclose(self) -> None:
@@ -483,6 +499,7 @@ class TestLiveHourlySyncAcceptance:
             CatalogAutoSyncCoordinator,
             PricingPolicy,
         )
+        from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY
         from cloud_platform.providers.leaseweb.cloud import LeasewebHourlyCloudProvider
         from cloud_platform.providers.leaseweb.cloud_auto_sync import (
             LeasewebHourlyCloudSyncSource,
@@ -510,7 +527,11 @@ class TestLiveHourlySyncAcceptance:
             assert report.ran is True
             offers_repo = SqlAlchemySellableOfferRepository(session_factory)
             stored = await offers_repo.get_by_ref(
-                "leaseweb", "lsw.c3.large", "eu-west-3", provider_account_id="north"
+                "leaseweb",
+                "lsw.c3.large",
+                "eu-west-3",
+                provider_account_id="north",
+                billing_model=BILLING_MODEL_HOURLY,
             )
             assert stored is not None
             assert stored.provider_account_id == "north"

@@ -35,6 +35,9 @@ USER = User(
     status=UserStatus.ACTIVE,
     role=Role.USER,
     telegram_user_id=12345,
+    phone_number="+989123456789",
+    national_id="1234567891",
+    phone_verified_at=datetime.now(UTC),
 )
 
 
@@ -305,6 +308,9 @@ class FakeCheckout:
 
 
 class FakeServers:
+    async def get_by_idempotency_key(self, idempotency_key: str) -> None:
+        return None
+
     async def list_by_user(self, user_id: UUID) -> list[Any]:
         return []
 
@@ -621,14 +627,3 @@ class TestPanelFlow:
         )
         confirm = await _press(bot, confirm_entry.callback_data or "")
         assert "Webmin" in confirm.text
-
-    async def test_confirm_callback_carries_panel_index_within_budget(self) -> None:
-        service = _service([_offer(location_id="FRA-01")])
-        offer = (await service._offers.list_sellable(PROVIDER))[0]
-        view = await service.confirmation(
-            user_id=uuid4(), offer_id=offer.id, os_index=0, panel_index=1
-        )
-        assert view.panel_name == "Webmin"
-        assert _size(view.confirm_callback) <= 64
-        target = _decode(view.confirm_callback)
-        assert target.args[1:] == ("0", "1")

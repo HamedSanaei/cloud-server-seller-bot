@@ -91,6 +91,15 @@ from cloud_platform.modules.compute.domain import (
     ServerRepository,
 )
 from cloud_platform.modules.offers.domain import SellableOffer, SellableOfferRepository
+from cloud_platform.modules.operations.create_attempts import (
+    CreateAccountAttemptRepository,
+    CreateAttemptConflict,
+    create_routing,
+    current_account,
+    last_attempt,
+    refused_accounts,
+    safe_pre_post,
+)
 from cloud_platform.modules.operations.domain import (
     InvalidOperationTransition,
     Operation,
@@ -134,6 +143,8 @@ from cloud_platform.providers.base import (
 )
 from cloud_platform.providers.errors import (
     ProviderAuthError,
+    ProviderCapacityError,
+    ProviderConflict,
     ProviderError,
     ProviderNotFound,
     ProviderOutcomeUnknown,
@@ -142,7 +153,11 @@ from cloud_platform.providers.errors import (
 )
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.retry import ErrorClass, classify_provider_error
-from cloud_platform.providers.routing import UnknownCredentialAccountError, provider_for
+from cloud_platform.providers.routing import (
+    UnknownCredentialAccountError,
+    normalize_account_id,
+    provider_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +480,7 @@ class OrderSettlementService:
         operation_repo: OperationRepository,
         audit_repo: AuditRepository,
         clock: Callable[[], datetime] | None = None,
+        create_attempts: CreateAccountAttemptRepository | None = None,
     ) -> None:
         self._wallets = wallet_repo
         self._holds = hold_repo
@@ -472,6 +488,7 @@ class OrderSettlementService:
         self._ledger = ledger_repo
         self._orders = orders_repo
         self._ops = operation_repo
+        self._create_attempts = create_attempts
         self._audit = AuditTrail(audit_repo)
         self._now = clock or (lambda: datetime.now(UTC))
 
@@ -622,7 +639,17 @@ class OrderSettlementService:
         is repaired WITHOUT any provider call.
         """
         op = await self._ops.get_by_key(order.operation_key)
-        if op is None or op.is_terminal:
+        if op is None or op.status in (OperationStatus.COMPLETED, OperationStatus.FAILED):
+            return
+        if create_routing(op) is not None:
+            if self._create_attempts is None:
+                raise CreateAttemptConflict("pooled acceptance has no fenced repository")
+            await self._create_attempts.save_outcome(
+                op.id,
+                op.attempts,
+                OperationStatus.COMPLETED,
+                correlation={"provider_order_id": order.provider_order_id, "settled": True},
+            )
             return
         try:
             op.complete(
@@ -659,6 +686,8 @@ class OrderWorker:
         clock: Callable[[], datetime] | None = None,
         event_sink: BusinessEventSink | None = None,
         user_repo: Any | None = None,
+        create_attempts: CreateAccountAttemptRepository | None = None,
+        fulfillment_routes: Any | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -673,6 +702,8 @@ class OrderWorker:
         self._delivery = delivery_notifier or _LoggingOrderDeliveryNotifier()
         self._events = event_sink
         self._users = user_repo
+        self._create_attempts = create_attempts
+        self._routes = fulfillment_routes
         self._settlement = settlement or OrderSettlementService(
             wallet_repo=wallet_repo,
             hold_repo=hold_repo,
@@ -682,8 +713,16 @@ class OrderWorker:
             operation_repo=operation_repo,
             audit_repo=audit_repo,
             clock=clock,
+            create_attempts=create_attempts,
         )
         self._now = clock or (lambda: datetime.now(UTC))
+
+    def _uses_account_pool(self, provider_key: str) -> bool:
+        return (
+            self._create_attempts is not None
+            and self._routes is not None
+            and (self._routes.supports_capacity_failover(provider_key))
+        )
 
     def _activator(self) -> OrderActivator:
         return OrderActivator(
@@ -733,34 +772,82 @@ class OrderWorker:
             return OrderWorkerOutcome.FAILED
         if operation.is_terminal:
             return OrderWorkerOutcome.SKIPPED_STATE
+        pooled = self._uses_account_pool(server.provider_key) and (
+            create_routing(operation) is not None
+            or (
+                operation.status is OperationStatus.PENDING
+                and operation.attempts == 0
+                and not order.post_attempted_at
+                and not server.provider_server_id
+                and not order.provider_order_id
+            )
+        )
         if operation.status is OperationStatus.IN_FLIGHT:
-            # A worker may have crashed mid-POST. After a grace period the
-            # outcome is UNKNOWN — the POST is NEVER blindly repeated. The
-            # order + operation move to OUTCOME_UNKNOWN and a READ-ONLY
-            # recovery scan (or a human) resolves them.
             updated = operation.updated_at or operation.created_at or self._now()
             if self._now() - updated <= STALE_IN_FLIGHT_GRACE:
+                return OrderWorkerOutcome.SKIPPED_IN_FLIGHT
+            if pooled and create_routing(operation) is not None:
+                assert self._create_attempts is not None
+                operation = await self._create_attempts.resume_safe_claim(
+                    operation.id, operation.attempts
+                )
+                attempt = last_attempt(operation)
+                if attempt is not None and attempt["phase"] == "refused":
+                    return await self._fail_permanent(
+                        server, order, "provider definitively refused the create", claimed=operation
+                    )
+                if operation.status is not OperationStatus.PENDING:
+                    return OrderWorkerOutcome.OUTCOME_UNKNOWN
+            else:
+                await self._mark_outcome_unknown(
+                    server,
+                    order,
+                    operation,
+                    "worker crashed around the order POST; read-only recovery required",
+                )
+                return OrderWorkerOutcome.OUTCOME_UNKNOWN
+        if self._uses_account_pool(server.provider_key) and not pooled:
+            historical_claim = await self._ops.claim(operation.id)
+            if historical_claim is None:
                 return OrderWorkerOutcome.SKIPPED_IN_FLIGHT
             await self._mark_outcome_unknown(
                 server,
                 order,
-                operation,
-                "worker crashed around the order POST; outcome unknown, "
-                "recovery requires a read-only scan",
+                historical_claim,
+                "historical create has no pre-POST routing proof; read-only recovery required",
             )
             return OrderWorkerOutcome.OUTCOME_UNKNOWN
-        claimed = await self._ops.claim(operation.id)
+        if pooled:
+            assert self._create_attempts is not None
+            catalog_account = (server.offer_fingerprint or {}).get("provider_account_id")
+            if catalog_account is not None and not isinstance(catalog_account, str):
+                raise CreateAttemptConflict("invalid catalog provenance")
+            claimed = await self._create_attempts.claim(
+                operation.id,
+                server.id,
+                order.id,
+                catalog_account_id=catalog_account,
+            )
+        else:
+            claimed = await self._ops.claim(operation.id)
         if claimed is None:
             return OrderWorkerOutcome.SKIPPED_IN_FLIGHT
 
         offer = await self._offers.get(order.offer_id) if order.offer_id else None
         if offer is None:
             return await self._fail_permanent(
-                server, order, "sellable offer row missing for order intent"
+                server,
+                order,
+                "sellable offer row missing for order intent",
+                claimed=claimed,
             )
         if server.os is None:
-            return await self._fail_permanent(server, order, "server has no recorded OS")
+            return await self._fail_permanent(
+                server, order, "server has no recorded OS", claimed=claimed
+            )
 
+        if pooled:
+            return await self._provision_direct(server, order, claimed, offer, None)
         # The ORDER's pin is authoritative (LEASEWEB-MULTIACCOUNT): it was
         # snapshotted at checkout, before any billable call. The server's pin is
         # the same value and only a fallback for rows written by older code.
@@ -1010,7 +1097,7 @@ class OrderWorker:
         order: ProviderOrder,
         claimed: Operation,
         offer: SellableOffer,
-        provider: CloudProvider,
+        provider: CloudProvider | None,
     ) -> OrderWorkerOutcome:
         """Provision through DIRECT server creation (no ordering pipeline).
 
@@ -1028,6 +1115,9 @@ class OrderWorker:
         never become a second POST, so an unknown outcome is recorded and
         resolved READ-ONLY through the provider's own operation identity.
         """
+        if create_routing(claimed) is not None:
+            return await self._provision_from_pool(server, order, claimed, offer)
+        assert provider is not None
         if not offer.sellable:
             return await self._fail_permanent(
                 server, order, f"offer {offer.ref} is no longer sellable (availability changed)"
@@ -1108,25 +1198,267 @@ class OrderWorker:
                 return OrderWorkerOutcome.REQUEUED
             return await self._fail_permanent(server, order, str(exc))
 
+        return await self._accept_direct(server, order, claimed, offer, created)
+
+    async def _provision_from_pool(
+        self,
+        server: CloudServer,
+        order: ProviderOrder,
+        claimed: Operation,
+        offer: SellableOffer,
+    ) -> OrderWorkerOutcome:
+        """Only definitive refusals consume an account; uncertainty never moves the intent."""
+        if not safe_pre_post(claimed):
+            return OrderWorkerOutcome.OUTCOME_UNKNOWN
+        assert self._create_attempts is not None
+        assert self._routes is not None
+        if (
+            not order.product_id
+            or not order.location_id
+            or not order.os_name
+            or server.os != order.os_name
+            or order.provider_cost_minor is None
+            or order.provider_cost_minor <= 0
+            or not order.provider_cost_currency
+            or not order.contract_term
+            or not order.billing_cycle
+            or order.control_panel is not None
+        ):
+            return await self._fail_permanent(
+                server,
+                order,
+                "monthly intent lacks a complete immutable provider contract",
+                claimed=claimed,
+            )
+        request = CreateServerRequest(
+            name=f"srv-{server.id.hex[:8]}",
+            plan_id=order.product_id,
+            image_id=order.os_name,
+            location_id=order.location_id,
+            labels={
+                "provider_price_minor": str(order.provider_cost_minor),
+                "provider_currency": order.provider_cost_currency,
+                "contract_term": order.contract_term,
+                "billing_cycle": order.billing_cycle,
+                "platform_server_id": str(server.id),
+            },
+        )
+        excluded = set(refused_accounts(claimed))
+        contract_mismatch = False
+        while True:
+            try:
+                account_id = await self._routes.account_for(
+                    server.provider_key,
+                    order.location_id,
+                    order.product_id,
+                    exclude=excluded,
+                )
+                provider = provider_for(self._registry, server.provider_key, account_id)
+            except ProviderCapacityError:
+                reason = (
+                    "no account can honor the pinned provider contract"
+                    if contract_mismatch
+                    else "all proven provider accounts are full or definitively refused"
+                )
+                return await self._fail_permanent(server, order, reason, claimed=claimed)
+            except ProviderNotFound:
+                return await self._fail_permanent(
+                    server,
+                    order,
+                    "no proven serving account for the pinned provider contract",
+                    claimed=claimed,
+                )
+            except (ProviderUnavailable, UnknownCredentialAccountError):
+                await self._create_attempts.save_outcome(
+                    claimed.id,
+                    claimed.attempts,
+                    OperationStatus.PENDING,
+                    error="provider eligibility or Project inventory is unreadable",
+                )
+                return OrderWorkerOutcome.REQUEUED
+            if (
+                account_id is None
+                or provisioning_mode_of(provider) is not ProvisioningMode.DIRECT_CREATE
+            ):
+                return await self._fail_permanent(
+                    server,
+                    order,
+                    "selected account cannot perform direct creation",
+                    claimed=claimed,
+                )
+            options = offer_options_support_of(provider)
+            if options is None:
+                return await self._fail_permanent(
+                    server,
+                    order,
+                    "selected account cannot prove mandatory checkout inputs",
+                    claimed=claimed,
+                )
+            try:
+                await options.validate_offer_for_checkout(
+                    location_id=order.location_id,
+                    product_id=order.product_id,
+                    os_name=order.os_name,
+                    expected_cost_minor=order.provider_cost_minor,
+                    currency=order.provider_cost_currency,
+                )
+            except ProviderAuthError:
+                return await self._fail_permanent(
+                    server,
+                    order,
+                    "provider credential rejected before create",
+                    claimed=claimed,
+                )
+            except (ProviderNotFound, ProviderConflict):
+                excluded.add(account_id)
+                contract_mismatch = True
+                continue
+            except ProviderError as exc:
+                await self._create_attempts.save_outcome(
+                    claimed.id,
+                    claimed.attempts,
+                    OperationStatus.PENDING,
+                    error=f"mandatory-input revalidation unreadable ({type(exc).__name__})",
+                )
+                return OrderWorkerOutcome.REQUEUED
+            claimed = await self._create_attempts.start_attempt(
+                claimed.id,
+                claimed.attempts,
+                account_id,
+            )
+            server.credential_account_id = account_id
+            order.credential_account_id = account_id
+            order.post_attempted_at = claimed.updated_at or self._now()
+            try:
+                created = await provider.create_server(
+                    request, IdempotencyKey(claimed.operation_key)
+                )
+            except ProviderCapacityError as exc:
+                if not exc.definitive_refusal:
+                    await self._mark_outcome_unknown(
+                        server,
+                        order,
+                        claimed,
+                        "capacity error lacks authoritative rejection proof; "
+                        "same-account recovery required",
+                    )
+                    return OrderWorkerOutcome.OUTCOME_UNKNOWN
+                claimed = await self._create_attempts.record_refusal(
+                    claimed.id,
+                    claimed.attempts,
+                    account_id,
+                    capacity=exc.allows_account_failover,
+                    error_code=exc.error_code,
+                    quota_names=exc.quota_names,
+                )
+                if not exc.allows_account_failover:
+                    return await self._fail_permanent(
+                        server,
+                        order,
+                        "provider refusal lacks authoritative capacity evidence",
+                        claimed=claimed,
+                    )
+                excluded.add(account_id)
+                continue
+            except ProviderError as exc:
+                if (
+                    isinstance(exc, ProviderOutcomeUnknown)
+                    or classify_provider_error(exc) is ErrorClass.RETRYABLE
+                ):
+                    claimed = await self._create_attempts.record_unknown(
+                        claimed.id,
+                        claimed.attempts,
+                        account_id,
+                    )
+                    recovered_created = await self._recover_direct_server(
+                        provider,
+                        order,
+                        claimed.operation_key,
+                        operation=claimed,
+                    )
+                    if recovered_created is None:
+                        await self._mark_outcome_unknown(
+                            server,
+                            order,
+                            claimed,
+                            "provider outcome unknown; same-account recovery required",
+                        )
+                        return OrderWorkerOutcome.OUTCOME_UNKNOWN
+                    created = recovered_created
+                else:
+                    claimed = await self._create_attempts.record_refusal(
+                        claimed.id,
+                        claimed.attempts,
+                        account_id,
+                        capacity=False,
+                        error_code=getattr(exc, "error_code", None),
+                    )
+                    return await self._fail_permanent(
+                        server,
+                        order,
+                        f"provider create definitively rejected ({type(exc).__name__})",
+                        claimed=claimed,
+                    )
+            except Exception:
+                await self._mark_outcome_unknown(
+                    server,
+                    order,
+                    claimed,
+                    "provider mutation returned an unverifiable outcome; "
+                    "same-account recovery required",
+                )
+                return OrderWorkerOutcome.OUTCOME_UNKNOWN
+            return await self._accept_direct(server, order, claimed, offer, created)
+
+    async def _accept_direct(
+        self,
+        server: CloudServer,
+        order: ProviderOrder,
+        claimed: Operation,
+        offer: SellableOffer,
+        created: ProviderServer,
+    ) -> OrderWorkerOutcome:
+        """Persist accepted ownership before the existing local settlement barrier."""
+        pooled = create_routing(claimed) is not None
+        if pooled:
+            assert self._create_attempts is not None
+            claimed = await self._create_attempts.record_acceptance(
+                claimed.id,
+                claimed.attempts,
+                current_account(claimed, server.credential_account_id),
+                created.id,
+                ipv4=created.ipv4,
+                ipv6=created.ipv6,
+            )
         # Accepted: the resource EXISTS. Persist its identity before money.
         server.provider_server_id = created.id
         if created.ipv4:
             server.ipv4 = created.ipv4
         if created.ipv6:
             server.ipv6 = created.ipv6
-        await self._servers.save(server)
+        if not pooled:
+            await self._servers.save(server)
         order.mark_submitted(created.id)
         order.attempts += 1
         order.error = None
-        await self._orders.save(order)
-        claimed.complete(
-            {
-                "provider_server_id": created.id,
-                "provider_state": created.status,
-                "idempotency_key": claimed.operation_key,
-            }
-        )
-        await self._ops.save(claimed)
+        if not pooled:
+            await self._orders.save(order)
+        correlation: dict[str, object] = {
+            "provider_server_id": created.id,
+            "provider_state": created.status,
+            "idempotency_key": claimed.operation_key,
+        }
+        if pooled:
+            assert self._create_attempts is not None
+            claimed = await self._create_attempts.save_outcome(
+                claimed.id,
+                claimed.attempts,
+                OperationStatus.COMPLETED,
+                correlation=correlation,
+            )
+        else:
+            claimed.complete(correlation)
+            await self._ops.save(claimed)
 
         await emit_safe(
             self._events,
@@ -1139,9 +1471,10 @@ class OrderWorker:
                 product_id=order.product_id or offer.product_id,
                 location_id=order.location_id or offer.location_id,
                 plan_name=offer.name,
-                provider_cost_minor=offer.provider_cost_minor,
-                currency=offer.provider_cost_currency,
+                provider_cost_minor=order.provider_cost_minor or offer.provider_cost_minor,
+                currency=order.provider_cost_currency or offer.provider_cost_currency,
                 operation_key=claimed.operation_key,
+                credential_account=server.credential_account_id,
             ),
         )
 
@@ -1211,7 +1544,12 @@ class OrderWorker:
         return OrderWorkerOutcome.SUBMITTED
 
     async def _recover_direct_server(
-        self, provider: CloudProvider, order: ProviderOrder, operation_key: str
+        self,
+        provider: CloudProvider,
+        order: ProviderOrder,
+        operation_key: str,
+        *,
+        operation: Operation | None = None,
     ) -> ProviderServer | None:
         """READ-ONLY: claim a server this operation may have created.
 
@@ -1223,14 +1561,26 @@ class OrderWorker:
         recovery = server_recovery_support_of(provider)
         if recovery is None:
             return None
-        result = await recovery.recover_server_by_operation(operation_key)
+        if operation is not None and create_routing(operation) is not None:
+            result = await recovery.recover_server_by_operation(
+                operation_key,
+                legacy_label=False,
+                platform_server_id=str(order.server_id),
+            )
+        else:
+            result = await recovery.recover_server_by_operation(
+                operation_key, legacy_label=True, platform_server_id=str(order.server_id)
+            )
         if result.verdict is OrderRecoveryVerdict.MATCHED and result.provider_order_id:
             logger.warning(
                 "order %s: ambiguous create resolved READ-ONLY to provider server %s",
                 order.id,
                 result.provider_order_id,
             )
-            return await provider.get_server(result.provider_order_id)
+            remote = await provider.get_server(result.provider_order_id)
+            if remote is None or remote.id != result.provider_order_id:
+                return None
+            return remote
         if result.verdict is OrderRecoveryVerdict.AMBIGUOUS:
             logger.error(
                 "order %s: %d candidate servers for operation %s; escalating for review",
@@ -1250,12 +1600,30 @@ class OrderWorker:
         """Record a billable POST whose outcome is unknown (release
         hardening). The hold stays reserved; no automatic re-POST follows;
         a READ-ONLY recovery scan (or a human) resolves the order."""
-        order.mark_outcome_unknown(reason)
-        order.attempts += 1
-        await self._orders.save(order)
-        if operation.status is not OperationStatus.OUTCOME_UNKNOWN:
-            operation.mark_outcome_unknown(reason)
-        await self._ops.save(operation)
+        if create_routing(operation) is not None:
+            assert self._create_attempts is not None
+            account_id = current_account(operation, server.credential_account_id)
+            attempt = last_attempt(operation)
+            if attempt is not None and attempt["phase"] == "sent":
+                operation = await self._create_attempts.record_unknown(
+                    operation.id,
+                    operation.attempts,
+                    account_id,
+                )
+            else:
+                operation = await self._create_attempts.save_outcome(
+                    operation.id,
+                    operation.attempts,
+                    OperationStatus.OUTCOME_UNKNOWN,
+                    error=reason,
+                )
+        if create_routing(operation) is None:
+            order.mark_outcome_unknown(reason)
+            order.attempts += 1
+            await self._orders.save(order)
+            if operation.status is not OperationStatus.OUTCOME_UNKNOWN:
+                operation.mark_outcome_unknown(reason)
+            await self._ops.save(operation)
         metrics.record_provisioning_failure("order_worker_outcome_unknown")
         await self._audit.record_mutation(
             actor_type=ActorType.SYSTEM,
@@ -1326,17 +1694,41 @@ class OrderWorker:
         return OrderWorkerOutcome.ALREADY_ACTIVE
 
     async def _fail_permanent(
-        self, server: CloudServer, order: ProviderOrder | None, reason: str
+        self,
+        server: CloudServer,
+        order: ProviderOrder | None,
+        reason: str,
+        *,
+        claimed: Operation | None = None,
     ) -> OrderWorkerOutcome:
+        pooled = False
         if order is not None:
-            order.mark_failed(reason)
-            await self._orders.save(order)
-            op = await self._ops.get_by_key(order.operation_key)
-            if op is not None and not op.is_terminal:
+            op = claimed if claimed is not None else await self._ops.get_by_key(order.operation_key)
+            if op is not None and create_routing(op) is not None:
+                pooled = True
+                if claimed is None:
+                    return OrderWorkerOutcome.SKIPPED_IN_FLIGHT
+                if self._create_attempts is None:
+                    raise CreateAttemptConflict("cannot release an unfenced pooled intent")
+                try:
+                    op = await self._create_attempts.save_outcome(
+                        op.id,
+                        op.attempts,
+                        OperationStatus.FAILED,
+                        error=reason,
+                    )
+                except CreateAttemptConflict:
+                    return OrderWorkerOutcome.SKIPPED_IN_FLIGHT
+            elif op is not None and not op.is_terminal:
                 op.fail(reason)
                 await self._ops.save(op)
+            order.mark_failed(reason)
+            if not pooled:
+                await self._orders.save(order)
         metrics.record_provisioning_failure("order_worker")
-        if server.state in (
+        if pooled:
+            server.state = ServerLifecycleState.ERROR
+        if not pooled and server.state in (
             ServerLifecycleState.REQUESTED,
             ServerLifecycleState.PROVISIONING,
         ):
@@ -1412,6 +1804,7 @@ class OrderReconciler:
         clock: Callable[[], datetime] | None = None,
         event_sink: BusinessEventSink | None = None,
         user_repo: Any | None = None,
+        create_attempts: CreateAccountAttemptRepository | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -1434,6 +1827,7 @@ class OrderReconciler:
             operation_repo=operation_repo,
             audit_repo=audit_repo,
             clock=clock,
+            create_attempts=create_attempts,
         )
         self._now = clock or (lambda: datetime.now(UTC))
 
@@ -1827,6 +2221,8 @@ class OrderRecoveryService:
         clock: Callable[[], datetime] | None = None,
         event_sink: BusinessEventSink | None = None,
         user_repo: Any | None = None,
+        create_attempts: CreateAccountAttemptRepository | None = None,
+        settlement: OrderSettlementService | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -1840,6 +2236,10 @@ class OrderRecoveryService:
         self._now = clock or (lambda: datetime.now(UTC))
         self._events = event_sink
         self._users = user_repo
+        if create_attempts is not None and settlement is None:
+            raise ValueError("pooled order recovery requires the settlement barrier")
+        self._create_attempts = create_attempts
+        self._settlement = settlement
 
     async def recover(
         self, provider_key: str = "leaseweb", limit: int = 50
@@ -1861,12 +2261,20 @@ class OrderRecoveryService:
         server = await self._servers.get(order.server_id)
         if server is None:
             return await self._escalate(order, "server row missing during recovery")
+        operation = await self._ops.get_by_key(order.operation_key)
+        if operation is not None and create_routing(operation) is not None:
+            return await self._recover_pooled(order, server, operation)
         try:
             provider = provider_for(
                 self._registry, server.provider_key, server.credential_account_id
             )
         except KeyError:
             return await self._escalate(order, f"provider {server.provider_key!r} not configured")
+        if (
+            provisioning_mode_of(provider) is ProvisioningMode.DIRECT_CREATE
+            and server_recovery_support_of(provider) is not None
+        ):
+            return await self._recover_historical_direct(order, server, operation, provider)
         from cloud_platform.providers.base import ordering_support_of
 
         ordering = ordering_support_of(provider)
@@ -1923,6 +2331,154 @@ class OrderRecoveryService:
             result.reason,
         )
         return RecoveryOutcome.LEFT_UNCHANGED
+
+    async def _recover_historical_direct(
+        self,
+        order: ProviderOrder,
+        server: CloudServer,
+        operation: Operation | None,
+        provider: CloudProvider,
+    ) -> RecoveryOutcome:
+        """Resolve a pre-cutover create on its original account without pool authority."""
+        if (
+            operation is None
+            or self._settlement is None
+            or not (
+                (operation.resource_type == "server_order" and operation.resource_id == order.id)
+                or (operation.resource_type == "server" and operation.resource_id == server.id)
+            )
+            or operation.provider_key != server.provider_key
+            or operation.operation_key != order.operation_key
+            or order.provider_key != server.provider_key
+            or normalize_account_id(order.credential_account_id)
+            != normalize_account_id(server.credential_account_id)
+            or operation.status
+            not in {
+                OperationStatus.IN_FLIGHT,
+                OperationStatus.OUTCOME_UNKNOWN,
+            }
+        ):
+            return RecoveryOutcome.LEFT_UNCHANGED
+        recovery = server_recovery_support_of(provider)
+        if recovery is None:
+            return RecoveryOutcome.LEFT_UNCHANGED
+        try:
+            result = await recovery.recover_server_by_operation(
+                operation.operation_key,
+                legacy_label=True,
+                platform_server_id=str(server.id),
+            )
+            if result.verdict is not OrderRecoveryVerdict.MATCHED or not result.provider_order_id:
+                return RecoveryOutcome.LEFT_UNCHANGED
+            remote = await provider.get_server(result.provider_order_id)
+        except ProviderError:
+            return RecoveryOutcome.LEFT_UNCHANGED
+        if remote is None or remote.id != result.provider_order_id:
+            return RecoveryOutcome.LEFT_UNCHANGED
+        if server.provider_server_id not in {None, remote.id}:
+            return RecoveryOutcome.LEFT_UNCHANGED
+        server.provider_server_id = remote.id
+        server.ipv4 = remote.ipv4 or server.ipv4
+        server.ipv6 = remote.ipv6 or server.ipv6
+        await self._servers.save(server)
+        order.mark_submitted(remote.id)
+        order.error = None
+        await self._orders.save(order)
+        operation.complete({"provider_server_id": remote.id, "recovered": True})
+        await self._ops.save(operation)
+        await self._settle_recovered_direct(order, server)
+        return RecoveryOutcome.RECOVERED
+
+    async def _settle_recovered_direct(self, order: ProviderOrder, server: CloudServer) -> None:
+        """Accepted identity alone never makes a monthly server eligible for activation."""
+        if self._settlement is None:
+            raise ValueError("direct recovery requires the settlement barrier")
+        verdict = await self._settlement.ensure_order_payment_settled(order, server)
+        if verdict is SettlementVerdict.SETTLED:
+            if server.state is ServerLifecycleState.REQUESTED:
+                server.transition_to(ServerLifecycleState.PROVISIONING)
+                await self._servers.save(server)
+        elif verdict is SettlementVerdict.NEEDS_REVIEW:
+            order.mark_needs_review(order.settlement_error or "payment settlement requires review")
+            await self._orders.save(order)
+
+    async def _recover_pooled(
+        self,
+        order: ProviderOrder,
+        server: CloudServer,
+        operation: Operation,
+    ) -> RecoveryOutcome:
+        if self._create_attempts is None or self._settlement is None:
+            return RecoveryOutcome.LEFT_UNCHANGED
+        try:
+            operation = await self._create_attempts.resume_safe_claim(
+                operation.id, operation.attempts
+            )
+            account_id = current_account(operation, server.credential_account_id)
+            provider = provider_for(self._registry, server.provider_key, account_id)
+            recovery = server_recovery_support_of(provider)
+            if recovery is None:
+                return RecoveryOutcome.LEFT_UNCHANGED
+            attempt = last_attempt(operation)
+            if attempt is not None and attempt["phase"] == "accepted":
+                identity = attempt["provider_server_id"]
+                assert identity is not None
+            else:
+                result = await recovery.recover_server_by_operation(
+                    operation.operation_key,
+                    legacy_label=False,
+                    platform_server_id=str(server.id),
+                )
+                if (
+                    result.verdict is not OrderRecoveryVerdict.MATCHED
+                    or not result.provider_order_id
+                ):
+                    return RecoveryOutcome.LEFT_UNCHANGED
+                identity = result.provider_order_id
+            remote = await provider.get_server(identity)
+            if remote is None or remote.id != identity:
+                return RecoveryOutcome.LEFT_UNCHANGED
+            operation = await self._create_attempts.record_acceptance(
+                operation.id,
+                operation.attempts,
+                account_id,
+                identity,
+                ipv4=remote.ipv4,
+                ipv6=remote.ipv6,
+            )
+            operation = await self._create_attempts.save_outcome(
+                operation.id,
+                operation.attempts,
+                OperationStatus.COMPLETED,
+                correlation={"provider_server_id": identity, "recovered": True},
+            )
+        except (CreateAttemptConflict, ProviderError, KeyError):
+            return RecoveryOutcome.LEFT_UNCHANGED
+        refreshed_order = await self._orders.get(order.id)
+        refreshed_server = await self._servers.get(server.id)
+        if refreshed_order is None or refreshed_server is None:
+            return RecoveryOutcome.LEFT_UNCHANGED
+        order = refreshed_order
+        server = refreshed_server
+        await self._settle_recovered_direct(order, server)
+        await emit_safe(
+            self._events,
+            provider_accepted_event(
+                user=await _load_user(self._users, server.user_id),
+                server_id=server.id,
+                order_id=order.id,
+                provider_key=server.provider_key,
+                provider_order_id=identity,
+                product_id=order.product_id,
+                location_id=order.location_id,
+                plan_name=order.product_id,
+                provider_cost_minor=order.provider_cost_minor,
+                currency=order.provider_cost_currency,
+                operation_key=operation.operation_key,
+                credential_account=account_id,
+            ),
+        )
+        return RecoveryOutcome.RECOVERED
 
     async def _attach(
         self, order: ProviderOrder, provider_order_id: str, reason: str

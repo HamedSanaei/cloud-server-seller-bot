@@ -3,8 +3,10 @@
 Validates user, offer and balance, then persists the intent: a ``REQUESTED``
 server row pinned to the exact catalog offer and a unique idempotency key,
 an immutable price snapshot (the single source of truth for billing), and a
-wallet hold reserving the first quantum of funds. The command never calls a
-provider — provisioning is the worker's job (M07-002).
+wallet hold reserving the first quantum of funds. Capacity-aware providers
+select a proven fulfillment account before reserving money; historical replay
+keeps the original account and price. The command never mutates a provider —
+provisioning is the worker's job (M07-002).
 
 Authorization/ownership is enforced here in the application layer: the
 requesting user must be active, and the idempotency key makes retries
@@ -18,7 +20,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid4
 
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
@@ -63,12 +65,14 @@ from cloud_platform.modules.users.domain import (
     User,
     UserStatus,
 )
+from cloud_platform.modules.users.identity import require_verified_identity
 from cloud_platform.modules.wallet.domain import (
     Hold,
     HoldRepository,
     WalletRepository,
 )
 from cloud_platform.observability.metrics import metrics
+from cloud_platform.providers.errors import ProviderCapacityError, ProviderError
 
 if TYPE_CHECKING:
     from cloud_platform.modules.billing.service import AccrualPeriodRepository
@@ -102,6 +106,14 @@ class MaintenanceBlockedError(CreateServerCommandError):
 
 class CostLimitReachedError(CreateServerCommandError):
     """Raised when a daily cost circuit breaker halts new spend for the scope."""
+
+
+class ProviderAccountsFullError(CreateServerCommandError):
+    """All independently eligible provider accounts are definitively at capacity."""
+
+
+class ProviderInventoryUnavailableError(CreateServerCommandError):
+    """Current provider eligibility or Project inventory cannot be proved."""
 
 
 class MaintenanceSwitchError(Exception):
@@ -149,6 +161,7 @@ class CreateServerService:
         maintenance: MaintenanceSwitchService | None = None,
         terms: TermsGate | None = None,
         cost_breaker: CostCircuitBreaker | None = None,
+        fulfillment_routes: Any | None = None,
     ) -> None:
         if not book_name or not book_name.strip():
             raise ValueError("book_name must not be empty")
@@ -165,6 +178,7 @@ class CreateServerService:
         self._maintenance = maintenance
         self._terms = terms
         self._cost_breaker = cost_breaker
+        self._fulfillment_routes = fulfillment_routes
 
     @staticmethod
     def _hold_key(idempotency_key: str) -> str:
@@ -185,19 +199,21 @@ class CreateServerService:
         1. User must be ACTIVE (frozen/banned users are rejected).
         1.5 The terms gate (M02-004), when wired, must see the user on the
             latest published terms (TermsAcceptanceRequiredError otherwise).
-        2. Offer must exist in the catalog and be enabled.
-        2.5 The maintenance switch (M10-005), when wired, must not block
+        2. Replay check: the same idempotency key returns the original server,
+           snapshot and hold before reading current catalog or allocation.
+        3. Offer must exist in the catalog and be enabled.
+        3.5 The maintenance switch (M10-005), when wired, must not block
             new orders for the offer's provider/location.
-        3. The user must have an ACTIVE account with the offer's provider.
-        4. The selling price is derived from the versioned price book.
-        5. Replay check: the same idempotency key returns the original
-           outcome without reserving funds again.
+        4. The user must have an ACTIVE account with the offer's provider.
+        5. The selling price is derived from the versioned price book.
         6. Quota: the user's active/lifetime server counts must leave room for one
-            more (QuotaExceededError).
+           more (QuotaExceededError).
+        6.5 Capacity-aware fulfillment must prove a serving account with live
+            headroom before any hold or intent is created.
         7. The wallet must exist and cover the first quantum: a hold
            reserves the funds (idempotent per command key).
         8. A REQUESTED server row is persisted with the unique
-           idempotency key and the pinned catalog offer.
+           idempotency key, pinned catalog offer and selected fulfillment account.
         9. An immutable price snapshot fixes the server's price.
         10. The mutation is audited (USER actor).
 
@@ -215,6 +231,8 @@ class CreateServerService:
             CostLimitReachedError: A daily cost circuit breaker tripped.
             NoProviderAccountError: No active account with the provider.
             QuotaExceededError: Concurrent or lifetime quota reached.
+            ProviderAccountsFullError: All eligible accounts are proven full.
+            ProviderInventoryUnavailableError: No serving route or readable capacity.
             InsufficientHoldBalanceError: Wallet balance below the price.
             ServerCreateError: Constraint violation on the server row.
             CreateServerCommandError: Idempotency key owned by another user.
@@ -224,10 +242,29 @@ class CreateServerService:
             raise CreateServerCommandError("a persisted user id is required")
         if user.status is not UserStatus.ACTIVE:
             raise UserNotActiveError(f"user {user.id} is {user.status.value}")
+        require_verified_identity(user)
 
         # 1.5 Terms (M02-004), when wired: provisioning requires the latest terms.
         if self._terms is not None:
             await self._terms.require_latest(user)
+
+        # Replay the persisted contract before reading any new-order facts.
+        hold_key = self._hold_key(idempotency_key)
+        existing = await self._servers.get_by_idempotency_key(idempotency_key)
+        if existing is not None:
+            if existing.user_id != user.id:
+                raise CreateServerCommandError(
+                    f"idempotency key {idempotency_key!r} belongs to another user"
+                )
+            wallet = await self._wallets.get(user.id)
+            wallet_id = wallet.id if wallet is not None and wallet.id is not None else None
+            hold: Hold | None = (
+                await self._holds.get_by_idempotency(wallet_id, hold_key)
+                if wallet_id is not None
+                else None
+            )
+            snapshot = await self._snapshots.get_snapshot(existing.id)
+            return CreateServerResult(server=existing, snapshot=snapshot, hold=hold, replayed=True)
 
         # 2. Offer.
         offer = await self._catalog.get_offer(offer_ref)
@@ -288,24 +325,6 @@ class CreateServerService:
             book_name=self._book_name, offer=cost, at=when
         )
 
-        # 5. Replay check (before reserving funds).
-        hold_key = self._hold_key(idempotency_key)
-        existing = await self._servers.get_by_idempotency_key(idempotency_key)
-        if existing is not None:
-            if existing.user_id != user.id:
-                raise CreateServerCommandError(
-                    f"idempotency key {idempotency_key!r} belongs to another user"
-                )
-            wallet = await self._wallets.get(user.id)
-            wallet_id = wallet.id if wallet is not None and wallet.id is not None else None
-            hold: Hold | None = (
-                await self._holds.get_by_idempotency(wallet_id, hold_key)
-                if wallet_id is not None
-                else None
-            )
-            snapshot = await self._snapshots.get_snapshot(existing.id)
-            return CreateServerResult(server=existing, snapshot=snapshot, hold=hold, replayed=True)
-
         # 5.5 Quota (after the replay check so replays stay idempotent).
         active = await self._servers.count_active(user.id)
         if active >= self._quota.max_active:
@@ -317,6 +336,31 @@ class CreateServerService:
             raise QuotaExceededError(
                 f"user has created {total} servers (lifetime limit {self._quota.max_total})"
             )
+
+        # Keep customer account ownership separate from fulfillment credentials.
+        # Legacy catalog creation validates the original plan in the worker;
+        # selection here uses the independently proven location route.
+        credential_account_id: str | None = None
+        if (
+            self._fulfillment_routes is not None
+            and self._fulfillment_routes.supports_capacity_failover(offer_ref.provider_key)
+        ):
+            try:
+                credential_account_id = await self._fulfillment_routes.account_for(
+                    offer_ref.provider_key, offer_ref.location_id, None
+                )
+            except ProviderCapacityError:
+                raise ProviderAccountsFullError(
+                    "all configured provider accounts are currently full"
+                ) from None
+            except ProviderError:
+                raise ProviderInventoryUnavailableError(
+                    "current provider availability could not be proved"
+                ) from None
+            if credential_account_id is None:
+                raise ProviderInventoryUnavailableError(
+                    "current provider availability could not be proved"
+                ) from None
 
         # 6. Wallet + hold (balance validation lives in the hold).
         wallet = await self._wallets.get(user.id)
@@ -333,6 +377,7 @@ class CreateServerService:
             user_id=user.id,
             provider_key=offer_ref.provider_key,
             provider_account_id=account.id,
+            credential_account_id=credential_account_id,
             state=ServerLifecycleState.REQUESTED,
         )
         intent = ServerCreateIntent(

@@ -259,6 +259,7 @@ class SqlAlchemySellableOfferRepository:
         location_id: str,
         update: OfferSpecUpdate,
         provider_account_id: str | None = None,
+        adopt_legacy_catalog_row: bool = False,
     ) -> SellableOffer:
         """Refresh one provider observation (idempotent per billing model/product/location).
 
@@ -285,6 +286,10 @@ class SqlAlchemySellableOfferRepository:
         ]
         if any(not isinstance(value, str) or not value.strip() for value in supplied_accounts):
             raise ValueError("provider_account_id must be non-empty when supplied")
+        if not isinstance(adopt_legacy_catalog_row, bool):
+            raise ValueError("legacy catalog adoption must be boolean")
+        if adopt_legacy_catalog_row and not supplied_accounts:
+            raise ValueError("legacy catalog adoption requires verified account provenance")
         if len({str(value).strip().casefold() for value in supplied_accounts}) > 1:
             raise ValueError("provider account arguments disagree")
         account_id = str(supplied_accounts[0]).strip().casefold() if supplied_accounts else None
@@ -321,7 +326,9 @@ class SqlAlchemySellableOfferRepository:
                     if str(candidate.provider_account_id or "").strip().casefold()
                     == str(account_id).strip().casefold()
                 ]
-                if any(candidate.provider_account_id is None for candidate in candidates):
+                if any(candidate.provider_account_id is None for candidate in candidates) and not (
+                    adopt_legacy_catalog_row and len(candidates) == 1
+                ):
                     raise ValueError(
                         "legacy unscoped offer conflicts with an account-scoped observation"
                     )

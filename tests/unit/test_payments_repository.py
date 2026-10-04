@@ -131,3 +131,51 @@ class TestSave:
 
         with pytest.raises(LookupError, match="not found"):
             await repo.save(persisted)
+
+
+class TestProviderInvoicePersistence:
+    async def test_save_and_load_total_credit_and_safe_metadata(
+        self, repo: SqlAlchemyPaymentSessionRepository, db: AsyncMock
+    ) -> None:
+        row = _row()
+        row.gateway_key = "atlaspay"
+        row.currency = "IRT"
+        row.idempotency_key = "atlas-invoice-persistence"
+        row.credit_amount_minor = 250
+        row.credit_currency = "EUR"
+        row.fx_source = "fixture"
+        row.fx_rate = "100000"
+        row.fx_path = "EUR->IRT"
+        row.payment_details = None
+        db.execute.return_value = MagicMock(scalar_one_or_none=lambda: row)
+        original = PaymentSession(
+            id=row.id,
+            user_id=row.user_id,
+            gateway_key="atlaspay",
+            amount_minor=250000,
+            currency="IRT",
+            idempotency_key="atlas-invoice-persistence",
+            credit_amount_minor=250,
+            credit_currency="EUR",
+            fx_source="fixture",
+            fx_rate="100000",
+            fx_path="EUR->IRT",
+        )
+        bound = original.with_payment_intent(
+            "66",
+            259739,
+            {
+                "payment_url": "https://t.me/atlaspaybot/pay?startapp=real",
+                "tracking_code": "5c23c12c9fa0c8b3",  # pragma: allowlist secret -- public fixture
+                "payment_deadline_at": "2026-08-05T21:58:56.329Z",
+            },
+        )
+        saved = await repo.save(bound)
+        loaded = await repo.get(saved.id)
+        assert loaded.amount_minor == 259739
+        assert loaded.credit_amount_minor == 250
+        assert loaded.credit_currency == "EUR"
+        assert loaded.fx_rate == "100000"
+        assert loaded.payment_details == bound.payment_details
+        assert row.amount_minor == 259739
+        db.commit.assert_awaited_once()

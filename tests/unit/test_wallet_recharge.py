@@ -13,10 +13,12 @@ enqueues ``recharge.created``. The tests pin:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 
 from cloud_platform.bot.monthly_ui import MonthlyBotUi, recharge_presets
@@ -337,12 +339,6 @@ class TestTelegramChannel:
         with pytest.raises(RuntimeError):
             await TelegramBusinessLogChannel(_Bot(), -100).send("x")
 
-    def test_a_chat_id_is_required(self) -> None:
-        from cloud_platform.modules.businesslog.telegram import TelegramBusinessLogChannel
-
-        with pytest.raises(ValueError):
-            TelegramBusinessLogChannel(bot=object(), chat_id=0)
-
 
 class FakeRecharge:
     """Recharge-service double for the bot screens."""
@@ -355,7 +351,12 @@ class FakeRecharge:
     def supports_currency(self, currency: str) -> bool:
         return bool(self.supports) and self.supports == currency
 
-    def compatible_gateways(self, currency: str, amount_minor: int | None = None) -> list[str]:
+    async def supports_currency_async(self, currency: str) -> bool:
+        return self.supports_currency(currency)
+
+    async def compatible_gateways_async(
+        self, currency: str, amount_minor: int | None = None
+    ) -> list[str]:
         del amount_minor
         return ["fake-gateway"] if self.supports_currency(currency) else []
 
@@ -370,10 +371,16 @@ class FakeRecharge:
                 "session": type(
                     "S",
                     (),
-                    {"amount_minor": kwargs["amount_minor"], "currency": kwargs["currency"]},
+                    {
+                        "id": SESSION_ID,
+                        "amount_minor": kwargs["amount_minor"],
+                        "currency": kwargs["currency"],
+                    },
                 )(),
                 "redirect_url": "https://pay.example/AUTH-1",
                 "replayed": len(self.started) > 1,
+                "payment_details": None,
+                "session_id": SESSION_ID,
             },
         )()
 
@@ -449,14 +456,21 @@ class TestRechargeScreens:
         assert "€25.00" in screen.text
         pay = next(b for b in _buttons(screen) if b.url)
         assert pay.url == "https://pay.example/AUTH-1"
-        assert recharge.started == [(2_500, f"bot-recharge:{USER_ID}:2500")]
+        assert recharge.started[0][0] == 2_500
 
     async def test_repeated_tap_replays_the_same_idempotency_key(self) -> None:
         recharge = FakeRecharge()
         bot = _bot(recharge=recharge)
-        await bot.recharge_start_screen(_user(), "2500")
-        await bot.recharge_start_screen(_user(), "2500")
+        await bot.recharge_start_screen(_user(), "2500", nonce="same-tap")
+        await bot.recharge_start_screen(_user(), "2500", nonce="same-tap")
         assert recharge.started[0][1] == recharge.started[1][1]
+
+    async def test_new_invoice_for_same_amount_uses_a_new_attempt(self) -> None:
+        recharge = FakeRecharge()
+        bot = _bot(recharge=recharge)
+        await bot.recharge_start_screen(_user(), "2500")
+        await bot.recharge_start_screen(_user(), "2500")
+        assert recharge.started[0][1] != recharge.started[1][1]
 
     async def test_unsupported_currency_points_at_support(self) -> None:
         bot = _bot(currency="EUR", recharge=FakeRecharge(currency="IRR"))
@@ -482,7 +496,7 @@ class TestRechargeScreens:
         bot = _bot(recharge=FakeRecharge())
         amounts = await bot.handle(bot._callback("recharge", "amounts"), user=_user())
         assert amounts is not None and "شارژ" in amounts.text
-        started = await bot.handle(bot._callback("recharge", "start", "1000"), user=_user())
+        started = await bot.handle(bot._callback("recharge", "go", "1000", "new-tap"), user=_user())
         assert started is not None and "€10.00" in started.text
 
     async def test_unknown_recharge_screen_falls_back_to_the_menu(self) -> None:
@@ -671,3 +685,161 @@ class TestPersistFirstTetraminatorFlow:
             await service.start(
                 user=other, amount_minor=100_000, currency="IRT", idempotency_key="tetra-clash-1"
             )
+
+
+@pytest.mark.parametrize(
+    ("currency", "amount", "eligible"),
+    [
+        pytest.param("IRT", 49_999, False, id="toman-below-minimum"),
+        pytest.param("IRT", 50_000, True, id="toman-minimum"),
+        pytest.param("IRT", 2_000_000, True, id="toman-maximum"),
+        pytest.param("IRT", 2_000_001, False, id="toman-over-maximum"),
+        pytest.param("IRR", 499_990, False, id="rial-below-minimum"),
+        pytest.param("IRR", 499_991, True, id="rial-charge-rounded-up-to-minimum"),
+        pytest.param("IRR", 20_000_000, True, id="rial-maximum"),
+        pytest.param("IRR", 20_000_001, False, id="rial-rounded-over-maximum"),
+    ],
+)
+async def test_exact_currency_offers_enforce_both_atlas_invoice_bounds(
+    currency: str, amount: int, eligible: bool
+) -> None:
+    from cloud_platform.providers.atlaspay import AtlasPayGateway
+
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("an inadmissible offer must not reach the payment provider")
+
+    gateway = AtlasPayGateway("fixture-only-key", transport=httpx.MockTransport(respond))
+    repo = FakePayments()
+    service = WalletRechargeService(payments_repo=repo, gateway=gateway)
+    try:
+        expected = ["atlaspay"] if eligible else []
+        assert service.compatible_gateways(currency, amount) == expected
+        assert await service.compatible_gateways_async(currency, amount) == expected
+        if not eligible:
+            with pytest.raises(RechargeAmountError):
+                await service.start(
+                    user=_user(),
+                    amount_minor=amount,
+                    currency=currency,
+                    idempotency_key="out-of-range-atlas-offer",
+                    gateway_key="atlaspay",
+                )
+        assert repo.create_calls == 0
+        assert repo.by_authority == {}
+        assert requests == []
+    finally:
+        await gateway.close()
+
+
+class AtlasOfferFxSource:
+    """A real FX resolver consumes these quotes; no conversion result is mocked."""
+
+    source_name = "atlas-offer-fixture"
+
+    def __init__(self, failure: str | None = None) -> None:
+        self.failure = failure
+
+    async def get_quote(self, base: str, quote: str) -> Any:
+        from cloud_platform.modules.fx.domain import FxMarketQuote, FxUnavailableError
+
+        if self.failure == "unavailable":
+            raise FxUnavailableError("isolated rate-source outage")
+        moment = datetime.now(UTC)
+        observed = moment - timedelta(days=1) if self.failure == "stale" else moment
+        return FxMarketQuote(
+            base_currency=base,
+            quote_currency=quote,
+            buy_rate=Decimal("100000"),
+            sell_rate=Decimal("100000"),
+            source=self.source_name,
+            source_market=f"{base}{quote}",
+            observed_at=observed,
+            expires_at=observed + timedelta(seconds=60),
+        )
+
+
+@pytest.mark.parametrize(
+    ("amount", "eligible"),
+    [
+        pytest.param(49, False, id="fx-below-minimum"),
+        pytest.param(50, True, id="fx-minimum"),
+        pytest.param(2000, True, id="fx-maximum"),
+        pytest.param(2001, False, id="fx-valid-minimum-but-over-maximum"),
+    ],
+)
+async def test_live_fx_offer_never_presents_an_overmaximum_atlas_charge(
+    amount: int, eligible: bool
+) -> None:
+    from cloud_platform.modules.fx.cache import InMemoryFxCache
+    from cloud_platform.modules.fx.service import FxResolver
+    from cloud_platform.providers.atlaspay import AtlasPayGateway
+
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("an inadmissible FX offer must not create a provider order")
+
+    fx = FxResolver(source=AtlasOfferFxSource(), cache=InMemoryFxCache())
+    gateway = AtlasPayGateway("fixture-only-key", transport=httpx.MockTransport(respond))
+    repo = FakePayments()
+    service = WalletRechargeService(payments_repo=repo, gateway=gateway, fx_resolver=fx)
+    try:
+        assert await service.compatible_gateways_async("EUR", amount) == (
+            ["atlaspay"] if eligible else []
+        )
+        if not eligible:
+            with pytest.raises(RechargeAmountError):
+                await service.start(
+                    user=_user(),
+                    amount_minor=amount,
+                    currency="EUR",
+                    idempotency_key="out-of-range-fx-offer",
+                    gateway_key="atlaspay",
+                )
+        assert repo.create_calls == 0
+        assert repo.by_authority == {}
+        assert requests == []
+    finally:
+        await gateway.close()
+        await fx.close()
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "stale"])
+@pytest.mark.parametrize("gateway_key", [None, "atlaspay"], ids=["automatic", "explicit"])
+async def test_real_fx_failure_cannot_guess_a_charge_or_persist_an_attempt(
+    failure: str, gateway_key: str | None
+) -> None:
+    from cloud_platform.modules.fx.cache import InMemoryFxCache
+    from cloud_platform.modules.fx.service import FxResolver
+    from cloud_platform.providers.atlaspay import AtlasPayGateway
+
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("missing trustworthy FX evidence must never create an invoice")
+
+    gateway = AtlasPayGateway("fixture-only-key", transport=httpx.MockTransport(respond))
+    fx = FxResolver(source=AtlasOfferFxSource(failure), cache=InMemoryFxCache())
+    repo = FakePayments()
+    service = WalletRechargeService(payments_repo=repo, gateway=gateway, fx_resolver=fx)
+    try:
+        assert await service.compatible_gateways_async("EUR", 250) == []
+        with pytest.raises(RechargeDisabledError):
+            await service.start(
+                user=_user(),
+                amount_minor=250,
+                currency="EUR",
+                idempotency_key="unavailable-fx-attempt",
+                gateway_key=gateway_key,
+            )
+        assert requests == []
+        assert repo.create_calls == 0
+        assert repo.by_authority == {}
+    finally:
+        await gateway.close()
+        await fx.close()

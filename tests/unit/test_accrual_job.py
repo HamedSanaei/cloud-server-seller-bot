@@ -66,6 +66,8 @@ def _server(**kw: object) -> CloudServer:
         state=ServerLifecycleState.RUNNING,
         idempotency_key=IK,
         created_at=T0,
+        billing_started_at=T0,
+        provider_server_id="provider-1",
         quantum_seconds=QUANTUM,
     )
     defaults.update(kw)
@@ -155,11 +157,21 @@ class Harness:
         )
 
     # -- ServerRepository -------------------------------------------------------
+    async def get(self, server_id) -> CloudServer | None:
+        return next((s for s in self.servers if s.id == server_id), None)
+
     async def list_running(self) -> list[CloudServer]:
-        return list(self.servers)
+        return [s for s in self.servers if s.state is ServerLifecycleState.RUNNING]
+
+    async def list_stopped(self) -> list[CloudServer]:
+        return [s for s in self.servers if s.state is ServerLifecycleState.STOPPED]
+
+    async def list_provisioning(self) -> list[CloudServer]:
+        return [s for s in self.servers if s.state is ServerLifecycleState.PROVISIONING]
 
     async def save(self, server: CloudServer) -> CloudServer:
         self.saved.append(server)
+        self.servers = [server if s.id == server.id else s for s in self.servers]
         return server
 
     # -- WalletRepository ---------------------------------------------------------
@@ -291,6 +303,13 @@ class Harness:
         async def capture_hold(self, wallet_id, hold_id, key):
             return await self.h.capture_hold(wallet_id, hold_id, key)
 
+        async def release_hold(self, wallet_id, hold_id, key):
+            hold = self.h.holds[key]
+            assert hold.id == hold_id
+            if hold.status is HoldStatus.CREATED:
+                hold.release()
+            return hold
+
     @dataclass
     class _LedgerRepo:
         h: Harness
@@ -359,7 +378,7 @@ class TestFirstPeriodViaHoldCapture:
             wallet=Wallet(USER_ID, id=WALLET_ID, balance=10_000),
             holds={HOLD_KEY: _hold(HOLD_KEY)},
         )
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
+        report = await h.make_job().run(now=T0)
 
         assert report.servers_checked == 1
         assert report.periods_posted == 1
@@ -374,20 +393,20 @@ class TestFirstPeriodViaHoldCapture:
         assert row.period_start == T0 and row.period_end == T0 + timedelta(hours=1)
         assert h.servers[0].last_accrued_at == T0 + timedelta(hours=1)
 
-    async def test_partial_period_not_settled(self) -> None:
+    async def test_paid_hour_is_not_charged_again_before_boundary(self) -> None:
         h = Harness(servers=[_server()], holds={HOLD_KEY: _hold(HOLD_KEY)})
+        await h.make_job().run(now=T0)
         report = await h.make_job().run(now=T0 + timedelta(minutes=59))
-
         assert report.periods_posted == 0
-        assert h.servers[0].last_accrued_at is None
-        assert h.entries == {}
-        assert h.captured == []
+        assert h.servers[0].last_accrued_at == T0 + timedelta(hours=1)
+        assert len(h.entries) == 1
+        assert h.captured == [HOLD_KEY]
 
 
 class TestLaterPeriods:
     async def test_second_period_is_a_plain_debit(self) -> None:
         h = Harness(servers=[_server(last_accrued_at=T0 + timedelta(hours=1))])
-        report = await h.make_job().run(now=T0 + timedelta(hours=2))
+        report = await h.make_job().run(now=T0 + timedelta(hours=1))
 
         assert report.periods_posted == 1
         assert h.debit_calls == [(SELLING, P1_KEY)]
@@ -398,7 +417,7 @@ class TestLaterPeriods:
 
     async def test_multiple_periods_in_one_run(self) -> None:
         h = Harness(servers=[_server(last_accrued_at=T0)])
-        report = await h.make_job().run(now=T0 + timedelta(hours=3))
+        report = await h.make_job().run(now=T0 + timedelta(hours=2))
 
         assert report.periods_posted == 3
         assert h.wallet.balance == 100_000 - 3 * SELLING
@@ -415,14 +434,14 @@ class TestNoDuplicateChargesOnRetry:
             wallet=Wallet(USER_ID, id=WALLET_ID, balance=10_000),
             holds={HOLD_KEY: _hold(HOLD_KEY)},
         )
-        first = await h.make_job().run(now=T0 + timedelta(hours=1))
+        first = await h.make_job().run(now=T0)
         assert first.periods_posted == 1
         balance_after_first = h.wallet.balance
         entries_after_first = len(h.entries)
 
         h.servers[0].last_accrued_at = None  # the crash lost the watermark
 
-        second = await h.make_job().run(now=T0 + timedelta(hours=1))
+        second = await h.make_job().run(now=T0)
 
         assert second.periods_posted == 0
         assert second.periods_replayed == 1
@@ -435,7 +454,7 @@ class TestNoDuplicateChargesOnRetry:
             servers=[_server(last_accrued_at=T0 + timedelta(hours=1))],
             holds={HOLD_KEY: _hold(HOLD_KEY)},
         )
-        report = await h.make_job().run(now=T0 + timedelta(hours=1, minutes=30))
+        report = await h.make_job().run(now=T0 + timedelta(minutes=30))
 
         assert report.periods_posted == 0
         assert h.debit_calls == []
@@ -446,26 +465,26 @@ class TestNoDuplicateChargesOnRetry:
         h = Harness(servers=[_server(last_accrued_at=T0 + timedelta(hours=1))])
         job = h.make_job()
 
-        await job.run(now=T0 + timedelta(hours=2))
+        await job.run(now=T0 + timedelta(hours=1))
         rows_after_first = len(h.accrual_rows)
 
         h.servers[0].last_accrued_at = T0 + timedelta(hours=1)  # crash rollback
-        await job.run(now=T0 + timedelta(hours=2))
+        await job.run(now=T0 + timedelta(hours=1))
 
         assert len(h.accrual_rows) == rows_after_first  # unique key held
 
 
 class TestHoldEdgeCases:
-    async def test_released_hold_falls_back_to_debit(self) -> None:
+    async def test_released_creation_hold_never_debits_activation(self) -> None:
         h = Harness(
             servers=[_server()],
             holds={HOLD_KEY: _hold(HOLD_KEY, status=HoldStatus.RELEASED)},
         )
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
-
-        assert report.periods_posted == 1
+        report = await h.make_job().run(now=T0)
+        assert report.errors == 1
+        assert report.periods_posted == 0
         assert h.captured == []
-        assert h.debit_calls == [(SELLING, P0_KEY)]
+        assert h.debit_calls == []
 
     async def test_capture_replay_when_hold_already_captured(self) -> None:
         hold = _hold(HOLD_KEY, status=HoldStatus.CAPTURED)
@@ -482,7 +501,7 @@ class TestHoldEdgeCases:
             reference_type="hold",
             description=f"hold captured for {HOLD_KEY}",
         )
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
+        report = await h.make_job().run(now=T0)
 
         assert report.periods_posted == 0
         assert report.periods_replayed == 1
@@ -496,13 +515,14 @@ class TestFailureModes:
             servers=[_server()],
             wallet=Wallet(USER_ID, id=WALLET_ID, balance=500),
         )
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
+        report = await h.make_job().run(now=T0)
 
         assert report.insufficient_balance == 1
         assert report.periods_posted == 0
         assert h.entries == {}
-        assert h.servers[0].last_accrued_at is None  # retried next run
-        assert h.saved == []
+        assert h.servers[0].last_accrued_at is None
+        assert h.servers[0].state is ServerLifecycleState.DELETE_REQUESTED
+        assert h.wallet.balance == 500
 
     async def test_one_bad_server_does_not_break_the_run(self) -> None:
         other_id = uuid4()
@@ -517,7 +537,7 @@ class TestFailureModes:
             holds={HOLD_KEY: _hold(HOLD_KEY)},
             snapshots={SERVER_ID: _snapshot()},  # the other server has no snapshot
         )
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
+        report = await h.make_job().run(now=T0)
 
         assert report.servers_checked == 2
         assert report.periods_posted == 1  # the healthy server was billed
@@ -535,7 +555,7 @@ class TestFailureModes:
             snapshot_repo=h._SnapshotRepo(h),
             audit_repo=h.audit,
         )
-        report = await job.run(now=T0 + timedelta(hours=1))
+        report = await job.run(now=T0)
         assert report.errors == 1
         assert report.periods_posted == 0
 
@@ -580,7 +600,7 @@ class TestFailureModes:
 class TestLock:
     async def test_lock_not_acquired_skips_entirely(self) -> None:
         h = Harness(servers=[_server()], lock_acquired=False)
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
+        report = await h.make_job().run(now=T0)
 
         assert report == AccrualRunReport()
         assert h.lock_used is True
@@ -589,7 +609,7 @@ class TestLock:
 
     async def test_lock_acquired_proceeds(self) -> None:
         h = Harness(servers=[_server()], holds={HOLD_KEY: _hold(HOLD_KEY)})
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
+        report = await h.make_job().run(now=T0)
 
         assert h.lock_used is True
         assert report.periods_posted == 1
@@ -604,10 +624,9 @@ class TestUnitBehavior:
         other = (T0 + timedelta(hours=1)).astimezone(tehran)
         assert accrual_charge_key(SERVER_ID, other) == key
 
-    async def test_missing_created_at_counts_as_error(self) -> None:
-        h = Harness(servers=[_server(created_at=None)])
-        h.servers[0].created_at = None
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
+    async def test_missing_billing_anchor_counts_as_error(self) -> None:
+        h = Harness(servers=[_server(billing_started_at=None)])
+        report = await h.make_job().run(now=T0)
         assert report.errors == 1
         assert report.periods_posted == 0
 
@@ -645,16 +664,16 @@ class TestUnitBehavior:
         text.encode("ascii")  # raises when non-ASCII
         assert "charged=5000EUR" in text
 
-    async def test_corrupted_watermark_rebases_to_start(self) -> None:
+    async def test_corrupt_paid_through_fails_closed(self) -> None:
         h = Harness(servers=[_server(last_accrued_at=T0 - timedelta(hours=5))])
-        report = await h.make_job().run(now=T0 + timedelta(hours=1))
-
-        assert report.periods_posted == 1
-        assert h.servers[0].last_accrued_at == T0 + timedelta(hours=1)
+        report = await h.make_job().run(now=T0)
+        assert report.periods_posted == 0
+        assert report.errors == 1
+        assert h.wallet.balance == 100_000
 
     async def test_audit_event_recorded_per_run(self) -> None:
         h = Harness(servers=[_server()])
-        await h.make_job().run(now=T0 + timedelta(hours=1))
+        await h.make_job().run(now=T0)
 
         event = h.audit.append.call_args.args[0]
         assert event.action == "billing.accrual"

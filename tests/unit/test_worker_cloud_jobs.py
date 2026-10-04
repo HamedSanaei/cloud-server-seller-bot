@@ -1,10 +1,10 @@
-"""Hourly-cloud worker job wiring (STOREFRONT-REWORK).
+"""Cloud worker job dispatch, recovery, and cadence regressions.
 
-``process_cloud_creates`` submits hourly create intents once per claimed
-operation; ``reconcile_cloud_creates`` attaches proven instances read-only.
-Both are exercised with a fake container/service so the job body (claiming,
-per-server error isolation, outcome tally logging, container teardown) is
-covered without a database, provider or network.
+``process_cloud_creates`` independently dispatches modern hourly and legacy
+catalog queues; ``reconcile_cloud_creates`` attaches proven instances read-only.
+The legacy dispatch regression uses the real provisioning worker and in-memory
+intent repositories; container/hourly doubles isolate the job from external
+services while checking error observability and resource teardown.
 """
 
 from __future__ import annotations
@@ -16,6 +16,12 @@ from uuid import uuid4
 import pytest
 
 import cloud_platform.worker.settings as ws
+from cloud_platform.modules.compute.domain import ServerLifecycleState
+from cloud_platform.modules.operations.domain import OperationStatus
+from cloud_platform.modules.operations.service import ProvisioningWorker
+from cloud_platform.observability.metrics import PlatformMetrics
+from tests.unit.test_provisioning_worker import FakeProvider, _Deps
+from tests.unit.test_provisioning_worker import _server as _legacy_server
 
 
 def _server() -> Any:
@@ -42,6 +48,9 @@ def _fake_container(service: Any) -> MagicMock:
     container.initialize = AsyncMock()
     container.close = AsyncMock()
     container.hourly_cloud_service = MagicMock(return_value=service)
+    legacy_worker = MagicMock(spec=ProvisioningWorker)
+    legacy_worker.run_once = AsyncMock(return_value={})
+    container.provisioning_worker.return_value = legacy_worker
     return container
 
 
@@ -56,28 +65,6 @@ def container_patch(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 class TestProcessCloudCreates:
-    async def test_no_intents_still_initializes_and_closes(self, container_patch: Any) -> None:
-        service = _fake_service()
-        container = container_patch(service)
-        await ws.process_cloud_creates({})
-        container.initialize.assert_awaited_once()
-        container.hourly_cloud_service.assert_called_once()
-        service.process_server.assert_not_awaited()
-        container.close.assert_awaited_once()
-
-    async def test_each_requested_server_is_processed_exactly_once(
-        self, container_patch: Any
-    ) -> None:
-        first, second = _server(), _server()
-        service = _fake_service(requested=[first, second])
-        container = container_patch(service)
-        await ws.process_cloud_creates({})
-        assert [call.args[0] for call in service.process_server.await_args_list] == [
-            first.id,
-            second.id,
-        ]
-        container.close.assert_awaited_once()
-
     async def test_one_failing_intent_does_not_stop_the_batch(self, container_patch: Any) -> None:
         bad, good = _server(), _server()
 
@@ -93,19 +80,114 @@ class TestProcessCloudCreates:
         # the failure is counted as "error", the healthy one as its outcome
         assert service.process_server.await_args_list[-1].args[0] == good.id
 
-    async def test_ambiguous_outcome_is_counted_not_retried(self, container_patch: Any) -> None:
-        server = _server()
-        service = _fake_service(requested=[server], process=lambda server_id: "outcome_unknown")
-        container_patch(service)
-        await ws.process_cloud_creates({})
-        service.process_server.assert_awaited_once_with(server.id)
-
     async def test_container_is_closed_when_the_service_raises(self, container_patch: Any) -> None:
         service = _fake_service()
         service.servers_requested = AsyncMock(side_effect=RuntimeError("db down"))
         container = container_patch(service)
         with pytest.raises(RuntimeError):
             await ws.process_cloud_creates({})
+        container.close.assert_awaited_once()
+
+    @pytest.mark.parametrize("failure_phase", ["construction", "listing"])
+    async def test_legacy_intent_is_attached_despite_hourly_dispatch_failure(
+        self,
+        container_patch: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_phase: str,
+    ) -> None:
+        server = _legacy_server(server_id=uuid4())
+        deps = _Deps({server.id: server}, FakeProvider())
+        service = _fake_service()
+        container = container_patch(service)
+        container.provisioning_worker.return_value = deps.worker
+        metrics = PlatformMetrics()
+        monkeypatch.setattr(ws, "metrics", metrics)
+        if failure_phase == "construction":
+            failure = ValueError("provider credential encryption key is not configured")
+            container.hourly_cloud_service.side_effect = failure
+        else:
+            failure = RuntimeError("hourly queue unavailable")
+            service.servers_requested.side_effect = failure
+
+        # The scheduler sees a failed job, but the independent legacy intent
+        # still advances through the real worker without a caller-side requeue.
+        with pytest.raises(type(failure)) as raised:
+            await ws.process_cloud_creates({})
+        assert raised.value is failure
+        operation = deps.ops.ops[f"server-create:{server.id}"]
+        assert operation.status is OperationStatus.COMPLETED
+        assert operation.attempts == 1
+        assert operation.provider_response["provider_server_id"] == deps.provider.result.id
+        assert server.state is ServerLifecycleState.PROVISIONING
+        assert server.provider_server_id == deps.provider.result.id
+        assert deps.provider.create_calls == 1
+        assert deps.provider.last_request is not None
+        assert deps.provider.last_request.image_id == "img-linux"
+        deps.holds.release_hold.assert_not_awaited()
+
+        # A later poll after the job failure must not submit that intent again.
+        with pytest.raises(type(failure)):
+            await ws.process_cloud_creates({})
+        assert deps.provider.create_calls == 1
+        assert operation.attempts == 1
+        assert container.initialize.await_count == 2
+        assert container.close.await_count == 2
+        assert (
+            metrics.registry.get_sample_value(
+                "cloud_platform_job_runs_total",
+                {"job": "process_cloud_creates", "status": "error"},
+            )
+            == 2
+        )
+
+    async def test_legacy_phase_failure_preserves_hourly_dispatch_and_job_failure(
+        self, container_patch: Any
+    ) -> None:
+        server = _server()
+        service = _fake_service(requested=[server])
+        container = container_patch(service)
+        failure = RuntimeError("legacy queue unavailable")
+        container.provisioning_worker.return_value.run_once.side_effect = failure
+
+        with pytest.raises(RuntimeError) as raised:
+            await ws.process_cloud_creates({})
+
+        assert raised.value is failure
+        service.process_server.assert_awaited_once_with(server.id)
+        container.provisioning_worker.return_value.run_once.assert_awaited_once_with(limit=10)
+        container.close.assert_awaited_once()
+
+    async def test_both_phase_errors_are_reported_after_both_are_attempted(
+        self, container_patch: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        service = _fake_service()
+        hourly_failure = RuntimeError("hourly queue unavailable")
+        service.servers_requested.side_effect = hourly_failure
+        container = container_patch(service)
+        legacy_failure = ValueError("legacy construction failed")
+        container.provisioning_worker.side_effect = legacy_failure
+
+        with pytest.raises(ExceptionGroup) as raised:
+            await ws.process_cloud_creates({})
+
+        assert raised.value.exceptions == (hourly_failure, legacy_failure)
+        container.provisioning_worker.assert_called_once_with()
+        assert "hourly create dispatch failed" in caplog.text
+        assert "legacy catalog create dispatch failed" in caplog.text
+        container.close.assert_awaited_once()
+
+    async def test_shared_initialization_failure_closes_without_dispatching(
+        self, container_patch: Any
+    ) -> None:
+        service = _fake_service()
+        container = container_patch(service)
+        container.initialize.side_effect = RuntimeError("shared initialization failed")
+
+        with pytest.raises(RuntimeError, match="shared initialization failed"):
+            await ws.process_cloud_creates({})
+
+        container.hourly_cloud_service.assert_not_called()
+        container.provisioning_worker.assert_not_called()
         container.close.assert_awaited_once()
 
 

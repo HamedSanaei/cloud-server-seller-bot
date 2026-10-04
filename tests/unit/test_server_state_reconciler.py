@@ -206,6 +206,7 @@ class _Deps:
             server_repo=self.server_repo,  # type: ignore[arg-type]
             provider_registry=self.registry,
             audit_repo=self.audit,  # type: ignore[arg-type]
+            prepay_server=AsyncMock(),
         )
 
     def audit_events(self) -> list:

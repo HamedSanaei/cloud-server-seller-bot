@@ -221,6 +221,7 @@ class TestProvisioningFailureFeed:
             audit_repo=AsyncMock(),
             wallet_repo=AsyncMock(),
             hold_repo=AsyncMock(),
+            prepay_server=AsyncMock(),
         )
 
         from cloud_platform.modules import operations

@@ -57,36 +57,60 @@ async def test_close_container():
     assert container is not None
 
 
-@pytest.mark.asyncio
-async def test_hetzner_hourly_adapter_is_configured_only_when_enabled(monkeypatch):
-    from types import SimpleNamespace
+async def test_explicit_hetzner_accounts_manage_their_own_resources(monkeypatch):
+    import httpx
 
     from cloud_platform.core import container as container_module
+    from cloud_platform.core.config import Settings
+    from cloud_platform.providers.routing import UnknownCredentialAccountError
 
+    settings = Settings(
+        _env_file=None,
+        providers_enabled={"hetzner": True},
+        hetzner_accounts=[
+            {"id": "preferred", "api_token": "fixture-a", "priority": 1},
+            {"id": "owner", "api_token": "fixture-b", "state": "draining", "server_limit": 5},
+        ],
+    )
+    monkeypatch.setattr(container_module, "get_settings", lambda: settings)
     container = create_container()
-    monkeypatch.setattr(
-        container_module,
-        "get_settings",
-        lambda: SimpleNamespace(
-            providers_enabled={"hetzner": False},
-            hetzner_api_token="fixture-token",
-            hetzner_api_base_url="https://api.hetzner.cloud/v1",
-            leaseweb_api_key="",
-        ),
-    )
-    assert "hetzner" not in container.hourly_cloud_providers()
+    try:
+        await container.initialize()
+        addresses = []
 
-    monkeypatch.setattr(
-        container_module,
-        "get_settings",
-        lambda: SimpleNamespace(
-            providers_enabled={"hetzner": True},
-            hetzner_api_token="fixture-token",
-            hetzner_api_base_url="https://api.hetzner.cloud/v1",
-            leaseweb_api_key="",
-        ),
-    )
-    adapter = container.hourly_cloud_providers()["hetzner"]
-    assert container.hourly_cloud_resolver().adapter_for("hetzner", None) is adapter
-    assert container.hourly_cloud_resolver().adapter_for("hetzner", "other-account") is None
-    await container.close()
+        def respond(request):
+            addresses.append(request.headers["Authorization"])
+            return httpx.Response(
+                200,
+                json={
+                    "server": {
+                        "id": 42,
+                        "name": "owned",
+                        "status": "off",
+                        "server_type": {"name": "cx-test"},
+                        "location": {"name": "fsn1"},
+                        "image": {"id": 7},
+                    }
+                },
+            )
+
+        owner = container.provider_registry.get_for("hetzner", "owner")
+        await owner._client.aclose()
+        owner._client = httpx.AsyncClient(
+            base_url=settings.hetzner_api_base_url,
+            transport=httpx.MockTransport(respond),
+        )
+        monthly = await owner.get_server("42")
+        hourly = (
+            await container.hourly_cloud_resolver()
+            .adapter_for("hetzner", "owner")
+            .get_instance("42")
+        )
+        assert monthly.id == hourly.provider_server_id == "42"
+        assert hourly.account_id == "owner"
+        assert addresses == ["Bearer fixture-b", "Bearer fixture-b"]
+        with pytest.raises(UnknownCredentialAccountError):
+            container.provider_registry.get_for("hetzner", None)
+        assert container.hourly_cloud_resolver().adapter_for("hetzner", "removed") is None
+    finally:
+        await container.close()

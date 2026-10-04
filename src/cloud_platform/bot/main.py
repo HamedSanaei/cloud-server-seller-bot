@@ -21,13 +21,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
+from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 
+from cloud_platform.backup.job import BackupError, PostgresBackupJob, build_backup_config
+from cloud_platform.bot.admin_ui import AdminBotUi
+from cloud_platform.bot.identity_flow import IdentityFlow
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.ui import BotScreen, BotUi
 from cloud_platform.core.config import get_settings
@@ -35,7 +42,8 @@ from cloud_platform.core.container import Container, close_container, get_contai
 from cloud_platform.core.i18n import Locale, Translator, get_catalog
 from cloud_platform.core.session_store import SessionStoreUnavailable
 from cloud_platform.modules.navigation.domain import CallbackError, decode_callback
-from cloud_platform.modules.users.domain import User
+from cloud_platform.modules.users.domain import PermissionDeniedError, Role, User, UserStatus
+from cloud_platform.modules.users.identity import IdentityService
 from cloud_platform.modules.users.onboarding import handle_start
 
 if TYPE_CHECKING:
@@ -73,8 +81,8 @@ async def _show_main_menu(
     the customer always lands on the same InlineKeyboard menu and no
     parallel navigation system can drift from it.
     """
-    await _resolve_user(container, message.from_user)
-    screen = monthly_ui.menu_screen()
+    user = await _resolve_user(container, message.from_user)
+    screen = monthly_ui.menu_screen(user)
     text = f"{_t.t('greeting.start')}\n\n{screen.text}" if include_greeting else screen.text
     await message.answer(text, reply_markup=screen.keyboard)
 
@@ -151,8 +159,97 @@ async def _send_ssh_password(
     await query.answer()
 
 
+async def _super_admin(message: Message, container: Container) -> User | None:
+    """Require a private account with an active database administrator role."""
+    actor = message.from_user
+    # Database role is the authority; admin_chat_id is an alert destination,
+    # not a restriction to a single privileged account.
+    if (
+        actor is None
+        or message.chat.type != ChatType.PRIVATE
+        or message.chat.id != actor.id
+        or actor.is_bot
+    ):
+        return None
+    user = await container.user_repository().get_by_telegram_user_id(actor.id)
+    if user is None or user.role != Role.ADMIN or user.status != UserStatus.ACTIVE:
+        return None
+    return user
+
+
+async def _admin_credit(message: Message, container: Container) -> None:
+    admin = await _super_admin(message, container)
+    if admin is None:
+        await message.answer("دسترسی مجاز نیست.")
+        return
+    parts = (message.text or "").split(maxsplit=3)
+    try:
+        if len(parts) != 4:
+            raise ValueError("missing fields")
+        target_ref = parts[1]
+        amount = int(parts[2])
+        reason = parts[3].strip()
+        if amount <= 0 or amount > 2**63 - 1 or not reason:
+            raise ValueError("invalid amount or reason")
+    except ValueError:
+        await message.answer("فرمت: /admin_credit <شناسه تلگرام یا UUID مشتری> <واحد خرد> <دلیل>")
+        return
+    try:
+        target = (
+            await container.user_repository().get_by_telegram_user_id(int(target_ref))
+            if target_ref.isascii() and target_ref.isdigit() and 0 < int(target_ref) <= 2**63 - 1
+            else await container.user_repository().get(UUID(target_ref))
+        )
+    except ValueError:
+        target = None
+    if target is None:
+        await message.answer("کاربر پیدا نشد.")
+        return
+    if target.id == admin.id or getattr(target, "role", Role.USER) == Role.ADMIN:
+        await message.answer(_t.t("recharge.admin_disabled"))
+        return
+    user_id = target.id
+    try:
+        wallet, _ = await container.wallet_admin_service().adjust_balance(
+            admin=admin,
+            user_id=user_id,
+            amount=amount,
+            reason=reason,
+            idempotency_key=f"telegram-admin-credit:{message.chat.id}:{message.message_id}",
+        )
+    except ValueError:
+        logger.warning("admin credit rejected")
+        await message.answer("شارژ انجام نشد؛ کیف پول یا مبلغ را بررسی کنید.")
+        return
+    await message.answer(f"شارژ انجام شد. موجودی: {wallet.balance} {wallet.currency}")
+
+
+async def _admin_dump(message: Message, container: Container) -> None:
+    if await _super_admin(message, container) is None:
+        await message.answer("دسترسی مجاز نیست.")
+        return
+    try:
+        with tempfile.TemporaryDirectory(prefix="cloud-admin-dump-") as directory:
+            config = build_backup_config(get_settings())
+            result = await PostgresBackupJob(replace(config, output_dir=Path(directory))).run()
+            await message.answer_document(
+                FSInputFile(Path(directory) / result.filename),
+                caption="بکاپ رمزگذاری‌شده پایگاه داده؛ کلید رمزگشایی را جداگانه نگهداری کنید.",
+                protect_content=True,
+            )
+    except BackupError:
+        logger.warning("admin database dump failed")
+        await message.answer("تهیه بکاپ ناموفق بود؛ تنظیمات بکاپ و دسترسی pg_dump را بررسی کنید.")
+
+
 def register_handlers(
-    dp: Dispatcher, ui: BotUi, monthly_ui: MonthlyBotUi, container: Container
+    dp: Dispatcher,
+    ui: BotUi,
+    monthly_ui: MonthlyBotUi,
+    container: Container,
+    *,
+    admin_ui: AdminBotUi | None = None,
+    identity_flow: IdentityFlow | None = None,
 ) -> None:
     """Attach the menu and callback handlers to ``dp``.
 
@@ -163,10 +260,27 @@ def register_handlers(
 
     @dp.message(CommandStart())
     async def _start(message: Message) -> None:
-        await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard())
-        await _show_main_menu(
-            message, container=container, monthly_ui=monthly_ui, include_greeting=False
-        )
+        user = await _resolve_user(container, message.from_user)
+        await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard(user))
+        screen = monthly_ui.menu_screen(user)
+        await message.answer(screen.text, reply_markup=screen.keyboard)
+
+    @dp.message(Command("admin_credit"))
+    async def _credit_command(message: Message) -> None:
+        await _admin_credit(message, container)
+
+    @dp.message(Command("admin_dump"))
+    async def _dump_command(message: Message) -> None:
+        await _admin_dump(message, container)
+
+    @dp.message(Command("admin"))
+    async def _admin_command(message: Message) -> None:
+        admin = await _super_admin(message, container)
+        if admin is None or admin_ui is None:
+            await message.answer(_t.t("admin.denied"))
+            return
+        screen = admin_ui.menu(admin)
+        await message.answer(screen.text, reply_markup=screen.keyboard)
 
     @dp.message(Command("menu"))
     async def _menu(message: Message) -> None:
@@ -174,7 +288,8 @@ def register_handlers(
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
-        await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard())
+        user = await _resolve_user(container, message.from_user)
+        await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard(user))
 
     @dp.message()
     async def _fallback(message: Message) -> None:
@@ -184,6 +299,33 @@ def register_handlers(
         sticker, voice, ...) all resolve to the canonical main menu instead
         of being silently ignored.
         """
+        user = await _resolve_user(container, message.from_user)
+        try:
+            if identity_flow is not None and user is not None:
+                handled, resume = await identity_flow.handle(message, user)
+                if handled:
+                    if resume is not None:
+                        user = await _resolve_user(container, message.from_user)
+                        screen = await monthly_ui.handle(resume, user=user, chat_id=message.chat.id)
+                        if screen is None:
+                            screen = await ui.handle(resume, user=user, chat_id=message.chat.id)
+                        await message.answer(screen.text, reply_markup=screen.keyboard)
+                    return
+            admin = await _super_admin(message, container)
+            if admin_ui is not None and admin is not None and message.text:
+                if _button_matches(message.text, "menu.admin"):
+                    screen = admin_ui.menu(admin)
+                else:
+                    screen = await admin_ui.handle_text(message.text, admin)
+                if screen is not None:
+                    await message.answer(screen.text, reply_markup=screen.keyboard)
+                    return
+        except SessionStoreUnavailable:
+            await message.answer(_t.t("servers.err_retry"))
+            return
+        except (ValueError, PermissionDeniedError):
+            await message.answer(_t.t("admin.credit_failed"))
+            return
         if message.text and not message.text.startswith("/"):
             user = await _resolve_user(container, message.from_user)
             try:
@@ -231,6 +373,46 @@ def register_handlers(
                 cb = decode_callback(data, get_settings().callback_signing_key)
             except CallbackError:
                 pass
+        if cb is not None and isinstance(query.message, Message):
+            try:
+                if cb.flow == "admin":
+                    actor = query.from_user
+                    private = query.message.chat.type == ChatType.PRIVATE
+                    if (
+                        admin_ui is None
+                        or user is None
+                        or user.role != Role.ADMIN
+                        or user.status != UserStatus.ACTIVE
+                        or not private
+                        or actor is None
+                        or query.message.chat.id != actor.id
+                    ):
+                        await query.answer(_t.t("admin.denied"), show_alert=True)
+                        return
+                    admin_screen = await admin_ui.handle(cb, user)
+                    await query.message.edit_text(
+                        admin_screen.text, reply_markup=admin_screen.keyboard
+                    )
+                    await query.answer()
+                    return
+                purchase = (
+                    (
+                        cb.flow == "store"
+                        and cb.screen in {"confirm", "buy", "cloud_confirm", "cloud_buy"}
+                    )
+                    or (cb.flow == "offers" and cb.screen in {"confirm", "buy"})
+                    or (cb.flow == "buy" and cb.screen in {"os", "confirm"})
+                )
+                if purchase and user is not None and identity_flow is not None:
+                    if await identity_flow.begin(query.message, user, data):
+                        await query.answer()
+                        return
+            except SessionStoreUnavailable:
+                await query.answer(_t.t("servers.err_retry"), show_alert=True)
+                return
+            except (ValueError, PermissionDeniedError):
+                await query.answer(_t.t("admin.credit_failed"), show_alert=True)
+                return
         if cb is not None and cb.flow == "servers" and cb.screen == "ssh" and len(cb.args) == 1:
             await _send_ssh_password(query, monthly_ui, user, cb.args[0])
             return
@@ -242,7 +424,7 @@ def register_handlers(
             screen = await monthly_ui.handle(data, user=user, chat_id=chat_id)
             if screen is None:
                 if _is_foreign_callback(data):
-                    menu = monthly_ui.menu_screen()
+                    menu = monthly_ui.menu_screen(user)
                     screen = BotScreen(
                         f"{_t.t('nav.expired')}\n\n{menu.text}",
                         menu.keyboard,
@@ -298,6 +480,7 @@ async def main() -> None:
         # second collection here would leak a set of HTTP clients that the
         # shutdown path below never closes.
         recharge=container.wallet_recharge_service(gateways=gateways, fx_resolver=fx_resolver),
+        payment_inquiry=container.payment_inquiry_service(gateways),
         # My Servers: the application service owns ownership, policy,
         # confirmations, idempotency and audit; the UI only renders.
         server_management=container.server_management_service(),
@@ -306,13 +489,28 @@ async def main() -> None:
         # prompts live in the SHARED store, so a restart or a second replica
         # does not lose the buttons the customer is holding.
         sessions=container.server_sessions(),
+        checkout_sessions=container.checkout_sessions(),
         # Catalog display equivalents (supplementary; the DB price stays
         # authoritative). The SAME resolver instance as recharge: one
         # AbanTether + one cache client per process, closed once below.
         fx_resolver=fx_resolver,
         fx_display_currency=settings.fx_default_display_currency,
     )
-    register_handlers(dp, ui, monthly_ui, container)
+    admin_ui = AdminBotUi(
+        settings.callback_signing_key,
+        gateways=container.gateway_management_service(gateways.keys()),
+        users=container.user_repository(),
+        wallets=container.wallet_repository(),
+        wallet_admin=container.wallet_admin_service(),
+        store=container.session_store(),
+        ttl_seconds=settings.telegram_sessions_prompt_ttl_seconds,
+    )
+    identity_flow = IdentityFlow(
+        IdentityService(container.user_repository()),
+        container.session_store(),
+        ttl_seconds=settings.telegram_sessions_prompt_ttl_seconds,
+    )
+    register_handlers(dp, ui, monthly_ui, container, admin_ui=admin_ui, identity_flow=identity_flow)
 
     logger.info("starting Telegram bot polling")
     try:

@@ -5,6 +5,7 @@ Acceptance: validates user/offer/balance and persists intent atomically.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
@@ -33,6 +34,8 @@ from cloud_platform.modules.compute.service import (
     MaintenanceSwitchService,
     NoWalletError,
     OfferDisabledError,
+    ProviderAccountsFullError,
+    ProviderInventoryUnavailableError,
     QuotaExceededError,
     UserNotActiveError,
 )
@@ -46,12 +49,18 @@ from cloud_platform.modules.provider_accounts.domain import (
     NoProviderAccountError,
     ProviderAccount,
 )
+from cloud_platform.modules.provider_routes.domain import ProviderRoute, RouteState
+from cloud_platform.modules.provider_routes.service import ProviderRouteSelector
 from cloud_platform.modules.users.domain import Role, User, UserStatus
+from cloud_platform.modules.users.identity import IdentityRequiredError
 from cloud_platform.modules.wallet.domain import (
     Hold,
     InsufficientHoldBalanceError,
     Wallet,
 )
+from cloud_platform.providers.base import AccountServerUsage
+from cloud_platform.providers.errors import ProviderUnavailable
+from cloud_platform.providers.routing import CredentialAccountState
 
 USER_ID = uuid4()
 OTHER_USER_ID = uuid4()
@@ -64,7 +73,17 @@ REF = OfferRef(provider_key="hetzner", plan_id="cx22", location_id="fsn1")
 
 
 def _user(status: UserStatus = UserStatus.ACTIVE) -> User:
-    return User(id=USER_ID, username="alice", email="a@example.com", role=Role.USER, status=status)
+    return User(
+        id=USER_ID,
+        username="alice",
+        email="a@example.com",
+        role=Role.USER,
+        status=status,
+        telegram_user_id=12345,
+        phone_number="+989123456789",
+        phone_verified_at=NOW,
+        national_id="1234567891",
+    )
 
 
 def _offer(enabled: bool = True, price: int = 100) -> OfferState:
@@ -163,6 +182,7 @@ class _Deps:
         quota: QuotaPolicy | None = None,
         maintenance: MaintenanceSwitchService | None = None,
         cost_breaker=None,
+        fulfillment_routes=None,
     ) -> CreateServerService:
         return CreateServerService(
             server_repo=self.servers,  # type: ignore[arg-type]
@@ -177,6 +197,7 @@ class _Deps:
             quota=quota,
             maintenance=maintenance,
             cost_breaker=cost_breaker,
+            fulfillment_routes=fulfillment_routes,
         )
 
     def run(self, **overrides: object):
@@ -190,9 +211,13 @@ class _Deps:
         quota = kwargs.pop("quota", None)
         maintenance = kwargs.pop("maintenance", None)
         cost_breaker = kwargs.pop("cost_breaker", None)
+        fulfillment_routes = kwargs.pop("fulfillment_routes", None)
         return (
             self.service(
-                quota=quota, maintenance=maintenance, cost_breaker=cost_breaker
+                quota=quota,
+                maintenance=maintenance,
+                cost_breaker=cost_breaker,
+                fulfillment_routes=fulfillment_routes,
             ).create_server(**kwargs)  # type: ignore[arg-type]
         )
 
@@ -509,3 +534,257 @@ class TestMaintenanceBlocked:
         deps = _Deps()
         result = await deps.run()  # maintenance defaults to None
         assert result.replayed is False
+
+
+def _capacity_routes(
+    routes: list[ProviderRoute],
+    usage: dict[str, AccountServerUsage | Exception],
+) -> tuple[ProviderRouteSelector, AsyncMock, AsyncMock]:
+    repository = AsyncMock()
+    repository.list_for_location.return_value = routes
+    reader = MagicMock()
+    reader.accepts_new_orders.return_value = True
+
+    async def server_usage(account_id: str) -> AccountServerUsage:
+        outcome = usage[account_id]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    reader.server_usage = AsyncMock(side_effect=server_usage)
+    selector = ProviderRouteSelector(repository=repository, usage_readers={"hetzner": reader})
+    return selector, reader, repository
+
+
+def _route(
+    account_id: str,
+    priority: int,
+    *,
+    state: RouteState = RouteState.ELIGIBLE_AVAILABLE,
+    account_state: CredentialAccountState = CredentialAccountState.ACTIVE,
+) -> ProviderRoute:
+    # Legacy catalog intents select a proven location, then their worker
+    # independently validates the original catalog plan before sending POST.
+    return ProviderRoute(
+        provider_key="hetzner",
+        credential_account_id=account_id,
+        location_id=REF.location_id,
+        state=state,
+        priority=priority,
+        account_state=account_state,
+    )
+
+
+class TestCapacityAwareFulfillment:
+    async def test_full_first_account_selects_second_before_hold_or_intent(self) -> None:
+        deps = _Deps()
+        selector, reader, _ = _capacity_routes(
+            [_route("hz-b", 20), _route("hz-a", 10)],
+            {
+                "hz-a": AccountServerUsage("hz-a", 5, 5),
+                "hz-b": AccountServerUsage("hz-b", 2, 5),
+            },
+        )
+        hold = _hold()
+
+        async def reserve(*args) -> Hold:
+            assert [call.args[0] for call in reader.server_usage.await_args_list] == [
+                "hz-a",
+                "hz-b",
+            ]
+            deps.servers.create.assert_not_awaited()
+            deps.snaps.create_snapshot.assert_not_awaited()
+            return hold
+
+        deps.holds.create_hold.side_effect = reserve
+        result = await deps.run(fulfillment_routes=selector)
+
+        assert result.server.credential_account_id == "hz-b"
+        assert result.server.provider_account_id == ACCOUNT_ID
+        assert result.hold is hold
+        deps.holds.create_hold.assert_awaited_once_with(
+            WALLET_ID, 107, "EUR", f"server-create:{KEY}"
+        )
+        created, intent = deps.servers.create.await_args.args
+        assert created.credential_account_id == "hz-b"
+        assert intent.catalog_id == OFFER_ID
+        assert intent.cost_minor == 100
+        assert result.snapshot is not None
+        assert result.snapshot.offer == _price().offer
+        assert result.snapshot.selling_minor == 107
+
+    async def test_all_full_creates_no_hold_intent_or_snapshot(self) -> None:
+        deps = _Deps()
+        selector, reader, _ = _capacity_routes(
+            [_route("hz-a", 10), _route("hz-b", 20)],
+            {
+                "hz-a": AccountServerUsage("hz-a", 5, 5),
+                "hz-b": AccountServerUsage("hz-b", 6, 5),
+            },
+        )
+
+        with pytest.raises(ProviderAccountsFullError) as caught:
+            await deps.run(fulfillment_routes=selector)
+
+        assert caught.value.__suppress_context__
+        assert [call.args[0] for call in reader.server_usage.await_args_list] == [
+            "hz-a",
+            "hz-b",
+        ]
+        deps.wallets.get.assert_not_awaited()
+        deps.holds.create_hold.assert_not_awaited()
+        deps.holds.release_hold.assert_not_awaited()
+        deps.servers.create.assert_not_awaited()
+        deps.snaps.create_snapshot.assert_not_awaited()
+        deps.audit.append.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "unproved_usage",
+        [
+            ProviderUnavailable("incomplete inventory containing private-provider-context"),
+            AccountServerUsage("wrong-account", 0, 5),
+        ],
+    )
+    async def test_unreadable_capacity_is_not_full_and_touches_no_funds(
+        self, unproved_usage: AccountServerUsage | Exception
+    ) -> None:
+        deps = _Deps()
+        selector, _, _ = _capacity_routes(
+            [_route("hz-a", 10), _route("hz-b", 20)],
+            {
+                "hz-a": AccountServerUsage("hz-a", 5, 5),
+                "hz-b": unproved_usage,
+            },
+        )
+
+        with pytest.raises(ProviderInventoryUnavailableError) as caught:
+            await deps.run(fulfillment_routes=selector)
+
+        assert caught.value.__suppress_context__
+        assert "private-provider-context" not in str(caught.value)
+        assert "hz-a" not in str(caught.value)
+        assert "hz-b" not in str(caught.value)
+        deps.wallets.get.assert_not_awaited()
+        deps.holds.create_hold.assert_not_awaited()
+        deps.holds.release_hold.assert_not_awaited()
+        deps.servers.create.assert_not_awaited()
+        deps.snaps.create_snapshot.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "routes",
+        [
+            [],
+            [_route("hz-a", 10, account_state=CredentialAccountState.DRAINING)],
+            [_route("hz-a", 10, state=RouteState.TRANSIENT_UNKNOWN)],
+        ],
+    )
+    async def test_missing_or_unproved_route_is_unavailable_before_hold(
+        self, routes: list[ProviderRoute]
+    ) -> None:
+        deps = _Deps()
+        selector, reader, _ = _capacity_routes(routes, {})
+
+        with pytest.raises(ProviderInventoryUnavailableError) as caught:
+            await deps.run(fulfillment_routes=selector)
+
+        assert caught.value.__suppress_context__
+        reader.server_usage.assert_not_awaited()
+        deps.wallets.get.assert_not_awaited()
+        deps.holds.create_hold.assert_not_awaited()
+        deps.servers.create.assert_not_awaited()
+        deps.snaps.create_snapshot.assert_not_awaited()
+
+    @pytest.mark.parametrize("credential_account_id", [None, "default", "hz-original"])
+    @pytest.mark.parametrize("current_route", ["full", "draining", "missing"])
+    async def test_replay_retains_original_contract_without_selector_calls(
+        self, credential_account_id: str | None, current_route: str
+    ) -> None:
+        deps = _Deps()
+        original = _existing()
+        original.credential_account_id = credential_account_id
+        deps.servers.get_by_idempotency_key.return_value = original
+        original_hold = _hold()
+        original_snapshot = _snapshot(original.id, _price(199))
+        deps.holds.get_by_idempotency.return_value = original_hold
+        deps.snaps.get_snapshot.return_value = original_snapshot
+        deps.catalog.get_offer.side_effect = AssertionError("replay must not read today's offer")
+        deps.accounts.get_active.side_effect = AssertionError("replay must not allocate ownership")
+        deps.books.sell_price.side_effect = AssertionError("replay must not reprice")
+        routes = (
+            []
+            if current_route == "missing"
+            else [
+                _route(
+                    "hz-original",
+                    10,
+                    account_state=(
+                        CredentialAccountState.DRAINING
+                        if current_route == "draining"
+                        else CredentialAccountState.ACTIVE
+                    ),
+                )
+            ]
+        )
+        selector, reader, repository = _capacity_routes(
+            routes, {"hz-original": AccountServerUsage("hz-original", 5, 5)}
+        )
+        selector.supports_capacity_failover = MagicMock(wraps=selector.supports_capacity_failover)
+        selector.account_for = AsyncMock(wraps=selector.account_for)
+
+        result = await deps.run(fulfillment_routes=selector)
+
+        assert result.replayed
+        assert result.server is original
+        assert result.server.credential_account_id == credential_account_id
+        assert result.server.provider_account_id == ACCOUNT_ID
+        assert result.snapshot is original_snapshot
+        assert result.snapshot.selling_minor == 199
+        assert result.hold is original_hold
+        selector.supports_capacity_failover.assert_not_called()
+        selector.account_for.assert_not_awaited()
+        repository.list_for_location.assert_not_awaited()
+        reader.server_usage.assert_not_awaited()
+        deps.holds.create_hold.assert_not_awaited()
+        deps.holds.release_hold.assert_not_awaited()
+        deps.servers.create.assert_not_awaited()
+        deps.snaps.create_snapshot.assert_not_awaited()
+
+    async def test_other_provider_keeps_existing_command_behavior(self) -> None:
+        deps = _Deps()
+        selector, reader, repository = _capacity_routes(
+            [_route("hz-a", 10)], {"hz-a": AccountServerUsage("hz-a", 5, 5)}
+        )
+        ref = OfferRef(provider_key="ovh", plan_id="vps", location_id="gra")
+        deps.catalog.get_offer.return_value = replace(_offer(), ref=ref)
+        deps.books.sell_price.return_value = replace(
+            _price(), offer=OfferCost("ovh", "vps", "gra", 100, "EUR")
+        )
+        deps.accounts.get_active.return_value = ProviderAccount(
+            id=ACCOUNT_ID, user_id=USER_ID, provider_key=ref.provider_key
+        )
+        selector.account_for = AsyncMock(wraps=selector.account_for)
+
+        result = await deps.run(offer_ref=ref, fulfillment_routes=selector)
+
+        assert not result.replayed
+        assert result.server.provider_key == "ovh"
+        assert result.server.provider_account_id == ACCOUNT_ID
+        assert result.server.credential_account_id is None
+        assert result.hold is not None
+        assert result.hold.amount == 107
+        deps.holds.create_hold.assert_awaited_once()
+        deps.servers.create.assert_awaited_once()
+        deps.snaps.create_snapshot.assert_awaited_once()
+        selector.account_for.assert_not_awaited()
+        repository.list_for_location.assert_not_awaited()
+        reader.server_usage.assert_not_awaited()
+
+
+async def test_unverified_identity_blocks_generic_purchase_before_effects() -> None:
+    deps = _Deps()
+    with pytest.raises(IdentityRequiredError):
+        await deps.run(user=replace(_user(), phone_verified_at=None))
+    deps.catalog.get_offer.assert_not_awaited()
+    deps.wallets.get.assert_not_awaited()
+    deps.holds.create_hold.assert_not_awaited()
+    deps.servers.create.assert_not_awaited()

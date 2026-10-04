@@ -19,6 +19,7 @@ from cloud_platform.db.timestamps import (
     to_db_utc,
     utc_now,
 )
+from cloud_platform.modules.operations.create_attempts import CreateAttemptConflict
 from cloud_platform.modules.operations.domain import (
     Operation,
     OperationStatus,
@@ -242,7 +243,9 @@ class SqlAlchemyOperationRepository:
             row = (
                 (
                     await session.execute(
-                        select(_OperationModel).where(_OperationModel.id == operation.id)
+                        select(_OperationModel)
+                        .where(_OperationModel.id == operation.id)
+                        .with_for_update()
                     )
                 )
                 .scalars()
@@ -250,6 +253,8 @@ class SqlAlchemyOperationRepository:
             )
             if row is None:
                 raise LookupError(f"operation {operation.id} not found")
+            if "create_routing" in (row.provider_response or {}):
+                raise CreateAttemptConflict("receipt-backed creates require fenced persistence")
             cast_any: Any = row
             cast_any.status = operation.status.value
             cast_any.provider_response = operation.provider_response

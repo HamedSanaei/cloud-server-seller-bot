@@ -169,6 +169,9 @@ class User:
     telegram_user_id: int | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    phone_number: str | None = None
+    phone_verified_at: datetime | None = None
+    national_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.username or not self.username.strip():
@@ -301,4 +304,14 @@ class UserRepository(Protocol):
 
     async def update_terms(self, user_id: uuid.UUID, terms_version: int) -> User:
         """Persist the user's accepted terms version."""
+        ...
+
+    async def update_verified_phone(
+        self, user_id: uuid.UUID, phone_number: str, verified_at: datetime
+    ) -> User:
+        """Persist a sender-owned Iranian Telegram contact verification."""
+        ...
+
+    async def update_national_id(self, user_id: uuid.UUID, national_id: str) -> User:
+        """Persist a checksum-valid national ID (not an identity-match claim)."""
         ...

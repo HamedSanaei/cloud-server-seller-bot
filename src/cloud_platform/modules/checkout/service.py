@@ -85,6 +85,7 @@ from cloud_platform.providers.base import (
 )
 from cloud_platform.providers.errors import (
     ProviderAuthError,
+    ProviderCapacityError,
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
@@ -119,6 +120,14 @@ class UserNotActiveError(CheckoutError):
 
 class OfferUnavailableError(CheckoutError):
     pass
+
+
+class ProviderAccountCapacityError(CheckoutError):
+    """Every proven eligible credential has refused or reached its ceiling."""
+
+
+class CheckoutProviderUnavailableError(CheckoutError):
+    """Current fulfillment availability could not be proved read-only."""
 
 
 class OsUnavailableError(CheckoutError):
@@ -161,7 +170,7 @@ class MonthlyCheckoutResult:
     server: CloudServer
     order: ProviderOrder
     hold: Hold | None
-    offer: SellableOffer
+    offer: SellableOffer | None
     replayed: bool
 
 
@@ -212,29 +221,70 @@ class MonthlyCheckoutService:
         # and no account is pinned.
         self._routes = fulfillment_routes
 
-    async def _fulfillment_account(self, offer: SellableOffer) -> str | None:
-        """Pick the credential account this purchase will be PINNED to.
+    async def _fulfillment_account(
+        self,
+        offer: SellableOffer,
+        *,
+        exclude: set[str] | None = None,
+    ) -> str | None:
+        """Select a proven credential before holding funds.
 
-        The decision is made BEFORE anything is persisted (server, order,
-        hold) so the account becomes a durable order fact rather than
-        something re-derived later — the worker must never re-decide whose key
-        to bill.
-
-        Fail-closed rule: when the provider IS served by credential accounts
-        but none currently serves this location/product, the purchase is
-        refused. Guessing an account could place a billable order through the
-        wrong credential.
+        The resulting pin may move only before acceptance under a durable
+        capacity-refusal receipt; an existing resource never follows priority.
         """
         if self._routes is None:
             return None
-        resolved: Any = await self._routes.account_for(
-            offer.provider_key, offer.location_id, offer.product_id
-        )
+        try:
+            resolved: Any = await self._routes.account_for(
+                offer.provider_key,
+                offer.location_id,
+                offer.product_id,
+                **({"exclude": exclude} if exclude else {}),
+            )
+        except ProviderCapacityError as exc:
+            raise ProviderAccountCapacityError("provider account pool is full") from exc
+        except ProviderUnavailable as exc:
+            raise CheckoutProviderUnavailableError("provider availability unreadable") from exc
+        except ProviderNotFound as exc:
+            raise OfferUnavailableError("no proven serving product/location") from exc
         if resolved is None and await self._routes.has_any_routes(offer.provider_key):
             raise OfferUnavailableError(
                 f"no provider credential account currently serves {offer.ref}"
             )
         return None if resolved is None else str(resolved)
+
+    async def _validated_fulfillment_account(
+        self,
+        offer: SellableOffer,
+        os_name: str,
+    ) -> str | None:
+        excluded: set[str] = set()
+        mismatch: CheckoutError | None = None
+        pooled = self._routes is not None and getattr(
+            self._routes, "supports_capacity_failover", lambda key: False
+        )(offer.provider_key)
+        if pooled and not str(offer.provider_account_id or "").strip():
+            raise OfferUnavailableError(
+                "catalog credential provenance is unproven; refresh the offer"
+            )
+        while True:
+            try:
+                account = await self._fulfillment_account(offer, exclude=excluded)
+            except (ProviderAccountCapacityError, OfferUnavailableError):
+                if mismatch is not None:
+                    raise mismatch from None
+                raise
+            try:
+                await self._validate_offer_selection(offer, os_name, account)
+            except (OfferUnavailableError, OsUnavailableError) as exc:
+                if not pooled or account is None or isinstance(exc.__cause__, ProviderAuthError):
+                    raise
+                # A read-only product/image mismatch is not a capacity refusal.
+                # No intent or money exists yet, so test another independent proof.
+                mismatch = exc
+                excluded.add(account)
+                continue
+            return account
 
     async def _validate_offer_selection(
         self,
@@ -274,6 +324,10 @@ class MonthlyCheckoutService:
             except (ProviderNotFound, ProviderAuthError) as exc:
                 logger.warning("offer %s: selection no longer offered: %s", offer.ref, exc)
                 raise OfferUnavailableError("product details currently unavailable") from exc
+            except ProviderUnavailable as exc:
+                raise CheckoutProviderUnavailableError(
+                    "provider selection temporarily unreadable"
+                ) from exc
             except ProviderError as exc:
                 logger.warning("offer %s: selection validation failed: %s", offer.ref, exc)
                 raise OfferUnavailableError("product details currently unavailable") from exc
@@ -316,6 +370,8 @@ class MonthlyCheckoutService:
         idempotency_key: str,
         at: datetime | None = None,
         panel_name: str | None = None,
+        expected_selling_price_minor: int | None = None,
+        expected_selling_currency: str | None = None,
     ) -> MonthlyCheckoutResult:
         """Validate everything and persist the order intent (no provider calls)."""
         # 1. User.
@@ -323,16 +379,9 @@ class MonthlyCheckoutService:
             raise CheckoutError("a persisted user id is required")
         if user.status is not UserStatus.ACTIVE:
             raise UserNotActiveError(f"user {user.id} is {user.status.value}")
+        from cloud_platform.modules.users.identity import require_verified_identity
 
-        # 2. Reload the offer: the single gate (available + enabled + priced).
-        offer = await self._offers.get(offer_id)
-        if offer is None or not offer.sellable:
-            raise OfferUnavailableError(f"offer {offer_id} is not sellable")
-        # 2b. Billing model: this command sells prepaid-monthly products
-        # only. Hourly products go through the hourly creation command, so a
-        # misrouted hourly offer fails here instead of taking a monthly hold.
-        if offer.billing_model != BILLING_MODEL_MONTHLY:
-            raise OfferUnavailableError(f"offer {offer_id} is not a monthly plan")
+        require_verified_identity(user)
 
         # 2.5 Replay: same command key -> the original intent, nothing new.
         existing = await self._servers.get_by_idempotency_key(idempotency_key)
@@ -352,8 +401,28 @@ class MonthlyCheckoutService:
             if order is None:  # pragma: no cover - created atomically with the server
                 raise CheckoutError("server intent exists without a provider order row")
             return MonthlyCheckoutResult(
-                server=existing, order=order, hold=hold, offer=offer, replayed=True
+                server=existing, order=order, hold=hold, offer=None, replayed=True
             )
+        # 2. Reload the offer: the single gate (available + enabled + priced).
+        offer = await self._offers.get(offer_id)
+        if offer is None or not offer.sellable:
+            raise OfferUnavailableError(f"offer {offer_id} is not sellable")
+        # 2b. Billing model: this command sells prepaid-monthly products
+        # only. Hourly products go through the hourly creation command, so a
+        # misrouted hourly offer fails here instead of taking a monthly hold.
+        if offer.billing_model != BILLING_MODEL_MONTHLY:
+            raise OfferUnavailableError(f"offer {offer_id} is not a monthly plan")
+
+        if (expected_selling_price_minor is None) != (expected_selling_currency is None):
+            raise OfferUnavailableError("selling price and currency must be pinned together")
+        if expected_selling_price_minor is not None and (
+            isinstance(expected_selling_price_minor, bool)
+            or not isinstance(expected_selling_price_minor, int)
+            or expected_selling_price_minor <= 0
+            or offer.selling_price_minor != expected_selling_price_minor
+            or offer.selling_currency != str(expected_selling_currency).strip().upper()
+        ):
+            raise OfferUnavailableError("offer price changed since confirmation")
 
         # 3. OS validation SERVER-SIDE against the live product API (free
         #    options only by default — the price shown is the price charged).
@@ -364,8 +433,7 @@ class MonthlyCheckoutService:
         #    price/currency have not moved since catalog sync, and the selected
         #    OS really exists — and the price comparison additionally guards
         #    the race between catalog sync and checkout.
-        credential_account_id = await self._fulfillment_account(offer)
-        await self._validate_offer_selection(offer, os_name, credential_account_id)
+        credential_account_id = await self._validated_fulfillment_account(offer, os_name)
 
         # 4. Provider account (per-customer link row; created on demand).
         account = await self._accounts.get_or_create_active(user.id, offer.provider_key)
@@ -387,6 +455,11 @@ class MonthlyCheckoutService:
 
         # 6. Server intent (REQUESTED, prepaid monthly, OS recorded).
         del at  # created_at is assigned by the repository
+        catalog_provenance: dict[str, object] | None = None
+        if self._routes is not None and getattr(
+            self._routes, "supports_capacity_failover", lambda key: False
+        )(offer.provider_key):
+            catalog_provenance = {"provider_account_id": offer.provider_account_id}
         server = CloudServer(
             id=uuid4(),
             user_id=user.id,
@@ -396,6 +469,7 @@ class MonthlyCheckoutService:
             billing_model=BILLING_MODEL_PREPAID_MONTHLY,
             os=os_name,
             credential_account_id=credential_account_id,
+            offer_fingerprint=catalog_provenance,
         )
         intent = ServerCreateIntent(
             catalog_id=None,  # prepaid: offer pinned via provider_orders.offer_id
@@ -577,7 +651,6 @@ class OfferConfirmView:
     balance_minor: int
     currency: str
     sufficient: bool
-    confirm_callback: str
     back_callback: str
     cancel_callback: str
     #: Free control panel chosen during configuration (None = no panel).
@@ -828,13 +901,13 @@ class CloudConfirmView:
     # non-payment is handled by the existing low-balance suspension.
     offer: OfferCatalogView
     image_label: str
+    image_id: str
     hourly_price_minor: int
     monthly_estimate_minor: int
     currency: str
     balance_minor: int
     location_name: str
     location_country: str | None
-    confirm_callback: str
     back_callback: str
     cancel_callback: str
 
@@ -849,7 +922,7 @@ class OfferCatalogViewService:
 
         store.market -> store.providers:{market} -> store.locations:{provider}
         -> store.plans:{provider}:{location} -> store.os:{offer}
-        -> store.confirm:{offer}:{os_index} -> store.buy:{offer}:{os_index}
+        -> store.confirm:{offer}:{os_index} -> owner-bound checkout nonce
 
     Which providers appear under a market comes from the operator
     configuration (``ProviderCatalog``); whether one can actually SELL comes
@@ -2092,15 +2165,13 @@ class OfferCatalogViewService:
         return CloudConfirmView(
             offer=self._view(offer),
             image_label=image.label,
+            image_id=image.id,
             hourly_price_minor=offer.selling_price_minor,
             monthly_estimate_minor=offer.selling_price_minor * HOURLY_MONTHLY_ESTIMATE_HOURS,
             currency=offer.selling_currency,
             balance_minor=balance,
             location_name=names.get(offer.location_id, (offer.location_id, None, None))[0],
             location_country=names.get(offer.location_id, (offer.location_id, None, None))[1],
-            confirm_callback=self._store_nav_callback(
-                "cloud_buy", self._offer_ref(offer.id), str(image_index)
-            ),
             back_callback=self._store_nav_callback("cloud_images", self._offer_ref(offer.id)),
             cancel_callback=self._store_nav_callback("market"),
         )
@@ -2323,12 +2394,6 @@ class OfferCatalogViewService:
         wallet = await self._wallets.get(user_id)
         balance = wallet.balance if wallet is not None else 0
 
-        confirm_callback = self._store_nav_callback(
-            "buy",
-            self._offer_ref(offer_id),
-            str(os_index),
-            str(panel_index if panel_index is not None else 0),
-        )
         back_callback = self._store_nav_callback("panel", self._offer_ref(offer_id), str(os_index))
         cancel_callback = self._store_nav_callback("market")
         return OfferConfirmView(
@@ -2337,7 +2402,6 @@ class OfferCatalogViewService:
             balance_minor=balance,
             currency=offer.selling_currency,
             sufficient=balance >= offer.selling_price_minor,
-            confirm_callback=confirm_callback,
             back_callback=back_callback,
             cancel_callback=cancel_callback,
             panel_name=panel_name,

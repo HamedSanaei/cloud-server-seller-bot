@@ -11,9 +11,9 @@ Usage::
 
     uv run python scripts/setup_dev.py
 
-The sync step needs ``HETZNER_API_TOKEN`` (from ``.env`` or the
-environment). If the token is missing the step is skipped with a warning and
-the script still exits 0, so the stack + schema alone can be brought up;
+The sync step needs a managed Hetzner credential account, configured through
+``providers.hetzner.accounts`` or the legacy ``HETZNER_API_TOKEN``. If none is
+configured the step is skipped with a warning and the script still exits 0;
 pass ``--skip-sync`` to skip it explicitly.
 
 Environment: reads ``.env`` if present (via pydantic-settings). Without
@@ -95,10 +95,10 @@ async def run(args: argparse.Namespace) -> int:
     if args.skip_sync:
         print("==> Skipping catalog sync (--skip-sync)")
         return 0
-    if not settings.hetzner_api_token:
+    if not settings.hetzner_new_order_accounts:
         print(
-            "==> Skipping catalog sync: HETZNER_API_TOKEN is not set "
-            "(add it to .env, then re-run scripts/sync_catalog.py).",
+            "==> Skipping catalog sync: no active Hetzner credential account "
+            "(configure providers.hetzner.accounts, then re-run scripts/sync_catalog.py).",
             file=sys.stderr,
         )
         return 0
@@ -106,11 +106,10 @@ async def run(args: argparse.Namespace) -> int:
     print("==> Syncing Hetzner catalog")
     container = create_container()
     syncer = container.hetzner_syncer
-    assert syncer is not None  # token is set, so the adapter is registered
+    assert syncer is not None  # active managed accounts register the shared syncer
     try:
         results = await syncer.sync_all()
     finally:
-        await syncer.close()
         await container.close()
     for name, result in results.items():
         print(

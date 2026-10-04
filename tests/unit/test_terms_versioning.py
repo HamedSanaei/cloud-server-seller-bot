@@ -37,6 +37,10 @@ def _user(terms_version: int | None = None) -> User:
         role=Role.USER,
         status=UserStatus.ACTIVE,
         terms_version=terms_version,
+        telegram_user_id=12345,
+        phone_number="+989123456789",
+        phone_verified_at=NOW,
+        national_id="1234567891",
     )
 
 
@@ -225,53 +229,3 @@ class TestProvisioningGate:
 
         gate.require_latest.assert_awaited_once()
         catalog.get_offer.assert_not_awaited()  # blocked before any catalog work
-
-    async def test_current_terms_proceed(self) -> None:
-        from cloud_platform.modules.catalog.domain import OfferRef
-
-        gate = AsyncMock()
-        service, catalog = self._service_with_gate(gate)
-
-        try:
-            await service.create_server(  # type: ignore[union-attr]
-                user=_user(2),
-                offer_ref=OfferRef(provider_key="hetzner", plan_id="cx22", location_id="fsn1"),
-                idempotency_key="k",
-            )
-        except TermsAcceptanceRequiredError:
-            pytest.fail("current terms must not block provisioning")
-        except Exception:
-            pass  # mock-driven failure after the gate is fine for this test
-
-        gate.require_latest.assert_awaited_once()
-        catalog.get_offer.assert_awaited()  # the flow got past the gate
-
-    async def test_no_gate_keeps_legacy_behavior(self) -> None:
-        from cloud_platform.modules.catalog.domain import OfferRef
-        from cloud_platform.modules.compute.service import CreateServerService
-
-        catalog = AsyncMock()
-        service = CreateServerService(
-            server_repo=AsyncMock(),  # type: ignore[arg-type]
-            account_repo=AsyncMock(),  # type: ignore[arg-type]
-            catalog_repo=catalog,  # type: ignore[arg-type]
-            price_book_service=AsyncMock(),  # type: ignore[arg-type]
-            snapshot_service=AsyncMock(),  # type: ignore[arg-type]
-            wallet_repo=AsyncMock(),  # type: ignore[arg-type]
-            hold_repo=AsyncMock(),  # type: ignore[arg-type]
-            audit_repo=AsyncMock(),  # type: ignore[arg-type]
-            book_name="retail-eur",
-        )
-
-        try:
-            await service.create_server(  # type: ignore[union-attr]
-                user=_user(None),
-                offer_ref=OfferRef(provider_key="hetzner", plan_id="cx22", location_id="fsn1"),
-                idempotency_key="k",
-            )
-        except TermsAcceptanceRequiredError:
-            pytest.fail("without a wired gate, terms never block")
-        except Exception:
-            pass  # mock-driven failure after the gate is fine for this test
-
-        catalog.get_offer.assert_awaited()

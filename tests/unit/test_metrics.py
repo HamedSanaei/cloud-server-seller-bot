@@ -159,6 +159,7 @@ class TestJobInstrumentation:
             wallet_repo=AsyncMock(),  # type: ignore[arg-type]
             hold_repo=AsyncMock(),  # type: ignore[arg-type]
             audit_repo=AsyncMock(),  # type: ignore[arg-type]
+            prepay_server=AsyncMock(),
         )
         before = _value(
             "cloud_platform_job_runs_total", {"job": "provisioning_worker", "status": "ok"}

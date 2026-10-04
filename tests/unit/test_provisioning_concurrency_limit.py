@@ -192,6 +192,7 @@ def _make(
         hold_repo=AsyncMock(),  # type: ignore[arg-type]
         audit_repo=AsyncMock(),  # type: ignore[arg-type]
         concurrency_limit=concurrency_limit,
+        prepay_server=AsyncMock(),
     )
     return worker, repo, provider, server_repo
 

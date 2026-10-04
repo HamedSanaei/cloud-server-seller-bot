@@ -148,7 +148,7 @@ class FakeServerRepo:
 
 
 class FakeProvider:
-    key = "hetzner"
+    key = "deduplicating"
     capabilities = frozenset({Capability.COMPUTE})
 
     def __init__(self) -> None:
@@ -191,7 +191,7 @@ def _server(
     return CloudServer(
         id=SERVER_ID,
         user_id=USER_ID,
-        provider_key="hetzner",
+        provider_key="deduplicating",
         provider_account_id=uuid4(),
         state=state,
         idempotency_key=idempotency_key,
@@ -245,7 +245,7 @@ def _in_flight_op(updated_at: datetime) -> Operation:
         operation_type=OperationType.SERVER_CREATE,
         resource_type="server",
         resource_id=SERVER_ID,
-        provider_key="hetzner",
+        provider_key="deduplicating",
     )
     op.mark_in_flight()
     op.updated_at = updated_at
@@ -387,7 +387,7 @@ class TestProvisioningReconciliation:
             operation_type=OperationType.SERVER_CREATE,
             resource_type="server",
             resource_id=SERVER_ID,
-            provider_key="hetzner",
+            provider_key="deduplicating",
         )
         op.mark_in_flight()
         op.complete(
@@ -419,7 +419,7 @@ class TestProvisioningReconciliation:
             operation_type=OperationType.SERVER_CREATE,
             resource_type="server",
             resource_id=SERVER_ID,
-            provider_key="hetzner",
+            provider_key="deduplicating",
         )
         op.mark_in_flight()
         op.complete({"provider_server_id": "prov-123", "idempotency_key": OP_KEY})
@@ -443,7 +443,7 @@ class TestProvisioningReconciliation:
             operation_type=OperationType.SERVER_CREATE,
             resource_type="server",
             resource_id=SERVER_ID,
-            provider_key="hetzner",
+            provider_key="deduplicating",
         )
         op.mark_in_flight()
         op.complete({"provider_server_id": "prov-123", "idempotency_key": OP_KEY})
@@ -474,7 +474,7 @@ class TestProvisioningReconciliation:
             operation_type=OperationType.SERVER_CREATE,
             resource_type="server",
             resource_id=SERVER_ID,
-            provider_key="hetzner",
+            provider_key="deduplicating",
         )
         op.mark_in_flight()
         op.complete({"provider_server_id": "prov-123", "idempotency_key": OP_KEY})
@@ -499,7 +499,8 @@ class TestRequestedOperationRecovery:
         assert recreated.status is OperationStatus.PENDING
         assert provider.create_calls == []  # the worker will claim it later
 
-    async def test_existing_pending_operation_is_left_alone(self) -> None:
+    @pytest.mark.parametrize("previous_attempt", [True, False])
+    async def test_existing_pending_operation_is_left_alone(self, previous_attempt: bool) -> None:
         server = _server()
         provider = FakeProvider()
         deps = _Deps({server.id: server}, provider)
@@ -508,8 +509,12 @@ class TestRequestedOperationRecovery:
             operation_type=OperationType.SERVER_CREATE,
             resource_type="server",
             resource_id=SERVER_ID,
-            provider_key="hetzner",
+            provider_key="deduplicating",
         )
+        if previous_attempt:
+            op.mark_in_flight()
+            op.requeue("native-idempotent retry")
+            op.updated_at = STALE
         assert op.status is OperationStatus.PENDING
 
         counts = await deps.reconciler.reconcile()

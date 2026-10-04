@@ -3,9 +3,9 @@
 Authorization is enforced here in the application layer (not only at the
 UI/bot layer): every adjustment requires the ``wallet:adjust`` permission,
 a non-empty human-readable reason, and leaves an append-only audit record
-linking the action to its actor. All audit writes go through the
-:class:`~cloud_platform.modules.audit.service.AuditTrail` facade, which
-structurally rejects admin mutations without a reason.
+linking the action to its actor. Wallet adjustments commit their audit and
+business-log outbox fact together with the wallet and ledger; hold release
+auditing uses :class:`~cloud_platform.modules.audit.service.AuditTrail`.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from uuid import UUID
 
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
-from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.domain import BusinessEvent, BusinessEventSink
 from cloud_platform.modules.businesslog.events import admin_adjustment_event
 from cloud_platform.modules.users.domain import Permission, PermissionChecker, User
 from cloud_platform.modules.wallet.domain import (
@@ -50,13 +50,11 @@ class WalletAdminService:
         self,
         wallet_repo: WalletRepository,
         ledger_repo: LedgerRepository,
-        audit_repo: AuditRepository,
         event_sink: BusinessEventSink | None = None,
         user_repo: object | None = None,
     ) -> None:
         self._wallet_repo = wallet_repo
         self._ledger_repo = ledger_repo
-        self._audit = AuditTrail(audit_repo)
         self._events = event_sink
         self._users = user_repo
 
@@ -82,68 +80,58 @@ class WalletAdminService:
         """
         checker = PermissionChecker(admin)
         checker.require(Permission.WALLET_ADJUST)
+        checker.require_active()
+        if admin.id is None:
+            raise ValueError("a persisted administrator is required")
+        if (
+            isinstance(amount, bool)
+            or not isinstance(amount, int)
+            or not -(2**63) <= amount <= 2**63 - 1
+        ):
+            raise ValueError("adjustment amount must be a signed 64-bit integer")
+        if amount > 0 and user_id == admin.id:
+            raise ValueError("superadmin self top-up is not available")
 
         if not reason or not reason.strip():
             raise ValueError("adjustment reason must not be empty")
         if amount == 0:
             raise ValueError("adjustment amount must not be zero")
+        idempotency_key = str(idempotency_key).strip()
+        if not idempotency_key:
+            raise ValueError("idempotency_key must not be empty")
+        target = await self._load_user(user_id)
+        policy = getattr(self._events, "policy", None)
 
-        wallet = await self._wallet_repo.get(user_id)
-        if wallet is None:
-            raise ValueError(f"no wallet for user {user_id}")
-        assert wallet.id is not None  # persisted wallets carry an id
-        wallet_id: UUID = wallet.id
-
-        # Idempotent replay: the same key returns the original outcome.
-        existing = await self._ledger_repo.get_entry_by_idempotency(wallet_id, idempotency_key)
-        if existing is not None:
-            logger.info(
-                "adjustment %s already applied for wallet %s; replaying",
-                idempotency_key,
-                wallet_id,
-            )
-            return wallet, existing
-
-        if amount > 0:
-            updated = await self._wallet_repo.add_funds(user_id, amount, idempotency_key)
-        else:
-            updated = await self._wallet_repo.debit(user_id, -amount, idempotency_key)
-
-        entry = await self._ledger_repo.post_entry(
-            wallet_id,
-            abs(amount),
-            updated.currency,
-            LedgerEntryType.ADJUSTMENT,
-            idempotency_key,
-            reference_type="admin_adjustment",
-            reference_id=str(admin.id) if admin.id is not None else "",
-            description=reason,
-        )
-
-        await self._audit.record_mutation(
-            actor_type=ActorType.ADMIN,
-            actor_id=admin.id,
-            action="wallet.adjust",
-            resource_type="wallet",
-            resource_id=str(wallet_id),
-            reason=reason,
-            metadata={"amount": str(amount), "currency": updated.currency},
-        )
-        # Operator channel: manual balance adjustments are financially
-        # sensitive, so they are always logged with actor, amount and reason.
-        await emit_safe(
-            self._events,
-            admin_adjustment_event(
+        def business_fact(wallet: Wallet) -> BusinessEvent | None:
+            event = admin_adjustment_event(
                 admin=admin,
-                user=await self._load_user(user_id),
+                user=target,
                 amount_minor=amount,
-                currency=updated.currency,
+                currency=wallet.currency,
                 entry_type=LedgerEntryType.ADJUSTMENT.value,
                 reason=reason,
-                balance_after_minor=updated.balance,
+                balance_after_minor=wallet.balance,
                 idempotency_key=idempotency_key,
-            ),
+            )
+            return event if policy is not None and policy.allows(event.event_type) else None
+
+        updated, _applied = await self._wallet_repo.adjust(
+            user_id,
+            amount,
+            idempotency_key,
+            entry_type=LedgerEntryType.ADJUSTMENT,
+            reference_type="admin_adjustment",
+            reference_id=str(admin.id),
+            description=reason,
+            audit_actor_id=admin.id,
+            business_event_factory=business_fact,
         )
+        assert updated.id is not None
+        wallet_id: UUID = updated.id
+        entry = await self._ledger_repo.get_entry_by_idempotency(wallet_id, idempotency_key)
+        if entry is None:
+            raise RuntimeError("atomic wallet adjustment has no ledger fact")
+
         return updated, entry
 
     async def _load_user(self, user_id: UUID) -> User | None:

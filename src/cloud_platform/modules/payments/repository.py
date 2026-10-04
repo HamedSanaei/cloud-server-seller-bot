@@ -50,6 +50,7 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
     fx_path_raw = getattr(row, "fx_path", None)
     fx_proxy_asset_raw = getattr(row, "fx_proxy_asset", None)
     fx_observed_raw = getattr(row, "fx_observed_at", None)
+    details_raw = getattr(row, "payment_details", None)
     session = PaymentSession(
         user_id=_attr(row, "user_id"),
         gateway_key=str(_attr(row, "gateway_key")),
@@ -71,6 +72,7 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
         fx_proxy_asset=fx_proxy_asset_raw if isinstance(fx_proxy_asset_raw, str) else None,
         created_at=created,
         updated_at=updated,
+        payment_details=dict(details_raw) if isinstance(details_raw, dict) else None,
     )
     if credited_at is not None:
         session = session.mark_credited(at=credited_at)
@@ -95,6 +97,7 @@ def _to_row(aggregate: PaymentSession) -> _PaymentModel:
         fx_observed_at=aggregate.fx_observed_at,
         fx_proxy=aggregate.fx_proxy,
         fx_proxy_asset=aggregate.fx_proxy_asset,
+        payment_details=aggregate.payment_details,
     )
 
 
@@ -174,6 +177,7 @@ class SqlAlchemyPaymentSessionRepository:
                     _PaymentModel.gateway_key == gateway_key,
                     _PaymentModel.status == PaymentSessionStatus.PENDING.value,
                     _PaymentModel.created_at <= cutoff,
+                    _PaymentModel.gateway_payment_id.is_not(None),
                 )
                 .order_by(_PaymentModel.created_at.asc())
                 .limit(limit)
@@ -194,6 +198,10 @@ class SqlAlchemyPaymentSessionRepository:
             cast_any.gateway_payment_id = session.gateway_payment_id
             cast_any.credited_at = to_db_utc_or_none(session.credited_at)
             cast_any.updated_at = to_db_utc(utc_now())
+            # The provider may add a unique suffix to its requested base amount.
+            # Binding that invoice total never modifies the frozen wallet credit.
+            cast_any.amount_minor = session.amount_minor
+            cast_any.payment_details = session.payment_details
             # Cross-currency snapshot columns (nullable; legacy rows keep NULL).
             for field_name in (
                 "credit_amount_minor",

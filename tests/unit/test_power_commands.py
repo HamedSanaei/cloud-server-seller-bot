@@ -218,6 +218,7 @@ class _Deps:
             operation_repo=self.ops,  # type: ignore[arg-type]
             provider_registry=self.registry,
             audit_repo=self.audit,  # type: ignore[arg-type]
+            prepay_server=AsyncMock(),
         )
         self.worker = ProvisioningWorker(
             operation_repo=self.ops,  # type: ignore[arg-type]
@@ -227,6 +228,7 @@ class _Deps:
             wallet_repo=self.wallets,  # type: ignore[arg-type]
             hold_repo=self.holds,  # type: ignore[arg-type]
             audit_repo=self.audit,  # type: ignore[arg-type]
+            prepay_server=AsyncMock(),
         )
 
     def audit_events(self) -> list:

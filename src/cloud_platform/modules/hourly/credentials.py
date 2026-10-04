@@ -15,6 +15,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import exists, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import Exists
 
 from cloud_platform.core.secrets import SecretBox, SecretEnvelope
 from cloud_platform.db.base import Server, ServerCreateCredential
@@ -53,7 +55,7 @@ class SqlAlchemyServerCredentialStore:
         self._box = box
 
     @staticmethod
-    def _owner_matches(server_id: UUID, user_id: UUID):
+    def _owner_matches(server_id: UUID, user_id: UUID) -> Exists:
         return exists(
             select(Server.id).where(
                 Server.id == server_id,
@@ -116,7 +118,7 @@ class SqlAlchemyServerCredentialStore:
             return found is not None
 
     @staticmethod
-    def _claim_available(now: datetime):
+    def _claim_available(now: datetime) -> ColumnElement[bool]:
         return or_(
             ServerCreateCredential.claim_id.is_(None),
             ServerCreateCredential.claim_expires_at <= now,

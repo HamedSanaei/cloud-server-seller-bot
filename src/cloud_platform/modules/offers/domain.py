@@ -852,10 +852,14 @@ class SellableOfferRepository(Protocol):
         location_id: str,
         update: OfferSpecUpdate,
         provider_account_id: str | None = None,
+        adopt_legacy_catalog_row: bool = False,
     ) -> SellableOffer:
         """Create or refresh the row from provider sync data.
 
         Never touches ``enabled`` or ``selling_price_minor`` (operator-owned).
+        A sole unscoped catalog row may be adopted only when the adapter explicitly
+        supplies a fresh independently verified account observation. Accepted
+        server/order/snapshot ownership is never part of this mutation.
         """
         ...
 

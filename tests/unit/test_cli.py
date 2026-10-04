@@ -736,23 +736,7 @@ class TestUsersAndWallet:
         monkeypatch.setattr(
             "cloud_platform.core.container.create_container", MagicMock(side_effect=AssertionError)
         )
-        assert await cli.wallet_adjust(str(uuid4()), 100, "   ") == 2
-
-    async def test_wallet_adjust_via_admin_service(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: Any
-    ) -> None:
-        wallet = Wallet(user_id=uuid4(), id=uuid4(), balance=6000, currency="EUR")
-        service = AsyncMock()
-        service.adjust_balance = AsyncMock(return_value=(wallet, MagicMock(id=uuid4())))
-        container = AsyncMock()
-        container.wallet_admin_service = MagicMock(return_value=service)
-        container.close = AsyncMock()
-        monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
-        assert await cli.wallet_adjust(str(uuid4()), 1000, "manual credit") == 0
-        assert "6000" in capsys.readouterr().out
-        # The idempotency key is deterministic per (user, amount, reason).
-        call_kwargs = service.adjust_balance.await_args.kwargs
-        assert call_kwargs["idempotency_key"].startswith("cli-adj:")
+        assert await cli.wallet_adjust(str(uuid4()), 100, "   ", str(uuid4())) == 2
 
 
 class TestOrdersCommands:

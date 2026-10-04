@@ -16,15 +16,16 @@ and reconciliation never fetch a new rate.
 
 Safety properties:
 
-- the gateway call happens FIRST and the session row is persisted with the
-  returned authority; a crash between the two leaves an *unpaid* authority
-  (harmless — no wallet effect without a verified callback);
+- ordinary gateways are called first; gateways without a provider-side
+  idempotency guarantee persist a durable attempt first and never POST a
+  second order for an unbound/ambiguous attempt;
 - a replayed request (same Telegram button, same idempotency key) that the
   gateway resolves to the same authority collides on the session's unique
   ``(gateway_key, gateway_payment_id)`` pair and returns the EXISTING session
   instead of creating a second one;
-- the amount is the customer's chosen integer minor units — the gateway
-  adapter validates currency and amount, and no float ever touches money;
+- the selected wallet credit remains frozen while the durable settlement
+  amount records the provider's authoritative invoice total (including any
+  unique payment suffix); no float ever touches money;
 - a wallet is credited only by :class:`PaymentWebhookService` (verified
   callback + idempotent deposit key), never by this service.
 """
@@ -46,6 +47,7 @@ from cloud_platform.modules.payments.domain import (
     session_credit_amount,
     session_credit_currency,
 )
+from cloud_platform.modules.users.domain import Role
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,10 @@ class RechargeDisabledError(RechargeError):
 
 class RechargeAmountError(RechargeError):
     """The requested top-up amount is not a positive integer amount."""
+
+
+class RechargeAdminForbiddenError(RechargeError):
+    """Administrator wallets cannot be topped up through customer gateways."""
 
 
 class RechargeGatewaySelectionRequired(RechargeError):
@@ -93,6 +99,30 @@ class RechargeStart:
     session: PaymentSession
     redirect_url: str
     replayed: bool
+    payment_details: RechargePaymentDetails | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RechargePaymentDetails:
+    """Safe customer-facing invoice data, never a sequential provider order id."""
+
+    amount_minor: int
+    currency: str
+    payment_url: str = ""
+    tracking_code: str = ""
+    payment_deadline_at: str = ""
+
+    @classmethod
+    def from_metadata(
+        cls, metadata: dict[str, Any], *, amount_minor: int, currency: str
+    ) -> RechargePaymentDetails:
+        return cls(
+            amount_minor=amount_minor,
+            currency=currency,
+            payment_url=str(metadata.get("payment_url") or ""),
+            tracking_code=str(metadata.get("tracking_code") or ""),
+            payment_deadline_at=str(metadata.get("payment_deadline_at") or ""),
+        )
 
 
 def _gateway_minimum_charge(gateway: Any, currency: str) -> int:
@@ -144,6 +174,7 @@ class WalletRechargeService:
         event_sink: BusinessEventSink | None = None,
         user_repo: object | None = None,
         fx_resolver: Any | None = None,
+        gateway_settings: Any | None = None,
     ) -> None:
         merged: dict[str, RechargeGateway] = dict(gateways or {})
         if gateway is not None:
@@ -156,6 +187,12 @@ class WalletRechargeService:
         # Owned by the process (like the gateway collection): this service
         # never closes it.
         self._fx = fx_resolver
+        self._gateway_settings = gateway_settings
+
+    async def _enabled(self, key: str) -> bool:
+        if self._gateway_settings is None:
+            return True
+        return await self._gateway_settings.get(key) is not False
 
     @property
     def gateway_key(self) -> str:
@@ -211,25 +248,8 @@ class WalletRechargeService:
         )
 
     async def supports_currency_async(self, currency: str) -> bool:
-        """Full compatibility probe, including FX-converted gateways."""
-        if self.supports_currency(currency):
-            return True
-        if self._fx is None:
-            return False
-        try:
-            from cloud_platform.modules.fx.domain import FxPurpose
-        except ImportError:
-            return False
-        for gateway in self._gateways.values():
-            settlement = self._settlement_currency(gateway)
-            if not settlement:
-                continue
-            try:
-                if await self._fx.can_convert(currency, settlement, FxPurpose.CHARGE):
-                    return True
-            except Exception:
-                continue
-        return False
+        """Current runtime policy plus currency/FX compatibility."""
+        return bool(await self.compatible_gateways_async(currency))
 
     def compatible_gateways(self, currency: str, amount_minor: int | None = None) -> list[str]:
         """Keys of gateways able to charge ``currency`` (and ``amount``).
@@ -252,6 +272,9 @@ class WalletRechargeService:
                     continue
                 if settlement < _gateway_minimum_charge(gateway, currency):
                     continue
+                maximum = getattr(gateway, "maximum_charge_minor", None)
+                if maximum is not None and settlement > maximum:
+                    continue
             compatible.append(key)
         return compatible
 
@@ -267,6 +290,8 @@ class WalletRechargeService:
         """
         compatible: list[str] = []
         for key, gateway in self._gateways.items():
+            if not await self._enabled(key):
+                continue
             settlement_currency = self._settlement_currency(gateway)
             if not settlement_currency:
                 continue
@@ -282,6 +307,9 @@ class WalletRechargeService:
                     gateway, currency
                 ):
                     continue
+                maximum = getattr(gateway, "maximum_charge_minor", None)
+                if amount_minor is not None and maximum is not None and converted > maximum:
+                    continue
                 compatible.append(key)
                 continue
             if self._fx is None:
@@ -296,6 +324,9 @@ class WalletRechargeService:
                         amount_minor, currency, settlement_currency, FxPurpose.CHARGE
                     )
                     if resolved.target_amount_minor < _gateway_minimum_charge(gateway, currency):
+                        continue
+                    maximum = getattr(gateway, "maximum_charge_minor", None)
+                    if maximum is not None and resolved.target_amount_minor > maximum:
                         continue
                 compatible.append(key)
             except Exception:
@@ -341,6 +372,8 @@ class WalletRechargeService:
         del amount_minor  # resolution is amount-independent; see docstring.
         if gateway_key is not None:
             gateway = self._gateways.get(gateway_key)
+            if not await self._enabled(gateway_key):
+                raise RechargeDisabledError(f"gateway {gateway_key!r} is disabled")
             if gateway is None:
                 raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             if self._supports_or_exact(gateway, currency):
@@ -457,7 +490,9 @@ class WalletRechargeService:
         """Create (or replay) one pending top-up session."""
         if user is None or getattr(user, "id", None) is None:
             raise RechargeError("a persisted user id is required")
-        if not isinstance(amount_minor, int) or amount_minor <= 0:
+        if getattr(user, "role", None) == Role.ADMIN:
+            raise RechargeAdminForbiddenError("administrator self-top-up is forbidden")
+        if type(amount_minor) is not int or amount_minor <= 0:
             raise RechargeAmountError("amount must be a positive integer of minor units")
         key = (idempotency_key or "").strip()
         if not key:
@@ -466,6 +501,30 @@ class WalletRechargeService:
             # Cheap structural guard: fail here with a domain error instead of
             # leaking a ValueError out of the IdempotencyKey value object.
             raise RechargeError("idempotency_key must be 8..128 characters")
+        # Recover existing durable attempts before consulting a fresh FX route
+        # or the new-order policy: neither can invalidate an issued invoice.
+        for registered_key, candidate in self._gateways.items():
+            if gateway_key is not None and registered_key != gateway_key:
+                continue
+            if not getattr(candidate, "requires_durable_creation", False):
+                continue
+            existing = await self._payments.get_by_idempotency_key(registered_key, key)
+            if existing is not None:
+                if (
+                    existing.user_id != user.id
+                    or session_credit_amount(existing) != amount_minor
+                    or session_credit_currency(existing) != (currency or "").upper()
+                ):
+                    raise RechargeError("recharge replay does not match its original owner/credit")
+                if not existing.gateway_payment_id:
+                    raise RechargeError("payment creation outcome is unknown; do not create again")
+                details = await self.payment_details(user=user, session_id=existing.id)
+                return RechargeStart(
+                    session=existing,
+                    redirect_url=details.payment_url,
+                    replayed=True,
+                    payment_details=details,
+                )
         gateway = await self._resolve_gateway_async(currency, gateway_key, amount_minor)
         resolved_key = gateway.key
         # Credit (wallet) -> settlement (gateway) is frozen ONCE here; the
@@ -478,6 +537,18 @@ class WalletRechargeService:
         if settlement_amount < minimum:
             raise RechargeAmountError(
                 f"amount {settlement_amount} is below the {resolved_key} minimum of {minimum}"
+            )
+        maximum = getattr(gateway, "maximum_charge_minor", None)
+        if maximum is not None and settlement_amount > maximum:
+            raise RechargeAmountError("amount exceeds the gateway maximum charge")
+        if getattr(gateway, "requires_durable_creation", False):
+            return await self._start_durable(
+                gateway=gateway,
+                user=user,
+                amount_minor=settlement_amount,
+                currency=settlement_currency,
+                key=key,
+                snapshot=snapshot,
             )
 
         if _gateway_needs_callback_reference(gateway):
@@ -552,6 +623,105 @@ class WalletRechargeService:
             replayed,
         )
         return RechargeStart(session=session, redirect_url=redirect, replayed=replayed)
+
+    async def payment_details(self, *, user: Any, session_id: Any) -> RechargePaymentDetails:
+        """Owned invoice metadata, recovered from API with genuine creation fallback."""
+        session = await self._payments.get(session_id)
+        if session is None or session.user_id != getattr(user, "id", None):
+            raise RechargeError("payment session belongs to another user")
+        gateway = self._gateways.get(session.gateway_key)
+        if gateway is None or not session.gateway_payment_id:
+            raise RechargeError("payment invoice is unavailable")
+        metadata = dict(session.payment_details or {})
+        getter = getattr(gateway, "get_payment_details", None)
+        if callable(getter):
+            fresh = await getter(session.gateway_payment_id)
+            if int(fresh.get("total_amount_minor", session.amount_minor)) != session.amount_minor:
+                raise RechargeError("payment metadata amount mismatch")
+            if fresh.get("merchant_order_ref", session.idempotency_key) != session.idempotency_key:
+                raise RechargeError("payment metadata merchant reference mismatch")
+            if fresh.get("currency", session.currency) != session.currency:
+                raise RechargeError("payment metadata currency mismatch")
+            saved_tracking = metadata.get("tracking_code")
+            if saved_tracking and fresh.get("tracking_code", saved_tracking) != saved_tracking:
+                raise RechargeError("payment metadata tracking code mismatch")
+            metadata.update(fresh)
+        elif not metadata.get("payment_url"):
+            metadata["payment_url"] = _gateway_payment_link(gateway, session.gateway_payment_id)
+        details = RechargePaymentDetails.from_metadata(
+            metadata, amount_minor=session.amount_minor, currency=session.currency
+        )
+        if not details.payment_url:
+            raise RechargeError("gateway API returned no recoverable payment link")
+        return details
+
+    async def _start_durable(
+        self,
+        *,
+        gateway: Any,
+        user: Any,
+        amount_minor: int,
+        currency: str,
+        key: str,
+        snapshot: dict[str, Any] | None,
+    ) -> RechargeStart:
+        """Record attempt before the single non-idempotent provider mutation.
+
+        An unbound row on replay is ambiguous, including a crash before POST:
+        do not issue a second order. A bound row reuses its frozen FX snapshot.
+        """
+        try:
+            attempted = await self._payments.create(
+                PaymentSession(
+                    user_id=user.id,
+                    gateway_key=gateway.key,
+                    amount_minor=amount_minor,
+                    currency=currency,
+                    idempotency_key=key,
+                    **(snapshot or {}),
+                )
+            )
+        except DuplicateExternalIdError as exc:
+            # A concurrent click must not initiate another external mutation.
+            raise RechargeError(
+                "payment creation already started; inquire before retrying"
+            ) from exc
+        intent = await gateway.create_payment(
+            amount_minor=amount_minor,
+            currency=currency,
+            reference=str(user.id),
+            idempotency_key=IdempotencyKey(key),
+            customer_telegram_id=getattr(user, "telegram_user_id", None),
+        )
+        authority = str(intent.gateway_payment_id or "")
+        metadata = dict(intent.metadata)
+        if not authority or not intent.redirect_url or intent.currency != currency:
+            raise RechargeError("gateway returned an invalid payment invoice")
+        metadata["payment_url"] = intent.redirect_url
+        session = await self._payments.save(
+            attempted.with_payment_intent(authority, intent.amount_minor, metadata)
+        )
+        if session.id is None:
+            raise RechargeError("a durable payment invoice must have a persisted identity")
+        details = RechargePaymentDetails.from_metadata(
+            metadata, amount_minor=session.amount_minor, currency=session.currency
+        )
+        await emit_safe(
+            self._events,
+            recharge_created_event(
+                user=user,
+                payment_session_id=session.id,
+                amount_minor=session_credit_amount(session),
+                currency=session_credit_currency(session),
+                gateway=session.gateway_key,
+            ),
+        )
+        return RechargeStart(
+            session=session,
+            redirect_url=details.payment_url,
+            replayed=False,
+            payment_details=details,
+        )
 
     async def _start_with_callback_reference(
         self,
@@ -676,11 +846,13 @@ class WalletRechargeService:
 
 
 __all__ = [
+    "RechargeAdminForbiddenError",
     "RechargeAmountError",
     "RechargeDisabledError",
     "RechargeError",
     "RechargeGateway",
     "RechargeGatewaySelectionRequired",
+    "RechargePaymentDetails",
     "RechargeStart",
     "WalletRechargeService",
 ]

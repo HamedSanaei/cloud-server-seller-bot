@@ -88,13 +88,13 @@ def _server_type(**overrides: object) -> dict[str, object]:
 
 
 def _plan(item: dict[str, object], location: str) -> hz.HetznerHourlyPlan:
-    parsed = hz.parse_hourly_plan(item, location)
+    parsed = hz.parse_hourly_plan(item, location, currency="EUR")
     assert isinstance(parsed, hz.HetznerHourlyPlan), parsed
     return parsed
 
 
 def _rejection(item: dict[str, object], location: str) -> hz.HetznerHourlyRejection:
-    parsed = hz.parse_hourly_plan(item, location)
+    parsed = hz.parse_hourly_plan(item, location, currency="EUR")
     assert isinstance(parsed, hz.HetznerHourlyRejection), parsed
     return parsed
 
@@ -209,9 +209,9 @@ def test_an_empty_price_block_is_rejected() -> None:
     assert _rejection(_server_type(prices=[]), "fsn1").reason == hz.REASON_NO_LOCATION_PRICE
 
 
-def test_an_unsupported_billing_currency_refuses_to_price(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(hz, "CURRENCY", "ZZZ")
-    rejection = _rejection(_server_type(), "fsn1")
+def test_an_unsupported_billing_currency_refuses_to_price() -> None:
+    rejection = hz.parse_hourly_plan(_server_type(), "fsn1", currency="ZZZ")
+    assert isinstance(rejection, hz.HetznerHourlyRejection)
     assert rejection.reason == hz.REASON_UNKNOWN_CURRENCY
 
 
@@ -254,6 +254,7 @@ def test_a_read_partitions_priced_plans_from_rejections() -> None:
             _server_type(id=23, name="cx32", prices=[_price("nbg1", "0.0102", "5.31")]),
         ],
         "fsn1",
+        currency="EUR",
     )
     assert read.location_id == "fsn1"
     assert [plan.plan_id for plan in read.plans] == ["cx22"]
@@ -263,13 +264,13 @@ def test_a_read_partitions_priced_plans_from_rejections() -> None:
 
 
 def test_a_non_list_payload_is_an_empty_read_not_a_crash() -> None:
-    read = hz.parse_hourly_plans({"error": {"code": "unauthorized"}}, "fsn1")
+    read = hz.parse_hourly_plans({"error": {"code": "unauthorized"}}, "fsn1", currency="EUR")
     assert read.plans == ()
     assert read.rejected == ()
 
 
 def test_a_non_dict_entry_is_reported_not_silently_dropped() -> None:
-    read = hz.parse_hourly_plans(["nonsense", _server_type()], "fsn1")
+    read = hz.parse_hourly_plans(["nonsense", _server_type()], "fsn1", currency="EUR")
     assert [plan.plan_id for plan in read.plans] == ["cx22"]
     assert [rejection.reason for rejection in read.rejected] == [hz.REASON_MISSING_IDENTITY]
 
@@ -296,9 +297,9 @@ def test_an_unknown_architecture_is_dropped_not_displayed() -> None:
 
 
 def test_minor_units_uses_the_audited_currency_exponent() -> None:
-    assert hz.minor_units(Decimal("3.92")) == 392
-    assert hz.minor_units(Decimal("0.0050")) == 1  # HALF_UP, never banker's rounding
-    assert hz.minor_units(Decimal("0.0049")) == 0
+    assert hz.minor_units(Decimal("3.92"), "EUR") == 392
+    assert hz.minor_units(Decimal("0.0050"), "EUR") == 1  # HALF_UP, never banker's rounding
+    assert hz.minor_units(Decimal("0.0049"), "EUR") == 0
 
 
 def test_fractional_memory_and_odd_traffic_render_from_decimal_only() -> None:
@@ -506,3 +507,34 @@ def test_an_instance_without_addresses_still_normalizes() -> None:
 
 def test_an_instance_is_never_read_from_a_non_object_payload() -> None:
     assert hz.parse_hourly_instance(["not", "a", "server"]) is None
+
+
+@pytest.mark.parametrize("currency", ["EUR", "USD", "GBP", "JPY"])
+def test_official_pricing_currency_preserves_exact_native_rates(currency: str) -> None:
+    actual = hz.pricing_currency({"pricing": {"currency": currency}})
+    parsed = hz.parse_hourly_plan(_server_type(), "fsn1", currency=actual)
+    assert isinstance(parsed, hz.HetznerHourlyPlan)
+    assert parsed.currency == currency
+    assert parsed.hourly_rate_exact == "0.0075"
+    assert parsed.monthly_cap_minor == hz.minor_units(Decimal(parsed.monthly_rate_exact), currency)
+    assert parsed.hourly_cost_minor == (0 if currency == "JPY" else 1)
+    assert parsed.monthly_cap_minor == (4 if currency == "JPY" else 392)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"currency": "EUR"},
+        {"pricing": {}},
+        {"pricing": {"currency": None}},
+        {"pricing": {"currency": "ZZZ"}},
+        {"pricing": {"currency": "eur"}},
+        {"pricing": {"currency": 123}},
+    ],
+)
+def test_missing_or_malformed_official_currency_never_defaults(payload: object) -> None:
+    from cloud_platform.providers.errors import ProviderUnavailable
+
+    with pytest.raises(ProviderUnavailable):
+        hz.pricing_currency(payload)

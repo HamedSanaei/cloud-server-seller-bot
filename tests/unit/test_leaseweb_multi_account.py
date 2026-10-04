@@ -1514,7 +1514,16 @@ def _offer(price: int = 1299, location: str = FRA) -> SellableOffer:
 
 
 def _customer() -> User:
-    return User(id=USER_ID, username="customer", email="c@t.me", status=UserStatus.ACTIVE)
+    return User(
+        id=USER_ID,
+        username="customer",
+        email="c@t.me",
+        status=UserStatus.ACTIVE,
+        telegram_user_id=12345,
+        phone_number="+989123456789",
+        national_id="1234567891",
+        phone_verified_at=datetime.now(UTC),
+    )
 
 
 def _checkout(

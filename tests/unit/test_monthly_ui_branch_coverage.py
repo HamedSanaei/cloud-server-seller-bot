@@ -26,10 +26,8 @@ from cloud_platform.bot.monthly_ui import (
 )
 from cloud_platform.core.i18n import Translator
 from cloud_platform.modules.checkout.service import (
-    CheckoutError,
     OfferUnavailableError,
     OsUnavailableError,
-    UserNotActiveError,
 )
 from cloud_platform.modules.compute.domain import ServerLifecycleState
 from cloud_platform.modules.navigation.domain import Callback, encode_callback, encode_offer_ref
@@ -38,7 +36,6 @@ from cloud_platform.modules.payments.recharge import (
     RechargeError,
 )
 from cloud_platform.modules.users.domain import Role, User, UserStatus
-from cloud_platform.modules.wallet.domain import InsufficientHoldBalanceError
 
 KEY = "monthly-ui-branch-key"
 OFFER_ID = uuid4()
@@ -327,12 +324,12 @@ def _confirm(offer: Any, **over: Any) -> SimpleNamespace:
         currency="EUR",
         balance_minor=10_000,
         sufficient=True,
-        confirm_callback="confirm-cb",
         back_callback="back-cb",
         cancel_callback="cancel-cb",
         # hourly confirmation shape (separate fields from the monthly view)
         hourly_price_minor=780,
         monthly_estimate_minor=780 * 730,
+        image_id="ubuntu-24.04",
         image_label="Ubuntu 24.04",
         location_name="Frankfurt",
         location_country="DE",
@@ -671,67 +668,6 @@ class TestStoreScreenGuards:
         labels = [b.text for row in screen.keyboard.inline_keyboard for b in row]
         assert screen.text and labels
 
-    async def test_cloud_buy_without_identity(self) -> None:
-        bot = _bot(SteeringView(), hourly=FakeHourly())
-        screen = await bot.store_cloud_buy_screen(None, "anyref", 0, "k")
-        assert screen.text
-
-    async def test_cloud_buy_without_the_hourly_service(self) -> None:
-        bot = _bot(SteeringView(), hourly=None)
-        screen = await bot.store_cloud_buy_screen(_user(), "anyref", 0, "k")
-        assert screen.text
-
-    async def test_cloud_buy_with_an_unknown_ref_expires(self) -> None:
-        bot = _bot(SteeringView(), hourly=FakeHourly())
-        assert (await bot.store_cloud_buy_screen(_user(), "zzzzzzzz", 0, "k")).text
-
-    async def test_cloud_buy_creates_an_intent_only(self) -> None:
-        view = SteeringView()
-        view.result["cloud_image_by_index"] = _image()
-        hourly = FakeHourly()
-        bot = _bot(view, hourly=hourly, offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}))
-        screen = await bot.store_cloud_buy_screen(_user(), encode_offer_ref(OFFER_ID), 0, "cbkey")
-        assert hourly.calls and hourly.calls[0]["idempotency_key"] == "bot-hourly:cbkey"
-        assert screen.text
-
-    async def test_cloud_buy_reports_a_replay(self) -> None:
-        view = SteeringView()
-        view.result["cloud_image_by_index"] = _image()
-        bot = _bot(
-            view,
-            hourly=FakeHourly(replayed=True),
-            offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}),
-        )
-        assert (await bot.store_cloud_buy_screen(_user(), encode_offer_ref(OFFER_ID), 0, "k")).text
-
-    async def test_cloud_buy_with_a_vanished_offer_is_unavailable(self) -> None:
-        view = SteeringView()
-        bot = _bot(view, hourly=FakeHourly(), offers_repo=FakeOffersRepo())
-        assert (await bot.store_cloud_buy_screen(_user(), encode_offer_ref(OFFER_ID), 0, "k")).text
-
-    async def test_cloud_buy_maps_hourly_errors_to_unavailable(self) -> None:
-        from cloud_platform.modules.hourly.service import HourlyError
-
-        view = SteeringView()
-        view.result["cloud_image_by_index"] = _image()
-        bot = _bot(
-            view,
-            hourly=FakeHourly(raises=HourlyError("not sellable")),
-            offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}),
-        )
-        screen = await bot.store_cloud_buy_screen(_user(), encode_offer_ref(OFFER_ID), 0, "k")
-        assert screen.text
-
-    async def test_cloud_buy_maps_unexpected_errors_to_the_error_screen(self) -> None:
-        view = SteeringView()
-        view.result["cloud_image_by_index"] = _image()
-        bot = _bot(
-            view,
-            hourly=FakeHourly(raises=RuntimeError("boom")),
-            offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}),
-        )
-        assert (await bot.store_cloud_buy_screen(_user(), encode_offer_ref(OFFER_ID), 0, "k")).text
-
     async def test_product_locations_unavailable_with_currency(self) -> None:
         view = SteeringView()
         view.raises["product_locations_screen"] = OfferUnavailableError("none")
@@ -950,19 +886,6 @@ class TestStoreDispatchGuards:
         cb = bot._callback("store", "buy", encode_offer_ref(OFFER_ID), "x")
         assert (await _press(bot, cb)).text
 
-    async def test_a_buy_callback_places_the_order(self) -> None:
-        checkout = FakeCheckout()
-        view = SteeringView()
-        view.result["os_by_index"] = "ubuntu-24.04"
-        bot = _bot(
-            view,
-            checkout=checkout,
-            offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}),
-        )
-        cb = bot._callback("store", "buy", encode_offer_ref(OFFER_ID), "0")
-        assert (await _press(bot, cb)).text
-        assert checkout.calls
-
     async def test_a_cloud_images_callback_with_a_stale_ref_expires(self) -> None:
         bot = _bot(SteeringView())
         assert (await _press(bot, bot._callback("store", "cloud_images", "zzzzzzzz"))).text
@@ -1063,67 +986,6 @@ class TestLegacyOffersFlow:
     async def test_an_unknown_offers_screen_returns_the_menu(self) -> None:
         bot = _bot(SteeringView())
         assert (await _press(bot, bot._callback("offers", "nonsense"))).text
-
-
-# ---------------------------------------------------------------------------
-# checkout / buy error branches
-# ---------------------------------------------------------------------------
-
-
-class TestBuyScreenErrorBranches:
-    async def _press_buy(self, raises: Exception | None, *, replayed: bool = False) -> Any:
-        view = SteeringView()
-        view.result["os_by_index"] = "ubuntu-24.04"
-        checkout = FakeCheckout(raises=raises, replayed=replayed)
-        bot = _bot(view, checkout=checkout, offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}))
-        return await bot.buy_screen(_user(), OFFER_ID, 0, None, "cbkey")
-
-    async def test_buy_without_identity(self) -> None:
-        bot = _bot(SteeringView())
-        assert (await bot.buy_screen(None, OFFER_ID, 0, None, "k")).text
-
-    async def test_buy_reports_an_insufficient_balance(self) -> None:
-        screen = await self._press_buy(InsufficientHoldBalanceError("100"))
-        assert screen.text
-
-    async def test_buy_reports_a_frozen_user(self) -> None:
-        assert (await self._press_buy(UserNotActiveError("frozen"))).text
-
-    async def test_buy_reports_an_unavailable_offer(self) -> None:
-        assert (await self._press_buy(OfferUnavailableError("gone"))).text
-
-    async def test_buy_reports_missing_os_images(self) -> None:
-        assert (await self._press_buy(OsUnavailableError("gone"))).text
-
-    async def test_buy_reports_a_generic_checkout_failure(self) -> None:
-        assert (await self._press_buy(CheckoutError("boom"))).text
-
-    async def test_buy_reports_a_replay(self) -> None:
-        assert (await self._press_buy(None, replayed=True)).text
-
-    async def test_resolving_the_os_name_for_a_vanished_offer_fails_closed(self) -> None:
-        from cloud_platform.modules.offers.domain import OfferNotFoundError
-
-        bot = _bot(SteeringView(), offers_repo=FakeOffersRepo())
-        with pytest.raises(OfferNotFoundError):
-            await bot._resolve_os_name(OFFER_ID, 0)
-
-    async def test_resolving_a_panel_name_uses_the_view_index(self) -> None:
-        view = SteeringView()
-        view.result["panel_name_by_index"] = "cPanel"
-        bot = _bot(view, offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}))
-        assert await bot._resolve_panel_name(OFFER_ID, 1) == "cPanel"
-
-    async def test_resolving_no_panel_name_short_circuits(self) -> None:
-        bot = _bot(SteeringView())
-        assert await bot._resolve_panel_name(OFFER_ID, None) is None
-
-    async def test_resolving_a_panel_name_for_a_vanished_offer_fails_closed(self) -> None:
-        from cloud_platform.modules.offers.domain import OfferNotFoundError
-
-        bot = _bot(SteeringView(), offers_repo=FakeOffersRepo())
-        with pytest.raises(OfferNotFoundError):
-            await bot._resolve_panel_name(OFFER_ID, 1)
 
 
 class TestConfirmScreenBranches:

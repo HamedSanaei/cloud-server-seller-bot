@@ -20,8 +20,9 @@ A synced offer arrives **disabled and unpriced** (`enabled = false`,
 `selling_price_minor = 0`) — safe by default. A catalog refresh therefore can
 never put a newly discovered provider product on sale, and a re-sync never
 overwrites an operator price. `provider cost` and `selling price` are separate
-snapshots and are never derived from each other; both are integer minor units,
-never float.
+snapshots. Customer prices use integer minor units; provider-native currency and
+exact hourly rates are preserved until the customer-currency rounding boundary.
+Financial arithmetic never uses float.
 
 An offer is customer-visible only when ALL THREE gates are open:
 `provider_available` **and** `enabled` **and** `selling_price_minor > 0`.
@@ -195,9 +196,174 @@ worse than a review.
 
 * Leaseweb: `[providers.leaseweb.accounts.<id>]` credential accounts (see
   `docs/leaseweb/MULTI_ACCOUNT.md`).
-* Hetzner: `[providers.hetzner]` with an API token (`hetzner_api_token`).
+* Hetzner: `[[providers.hetzner.accounts]]` or keyed
+  `[providers.hetzner.accounts.<id>]` entries with stable `id`, `api_token`,
+  `enabled`, `priority`, `state`, optional `label` and optional `server_limit`.
+  The legacy `[providers.hetzner] api_token` becomes account `default` only when
+  explicit accounts are absent; an explicit empty list is authoritative.
   Tokens live only in server-owned configuration — never in Git, compose files,
   deploy env or logs.
+
+### Hetzner capacity and ownership
+
+Use `active` for new purchases, `draining` for managing/reconciling existing
+resources without new purchases, and `disabled` to exclude the credential.
+Keep IDs stable. When migrating from the single token, retain the original
+credential as an explicit `default` account if any NULL/default-owned resources
+still exist. Removing it fails closed; the preferred account never substitutes
+for a missing owner.
+
+`GET /servers` counts the complete token Project, including powered-off and
+manually created resources. `server_limit` is an operator-confirmed Project
+ceiling, not an API-discovered account-wide limit. Omit it when unknown; doctors
+report no configured ceiling, not unlimited capacity. Multiple tokens for the
+same Project, or Projects sharing an owning-account quota, do not establish
+independent capacity.
+
+Read-only diagnostics:
+
+```bash
+python -m cloud_platform.cli hetzner doctor
+python -m cloud_platform.cli hetzner cloud doctor
+python -m cloud_platform.cli catalog auto-sync doctor
+```
+
+The two billing families publish separate offers but share independently
+observed product/location routes. A known-full preferred Project is skipped.
+Every selected alternative must independently prove the original native
+cost/currency, product/location and OS/image; hourly creation also proves the
+frozen root disk. Inventory/read failures mean unavailable, not "all full", and
+must not retire the catalog. Catalog refresh never changes accepted contracts.
+
+Native currency is read from each credential's official `GET /pricing` response,
+at `pricing.currency`. The location's `/server_types` price entries do not carry
+currency. Account currency may differ; missing/unsupported currency is unavailable,
+never an EUR/default assumption. Currency reads scale with credential passes, not
+offer count; every candidate re-proves the accepted native currency before POST.
+
+The worker records each account as `sent` before POST. Hetzner's documented
+HTTP 403 `resource_limit_exceeded` can become `capacity_refused` and continue
+the **same** intent/hold/snapshot on another eligible account. Transport loss,
+408/429/5xx, `422 service_error`, malformed success and unproven rejection remain `outcome_unknown`:
+no alternative POST, no release of a monthly reservation. Recovery scans only
+the attempted credential using the bounded operation label; no match or an
+ambiguous/foreign match remains unresolved.
+
+HTTP 412 `resource_unavailable` is a definitive non-capacity refusal, not permission
+to try another account. A crash after committing a terminal refusal can be fenced
+and finalized without a new POST; only then may a monthly reservation be released.
+Historical attempted pending/in-flight intents without receipts use their original
+account and exact legacy correlation for read-only recovery; never reconstruct
+cross-account authorization from their current catalog.
+
+For monthly orders, accepted provider identity alone does not unlock provisioning
+or activation. Failed/pending local settlement leaves the server `requested` with
+the accepted identity intact. The existing capture and ledger proof must succeed
+before the server can leave that barrier.
+
+Legacy bot intents are handled by the legacy provisioning worker inside the
+existing create job; modern versioned hourly and prepaid monthly intents have
+their own owners. There is no second poller or new infrastructure. Terminal
+Telegram buttons reference an owner-bound shared-store confirmation, not a
+mutable image index. Changed prices, expired references and store outages fail
+closed; repeated valid clicks replay the original intent.
+
+Receipt storage uses existing operation/server/order JSON and pin columns.
+No schema migration is introduced. Real lock/rollback acceptance requires
+`CLOUD_PLATFORM_TEST_POSTGRES_URL` on an isolated test PostgreSQL instance and:
+
+```bash
+uv run pytest tests/live/test_postgres_hetzner_account_attempts.py
+```
+
+The fixture creates and drops only its generated scratch database; its test
+principal must have that permission. Never point it at the production database.
+
+## Customer identity and payments before the first sale
+
+Release revision `0050` through the existing migrate/deploy pipeline before
+starting the new application. It adds nullable phone/identity fields,
+gateway settings, safe invoice details, the AtlasPay attempt uniqueness guard
+and the hourly activation anchor. Existing customers must complete identity
+before another server purchase; accepted server price snapshots are unchanged.
+
+Checkout requests a private-chat Telegram **contact keyboard**. The contact
+must belong to the sender's own Telegram account, must not be forwarded, and
+must normalize to an Iranian mobile number (`+989xxxxxxxxx`). Text-only phone
+input and another account's contact are rejected. Then the customer supplies
+a checksum-valid ten-digit Iranian national ID. This proves Telegram contact
+ownership and validates ID structure; it does **not** perform legal
+phone-to-national-ID verification through Shahkar or another identity registry.
+The owner-bound pending purchase survives a bot restart and resumes after
+verification. Phone/national-ID values must not appear in logs.
+
+Configure AtlasPay in the server-owned configuration:
+
+```toml
+[payments.atlaspay]
+enabled = true
+api_key = "<provision through secret storage>"
+base_url = "https://api.atlaspay.space/api/v1"
+timeout_seconds = 30
+```
+
+Use the official URL/configuration example shipped with this release; never
+put the real key into the public repository. AtlasPay takes integer Toman
+(`IRT`) order amounts between 50,000 and 2,000,000. The displayed invoice
+total comes from `totalAmountToman`, including provider fees; the frozen
+wallet credit and FX snapshot remain the amount accepted by the customer.
+Tracking/deadline/link are shown; internal order IDs or bank/card facts are not.
+
+Foreign storefront wallets use the canonical catalog currency (`USD`). AtlasPay
+can issue a new invoice only when the configured FX policy supplies an
+authoritative `USD`→`IRT` charge conversion. Check that conversion before the
+first sale; provider-native currency conversion and wallet settlement are
+different operations. An unavailable/stale rate hides new invoices, not pending
+settlement. Never invent a 1:1 rate or silently enable USDT-proxy settlement.
+
+AtlasPay has no assumed merchant-reference idempotency guarantee. The platform
+persists a unique attempt before its single creation POST. A lost/ambiguous
+creation response remains unresolved and cannot trigger another POST. Check
+that attempt with AtlasPay before any operator action; do not ask the customer
+to pay a guessed invoice. Paid/confirmed authoritative inquiry must match the
+invoice identity, merchant reference and amount before atomic credit.
+Underpayment/manual-verification responses remain pending.
+
+Active super-admins use `/admin` to switch configured gateways or credit a
+registered customer manually. A disabled gateway cannot create new invoices;
+existing invoices still settle. Manual credit requires target, amount, reason
+and confirmation, with one atomic wallet/ledger/audit/business-outbox commit.
+Self/admin credit and super-admin self recharge are unavailable.
+
+## Hourly resources buy their next hour in advance
+
+Checkout reserves the first hour at the immutable selling-price snapshot.
+A definitive pre-activation create failure releases that reservation; an
+ambiguous provider outcome does not. Provider readiness establishes the exact
+`billing_started_at` instant and captures the first hour before delivery or
+power actions. `last_accrued_at` is now the exclusive **paid-through** instant,
+not a completed-usage watermark. Real PostgreSQL advisory locking and stable
+ledger keys prevent duplicate capture or stale-worker re-anchoring.
+
+The billing worker schedules each next purchase at paid-through minus five
+seconds in the existing ARQ queue; the periodic job recovers missing schedules.
+If the next hour is unaffordable early, the already-paid hour remains valid
+and the worker retries at its boundary. At an unaffordable boundary it requests
+the existing reconciled delete saga, not an unpaid grace period. Low-balance
+thresholds warn but do not revoke paid time.
+
+Stopped resources continue to incur charges until provider deletion is
+confirmed. Deletion posts no extra trailing hour and does not refund an
+already purchased hour. Existing provider-bound hourly rows retain their old
+anchor during migration; frozen customer prices and native provider rates
+are never rebuilt from current catalog/FX facts.
+
+First-sale checks after an authorized deploy: customer contact/ID → AtlasPay
+invoice/status → exactly one wallet credit → approved smallest server →
+first-hour capture before readiness → next-hour debit before coverage expires
+→ deletion reconciliation. Local real-PostgreSQL/Redis checks use synthetic
+provider resources and official-shaped payment transports; they are not a
+claim that a real payment or billable provider order was performed.
 
 ## Nothing here mutates a provider
 

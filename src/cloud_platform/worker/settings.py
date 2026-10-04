@@ -1,9 +1,11 @@
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from inspect import isawaitable
 from typing import Any, ClassVar
+from uuid import UUID
 
-from arq.connections import RedisSettings
+from arq.connections import ArqRedis, RedisSettings
+from arq.worker import Retry, func
 
 from cloud_platform.core.config import get_settings
 from cloud_platform.observability.metrics import metrics
@@ -166,9 +168,23 @@ def _has_order_provider_credentials(settings: object) -> bool:
     """Whether any configured provider can own an order/recovery pass."""
     if any(
         str(getattr(settings, name, "") or "").strip()
-        for name in ("leaseweb_api_key", "hetzner_api_token", "arvancloud_api_key")
+        for name in ("leaseweb_api_key", "arvancloud_api_key")
     ):
         return True
+    hetzner_accounts = getattr(settings, "hetzner_managed_accounts", None)
+    if hetzner_accounts is not None:
+        if hetzner_accounts:
+            return True
+    elif not hasattr(settings, "hetzner_accounts"):
+        # Standalone settings consumers may still expose only the legacy token.
+        if str(getattr(settings, "hetzner_api_token", "") or "").strip():
+            return True
+    else:
+        if any(
+            bool(getattr(account, "usable", False))
+            for account in getattr(settings, "hetzner_accounts", ())
+        ):
+            return True
     accounts = getattr(settings, "leaseweb_accounts", ())
     try:
         return any(bool(getattr(account, "usable", False)) for account in accounts)
@@ -213,6 +229,7 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
                 wallet_repo=container.wallet_repository(),
                 hold_repo=hold_repo,
                 audit_repo=audit_repo,
+                create_attempts=container.create_account_attempt_repository(),
             )
             create_report = await create_reconciler.reconcile()
             state_report = await ServerStateReconciler(
@@ -226,6 +243,7 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
                 event_sink=container.business_event_sink(),
                 user_repo=container.user_repository(),
                 customer_sink=container.customer_provisioned_sink(),
+                prepay_server=container.accrual_job().prepay_server,
             ).reconcile()
             logger.info(
                 "provider resource reconciliation: create=%s state=%s",
@@ -237,12 +255,12 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
 
 
 async def accrue_usage(ctx: dict[str, object]) -> None:
-    """Settle complete usage periods for all RUNNING servers (M06-005).
+    """Charge upcoming hourly periods and promptly stop unpaid resources.
 
-    Scheduled periodically (arq cron); the advisory lock inside the job makes
-    overlapping schedules safe.
+    The shared advisory lock serializes activation and periodic settlement.
     """
-    del ctx
+    from typing import cast
+
     async with metrics.job("accrue_usage"):
         from cloud_platform.db.session import SessionFactory
         from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
@@ -278,6 +296,72 @@ async def accrue_usage(ctx: dict[str, object]) -> None:
             lock=PostgresAdvisoryAccrualLock(SessionFactory),
         )
         await job.run()
+        repository = SqlAlchemyServerRepository(SessionFactory)
+        active = (
+            await repository.list_running()
+            + await repository.list_stopped()
+            + await repository.list_provisioning()
+        )
+        for server in active:
+            if not server.is_prepaid_monthly and server.last_accrued_at is not None:
+                await _schedule_hourly_renewal(cast(ArqRedis, ctx["redis"]), server)
+        await reconcile_deletes(ctx)
+        await process_deletes(ctx)
+
+
+async def _schedule_hourly_renewal(redis: ArqRedis, server: Any) -> None:
+    """ARQ persists the exact arbitrary coverage deadline in its owning queue."""
+    boundary = server.last_accrued_at
+    if boundary is None:
+        return
+    await redis.enqueue_job(
+        "renew_hourly_coverage",
+        str(server.id),
+        _job_id=f"hourly-renew:{server.id}:{boundary.isoformat()}",
+        _defer_until=boundary - timedelta(seconds=5),
+    )
+
+
+async def renew_hourly_coverage(ctx: dict[str, object], server_id: str) -> None:
+    """Prepay five seconds early; on shortage preserve the paid hour until expiry."""
+    from typing import cast
+
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.billing.service import BillingLockBusyError
+    from cloud_platform.modules.compute.domain import ServerLifecycleState
+    from cloud_platform.modules.wallet.domain import InsufficientBalanceError
+
+    container = create_container()
+    try:
+        server = await container.server_repository().get(UUID(server_id))
+        if (
+            server is None
+            or server.is_prepaid_monthly
+            or server.state
+            not in {
+                ServerLifecycleState.PROVISIONING,
+                ServerLifecycleState.RUNNING,
+                ServerLifecycleState.STOPPED,
+            }
+        ):
+            return
+        try:
+            await container.accrual_job().prepay_server(server, renew_ahead_seconds=5)
+        except BillingLockBusyError:
+            raise Retry(defer=timedelta(milliseconds=250)) from None
+        except InsufficientBalanceError:
+            boundary = server.last_accrued_at
+            now = datetime.now(UTC)
+            if boundary is not None and boundary > now:
+                # Retry this same durable job exactly at expiry, not the next
+                # minute and not before the customer-used hour ends.
+                raise Retry(defer=boundary - now) from None
+            await reconcile_deletes(ctx)
+            await process_deletes(ctx)
+            return
+        await _schedule_hourly_renewal(cast(ArqRedis, ctx["redis"]), server)
+    finally:
+        await container.close()
 
 
 async def evaluate_low_balance(ctx: dict[str, object]) -> None:
@@ -404,15 +488,15 @@ async def _process_deletes_impl(ctx: dict[str, object], owned_resources: list[An
 
         settings = get_settings()
         registry = ProviderRegistry()
-        if settings.hetzner_api_token:
-            from cloud_platform.providers.hetzner.client import HetznerCloudProvider
+        from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
 
-            hetzner_provider = HetznerCloudProvider(
-                token=settings.hetzner_api_token,
-                base_url=settings.hetzner_api_base_url,
-            )
-            owned_resources.append(hetzner_provider)
-            registry.register(hetzner_provider)
+        registry.disable_default_account_fallback("hetzner")
+        hetzner_router = build_hetzner_account_router(settings)
+        if hetzner_router is not None:
+            owned_resources.append(hetzner_router)
+            for account_id, hetzner_provider in hetzner_router.providers.items():
+                registry.register_route("hetzner", account_id, hetzner_provider)
+            registry.register_account_views("hetzner", hetzner_router.views())
         # LEASEWEB-MULTIACCOUNT: every configured credential account registers
         # as its own ROUTE under the ONE logical ``leaseweb`` key, each with its
         # own transport, so this worker resolves a server's pinned account
@@ -881,7 +965,13 @@ async def run_catalog_auto_sync_once() -> Any:
                         "skipping hourly sync (VPS ordering is unaffected)"
                     )
             if settings.providers_enabled.get("hetzner", True):
-                if settings.hetzner_api_token:
+                from cloud_platform.providers.hetzner.accounts import (
+                    build_hetzner_account_router,
+                )
+
+                hetzner_router = build_hetzner_account_router(settings)
+                if hetzner_router is not None:
+                    owned_resources.append(hetzner_router)
                     from cloud_platform.providers.hetzner.auto_sync import (
                         HetznerCatalogSyncSource,
                     )
@@ -889,6 +979,8 @@ async def run_catalog_auto_sync_once() -> Any:
 
                     hetzner_syncer = HetznerCatalogSyncer(
                         SessionFactory,
+                        account_router=hetzner_router,
+                        base_url=settings.hetzner_api_base_url,
                         catalog_currency=settings.fx_catalog_pricing_currency,
                         catalog_stale_limit_seconds=(
                             settings.fx_frankfurter_catalog_max_stale_seconds
@@ -957,12 +1049,12 @@ async def run_catalog_auto_sync_once() -> Any:
 
 
 async def process_cloud_creates(ctx: dict[str, object]) -> None:
-    """Submit hourly cloud create intents (STOREFRONT-REWORK).
+    """Dispatch modern hourly and legacy catalog creates in one polling job.
 
-    Picks up REQUESTED hourly servers, claims each ``server-create``
-    operation once, and POSTs the hourly instance exactly once per claimed
-    operation. Ambiguous outcomes become OUTCOME_UNKNOWN (never a blind
-    re-POST); the reconciler below attaches proven resources.
+    Each queue runs independently after shared container initialization; a
+    phase failure is reported only after the other queue has been attempted.
+    Workers claim their own intents and preserve unknown-outcome recovery,
+    so another poll never authorizes a blind re-POST.
     """
     del ctx
     async with metrics.job("process_cloud_creates"):
@@ -971,17 +1063,33 @@ async def process_cloud_creates(ctx: dict[str, object]) -> None:
         container = create_container()
         try:
             await container.initialize()
-            service = container.hourly_cloud_service()
-            outcomes: dict[str, int] = {}
-            for server in await service.servers_requested():
-                try:
-                    outcome = await service.process_server(server.id)
-                except Exception as exc:
-                    logger.warning("hourly create %s failed: %s", server.id, exc)
-                    outcome = "error"
-                outcomes[outcome] = outcomes.get(outcome, 0) + 1
-            if outcomes:
-                logger.info("hourly creates processed: %s", outcomes)
+            phase_errors: list[Exception] = []
+            try:
+                service = container.hourly_cloud_service()
+                outcomes: dict[str, int] = {}
+                for server in await service.servers_requested():
+                    try:
+                        outcome = await service.process_server(server.id)
+                    except Exception as exc:
+                        logger.warning("hourly create %s failed: %s", server.id, exc)
+                        outcome = "error"
+                    outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                if outcomes:
+                    logger.info("hourly creates processed: %s", outcomes)
+            except Exception as exc:
+                logger.exception("hourly create dispatch failed")
+                phase_errors.append(exc)
+            try:
+                legacy_report = await container.provisioning_worker().run_once(limit=10)
+                if legacy_report:
+                    logger.info("legacy catalog creates processed: %s", legacy_report)
+            except Exception as exc:
+                logger.exception("legacy catalog create dispatch failed")
+                phase_errors.append(exc)
+            if len(phase_errors) == 1:
+                raise phase_errors[0]
+            if phase_errors:
+                raise ExceptionGroup("cloud create dispatch phases failed", phase_errors)
         finally:
             await container.close()
 
@@ -991,8 +1099,8 @@ async def reconcile_cloud_creates(ctx: dict[str, object]) -> None:
 
     For hourly servers stuck without a provider id, an exact reference
     match proves the earlier POST landed and is attached; anything else
-    stays unknown for operator review (requeue re-POSTs safely through
-    get-before-create).
+    stays unknown for operator review. Absence alone never authorizes a
+    new POST.
     """
     del ctx
     async with metrics.job("reconcile_cloud_creates"):
@@ -1201,6 +1309,49 @@ async def reconcile_tetraminator_payments(ctx: dict[str, object]) -> None:
             await gateway.close()
 
 
+async def reconcile_atlaspay_payments(ctx: dict[str, object]) -> None:
+    """Authenticated inquiry settles AtlasPay invoices even after gateway disable."""
+    del ctx
+    async with metrics.job("reconcile_atlaspay_payments"):
+        from datetime import timedelta
+
+        from cloud_platform.core.container import create_container
+        from cloud_platform.modules.payments.reconcile import PaymentReconciliationService
+        from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
+        from cloud_platform.modules.payments.service import PaymentWebhookService
+        from cloud_platform.providers.atlaspay.client import AtlasPayGateway
+
+        settings = get_settings()
+        if not settings.atlaspay_enabled or not settings.atlaspay_api_key:
+            return
+        container = create_container()
+        gateway = AtlasPayGateway(
+            api_key=settings.atlaspay_api_key,
+            base_url=settings.atlaspay_base_url,
+            timeout_seconds=settings.atlaspay_timeout_seconds,
+        )
+        try:
+            repo = SqlAlchemyPaymentSessionRepository(container.session_factory)
+            service = PaymentReconciliationService(
+                payments_repo=repo,
+                webhook_service=PaymentWebhookService(
+                    payments_repo=repo,
+                    wallet_repo=container.wallet_repository(),
+                    ledger_repo=container.ledger_repository(),
+                    event_sink=container.business_event_sink(),
+                    user_repo=container.user_repository(),
+                ),
+                gateway=gateway,
+                audit_repo=container.audit_repository(),
+                stale_after=timedelta(seconds=0),
+            )
+            report = await service.run()
+            logger.info("atlaspay reconcile: %s", report.render())
+        finally:
+            await gateway.close()
+            await container.close()
+
+
 async def deliver_business_log_events(ctx: dict[str, object]) -> None:
     """Deliver queued operator and private customer cards from the durable outbox.
 
@@ -1271,7 +1422,7 @@ def _cron_jobs() -> list[Any]:
         cron(reconcile_provider_resources, minute=every_three_minutes, run_at_startup=True),
         cron(process_deletes, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_deletes, minute=every_three_minutes, run_at_startup=True),
-        cron(accrue_usage, minute={0}, run_at_startup=True),
+        cron(accrue_usage, minute=every_minute, run_at_startup=True),
         cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
@@ -1279,6 +1430,7 @@ def _cron_jobs() -> list[Any]:
         cron(deliver_business_log_events, minute=every_minute, run_at_startup=True),
         cron(reconcile_tetraminator_payments, minute=every_fifteen_minutes, run_at_startup=True),
         cron(reconcile_payments, minute=every_fifteen_minutes, run_at_startup=True),
+        cron(reconcile_atlaspay_payments, minute=every_minute, run_at_startup=True),
     ]
 
 
@@ -1288,6 +1440,7 @@ class WorkerSettings:
     functions: ClassVar[list[Any]] = [
         reconcile_provider_resources,
         accrue_usage,
+        func(renew_hourly_coverage, max_tries=240, keep_result=0),
         evaluate_low_balance,
         process_deletes,
         reconcile_deletes,
@@ -1300,6 +1453,7 @@ class WorkerSettings:
         process_leaseweb_orders,
         reconcile_leaseweb_orders,
         reconcile_tetraminator_payments,
+        reconcile_atlaspay_payments,
         check_renewals,
         deliver_business_log_events,
     ]
@@ -1331,9 +1485,11 @@ PROVISIONING_FUNCTIONS: list[Any] = [
 ]
 BILLING_FUNCTIONS: list[Any] = [
     accrue_usage,
+    func(renew_hourly_coverage, max_tries=240, keep_result=0),
     evaluate_low_balance,
     reconcile_payments,
     reconcile_tetraminator_payments,
+    reconcile_atlaspay_payments,
     check_renewals,
     deliver_business_log_events,
 ]
@@ -1370,12 +1526,13 @@ def _role_cron_jobs(role: str) -> list[Any]:
         ]
     if role == "billing":
         return [
-            cron(accrue_usage, minute={0}, run_at_startup=True),
+            cron(accrue_usage, minute=every_minute, run_at_startup=True),
             cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
             cron(reconcile_payments, minute=every_fifteen_minutes, run_at_startup=True),
             cron(
                 reconcile_tetraminator_payments, minute=every_fifteen_minutes, run_at_startup=True
             ),
+            cron(reconcile_atlaspay_payments, minute=every_minute, run_at_startup=True),
             cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
         ]
     return [

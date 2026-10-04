@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import httpx
 import pytest
 
+from cloud_platform.core.config import HetznerAccountSettings, Settings
 from scripts import post_deploy_smoke as smoke
 
 
@@ -88,32 +90,124 @@ class TestMigrationHead:
 
 
 class TestProviderCheck:
-    def test_no_token_skips_without_failure(self) -> None:
-        result = smoke.check_provider_read_only("hetzner", None, None)
+    @staticmethod
+    def _transport(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        fail: bool = False,
+    ) -> list[httpx.Request]:
+        requests: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            assert request.method == "GET", "smoke diagnostics must remain read-only"
+            if fail:
+                return httpx.Response(
+                    401,
+                    json={
+                        "error": {
+                            "code": "unauthorized",
+                            "message": "private-token-diagnostic",
+                        }
+                    },
+                )
+            key = request.url.path.rsplit("/", 1)[-1]
+            if key == "images":
+                values = [{"id": 1, "name": "ubuntu-24.04"}]
+            elif key == "servers":
+                values = [
+                    {"id": 1, "status": "off", "labels": {}},
+                    {"id": 2, "status": "running", "name": "manual", "labels": {}},
+                ]
+            else:
+                raise AssertionError(f"unexpected smoke endpoint {request.url.path}")
+            return httpx.Response(
+                200,
+                json={
+                    key: values,
+                    "meta": {
+                        "pagination": {
+                            "page": 1,
+                            "next_page": None,
+                            "last_page": 1,
+                            "total_entries": len(values),
+                        }
+                    },
+                },
+            )
+
+        client = httpx.AsyncClient
+        monkeypatch.setattr(
+            "cloud_platform.providers.hetzner.client.httpx.AsyncClient",
+            lambda **kwargs: client(**kwargs, transport=httpx.MockTransport(handle)),
+        )
+        return requests
+
+    @staticmethod
+    def _settings() -> Settings:
+        return Settings(
+            _env_file=None,
+            hetzner_api_token="",
+            hetzner_accounts=[
+                HetznerAccountSettings(id="main", api_token="main-secret", server_limit=5),
+                HetznerAccountSettings(id="old", api_token="old-secret", state="draining"),
+                HetznerAccountSettings(id="disabled", api_token="", state="disabled"),
+            ],
+        )
+
+    def test_explicit_empty_accounts_skip_without_using_legacy_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        requests = self._transport(monkeypatch)
+        settings = Settings(
+            _env_file=None,
+            hetzner_api_token="unused-secret",
+            hetzner_accounts=[],
+        )
+
+        result = smoke.check_provider_read_only("hetzner", None, settings)
+
         assert result.ok is True
         assert "skipped" in result.detail
+        assert not requests
 
-    def test_read_only_list_images(self) -> None:
-        from cloud_platform.providers.hetzner.client import HetznerCloudProvider
+    def test_account_only_configuration_reads_each_managed_project(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        requests = self._transport(monkeypatch)
 
-        async def _images(self: object) -> list:
-            return ["img-1", "img-2"]
+        result = smoke.check_provider_read_only("hetzner", "https://api.test/v1", self._settings())
 
-        with patch.object(HetznerCloudProvider, "list_images", _images):
-            result = smoke.check_provider_read_only("hetzner", "https://api.test", "tok")
         assert result.ok is True
-        assert "images" in result.detail
+        assert {request.headers["authorization"] for request in requests} == {
+            "Bearer main-secret",
+            "Bearer old-secret",
+        }
+        assert all(request.url.host == "api.test" for request in requests)
+        assert "account old (draining)" in result.detail
+        assert "Project servers=2; operator-configured server ceiling=5" in result.detail
+        assert "operator-configured server ceiling=unknown" in result.detail
+        assert "disabled" not in result.detail
+        assert "secret" not in result.detail
 
-    def test_provider_failure_fails_the_check(self) -> None:
-        from cloud_platform.providers.hetzner.client import HetznerCloudProvider
+    def test_provider_failure_is_unknown_and_does_not_expose_payload(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        requests = self._transport(monkeypatch, fail=True)
 
-        async def _boom(self: object) -> object:
-            raise RuntimeError("401 unauthorized")
+        result = smoke.check_provider_read_only("hetzner", "https://api.test", self._settings())
 
-        with patch.object(HetznerCloudProvider, "list_images", _boom):
-            result = smoke.check_provider_read_only("hetzner", "https://api.test", "tok")
         assert result.ok is False
-        assert "FAILED" in result.detail
+        assert "Project availability unknown" in result.detail
+        assert "private-token-diagnostic" not in result.detail
+        assert "secret" not in result.detail
+        assert {request.headers["authorization"] for request in requests} == {
+            "Bearer main-secret",
+            "Bearer old-secret",
+        }
 
 
 class TestMain:
@@ -142,3 +236,33 @@ class TestMain:
         out = capsys.readouterr().out
         assert "provider" not in out  # no provider check without --provider-key
         assert code == 0
+
+
+def test_main_provider_check_accepts_account_only_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requests = TestProviderCheck._transport(monkeypatch)
+    monkeypatch.setattr(
+        "cloud_platform.core.config.get_settings",
+        TestProviderCheck._settings,
+    )
+    monkeypatch.setattr(smoke, "http_get", _fake_http(OK))
+
+    code = smoke.main(
+        [
+            "--base-url",
+            "http://x",
+            "--provider-key",
+            "hetzner",
+            "--provider-base-url",
+            "https://api.test/v1",
+        ]
+    )
+
+    assert code == 0
+    assert requests
+    text = capsys.readouterr().out
+    assert "Project servers=2" in text
+    assert "skipped" not in text
+    assert "secret" not in text

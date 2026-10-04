@@ -58,6 +58,48 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "menu.wallet": "💰 کیف پول",
         "menu.recharge": "⬆️ شارژ حساب",
         "menu.support": "🎧 پشتیبانی",
+        "menu.admin": "مدیریت",
+        "admin.title": "مدیریت سوپرادمین",
+        "admin.gateways": "مدیریت درگاه‌ها",  # noqa: RUF001
+        "admin.credit": "شارژ دستی مشتری",
+        "admin.enabled": "روشن",
+        "admin.disabled": "خاموش",
+        "admin.enable": "روشن کردن {name}",
+        "admin.disable": "خاموش کردن {name}",
+        "admin.target_prompt": "شناسه عددی تلگرام یا UUID مشتری را ارسال کنید.",
+        "admin.invalid_target": "مشتری پیدا نشد؛ شارژ حساب سوپرادمین مجاز نیست.",
+        "admin.amount_prompt": "مبلغ شارژ را به {currency} وارد کنید (مثلاً 10.50 USD).",
+        "admin.reason_prompt": "دلیل شارژ را بنویسید (حداکثر ۵۰۰ کاراکتر).",  # noqa: RUF001
+        "admin.confirm_credit": "تأیید شارژ",
+        "admin.credit_confirm": "مشتری: {user_id}\nمبلغ: {amount}\nدلیل: {reason}",
+        "admin.credit_done": "شارژ انجام شد. موجودی فعلی: {balance}",
+        "admin.credit_failed": "شارژ انجام نشد؛ کیف پول و مبلغ را بررسی کنید.",
+        "admin.denied": "دسترسی مجاز نیست.",
+        "recharge.admin_disabled": "سوپرادمین نیازی به شارژ حساب ندارد.",
+        "identity.phone_prompt": (
+            "برای خرید سرور، شماره موبایل ایرانی همین حساب تلگرام را با دکمه زیر ارسال کنید."
+        ),
+        "identity.share_contact": "ارسال شماره تلفن",
+        "identity.cancel": "لغو",
+        "identity.national_id_prompt": (
+            "کد ملی ۱۰ رقمی خود را وارد کنید. فقط قالب و رقم کنترل بررسی می‌شود؛ "  # noqa: RUF001
+            "این بررسی تطبیق مالکیت شماره با کد ملی نیست."
+        ),
+        "identity.cancelled": "ثبت اطلاعات لغو شد.",
+        "identity.private_only": "تأیید اطلاعات فقط در گفت‌وگوی خصوصی با ربات انجام می‌شود.",
+        "identity.invalid_contact": (
+            "از دکمه ارسال شماره استفاده کنید؛ contact باید متعلق به همین حساب "
+            "تلگرام و شماره ایرانی باشد. contact فورواردشده پذیرفته نیست."
+        ),
+        "identity.invalid_national_id": "کد ملی باید ۱۰ رقم با رقم کنترل معتبر باشد.",  # noqa: RUF001
+        "identity.complete": "شماره تأیید و کد ملی ثبت شد.",
+        "recharge.invoice": "مبلغ دقیق قابل پرداخت: {amount}",
+        "recharge.tracking": "کد پیگیری: {tracking}",
+        "recharge.deadline": "مهلت پرداخت: {deadline}",
+        "recharge.exact_warning": (
+            "دقیقاً مبلغ اعلام‌شده را پیش از پایان مهلت واریز کنید. "
+            "مبلغ رند یا متفاوت ممکن است تأیید نشود."
+        ),
         "offers.locations_title": "🌍 انتخاب لوکیشن:",
         "offers.location_row": "{code} ({city})",
         "offers.plans_title": "📋 پلن‌های {location}:",
@@ -375,6 +417,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.cloud_no_images": "در حال حاضر سیستم‌عامل قابل نصب برای این پلن در دسترس نیست.",
         "store.cloud_previous_failed": "درخواست قبلی ساخت سرور ناموفق شده است.\nلطفاً یک سفارش جدید ایجاد کنید.",  # noqa: E501, RUF001
         "store.cloud_account_capacity": "ظرفیت ساخت سرور جدید در حساب ارائه‌دهنده تکمیل شده است.\nلطفاً کمی بعد دوباره تلاش کنید یا پلن/موقعیت دیگری را انتخاب کنید.",  # noqa: E501, RUF001
+        "store.provider_account_capacity": "ظرفیت ساخت سرور جدید در همه حساب‌های این ارائه‌دهنده تکمیل شده است.\nلطفاً کمی بعد دوباره تلاش کنید یا پلن/موقعیت دیگری را انتخاب کنید.",  # noqa: E501, RUF001
         "store.cloud_retry_later": "ارتباط با تأمین‌کننده سرویس در حال حاضر برقرار نیست.\nلطفاً چند دقیقه دیگر دوباره تلاش کنید.",  # noqa: E501, RUF001
         "store.cloud_confirm_title": "\u2601\ufe0f \u062a\u0627\u06cc\u06cc\u062f \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc",  # noqa: E501
         "store.cloud_confirm_provider": "\u0627\u0631\u0627\u0626\u0647\u200c\u062f\u0647\u0646\u062f\u0647: {provider}",  # noqa: E501
@@ -384,7 +427,11 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.cloud_confirm_specs": "CPU: {vcpu} vCPU\nRAM: {ram} GB\nDisk: {disk} GB",
         "store.cloud_confirm_os": "OS: {os}",
         "store.cloud_confirm_cost": "\U0001f4b0 \u0647\u0632\u06cc\u0646\u0647:\n{hourly}\n\u0628\u0631\u0622\u0648\u0631\u062f \u0645\u0635\u0631\u0641 \u06f7\u06f3\u06f0 \u0633\u0627\u0639\u062a\u06cc (\u0646\u0647 \u0647\u0632\u06cc\u0646\u0647 \u062b\u0627\u0628\u062a \u06cc\u0627 \u0633\u0642\u0641 \u0645\u0627\u0647\u0627\u0646\u0647):\n{monthly}",  # noqa: E501
-        "store.cloud_confirm_warning": "\u26a0\ufe0f \u062a\u0627 \u0632\u0645\u0627\u0646\u06cc \u06a9\u0647 Resource \u062d\u0630\u0641 \u0646\u0634\u062f\u0647\u060c \u0647\u0632\u06cc\u0646\u0647 Cloud \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0627\u062f\u0627\u0645\u0647 \u062f\u0627\u0634\u062a\u0647 \u0628\u0627\u0634\u062f.",  # noqa: E501
+        "store.cloud_confirm_warning": (
+            "هزینه هر ساعت پیش از شروع آن از کیف پول کسر می‌شود؛ ساعت اول هنگام "
+            "فعال‌سازی دریافت می‌شود. خاموش‌کردن سرور هزینه را متوقف نمی‌کند. "
+            "اگر موجودی ساعت بعد کافی نباشد، فرایند حذف سرور آغاز می‌شود."
+        ),
         "store.cloud_confirm_create": "\u2705 \u0633\u0627\u062e\u062a \u0633\u0631\u0648\u0631",
         "store.cloud_created": "\u2601\ufe0f \u0633\u0631\u0648\u0631 \u0633\u0627\u0639\u062a\u06cc \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0634\u062f! \u0634\u0646\u0627\u0633\u0647: {server_id}",  # noqa: E501
         "store.detail_title": "🖥 {name}",
@@ -408,6 +455,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "recharge.gateway_row": "پرداخت با {name}",
         "payments.gateway.tetraminator": "تترامیناتور",
         "payments.gateway.zarinpal": "زرین‌پال",
+        "payments.gateway.atlaspay": "اطلس‌پی",
         # The escaped newline + `{amount}` make this literal mixed-script, which
         # the ambiguous-unicode rule flags even though the Persian text is fine.
         "recharge.created": "🧾 درخواست شارژ به مبلغ {amount} ثبت شد.\nبرای پرداخت روی دکمه زیر بزنید.",  # noqa: E501, RUF001
@@ -476,6 +524,43 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "menu.wallet": "💰 Wallet",
         "menu.recharge": "⬆️ Top up",
         "menu.support": "🎧 Support",
+        "menu.admin": "Administration",
+        "admin.title": "Superadmin management",
+        "admin.gateways": "Manage gateways",
+        "admin.credit": "Credit a customer",
+        "admin.enabled": "Enabled",
+        "admin.disabled": "Disabled",
+        "admin.enable": "Enable {name}",
+        "admin.disable": "Disable {name}",
+        "admin.target_prompt": "Send the customer's Telegram numeric ID or platform UUID.",
+        "admin.invalid_target": "Customer not found; superadmin top-up is not allowed.",
+        "admin.amount_prompt": "Enter the credit in {currency} major units (e.g. 10.50 USD).",
+        "admin.reason_prompt": "Enter a reason for the credit (maximum 500 characters).",
+        "admin.confirm_credit": "Confirm credit",
+        "admin.credit_confirm": "Customer: {user_id}\nAmount: {amount}\nReason: {reason}",
+        "admin.credit_done": "Credit posted. Current balance: {balance}",
+        "admin.credit_failed": "Credit failed; check the wallet and amount.",
+        "admin.denied": "Access denied.",
+        "recharge.admin_disabled": "Superadmin account top-up is not available.",
+        "identity.phone_prompt": "Share this Telegram account's Iranian mobile via the button.",
+        "identity.share_contact": "Share phone number",
+        "identity.cancel": "Cancel",
+        "identity.national_id_prompt": (
+            "Enter your ten-digit Iranian national ID. Only format and checksum are checked; "
+            "this does not match the phone's owner to the national ID."
+        ),
+        "identity.cancelled": "Identity collection cancelled.",
+        "identity.private_only": "Identity verification is only available in a private bot chat.",
+        "identity.invalid_contact": (
+            "Use the contact button to share your own Iranian Telegram contact. "
+            "Forwarded contacts are not accepted."
+        ),
+        "identity.invalid_national_id": "Enter a ten-digit national ID with a valid checksum.",
+        "identity.complete": "Phone verified and national ID recorded.",
+        "recharge.invoice": "Exact amount to pay: {amount}",
+        "recharge.tracking": "Tracking code: {tracking}",
+        "recharge.deadline": "Payment deadline: {deadline}",
+        "recharge.exact_warning": "Pay the exact amount before the deadline; do not round it.",
         "offers.locations_title": "🌍 Choose a location:",
         "offers.location_row": "{code} ({city})",
         "offers.plans_title": "📋 Plans at {location}:",
@@ -791,6 +876,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.cloud_no_images": "No installable operating system is available for this plan right now.",  # noqa: E501
         "store.cloud_previous_failed": "The previous server request failed.\nPlease create a new order.",  # noqa: E501
         "store.cloud_account_capacity": "The provider's capacity for new servers is currently full.\nPlease try again shortly or choose another plan/location.",  # noqa: E501
+        "store.provider_account_capacity": "All configured provider accounts are currently full for new servers.\nPlease try again later or choose another plan/location.",  # noqa: E501
         "store.cloud_retry_later": "The provider is currently unreachable.\nPlease try again in a few minutes.",  # noqa: E501
         "store.cloud_confirm_title": "\u2601\ufe0f Confirm hourly server creation",
         "store.cloud_confirm_provider": "Provider: {provider}",
@@ -800,7 +886,11 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.cloud_confirm_specs": "CPU: {vcpu} vCPU\nRAM: {ram} GB\nDisk: {disk} GB",
         "store.cloud_confirm_os": "OS: {os}",
         "store.cloud_confirm_cost": "\U0001f4b0 Cost:\n{hourly}\n730-hour usage estimate (not a fixed monthly fee or cap):\n{monthly}",  # noqa: E501
-        "store.cloud_confirm_warning": "\u26a0\ufe0f Until the resource is deleted, cloud charges can continue.",  # noqa: E501
+        "store.cloud_confirm_warning": (
+            "Each upcoming hour is charged in advance; the first hour is charged at activation. "
+            "Powering off does not stop billing. Insufficient funds for the next hour "
+            "starts server deletion."
+        ),
         "store.cloud_confirm_create": "\u2705 Create server",
         "store.cloud_created": "\u2601\ufe0f Hourly server requested! ID: {server_id}",
         "store.detail_title": "🖥 {name}",
@@ -824,6 +914,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "recharge.gateway_row": "Pay with {name}",
         "payments.gateway.tetraminator": "Tetraminator",
         "payments.gateway.zarinpal": "ZarinPal",
+        "payments.gateway.atlaspay": "AtlasPay",
         "recharge.created": "🧾 Top-up of {amount} created.\nUse the button below to pay.",
         "recharge.unavailable": "Online top-up is currently disabled. Please contact support.",
         "recharge.invalid_amount": "The selected amount is not valid.",

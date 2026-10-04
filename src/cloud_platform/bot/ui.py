@@ -37,6 +37,8 @@ from cloud_platform.modules.compute.service import (
     CreateServerResult,
     MaintenanceBlockedError,
     OfferDisabledError,
+    ProviderAccountsFullError,
+    ProviderInventoryUnavailableError,
     QuotaExceededError,
     UserNotActiveError,
 )
@@ -312,6 +314,8 @@ class BotUi:
             OfferDisabledError: "offer.unavailable",
             MaintenanceBlockedError: "maintenance.blocked",
             QuotaExceededError: "quota.exceeded",
+            ProviderAccountsFullError: "store.provider_account_capacity",
+            ProviderInventoryUnavailableError: "offer.unavailable",
             NoProviderAccountError: "buy.no_account",
             InsufficientHoldBalanceError: "wallet.insufficient_balance",
         }

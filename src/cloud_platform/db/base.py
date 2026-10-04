@@ -54,6 +54,9 @@ class User(Base):
     terms_version = Column(Integer, nullable=True)
     terms_accepted_at = Column(DateTime, nullable=True)
     telegram_user_id = Column(BigInteger, nullable=True, unique=True)
+    phone_number = Column(String(16), nullable=True)
+    phone_verified_at = Column(DateTime(timezone=True), nullable=True)
+    national_id = Column(String(10), nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(
         DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
@@ -403,6 +406,7 @@ class Server(Base):
     )
     deleted_at = Column(DateTime, nullable=True)
     last_accrued_at = Column(DateTime(timezone=True), nullable=True)
+    billing_started_at = Column(DateTime(timezone=True), nullable=True)
     low_balance_since = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
@@ -1019,6 +1023,23 @@ class AuditEvent(Base):
 # ---------------------------------------------------------------------------
 
 
+class GatewaySetting(Base):
+    """Durable operator switch; disabling new invoices never blocks settlement."""
+
+    __tablename__ = "payment_gateway_settings"
+
+    key = Column(String(32), primary_key=True)
+    enabled = Column(Boolean, nullable=False)
+    updated_by = Column(PG_UUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=sa.func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=sa.func.now(),
+        onupdate=sa.func.now(),
+        nullable=False,
+    )
+
+
 class PaymentSession(Base):
     """Persistent record of one inbound payment attempt at a gateway.
 
@@ -1049,6 +1070,16 @@ class PaymentSession(Base):
     """
 
     __tablename__ = "payment_sessions"
+    __table_args__ = (
+        Index(
+            "uq_atlaspay_merchant_ref",
+            "gateway_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=sa.text("gateway_key = 'atlaspay'"),
+            sqlite_where=sa.text("gateway_key = 'atlaspay'"),
+        ),
+    )
 
     id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
     user_id = Column(PG_UUID, nullable=False)
@@ -1069,6 +1100,7 @@ class PaymentSession(Base):
     fx_observed_at = Column(DateTime(timezone=True), nullable=True)
     fx_proxy = Column(Boolean, nullable=True)
     fx_proxy_asset = Column(String(16), nullable=True)
+    payment_details = Column(JSONB, nullable=True)
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
 

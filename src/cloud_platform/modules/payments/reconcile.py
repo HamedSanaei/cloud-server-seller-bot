@@ -24,6 +24,7 @@ from uuid import UUID
 
 from cloud_platform.db.timestamps import from_db_utc
 from cloud_platform.modules.audit.domain import ActorType, AuditEvent
+from cloud_platform.modules.payments.inquiry import verify_payment_session
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +87,7 @@ class PaymentReconciliationService:
                 continue
             checked += 1
             try:
-                intent: Any = await self.gateway.verify_with_amount(
-                    external_id, session.amount_minor
-                )
+                intent: Any = await verify_payment_session(self.gateway, session)
             except Exception:
                 logger.warning("reconcile verify failed for %s", session_id, exc_info=True)
                 errors += 1
@@ -141,13 +140,18 @@ class PaymentReconciliationService:
 
     async def _stuck_sessions(self, cutoff: datetime) -> list[Any]:
         repo: Any = self.payments_repo
+        if hasattr(repo, "list_pending_before"):
+            rows: list[Any] = await repo.list_pending_before(self.gateway.key, cutoff)
+            return rows
         if hasattr(repo, "list_stuck_pending"):
             result: list[Any] = await repo.list_stuck_pending(cutoff)
-            return result
+            return [item for item in result if item.gateway_key == self.gateway.key]
         if hasattr(repo, "list_pending"):
             sessions: list[Any] = await repo.list_pending()
             out: list[Any] = []
             for item in sessions:
+                if item.gateway_key != self.gateway.key:
+                    continue
                 created = getattr(item, "created_at", None)
                 if created is None:
                     out.append(item)

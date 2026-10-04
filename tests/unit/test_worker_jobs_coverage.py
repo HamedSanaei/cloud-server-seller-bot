@@ -32,8 +32,23 @@ class TestHasOrderProviderCredentials:
     def test_leaseweb_key_counts(self) -> None:
         assert ws._has_order_provider_credentials(_ns(leaseweb_api_key="k")) is True
 
-    def test_hetzner_token_counts(self) -> None:
-        assert ws._has_order_provider_credentials(_ns(hetzner_api_token="h")) is True
+    def test_hetzner_managed_accounts_count_without_legacy_token(self) -> None:
+        from cloud_platform.core.config import HetznerAccountSettings
+
+        account = HetznerAccountSettings(id="hz-managed", api_token="configured", state="draining")
+        assert ws._has_order_provider_credentials(_ns(hetzner_accounts=[account])) is True
+
+    def test_explicit_empty_hetzner_accounts_do_not_use_legacy_token(self) -> None:
+        assert (
+            ws._has_order_provider_credentials(_ns(hetzner_api_token="legacy", hetzner_accounts=[]))
+            is False
+        )
+
+    def test_disabled_hetzner_accounts_do_not_enable_jobs(self) -> None:
+        from cloud_platform.core.config import HetznerAccountSettings
+
+        account = HetznerAccountSettings(id="hz-disabled", api_token="configured", enabled=False)
+        assert ws._has_order_provider_credentials(_ns(hetzner_accounts=[account])) is False
 
     def test_arvan_key_counts(self) -> None:
         assert ws._has_order_provider_credentials(_ns(arvancloud_api_key="a")) is True

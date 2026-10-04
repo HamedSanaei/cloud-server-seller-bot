@@ -32,8 +32,8 @@ Commands::
     offers price <offer_id> <minor> [currency]   Set the customer price
     users find <telegram_id>     Resolve a user by Telegram id
     wallet balance <user_id>     Show a user's wallet
-    wallet credit <user_id> <minor> <reason>     Ledger-safe admin credit
-    wallet debit  <user_id> <minor> <reason>     Ledger-safe admin debit
+    wallet credit <user_id> <minor> <reason> --admin-user-id <uuid>
+    wallet debit  <user_id> <minor> <reason> --admin-user-id <uuid>
     orders list                  Open provider orders
     orders attention             FAILED + NEEDS_REVIEW orders
     orders inspect <order_id>    One order with its server/operation
@@ -724,6 +724,37 @@ async def leaseweb_sync_offers() -> int:
     return 0
 
 
+async def _hetzner_project_usage(router: Any, account_id: str, lines: list[str]) -> bool:
+    """Report complete token-Project inventory, never an account-wide quota."""
+    state = router.account_states[account_id].value
+    lines.append(f"account {account_id}: state={state} priority={router.priorities[account_id]}")
+    configured_limit = next(
+        account.server_limit for account in router.accounts if account.account_id == account_id
+    )
+    ceiling = str(configured_limit) if configured_limit is not None else "unknown"
+    if state != "active":
+        lines.append("  new orders: disabled; existing ownership remains manageable")
+    try:
+        usage = await router.server_usage(account_id)
+    except Exception as exc:
+        lines.append(
+            f"  Project server usage: unknown ({type(exc).__name__}); "
+            f"operator-configured server ceiling: {ceiling}"
+        )
+        return False
+    lines.append(
+        f"  Project server usage: {usage.server_count}; "
+        f"operator-configured server ceiling: {ceiling}"
+    )
+    if (
+        state == "active"
+        and usage.server_limit is not None
+        and usage.server_count >= usage.server_limit
+    ):
+        lines.append("  new orders: configured Project ceiling reached")
+    return True
+
+
 async def hetzner_sync_offers() -> int:
     """Refresh the sellable-offer price book from the Hetzner API.
 
@@ -733,21 +764,28 @@ async def hetzner_sync_offers() -> int:
     ENABLE (see docs/payments/HETZNER.md).
     """
     from cloud_platform.db.session import SessionFactory
+    from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
     from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
 
     settings = get_settings()
-    if not settings.hetzner_api_token:
-        print("No Hetzner API token is configured; cannot sync.")
+    router = build_hetzner_account_router(settings)
+    if router is None or not router.new_order_clients():
+        if router is not None:
+            await router.aclose()
+        print("No active Hetzner credential account is configured; cannot sync.")
         return 1
     syncer = HetznerCatalogSyncer(
         SessionFactory,
-        token=settings.hetzner_api_token,
+        account_router=router,
         base_url=settings.hetzner_api_base_url,
+        catalog_currency=settings.fx_catalog_pricing_currency,
+        catalog_stale_limit_seconds=settings.fx_frankfurter_catalog_max_stale_seconds,
     )
     try:
         result = await syncer.sync_offers()
     finally:
         await syncer.close()
+        await router.aclose()
 
     print(f"offers written: {result.offers_written}")
     for report in result.locations:
@@ -770,43 +808,39 @@ async def hetzner_doctor() -> DoctorResult:
     Counts and class names only — never a token, never a price.
     """
     from cloud_platform.db.session import SessionFactory
-    from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
+    from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
 
     settings = get_settings()
     lines: list[str] = ["Hetzner doctor (read-only)"]
     ok = True
-    if not settings.hetzner_api_token:
-        lines.append("[FAIL] hetzner_api_token is not configured")
+    router = build_hetzner_account_router(settings)
+    if router is None or not router.providers:
+        if router is not None:
+            await router.aclose()
+        lines.append("[FAIL] no managed Hetzner credential accounts configured")
         return DoctorResult(False, lines)
-    lines.append("[OK  ] hetzner_api_token configured")
-
-    syncer = HetznerCatalogSyncer(
-        SessionFactory,
-        token=settings.hetzner_api_token,
-        base_url=settings.hetzner_api_base_url,
-    )
+    lines.append(f"[OK  ] managed credential accounts: {len(router.providers)}")
+    if not router.new_order_clients():
+        lines.append("[WARN] no active credential account accepts new orders")
+        ok = False
     try:
-        try:
-            locations, location_errors = await syncer.probe_locations()
-        except Exception as exc:  # pragma: no cover - transport guard
-            lines.append(f"[FAIL] locations unreachable ({type(exc).__name__})")
-            return DoctorResult(False, lines)
-        for error in location_errors:
-            lines.append(f"[WARN] {error}")
-        lines.append(f"[OK  ] locations visible to this credential: {len(locations)}")
-        total = 0
-        for location_id in locations:
+        for account_id, provider in router.providers.items():
+            if not await _hetzner_project_usage(router, account_id, lines):
+                ok = False
             try:
-                items = await syncer.probe_server_types(location_id)
+                locations = await provider.list_locations()
+                products = await provider.list_plans()
             except Exception as exc:
-                lines.append(f"[WARN] {location_id}: list endpoint failed ({type(exc).__name__})")
+                lines.append(f"  [FAIL] catalog unreachable ({type(exc).__name__})")
                 ok = False
                 continue
-            total += len(items)
-            lines.append(f"[OK  ] {location_id} products: {len(items)}")
-        lines.append(f"Summary: locations={len(locations)} products observed={total}")
+            lines.append(
+                f"  [OK  ] catalog locations={len(locations)} products observed={len(products)}"
+            )
+            if not locations or not products:
+                ok = False
     finally:
-        await syncer.close()
+        await router.aclose()
 
     try:
         from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
@@ -850,7 +884,7 @@ async def hetzner_cloud_doctor() -> DoctorResult:
         SqlAlchemySellableOfferRepository,
     )
     from cloud_platform.providers.errors import ProviderAuthError
-    from cloud_platform.providers.hetzner.hourly import HetznerHourlyCloudProvider
+    from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
 
     settings = get_settings()
     lines = ["Hetzner Cloud hourly doctor (read-only)"]
@@ -876,38 +910,45 @@ async def hetzner_cloud_doctor() -> DoctorResult:
         if not policy.auto_publish:
             ok = False
 
-    if not settings.hetzner_api_token:
-        lines.append("[WARN] Hetzner Cloud token not configured; live catalog not checked")
+    router = build_hetzner_account_router(settings)
+    if router is None or not router.providers:
+        if router is not None:
+            await router.aclose()
+        lines.append("[WARN] no managed Hetzner credentials; live catalog not checked")
         ok = False
     else:
         from collections import Counter
 
-        rejection_counts: Counter[str] = Counter()
-        image_architectures: Counter[str] = Counter()
-        type_ids: set[str] = set()
-        pair_count = 0
-        image_ids: set[str] = set()
-        provider = HetznerHourlyCloudProvider(
-            token=settings.hetzner_api_token, base_url=settings.hetzner_api_base_url
-        )
+        if not router.new_order_clients():
+            lines.append("[WARN] no active credential account accepts new orders")
+            ok = False
         try:
-            try:
-                locations = await provider.read_locations()
-            except ProviderAuthError:
-                lines.append(
-                    "[FAIL] Hetzner Cloud API rejected the configured token (HTTP 401/403)"
-                )
-                ok = False
-            except Exception as exc:
-                lines.append(f"[WARN] live locations unreadable ({type(exc).__name__})")
-                ok = False
-            else:
-                lines.append(f"live locations: {len(locations)}")
+            for account_id in router.providers:
+                if not await _hetzner_project_usage(router, account_id, lines):
+                    ok = False
+                provider = router.hourly_for(account_id)
+                rejection_counts: Counter[str] = Counter()
+                image_architectures: Counter[str] = Counter()
+                type_ids: set[str] = set()
+                pair_count = 0
+                image_ids: set[str] = set()
+                try:
+                    locations = await provider.read_locations()
+                except ProviderAuthError:
+                    lines.append(
+                        "  [FAIL] Hetzner Cloud API rejected the configured token (HTTP 401/403)"
+                    )
+                    ok = False
+                    continue
+                except Exception as exc:
+                    lines.append(f"  [WARN] live locations unreadable ({type(exc).__name__})")
+                    ok = False
+                    continue
+                lines.append(f"  live locations: {len(locations)}")
                 if not locations:
                     ok = False
                 for location in locations:
-                    # Location identifiers originate from the provider; print
-                    # counts only, never raw payloads or exception messages.
+                    # Counts only: never raw payloads or exception messages.
                     try:
                         read = await provider.read_instance_types(location.id)
                         images = await provider.list_images(location.id)
@@ -946,13 +987,15 @@ async def hetzner_cloud_doctor() -> DoctorResult:
                     if not compatible_types:
                         ok = False
                 lines.append(
-                    f"live server types: {len(type_ids)}, "
+                    f"  live server types: {len(type_ids)}, "
                     f"proven type/location pairs: {pair_count}, system images: {len(image_ids)}"
                 )
-                lines.append(f"image architectures: {dict(sorted(image_architectures.items()))}")
-                lines.append(f"rejected pairs by reason: {dict(sorted(rejection_counts.items()))}")
+                lines.append(f"  image architectures: {dict(sorted(image_architectures.items()))}")
+                lines.append(
+                    f"  rejected pairs by reason: {dict(sorted(rejection_counts.items()))}"
+                )
         finally:
-            await provider.aclose()
+            await router.aclose()
 
     try:
         rows = [
@@ -2057,7 +2100,7 @@ async def catalog_auto_sync_doctor() -> int:
         pass
     credentials = {
         "leaseweb": leaseweb_credential,
-        "hetzner": bool(settings.hetzner_api_token),
+        "hetzner": bool(settings.hetzner_managed_accounts),
     }
 
     toggle = "enabled" if settings.storefront_catalog_sync_enabled else "disabled"
@@ -3792,21 +3835,22 @@ async def wallet_balance(user_id: str) -> int:
     return 0
 
 
-async def wallet_adjust(user_id: str, amount: int, reason: str) -> int:
+async def wallet_adjust(user_id: str, amount: int, reason: str, admin_user_id: str) -> int:
     from cloud_platform.core.container import create_container
-    from cloud_platform.modules.users.domain import Role, User, UserStatus
+    from cloud_platform.modules.users.domain import Permission, PermissionChecker
 
     if not reason or not reason.strip():
         print("a non-empty reason is required")
         return 2
     container = create_container()
     try:
-        admin = User(
-            username="cli-operator",
-            email="operator@local",
-            status=UserStatus.ACTIVE,
-            role=Role.ADMIN,
-        )
+        admin = await container.user_repository().get(UUID(admin_user_id))
+        if admin is None:
+            print("persisted administrator not found")
+            return 2
+        checker = PermissionChecker(admin)
+        checker.require(Permission.WALLET_ADJUST)
+        checker.require_active()
         import hashlib
 
         digest = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:12]
@@ -4428,6 +4472,7 @@ def _parser() -> argparse.ArgumentParser:
         p.add_argument("user_id")
         p.add_argument("minor", type=int, help="amount in minor units (positive)")
         p.add_argument("reason")
+        p.add_argument("--admin-user-id", required=True, help="UUID of the active administrator")
 
     orders = sub.add_parser("orders")
     orders_sub = orders.add_subparsers(dest="subcommand", required=True)
@@ -4612,7 +4657,7 @@ async def _dispatch(args: argparse.Namespace) -> int:
         if args.subcommand == "balance":
             return await wallet_balance(args.user_id)
         amount = args.minor if args.subcommand == "credit" else -abs(args.minor)
-        return await wallet_adjust(args.user_id, amount, args.reason)
+        return await wallet_adjust(args.user_id, amount, args.reason, args.admin_user_id)
     if args.command == "orders":
         if args.subcommand == "list":
             return await orders_list(False)

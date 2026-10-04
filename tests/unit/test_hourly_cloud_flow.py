@@ -19,6 +19,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
+from cloud_platform.core.i18n import Translator
 from cloud_platform.modules.catalog.domain import LocationRecord
 from cloud_platform.modules.checkout.service import OfferCatalogViewService
 from cloud_platform.modules.fx.domain import FxReferenceQuote
@@ -53,6 +54,7 @@ from cloud_platform.providers.leaseweb.cloud import (
     resolve_root_disk,
     validate_root_disk,
 )
+from tests.unit.hourly_money import hourly_money
 
 SIGNING_KEY = "hourly-flow-signing-key"
 PROVIDER = "leaseweb"
@@ -64,6 +66,9 @@ USER = User(
     status=UserStatus.ACTIVE,
     role=Role.USER,
     telegram_user_id=12345,
+    phone_number="+989123456789",
+    phone_verified_at=datetime.now(UTC),
+    national_id="1234567891",
 )
 
 
@@ -1000,24 +1005,6 @@ class TestCloudScreens:
         await _press(bot, image_button.callback_data or "")
         assert cloud.posts == [], "browsing menus must never POST to the provider"
 
-    async def test_hourly_confirmation_says_hourly(self) -> None:
-        bot = _ui(_service([_offer()]))
-        detail = await _press(
-            bot, bot._callback("store", "cloud_detail", PROVIDER, "eu-west-3", "lsw.mini")
-        )
-        continuation = next(
-            b for b in _buttons(detail) if _decode(b.callback_data or "").screen == "cloud_images"
-        )
-        images = await _press(bot, continuation.callback_data or "")
-        image_button = next(
-            b for b in _buttons(images) if _decode(b.callback_data or "").screen == "cloud_confirm"
-        )
-        confirm = await _press(bot, image_button.callback_data or "")
-        assert "ساعت" in confirm.text
-        assert "ماه" in confirm.text  # monthly estimate, display only
-        assert "Resource" in confirm.text  # delete-to-stop-billing warning
-        assert "stop billing" not in confirm.text.lower()
-
     async def test_monthly_locations_exclude_hourly_offers(self) -> None:
         from cloud_platform.modules.offers.domain import BILLING_MODEL_MONTHLY
 
@@ -1107,6 +1094,68 @@ class TestHourlyPlanToOsPath:
         create = _pick(confirm, target="cloud_buy")
         assert create, "confirmation must offer the explicit create action"
 
+    async def test_confirmed_image_survives_reordering_and_double_tap_replays_one_intent(
+        self,
+    ) -> None:
+        offer = await _usd_offer()
+        cloud = FakeHourlyProvider()
+        catalog = _service([offer], cloud=cloud)
+        application = TestHourlyCreate()._hourly_service(catalog._offers, cloud)
+        bot = _ui(catalog, hourly=application)
+        confirm = await bot.store_cloud_confirm_screen(USER, encode_offer_ref(offer.id), 0)
+        callback = _pick(confirm, target="cloud_buy")
+        cloud._images[offer.location_id] = [
+            CloudImage("DEBIAN_12", "Debian 12", "debian", "x86_64"),
+            CloudImage("UBUNTU_24_04", "Ubuntu 24.04", "ubuntu", "x86_64"),
+        ]
+        first = await _press(bot, callback)
+        assert first.text != Translator().t("offers.unavailable")
+        assert len(application._servers.servers) == 1
+        server = next(iter(application._servers.servers.values()))
+        assert server.image_id == "UBUNTU_24_04"
+        assert server.offer_fingerprint["selling_price_minor"] == offer.selling_price_minor
+        await catalog._offers.set_selling_price(
+            offer.id, offer.selling_price_minor + 100, offer.selling_currency
+        )
+        second = await _press(bot, callback)
+        assert Translator().t("offers.order_replayed") in second.text
+        assert len(application._servers.servers) == 1
+        assert len(application._snapshots.created) == 1
+        assert cloud.posts == []
+
+    async def test_price_change_after_confirmation_blocks_the_real_application_intent(
+        self,
+    ) -> None:
+        offer = await _usd_offer()
+        cloud = FakeHourlyProvider()
+        catalog = _service([offer], cloud=cloud)
+        application = TestHourlyCreate()._hourly_service(catalog._offers, cloud)
+        bot = _ui(catalog, hourly=application)
+        confirm = await bot.store_cloud_confirm_screen(USER, encode_offer_ref(offer.id), 0)
+        await catalog._offers.set_selling_price(
+            offer.id, offer.selling_price_minor + 100, offer.selling_currency
+        )
+        result = await _press(bot, _pick(confirm, target="cloud_buy"))
+        assert result.text == Translator().t("offers.unavailable")
+        assert application._servers.servers == {}
+        assert application._snapshots.created == []
+        assert cloud.posts == []
+
+    async def test_missing_confirmed_image_blocks_the_real_application_intent(self) -> None:
+        offer = await _usd_offer()
+        cloud = FakeHourlyProvider()
+        catalog = _service([offer], cloud=cloud)
+        application = TestHourlyCreate()._hourly_service(catalog._offers, cloud)
+        bot = _ui(catalog, hourly=application)
+        confirm = await bot.store_cloud_confirm_screen(USER, encode_offer_ref(offer.id), 0)
+        cloud._images[offer.location_id] = [
+            CloudImage("DEBIAN_12", "Debian 12", "debian", "x86_64")
+        ]
+        await _press(bot, _pick(confirm, target="cloud_buy"))
+        assert application._servers.servers == {}
+        assert application._snapshots.created == []
+        assert cloud.posts == []
+
     async def test_back_from_the_os_picker_returns_to_the_same_plan_family(self) -> None:
         bot = _ui(_service([_offer()]))
         plans = await self._to_plan_rows(bot)
@@ -1195,6 +1244,7 @@ class TestHourlyCreate:
             operation_repo=FakeOpsRepo(),
             audit_repo=FakeAuditRepo(),
             cloud_providers={PROVIDER: cloud},
+            **hourly_money(),
         )
 
     async def test_intent_persists_snapshot_without_charging(self) -> None:
@@ -1394,7 +1444,13 @@ class FakeAccountRepo:
 
 class FakeWalletRepo2:
     async def get(self, user_id: UUID) -> Any:
-        return type("W", (), {"id": uuid4(), "balance": 50_000, "currency": "USD"})()
+        from cloud_platform.modules.wallet.domain import WalletStatus
+
+        return type(
+            "W",
+            (),
+            {"id": uuid4(), "balance": 50_000, "currency": "USD", "status": WalletStatus.ACTIVE},
+        )()
 
 
 class FakeSnapshots:

@@ -1,11 +1,9 @@
 """Hourly cloud instance creation (STOREFRONT-REWORK).
 
-The usage-based counterpart of the monthly order intent: it validates the
-customer's hourly plan choice and persists a durable creation intent (hourly
-``CloudServer`` + immutable hourly price snapshot + ``SERVER_CREATE``
-operation) WITHOUT calling the provider and WITHOUT charging upfront.
-Hourly money moves later, per quantum, through the existing accrual job,
-which reads only the snapshot — never today's catalog price.
+The command persists the immutable hourly contract and reserves the first
+hour before enqueuing provider creation. The reservation is captured at the
+first proven running observation; provisioning wait is never customer usage.
+Subsequent hours are purchased in advance from the immutable snapshot.
 
 Billing-model branching is structural: this command accepts hourly offers
 only, and the monthly command accepts monthly offers only. Neither branches
@@ -16,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -52,6 +51,14 @@ from cloud_platform.modules.offers.domain import (
     SellableOfferRepository,
     is_sellable_in_currency,
 )
+from cloud_platform.modules.operations.create_attempts import (
+    CreateAccountAttemptRepository,
+    CreateAttemptConflict,
+    create_routing,
+    current_account,
+    last_attempt,
+    refused_accounts,
+)
 from cloud_platform.modules.operations.domain import (
     Operation,
     OperationRepository,
@@ -77,7 +84,14 @@ from cloud_platform.modules.provider_capacity.domain import (
     recovery_backoff_seconds as recovery_delay_for_attempts,
 )
 from cloud_platform.modules.users.domain import User, UserStatus
-from cloud_platform.modules.wallet.domain import WalletRepository, WalletStatus
+from cloud_platform.modules.users.identity import require_verified_identity
+from cloud_platform.modules.wallet.domain import (
+    HoldRepository,
+    HoldStatus,
+    WalletRepository,
+    WalletStatus,
+)
+from cloud_platform.modules.wallet.repository import HoldService
 from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.errors import (
     ProviderAuthError,
@@ -89,19 +103,18 @@ from cloud_platform.providers.errors import (
     ProviderRateLimited,
     ProviderUnavailable,
 )
-from cloud_platform.providers.routing import DEFAULT_CREDENTIAL_ACCOUNT
+from cloud_platform.providers.retry import ErrorClass, classify_provider_error
+from cloud_platform.providers.routing import DEFAULT_CREDENTIAL_ACCOUNT, normalize_account_id
 
 logger = logging.getLogger(__name__)
 
 RESOURCE_TYPE_CLOUD_SERVER = "cloud_server"
 
-#: Immutable-contract fingerprint version. Version 2 additionally pins the
-#: launch root disk (size + storage type) because the provider REQUIRES both
-#: on create; version 1 accepted contracts cannot be re-created and therefore
-#: fail closed instead of guessing a disk after the customer confirmed.
-FINGERPRINT_VERSION = 2
-#: Fingerprint versions this build still understands (v1 = pre-root-disk rows).
-SUPPORTED_FINGERPRINT_VERSIONS = frozenset({1, FINGERPRINT_VERSION})
+#: v1/v2 contracts retain their original credential pin. v3 separates immutable
+#: catalog provenance from receipt-owned fulfillment, without changing money,
+#: image, product, location or disk after customer acceptance.
+FINGERPRINT_VERSION = 3
+SUPPORTED_FINGERPRINT_VERSIONS = frozenset({1, 2, FINGERPRINT_VERSION})
 #: Bound for a pinned root-disk size. The real provider range (5-1000 GB) is
 #: enforced by the adapter at the POST boundary; this only rejects nonsense.
 MAX_PINNED_ROOT_DISK_GB = 9_223_372_036_854_775_807
@@ -257,22 +270,21 @@ def _offer_fingerprint(
     credential_account_id: str | None = None,
     image_id: str | None = None,
     root_disk: Any = None,
+    *,
+    fulfillment_policy: str | None = None,
 ) -> dict[str, object]:
     size_gb, storage_type = (
         _offer_root_disk(offer) if root_disk is None else _pinned_root_disk_value(root_disk)
     )
     fingerprint: dict[str, object] = {
-        "fingerprint_version": FINGERPRINT_VERSION,
+        "fingerprint_version": FINGERPRINT_VERSION
+        if fulfillment_policy == "capacity_failover"
+        else 2,
         "offer_id": str(getattr(offer, "id", "")),
         "provider_key": str(getattr(offer, "provider_key", "")),
         "product_id": str(getattr(offer, "product_id", "")),
         "location_id": str(getattr(offer, "location_id", "")),
         "provider_account_id": str(getattr(offer, "provider_account_id", "") or ""),
-        "credential_account_id": str(
-            credential_account_id
-            if credential_account_id is not None
-            else (getattr(offer, "provider_account_id", "") or "")
-        ),
         "billing_model": str(getattr(offer, "billing_model", "")),
         "selling_price_minor": offer.selling_price_minor,
         "selling_currency": offer.selling_currency.strip().upper(),
@@ -285,6 +297,14 @@ def _offer_fingerprint(
         "pricing_metadata": dict(offer.pricing_metadata or {}),
         "technical_metadata": dict(offer.technical_metadata or {}),
     }
+    if fulfillment_policy == "capacity_failover":
+        fingerprint["fulfillment_policy"] = fulfillment_policy
+    else:
+        fingerprint["credential_account_id"] = str(
+            credential_account_id
+            if credential_account_id is not None
+            else (getattr(offer, "provider_account_id", "") or "")
+        )
     if image_id is not None:
         normalized_image = str(image_id).strip()
         if not normalized_image:
@@ -301,8 +321,19 @@ def _validate_hourly_contract(server: Any, snapshot: Any) -> None:
     version = fingerprint.get("fingerprint_version")
     if isinstance(version, bool) or version not in SUPPORTED_FINGERPRINT_VERSIONS:
         raise HourlyNotAvailableError("hourly server has no versioned offer fingerprint")
-    if version >= FINGERPRINT_VERSION and _fingerprint_root_disk(fingerprint) is None:
+    if version >= 2 and _fingerprint_root_disk(fingerprint) is None:
         raise HourlyNotAvailableError("hourly fingerprint has no pinned root disk")
+    if version == 3 and (
+        fingerprint.get("fulfillment_policy") != "capacity_failover"
+        or not isinstance(fingerprint.get("provider_account_id"), str)
+        or not fingerprint["provider_account_id"]
+        or normalize_account_id(fingerprint["provider_account_id"])
+        != fingerprint["provider_account_id"]
+        or "credential_account_id" in fingerprint
+    ):
+        raise HourlyNotAvailableError(
+            "hourly fingerprint has invalid fulfillment policy/provenance"
+        )
     if getattr(snapshot, "offer_fingerprint", None) != fingerprint:
         raise HourlyNotAvailableError("hourly snapshot fingerprint does not match the server")
     required_text = (
@@ -336,8 +367,6 @@ def _validate_hourly_contract(server: Any, snapshot: Any) -> None:
     for key in ("billing_parameters", "pricing_metadata", "technical_metadata"):
         if not isinstance(fingerprint.get(key), dict):
             raise HourlyNotAvailableError(f"hourly fingerprint field {key!r} is not a mapping")
-    if version >= FINGERPRINT_VERSION and _fingerprint_root_disk(fingerprint) is None:
-        raise HourlyNotAvailableError("hourly fingerprint has no pinned root disk")
     try:
         exact_rate = Decimal(str(fingerprint["provider_rate_exact"]).strip())
         expected_cost_minor = major_to_minor(
@@ -359,7 +388,7 @@ def _validate_hourly_contract(server: Any, snapshot: Any) -> None:
         raise HourlyNotAvailableError("hourly server provider differs from its fingerprint")
     if fingerprint["billing_model"] != getattr(server, "billing_model", ""):
         raise HourlyNotAvailableError("hourly server billing model differs from its fingerprint")
-    if fingerprint["provider_account_id"] != str(
+    if version < 3 and fingerprint["provider_account_id"] != str(
         getattr(server, "credential_account_id", "") or ""
     ):
         raise HourlyNotAvailableError("hourly fingerprint credential account is inconsistent")
@@ -372,7 +401,6 @@ def _validate_hourly_contract(server: Any, snapshot: Any) -> None:
         "product_id": snapshot.offer.plan_id,
         "location_id": snapshot.offer.location_id,
         "provider_account_id": str(fingerprint.get("provider_account_id", "")),
-        "credential_account_id": str(getattr(server, "credential_account_id", "") or ""),
         "billing_model": getattr(server, "billing_model", ""),
         "selling_price_minor": snapshot.selling_minor,
         "selling_currency": snapshot.selling_currency,
@@ -381,6 +409,8 @@ def _validate_hourly_contract(server: Any, snapshot: Any) -> None:
         "provider_rate_exact": snapshot.offer.provider_rate_exact or "",
         "image_id": str(getattr(server, "image_id", "") or "").strip(),
     }
+    if version < 3:
+        expected["credential_account_id"] = str(getattr(server, "credential_account_id", "") or "")
     for key, actual in expected.items():
         if fingerprint.get(key) != actual:
             raise HourlyNotAvailableError(f"hourly fingerprint field {key!r} is inconsistent")
@@ -486,6 +516,10 @@ class HourlyAccountCapacityError(HourlyError):
     """
 
 
+class HourlyPoolCapacityError(HourlyAccountCapacityError):
+    """All independently proven serving accounts are full or definitively refused."""
+
+
 class HourlyCloudResolver:
     """Provider-neutral port for hourly cloud adapters (multi-account).
 
@@ -540,7 +574,7 @@ class CanaryClaim:
 
 
 class HourlyCloudService:
-    """The hourly creation command handler (no provider calls, no charge)."""
+    """Reserve hourly creation, then execute its durable provider intent."""
 
     def __init__(
         self,
@@ -549,6 +583,8 @@ class HourlyCloudService:
         offers_repo: SellableOfferRepository,
         account_repo: ProviderAccountRepository,
         wallet_repo: WalletRepository,
+        hold_repo: HoldRepository,
+        hold_service: HoldService,
         snapshot_service: ServerPriceSnapshotService,
         operation_repo: OperationRepository,
         audit_repo: AuditRepository,
@@ -589,11 +625,17 @@ class HourlyCloudService:
         #: Durable, encrypted one-time store for passwords issued by a POST.
         #: Required before using an adapter that can issue a password.
         credential_store: Any | None = None,
+        create_attempts: CreateAccountAttemptRepository | None = None,
+        fulfillment_routes: Any | None = None,
+        prepay_server: Callable[[CloudServer], Awaitable[CloudServer]] | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
         self._accounts = account_repo
         self._wallets = wallet_repo
+        self._hold_repo = hold_repo
+        self._holds = hold_service
+        self._prepay_server = prepay_server
         self._snapshots = snapshot_service
         self._ops = operation_repo
         self._audit = AuditTrail(audit_repo)
@@ -620,6 +662,15 @@ class HourlyCloudService:
         self._events = event_sink
         self._users = user_repo
         self._credential_store = credential_store
+        self._create_attempts = create_attempts
+        self._routes = fulfillment_routes
+
+    def _uses_account_pool(self, provider_key: str) -> bool:
+        return (
+            self._create_attempts is not None
+            and self._routes is not None
+            and self._routes.supports_capacity_failover(provider_key)
+        )
 
     def _adapter_for(self, provider_key: str, credential_account_id: str | None) -> Any:
         """Exact cloud adapter for a pinned credential account (fail closed).
@@ -979,9 +1030,17 @@ class HourlyCloudService:
         offer = await self._offers.get(offer_id)
         if offer is None or offer.billing_model != BILLING_MODEL_HOURLY:
             return False
-        if existing.offer_fingerprint != _offer_fingerprint(
-            offer, getattr(existing, "credential_account_id", None), image_id
-        ):
+        fulfillment_policy = existing.offer_fingerprint.get("fulfillment_policy")
+        if fulfillment_policy is not None and not isinstance(fulfillment_policy, str):
+            return False
+        expected_fingerprint = _offer_fingerprint(
+            offer,
+            getattr(existing, "credential_account_id", None),
+            image_id,
+            root_disk=_fingerprint_root_disk(existing.offer_fingerprint),
+            fulfillment_policy=fulfillment_policy,
+        )
+        if existing.offer_fingerprint != expected_fingerprint:
             return False
         if expected_selling_price_minor is None or expected_selling_currency is None:
             return False
@@ -1021,9 +1080,7 @@ class HourlyCloudService:
             version=1,
             priced_at=datetime.now(UTC),
             pricing_metadata=metadata,
-            offer_fingerprint=_offer_fingerprint(
-                offer, getattr(existing, "credential_account_id", None), image_id
-            ),
+            offer_fingerprint=expected_fingerprint,
         )
         try:
             existing_snapshot = await self._snapshots.get_snapshot(existing.id)
@@ -1036,10 +1093,7 @@ class HourlyCloudService:
                 )
             else:
                 if (
-                    existing.offer_fingerprint
-                    != _offer_fingerprint(
-                        offer, getattr(existing, "credential_account_id", None), image_id
-                    )
+                    existing.offer_fingerprint != expected_fingerprint
                     or existing_snapshot.selling_minor != price.selling_minor
                     or existing_snapshot.selling_currency != price.selling_currency
                     or existing_snapshot.offer.provider_key != offer.provider_key
@@ -1086,6 +1140,9 @@ class HourlyCloudService:
         if existing.user_id != user.id:
             raise HourlyError("idempotency key belongs to another user")
         if existing.state not in REPLAYABLE_HOURLY_STATES:
+            operation = await self._ops.get_by_key(f"server-create:{existing.id}")
+            if operation is not None and operation.status is OperationStatus.FAILED:
+                await self._release_creation_hold(existing)
             # The intent is terminal (failed, errored, unrecoverable): this
             # confirmation cannot be replayed into a working order, and the
             # customer must start a new one instead of pressing it again.
@@ -1107,9 +1164,12 @@ class HourlyCloudService:
                     raise HourlyError("idempotency key was reused for a different offer")
                 if getattr(snapshot, "offer_fingerprint", None) != fingerprint:
                     raise HourlyError("hourly snapshot is missing its complete offer fingerprint")
-                if str(fingerprint.get("credential_account_id") or "") != str(
-                    getattr(existing, "credential_account_id", "") or ""
-                ):
+                fingerprint_version = fingerprint["fingerprint_version"]
+                if type(fingerprint_version) is not int:
+                    raise HourlyError("hourly replay fingerprint version is invalid")
+                if fingerprint_version < 3 and str(
+                    fingerprint.get("credential_account_id") or ""
+                ) != str(getattr(existing, "credential_account_id", "") or ""):
                     raise HourlyError("hourly replay credential fingerprint is inconsistent")
                 if any(
                     fingerprint.get(key) != actual
@@ -1369,8 +1429,27 @@ class HourlyCloudService:
         per-minute reconciler from re-posting the same warning, and the card
         explicitly tells the operator not to blind-retry the create.
         """
-        operation.mark_outcome_unknown(reason)
-        await self._ops.save(operation)
+        if create_routing(operation) is not None:
+            if self._create_attempts is None:
+                raise HourlyError("create attempt persistence is not configured")
+            attempt = last_attempt(operation)
+            account_id = current_account(operation, server.credential_account_id)
+            if attempt is not None and attempt["phase"] == "sent":
+                operation = await self._create_attempts.record_unknown(
+                    operation.id,
+                    operation.attempts,
+                    account_id,
+                )
+            else:
+                operation = await self._create_attempts.save_outcome(
+                    operation.id,
+                    operation.attempts,
+                    OperationStatus.OUTCOME_UNKNOWN,
+                    error=reason,
+                )
+        else:
+            operation.mark_outcome_unknown(reason)
+            await self._ops.save(operation)
         # A canary whose outcome is UNKNOWN proves nothing: release its lease so
         # the next scheduled window can attempt again, but never claim recovery.
         await self._release_canary_lease(
@@ -1408,6 +1487,7 @@ class HourlyCloudService:
             raise HourlyError("a persisted user id is required")
         if user.status is not UserStatus.ACTIVE:
             raise HourlyError(f"user {user.id} is {user.status.value}")
+        require_verified_identity(user)
         if (expected_selling_price_minor is None) != (expected_selling_currency is None):
             raise HourlyNotAvailableError("selling price and currency must be pinned together")
         if expected_selling_price_minor is not None and (
@@ -1473,20 +1553,10 @@ class HourlyCloudService:
         wallet = await self._wallets.get(user.id)
         if wallet is None:
             raise HourlyError(f"user {user.id} has no wallet")
-        if getattr(wallet, "status", WalletStatus.ACTIVE) is not WalletStatus.ACTIVE:
+        if getattr(wallet, "status", None) is not WalletStatus.ACTIVE:
             raise HourlyError("wallet is not active for a new purchase")
-        # A wallet balance has one unit.  Do not create an intent whose later
-        # accrual would need a silent conversion or currency relabel.  Some
-        # legacy in-memory test doubles predate ``Wallet.currency``; the
-        # persisted wallet always has it, and those doubles are treated as the
-        # historical same-currency path for compatibility.
+        # The wallet port must declare its unit; never infer it from an offer.
         wallet_currency = getattr(wallet, "currency", None)
-        if not hasattr(wallet, "currency"):
-            # A small number of legacy in-memory ports predate the persisted
-            # Wallet.currency field. Production ORM/domain wallets always
-            # expose it, so only an actually absent attribute gets the
-            # historical same-currency compatibility path.
-            wallet_currency = offer.selling_currency
         if str(wallet_currency or "").strip().upper() != offer.selling_currency.strip().upper():
             raise HourlyError(
                 f"wallet currency {wallet_currency} does not match offer selling currency "
@@ -1494,7 +1564,10 @@ class HourlyCloudService:
             )
 
         account = await self._accounts.get_or_create_active(user.id, offer.provider_key)
-        pinned_account = str(offer.provider_account_id or "").strip() or None
+        catalog_account = str(offer.provider_account_id or "").strip() or None
+        pinned_account = catalog_account
+        pooled = self._uses_account_pool(offer.provider_key)
+        fulfillment_policy = "capacity_failover" if pooled else None
         # PRE-CHECKOUT capacity gate. If the account pinned to this offer has
         # already definitively refused a new instance (and the signal has not
         # expired), no new order may be accepted against it: the provider would
@@ -1503,7 +1576,9 @@ class HourlyCloudService:
         # learned. It never re-routes to another account — the accepted
         # contract is pinned to this one — and it answers about the ACCOUNT, so
         # it is evaluated before anything else about the account is resolved.
-        capacity = await self._account_capacity(offer.provider_key, pinned_account)
+        capacity = (
+            None if pooled else await self._account_capacity(offer.provider_key, pinned_account)
+        )
         if capacity is not None and not capacity.accepts_new_orders():
             # Two genuinely different situations, one customer answer: the
             # provider limit is still inside its window, or the window elapsed
@@ -1514,34 +1589,32 @@ class HourlyCloudService:
                 f"instances ({blocked}, {capacity.error_code or 'limit reached'}); "
                 "a new order is possible only after capacity recovery is proven"
             )
-        try:
+        if pooled:
+            pinned_account, _, facts = await self._pool_checkout_facts(offer, image_id)
+        else:
             adapter = self._adapter_for(offer.provider_key, pinned_account)
-        except HourlyNotAvailableError as exc:
-            raise HourlyNotAvailableError(str(exc)) from exc
-        validator = getattr(adapter, "validate_hourly_offer_for_checkout", None)
-        if not callable(validator):
-            raise HourlyNotAvailableError(
-                "provider adapter lacks hourly image compatibility validation"
-            )
-        try:
-            facts = await validator(
-                location_id=offer.location_id,
-                product_id=offer.product_id,
-                image_id=image_id,
-                expected_cost_minor=offer.provider_cost_minor,
-                currency=offer.provider_cost_currency,
-                expected_cost_exact=_provider_hourly_rate(offer),
-            )
-        except ProviderUnavailable as exc:
-            # A transient provider problem is NOT an unavailable offer: the
-            # customer may retry the same selection in a moment.
-            raise HourlyProviderUnavailableError(
-                f"hourly checkout revalidation is unavailable: {exc}"
-            ) from exc
-        except Exception as exc:
-            raise HourlyNotAvailableError(
-                f"hourly image is not compatible with the pinned offer: {exc}"
-            ) from exc
+            validator = getattr(adapter, "validate_hourly_offer_for_checkout", None)
+            if not callable(validator):
+                raise HourlyNotAvailableError(
+                    "provider lacks hourly image compatibility validation"
+                )
+            try:
+                facts = await validator(
+                    location_id=offer.location_id,
+                    product_id=offer.product_id,
+                    image_id=image_id,
+                    expected_cost_minor=offer.provider_cost_minor,
+                    currency=offer.provider_cost_currency,
+                    expected_cost_exact=_provider_hourly_rate(offer),
+                )
+            except ProviderUnavailable as exc:
+                raise HourlyProviderUnavailableError(
+                    "hourly checkout revalidation unavailable"
+                ) from exc
+            except Exception as exc:
+                raise HourlyNotAvailableError(
+                    "hourly image incompatible with pinned offer"
+                ) from exc
         # The launch root disk (size + storage type) is a MANDATORY provider
         # create input, so it becomes part of the immutable contract here:
         # derived by the adapter from live provider facts (type minimum, image
@@ -1563,15 +1636,23 @@ class HourlyCloudService:
         ):
             raise HourlyNotAvailableError("offer became unavailable during checkout")
         if _offer_fingerprint(
-            latest_offer, pinned_account, image_id, root_disk=root_disk
-        ) != _offer_fingerprint(offer, pinned_account, image_id, root_disk=root_disk):
+            latest_offer,
+            pinned_account,
+            image_id,
+            root_disk=root_disk,
+            fulfillment_policy=fulfillment_policy,
+        ) != _offer_fingerprint(
+            offer,
+            pinned_account,
+            image_id,
+            root_disk=root_disk,
+            fulfillment_policy=fulfillment_policy,
+        ):
             raise HourlyNotAvailableError("offer facts changed during checkout")
         offer = latest_offer
         latest_account = str(latest_offer.provider_account_id or "").strip() or None
-        if (pinned_account is None and latest_account is not None) or (
-            pinned_account is not None and latest_account != pinned_account
-        ):
-            raise HourlyNotAvailableError("offer credential account changed during checkout")
+        if latest_account != catalog_account:
+            raise HourlyNotAvailableError("offer catalog provenance changed during checkout")
 
         # Build the immutable price contract before persisting a REQUESTED
         # server. Invalid exact rates must not leave a replayable partial
@@ -1611,28 +1692,34 @@ class HourlyCloudService:
             priced_at=datetime.now(UTC),
             pricing_metadata=hourly_pricing_metadata,
             offer_fingerprint=_offer_fingerprint(
-                offer, pinned_account, image_id, root_disk=root_disk
+                offer,
+                pinned_account,
+                image_id,
+                root_disk=root_disk,
+                fulfillment_policy=fulfillment_policy,
             ),
         )
 
-        # Hourly offer provenance: the credential account that actually
-        # supplied/owns the observation (persisted by the multi-account
-        # cloud sync in ``SellableOffer.provider_account_id``) is pinned
-        # on the server now, before any provider call, so the worker POSTs
-        # through exactly that credential — never an arbitrary first key.
+        # v3 preserves catalog observation identity, while the mutable resource
+        # pin is atomically advanced only with a durable pre-acceptance receipt.
         server = CloudServer(
             id=uuid4(),
             user_id=user.id,
             provider_key=offer.provider_key,
             provider_account_id=account.id,
             state=ServerLifecycleState.REQUESTED,
+            idempotency_key=idempotency_key,
             billing_model=BILLING_MODEL_HOURLY,
             quantum_seconds=3600,
             os=image_label,
             image_id=image_id,
             credential_account_id=pinned_account,
             offer_fingerprint=_offer_fingerprint(
-                offer, pinned_account, image_id, root_disk=root_disk
+                offer,
+                pinned_account,
+                image_id,
+                root_disk=root_disk,
+                fulfillment_policy=fulfillment_policy,
             ),
         )
         intent = ServerCreateIntent(
@@ -1646,7 +1733,11 @@ class HourlyCloudService:
             image_id=image_id,
             offer_id=offer.id,
             offer_fingerprint=_offer_fingerprint(
-                offer, pinned_account, image_id, root_disk=root_disk
+                offer,
+                pinned_account,
+                image_id,
+                root_disk=root_disk,
+                fulfillment_policy=fulfillment_policy,
             ),
         )
         try:
@@ -1668,6 +1759,7 @@ class HourlyCloudService:
             try:
                 created.transition_to(ServerLifecycleState.ERROR)
                 await self._servers.save(created)
+                await self._release_creation_hold(created)
             except Exception:
                 logger.exception("failed to quarantine partial hourly intent")
 
@@ -1678,6 +1770,7 @@ class HourlyCloudService:
                 actor=None,
                 reason="hourly cloud create request",
             )
+            await self._reserve_first_hour(created, price)
             await self._ops.get_or_create(
                 operation_key=f"server-create:{created.id}",
                 operation_type=OperationType.SERVER_CREATE,
@@ -1735,6 +1828,373 @@ class HourlyCloudService:
         )
         return HourlyCreateResult(server=created, replayed=False)
 
+    async def _reserve_first_hour(self, server: CloudServer, snapshot: Any) -> None:
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id is None or not server.idempotency_key:
+            raise HourlyError("first-hour reservation requires a persisted wallet and order")
+        currency = str(snapshot.selling_currency).strip().upper()
+        if wallet.currency != currency:
+            raise HourlyError("wallet currency does not match hourly contract")
+        hold = await self._holds.create_hold(
+            wallet.id,
+            snapshot.selling_minor,
+            currency,
+            f"server-create:{server.idempotency_key}",
+        )
+        if hold.status is not HoldStatus.CREATED:
+            raise HourlyRequestFailedError("first-hour reservation is no longer active")
+
+    async def _release_creation_hold(self, server: CloudServer) -> None:
+        if not server.idempotency_key:
+            return
+        wallet = await self._wallets.get(server.user_id)
+        if wallet is None or wallet.id is None:
+            raise HourlyError("cannot release reservation without its wallet")
+        key = f"server-create:{server.idempotency_key}"
+        hold = await self._hold_repo.get_by_idempotency(wallet.id, key)
+        if hold is not None and hold.status is HoldStatus.CREATED:
+            assert hold.id is not None
+            await self._holds.release_hold(wallet.id, hold.id, key)
+
+    async def _prepay_ready_instance(self, server: CloudServer, response: Any) -> None:
+        raw = getattr(response, "status", None) or getattr(response, "state", "")
+        status = str(getattr(raw, "value", raw) or "").strip().lower()
+        if status not in {"running", "active", "ready"}:
+            return
+        if self._prepay_server is None:
+            raise RuntimeError("hourly activation prepayment is not configured")
+        await self._prepay_server(server)
+
+    async def _pool_checkout_facts(self, offer: Any, image_id: str) -> tuple[str, Any, Any]:
+        """Find an independently validated route without changing the shown contract."""
+        if self._routes is None:
+            raise HourlyError("fulfillment routing is not configured")
+        if not offer.provider_account_id:
+            raise HourlyNotAvailableError("hourly offer has no catalog account provenance")
+        excluded: set[str] = set()
+        while True:
+            try:
+                account_id = await self._routes.account_for(
+                    offer.provider_key,
+                    offer.location_id,
+                    offer.product_id,
+                    exclude=excluded,
+                )
+            except ProviderCapacityError as exc:
+                if excluded:
+                    raise HourlyNotAvailableError(
+                        "no account can honor the shown image and native rate"
+                    ) from exc
+                raise HourlyPoolCapacityError("all proven provider Projects are full") from exc
+            except ProviderNotFound as exc:
+                raise HourlyNotAvailableError("no proven product/location route") from exc
+            except ProviderError as exc:
+                raise HourlyProviderUnavailableError(
+                    "provider Project inventory is unreadable"
+                ) from exc
+            if account_id is None:
+                raise HourlyNotAvailableError("new hourly orders require an explicit account")
+            adapter = self._adapter_for(offer.provider_key, account_id)
+            validator = getattr(adapter, "validate_hourly_offer_for_checkout", None)
+            if not callable(validator) or not callable(getattr(adapter, "find_by_operation", None)):
+                raise HourlyNotAvailableError("account cannot prove or recover the hourly contract")
+            try:
+                facts = await validator(
+                    location_id=offer.location_id,
+                    product_id=offer.product_id,
+                    image_id=image_id,
+                    expected_cost_minor=offer.provider_cost_minor,
+                    currency=offer.provider_cost_currency,
+                    expected_cost_exact=_provider_hourly_rate(offer),
+                )
+            except ProviderAuthError as exc:
+                raise HourlyProviderUnavailableError(
+                    "selected account credential is rejected"
+                ) from exc
+            except (ProviderNotFound, ProviderConflict):
+                excluded.add(account_id)
+                continue
+            except ProviderError as exc:
+                raise HourlyProviderUnavailableError(
+                    "hourly mandatory inputs are unreadable"
+                ) from exc
+            if facts is None or getattr(facts, "root_disk", None) is None:
+                raise HourlyNotAvailableError("account cannot prove the launch root disk")
+            return account_id, adapter, facts
+
+    async def _process_account_pool(
+        self,
+        server: CloudServer,
+        operation: Operation,
+        snapshot: Any,
+    ) -> str:
+        if self._create_attempts is None or self._routes is None:
+            raise HourlyError("pooled create dependencies are not configured")
+        fingerprint = server.offer_fingerprint
+        if fingerprint is None:
+            raise HourlyError("hourly pooled contract fingerprint is missing")
+        catalog_account = fingerprint.get("provider_account_id")
+        if catalog_account is not None and not isinstance(catalog_account, str):
+            raise HourlyError("hourly catalog account provenance is invalid")
+        receipt = create_routing(operation)
+        if operation.status is OperationStatus.IN_FLIGHT:
+            if receipt is None:
+                return await self._mark_outcome_unknown(
+                    operation,
+                    server,
+                    "historical claim lacks pre-POST routing proof",
+                )
+            updated = operation.updated_at or operation.created_at
+            if updated is not None and datetime.now(UTC) - updated < timedelta(minutes=15):
+                return "still-inflight"
+            operation = await self._create_attempts.resume_safe_claim(
+                operation.id, operation.attempts
+            )
+            if operation.status is OperationStatus.PENDING:
+                return "requeued"
+            attempt = last_attempt(operation)
+            if attempt is not None and attempt["phase"] == "refused":
+                return await self._fail_operation(
+                    operation, server, "provider definitively refused the create"
+                )
+            return await self._reconcile_account_pool(server, operation)
+        if operation.status is OperationStatus.OUTCOME_UNKNOWN:
+            return await self._reconcile_account_pool(server, operation)
+        try:
+            claimed = await self._create_attempts.claim(
+                operation.id,
+                server.id,
+                catalog_account_id=catalog_account,
+            )
+        except CreateAttemptConflict:
+            return "claimed-elsewhere"
+        if claimed is None:
+            return "claimed-elsewhere"
+        root_disk = _fingerprint_root_disk(server.offer_fingerprint)
+        if root_disk is None:
+            return await self._fail_operation(
+                claimed,
+                server,
+                "accepted hourly contract has no root disk",
+                category=FAILURE_INVALID_CONTRACT,
+                stage="validation",
+            )
+        excluded = set(refused_accounts(claimed))
+        contract_mismatch = False
+        while True:
+            try:
+                account_id = await self._routes.account_for(
+                    server.provider_key,
+                    snapshot.offer.location_id,
+                    snapshot.offer.plan_id,
+                    exclude=excluded,
+                )
+            except (ProviderCapacityError, ProviderNotFound):
+                return await self._fail_operation(
+                    claimed,
+                    server,
+                    "no account can honor the accepted contract"
+                    if contract_mismatch
+                    else "all proven provider Projects are full or definitively refused",
+                    category=FAILURE_OFFER_REVALIDATION
+                    if contract_mismatch
+                    else FAILURE_PROVIDER_CAPACITY,
+                    stage="selection",
+                )
+            except ProviderError:
+                return await self._requeue_operation(
+                    claimed, "provider eligibility or inventory unreadable"
+                )
+            if account_id is None:
+                return await self._fail_operation(
+                    claimed, server, "no explicit fulfillment account"
+                )
+            try:
+                adapter = self._adapter_for(server.provider_key, account_id)
+                validator = getattr(adapter, "validate_hourly_offer_for_checkout", None)
+                if not callable(validator) or not callable(
+                    getattr(adapter, "find_by_operation", None)
+                ):
+                    raise HourlyNotAvailableError("account lacks mandatory validation/recovery")
+                await validator(
+                    location_id=snapshot.offer.location_id,
+                    product_id=snapshot.offer.plan_id,
+                    image_id=server.image_id,
+                    expected_cost_minor=snapshot.offer.cost_minor,
+                    currency=snapshot.offer.currency,
+                    expected_cost_exact=snapshot.offer.provider_rate_exact or "",
+                    root_disk_size_gb=root_disk[0],
+                    root_disk_storage_type=root_disk[1],
+                )
+            except ProviderAuthError:
+                return await self._fail_operation(
+                    claimed,
+                    server,
+                    "account credential rejected before create",
+                    category=FAILURE_PROVIDER_AUTH,
+                    stage="offer_revalidation",
+                )
+            except (ProviderNotFound, ProviderConflict):
+                excluded.add(account_id)
+                contract_mismatch = True
+                continue
+            except HourlyNotAvailableError as exc:
+                return await self._fail_operation(claimed, server, str(exc), stage="adapter")
+            except Exception:
+                return await self._requeue_operation(claimed, "hourly mandatory inputs unreadable")
+            if (
+                getattr(adapter, "issues_password_on_create", False)
+                and self._credential_store is None
+            ):
+                return await self._fail_operation(
+                    claimed,
+                    server,
+                    "encrypted create credential store is not configured",
+                    stage="credentials",
+                )
+            try:
+                claimed = await self._create_attempts.start_attempt(
+                    claimed.id, claimed.attempts, account_id
+                )
+            except CreateAttemptConflict:
+                return "claimed-elsewhere"
+            server.credential_account_id = account_id
+            reference = hourly_reference_name(server.id)
+            try:
+                created = await adapter.create_instance(
+                    instance_type=snapshot.offer.plan_id,
+                    image_id=server.image_id,
+                    region=snapshot.offer.location_id,
+                    reference=reference,
+                    root_disk_size_gb=root_disk[0],
+                    root_disk_storage_type=root_disk[1],
+                    image_label=server.os,
+                    idempotency_key=IdempotencyKey(claimed.operation_key),
+                    platform_server_id=str(server.id),
+                )
+            except ProviderCapacityError as exc:
+                if not exc.definitive_refusal:
+                    return await self._mark_outcome_unknown(
+                        claimed,
+                        server,
+                        "capacity error lacks authoritative rejection proof",
+                    )
+                claimed = await self._create_attempts.record_refusal(
+                    claimed.id,
+                    claimed.attempts,
+                    account_id,
+                    capacity=exc.allows_account_failover,
+                    error_code=exc.error_code,
+                    quota_names=exc.quota_names,
+                )
+                if not exc.allows_account_failover:
+                    return await self._fail_operation(
+                        claimed,
+                        server,
+                        "provider refusal has no documented capacity proof",
+                        category=FAILURE_PROVIDER_REJECTED,
+                    )
+                excluded.add(account_id)
+                continue
+            except (ProviderOutcomeUnknown, ProviderUnavailable, ProviderRateLimited) as exc:
+                return await self._mark_outcome_unknown(claimed, server, type(exc).__name__)
+            except ProviderError as exc:
+                if classify_provider_error(exc) is ErrorClass.RETRYABLE:
+                    return await self._mark_outcome_unknown(
+                        claimed,
+                        server,
+                        "provider error lacks definitive rejection proof",
+                    )
+                claimed = await self._create_attempts.record_refusal(
+                    claimed.id,
+                    claimed.attempts,
+                    account_id,
+                    capacity=False,
+                    error_code=getattr(exc, "error_code", None),
+                )
+                return await self._fail_operation(
+                    claimed,
+                    server,
+                    "provider create definitively rejected",
+                    category=FAILURE_PROVIDER_AUTH
+                    if isinstance(exc, ProviderAuthError)
+                    else FAILURE_PROVIDER_REJECTED,
+                )
+            except Exception:
+                return await self._mark_outcome_unknown(
+                    claimed,
+                    server,
+                    "provider create returned no trustworthy outcome",
+                )
+            return await self._accept_instance(
+                server,
+                claimed,
+                snapshot,
+                created,
+                account_id,
+                reference,
+            )
+
+    async def _reconcile_account_pool(self, server: CloudServer, operation: Operation) -> str:
+        """Only the receipt-owned account and exact operation may resolve SENT/unknown."""
+        if self._create_attempts is None:
+            raise HourlyError("create attempt persistence is not configured")
+        if operation.status not in {OperationStatus.IN_FLIGHT, OperationStatus.OUTCOME_UNKNOWN}:
+            return "skipped"
+        attempt = last_attempt(operation)
+        if attempt is None or attempt["phase"] == "capacity_refused":
+            return "still-inflight"
+        if attempt["phase"] == "refused":
+            try:
+                operation = await self._create_attempts.resume_safe_claim(
+                    operation.id, operation.attempts
+                )
+                return await self._fail_operation(
+                    operation, server, "provider definitively refused the create"
+                )
+            except CreateAttemptConflict:
+                return "claimed-elsewhere"
+        try:
+            account_id = current_account(operation, server.credential_account_id)
+            snapshot = await self._snapshots.require_snapshot(server.id)
+            _validate_hourly_contract(server, snapshot)
+            adapter = self._adapter_for(server.provider_key, account_id)
+            if attempt["phase"] == "accepted":
+                found = await adapter.get_instance(attempt["provider_server_id"])
+            else:
+                found = await adapter.find_by_operation(
+                    operation.operation_key,
+                    platform_server_id=str(server.id),
+                )
+        except Exception:
+            return "still-unknown"
+        if (
+            found is None
+            or _recovered_hourly_state_problem(found) is not None
+            or not server.image_id
+            or not _response_identity_matches(
+                found,
+                location_id=snapshot.offer.location_id,
+                plan_id=snapshot.offer.plan_id,
+                image_id=server.image_id,
+                account_id=account_id,
+                reference=hourly_reference_name(server.id),
+            )
+        ):
+            return "still-unknown"
+        try:
+            outcome = await self._accept_instance(
+                server,
+                operation,
+                snapshot,
+                found,
+                account_id,
+                hourly_reference_name(server.id),
+            )
+        except CreateAttemptConflict:
+            return "claimed-elsewhere"
+        return "attached" if outcome == "provisioned" else outcome
+
     async def cloud_image_by_index(self, offer: Any, index: int) -> Any:
         """Reject legacy positional image callbacks.
 
@@ -1768,7 +2228,13 @@ class HourlyCloudService:
     async def servers_requested(self) -> list[CloudServer]:
         """Hourly servers awaiting creation (the process job's queue)."""
         servers = await self._servers.list_requested()
-        return [s for s in servers if not s.is_prepaid_monthly]
+        return [
+            s
+            for s in servers
+            if not s.is_prepaid_monthly
+            and isinstance(s.offer_fingerprint, dict)
+            and "fingerprint_version" in s.offer_fingerprint
+        ]
 
     async def servers_for_reconcile(self) -> list[CloudServer]:
         """Hourly rows needing read-only create reconciliation.
@@ -1779,7 +2245,13 @@ class HourlyCloudService:
         """
         servers = await self._servers.list_requested()
         servers.extend(await self._servers.list_provisioning())
-        return [s for s in servers if not s.is_prepaid_monthly and not s.provider_server_id]
+        return [
+            s
+            for s in servers
+            if not s.is_prepaid_monthly
+            and isinstance(s.offer_fingerprint, dict)
+            and "fingerprint_version" in s.offer_fingerprint
+        ]
 
     async def process_server(self, server_id: UUID) -> str:
         """Execute one hourly server's create intent (worker-called).
@@ -1821,6 +2293,12 @@ class HourlyCloudService:
         _validate_hourly_operation(operation, server)
         if operation.is_terminal:
             return "skipped"
+        if operation.status is OperationStatus.PENDING:
+            await self._reserve_first_hour(server, preflight_snapshot)
+        if server.offer_fingerprint.get("fingerprint_version") == 3:
+            if not self._uses_account_pool(server.provider_key):
+                return "routing-unavailable"
+            return await self._process_account_pool(server, operation, preflight_snapshot)
         try:
             claimed = await self._ops.claim(operation.id)
         except Exception as exc:
@@ -2081,6 +2559,33 @@ class HourlyCloudService:
                 stage="provider_create",
                 failure=exc,
             )
+        return await self._accept_instance(
+            server,
+            claimed,
+            snapshot,
+            created,
+            pinned_account,
+            reference,
+            canary,
+        )
+
+    async def _accept_instance(
+        self,
+        server: CloudServer,
+        claimed: Operation,
+        snapshot: Any,
+        created: Any,
+        pinned_account: str | None,
+        reference: str,
+        canary: CanaryClaim | None = None,
+    ) -> str:
+        image_id = server.image_id
+        if not image_id:
+            return await self._mark_outcome_unknown(
+                claimed, server, "hourly provider response has no pinned image"
+            )
+        canary = canary or CanaryClaim()
+
         created_id = getattr(created, "id", None)
         if not isinstance(created_id, str) or not created_id.strip():
             # A provider response without a durable resource identity cannot
@@ -2162,18 +2667,37 @@ class HourlyCloudService:
         # the operation. If this save fails/crashes, the operation remains
         # IN_FLIGHT and reconciliation can find the exact POST outcome; the
         # inverse order would strand a billed resource in REQUESTED.
-        server.provider_server_id = created_id
-        if server.state is ServerLifecycleState.REQUESTED:
-            server.transition_to(ServerLifecycleState.PROVISIONING)
-        await self._servers.save(server)
-        claimed.complete(
-            {
-                "provider_server_id": created_id,
-                "provider_status": getattr(created, "state", None),
-                "idempotency_key": claimed.operation_key,
-            }
-        )
-        await self._ops.save(claimed)
+        correlation: dict[str, object] = {
+            "provider_server_id": created_id,
+            "provider_status": provider_status,
+            "idempotency_key": claimed.operation_key,
+        }
+        if create_routing(claimed) is not None:
+            if self._create_attempts is None or pinned_account is None:
+                raise HourlyError("pooled acceptance has no attempt repository or owner")
+            claimed = await self._create_attempts.record_acceptance(
+                claimed.id,
+                claimed.attempts,
+                pinned_account,
+                created_id,
+            )
+            claimed = await self._create_attempts.save_outcome(
+                claimed.id,
+                claimed.attempts,
+                OperationStatus.COMPLETED,
+                correlation=correlation,
+            )
+            server = await self._servers.get(server.id)
+            if server is None:
+                raise HourlyError("accepted hourly server disappeared")
+        else:
+            server.provider_server_id = created_id
+            if server.state is ServerLifecycleState.REQUESTED:
+                server.transition_to(ServerLifecycleState.PROVISIONING)
+            server = await self._servers.save(server)
+            claimed.complete(correlation)
+            await self._ops.save(claimed)
+        await self._prepay_ready_instance(server, created)
         await self._audit.record_mutation(
             actor_type=ActorType.SYSTEM,
             actor_id=None,
@@ -2269,7 +2793,7 @@ class HourlyCloudService:
             server.provider_server_id = found_id
             if server.state is ServerLifecycleState.REQUESTED:
                 server.transition_to(ServerLifecycleState.PROVISIONING)
-            await self._servers.save(server)
+            server = await self._servers.save(server)
             try:
                 operation.complete(
                     {
@@ -2282,6 +2806,7 @@ class HourlyCloudService:
                 await self._ops.save(operation)
             except Exception:
                 logger.exception("failed to complete recovered hourly operation %s", operation.id)
+            await self._prepay_ready_instance(server, found)
             # READ-ONLY RECOVERY: the deterministic provider reference proved
             # the earlier POST landed and the identity is now durably attached.
             # The same ``purchase.provider_accepted:<server_id>`` key as the
@@ -2317,8 +2842,18 @@ class HourlyCloudService:
 
     async def _requeue_operation(self, claimed: Any, error: str) -> str:
         """Return a pre-POST transient failure to the durable queue."""
-        claimed.requeue(error)
-        await self._ops.save(claimed)
+        if create_routing(claimed) is not None:
+            if self._create_attempts is None:
+                raise HourlyError("create attempt persistence is not configured")
+            await self._create_attempts.save_outcome(
+                claimed.id,
+                claimed.attempts,
+                OperationStatus.PENDING,
+                error=error,
+            )
+        else:
+            claimed.requeue(error)
+            await self._ops.save(claimed)
         logger.warning("hourly create requeued before provider POST: %s", error)
         return "requeued"
 
@@ -2362,6 +2897,7 @@ class HourlyCloudService:
             if server.state is ServerLifecycleState.REQUESTED:
                 server.transition_to(ServerLifecycleState.ERROR)
             await self._servers.save(server)
+            await self._release_creation_hold(server)
             # The failure transition is durable: tell the operator once (the
             # category-scoped key dedupes repeated quarantines).
             await self._emit_purchase_failed(
@@ -2392,13 +2928,25 @@ class HourlyCloudService:
         have. The category-scoped deterministic key means a re-processed
         failure never posts twice.
         """
-        claimed.fail(error)
-        await self._ops.save(claimed)
-        try:
-            server.transition_to(ServerLifecycleState.ERROR)
-            await self._servers.save(server)
-        except Exception:
-            logger.exception("failed to mark hourly server %s ERROR", server.id)
+        if create_routing(claimed) is not None:
+            if self._create_attempts is None:
+                raise HourlyError("create attempt persistence is not configured")
+            await self._create_attempts.save_outcome(
+                claimed.id,
+                claimed.attempts,
+                OperationStatus.FAILED,
+                error=error,
+            )
+            server.state = ServerLifecycleState.ERROR
+        else:
+            claimed.fail(error)
+            await self._ops.save(claimed)
+            try:
+                server.transition_to(ServerLifecycleState.ERROR)
+                await self._servers.save(server)
+            except Exception:
+                logger.exception("failed to mark hourly server %s ERROR", server.id)
+        await self._release_creation_hold(server)
         logger.warning("hourly create %s failed: %s", server.id, error)
         code, correlation = self._provider_evidence(failure)
         await self._emit_purchase_failed(
@@ -2426,6 +2974,10 @@ class HourlyCloudService:
         operation = await self._ops.get_by_key(f"server-create:{server.id}")
         if operation is not None:
             _validate_hourly_operation(operation, server)
+            if create_routing(operation) is not None:
+                if not self._uses_account_pool(server.provider_key):
+                    return "routing-unavailable"
+                return await self._reconcile_account_pool(server, operation)
         if server.provider_server_id:
             if operation is not None and operation.status in {
                 OperationStatus.IN_FLIGHT,
@@ -2501,7 +3053,7 @@ class HourlyCloudService:
         server.provider_server_id = found_id
         if server.state is ServerLifecycleState.REQUESTED:
             server.transition_to(ServerLifecycleState.PROVISIONING)
-        await self._servers.save(server)
+        server = await self._servers.save(server)
         operation.complete(
             {
                 "provider_server_id": found_id,
@@ -2510,6 +3062,7 @@ class HourlyCloudService:
             }
         )
         await self._ops.save(operation)
+        await self._prepay_ready_instance(server, found)
         logger.info("hourly reconcile %s attached provider %s", server.id, found_id)
         # READ-ONLY RECOVERY CARD: same deterministic key as the fresh accept,
         # so a server that was recovered here can never produce two cards.

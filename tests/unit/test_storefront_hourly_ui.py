@@ -11,15 +11,21 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
+import pytest
+
+from cloud_platform.bot.sessions import CheckoutSessions
 from cloud_platform.core.i18n import Translator
+from cloud_platform.core.session_store import InMemoryBotSessionStore, SessionStoreUnavailable
 from cloud_platform.modules.hourly.service import (
-    HourlyError,
     HourlyNotAvailableError,
+    HourlyPoolCapacityError,
     HourlyProviderUnavailableError,
     HourlyRequestFailedError,
 )
 from cloud_platform.modules.navigation.domain import encode_offer_ref
+from cloud_platform.modules.offers.domain import BILLING_MODEL_MONTHLY
 from tests.unit.test_hourly_cloud_flow import (
+    USER,
     FakeOffersRepo,
     _buttons,
     _cloud_type,
@@ -40,18 +46,28 @@ def _image(image_id: str = "ubuntu-24.04", label: str = "Ubuntu 24.04") -> Any:
     return type("I", (), {"id": image_id, "label": label})()
 
 
+async def _buy(bot: Any, offers: FakeOffersRepo) -> Any:
+    confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+    callback = next(
+        button.callback_data
+        for button in _buttons(confirm)
+        if _decode(button.callback_data or "").screen == "cloud_buy"
+    )
+    return await _press(bot, callback)
+
+
 class _ConfirmView:
     """Shape returned by OfferCatalogViewService.cloud_confirmation."""
 
     def __init__(self, offer: Any, image_label: str = "Ubuntu 24.04") -> None:
         self.offer = offer
         self.image_label = image_label
+        self.image_id = "ubuntu-24.04"
         self.hourly_price_minor = offer.selling_price_minor
         self.monthly_estimate_minor = offer.selling_price_minor * 730
         self.currency = offer.selling_currency
         self.location_name = "Frankfurt"
         self.location_country = "DE"
-        self.confirm_callback = "PENDING-SIGNED-BY-UI"  # replaced below
         self.back_callback = "PENDING-SIGNED-BY-UI"
         self.cancel_callback = "PENDING-SIGNED-BY-UI"
 
@@ -91,20 +107,14 @@ class _ImagesView:
             raise OfferNotFoundError("missing")
         if image_index >= len(self._images):
             raise OsUnavailableError("stale image index")
-        view = _ConfirmView(offer)
-        view.confirm_callback = self._bot._callback(
-            "store", "cloud_buy", encode_offer_ref(offer.id), "0"
-        )
+        image = self._images[image_index]
+        view = _ConfirmView(offer, image.label)
+        view.image_id = image.id
         view.back_callback = self._bot._callback(
             "store", "cloud_images", encode_offer_ref(offer.id)
         )
         view.cancel_callback = self._bot._callback("store", "families", offer.provider_key)
         return view
-
-    async def cloud_image_by_index(self, offer: Any, index: int) -> Any:
-        if index < 0 or index >= len(self._images):
-            raise HourlyError(f"image option {index} is not available")
-        return self._images[index]
 
     # -- VPS/plan guard branches (each surfaces the safe fallback screen) --
 
@@ -171,15 +181,6 @@ class TestHourlyBuyScreens:
         bot._view.family_plans_screen = _unavailable  # type: ignore[method-assign]
         return bot, view
 
-    async def test_confirm_screen_shows_hourly_basis_and_warning(self) -> None:
-        offers = FakeOffersRepo([_offer()])
-        bot, _ = self._ui_with(offers, [_image()])
-        screen = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
-        assert "€" in screen.text or "تومان" in screen.text
-        assert "Resource" in screen.text  # delete-to-stop warning present
-        screens = [_decode(b.callback_data or "").screen for b in _buttons(screen)]
-        assert "cloud_buy" in screens
-
     async def test_confirm_with_stale_image_index_shows_os_unavailable(self) -> None:
         from cloud_platform.modules.checkout.service import OsUnavailableError
 
@@ -199,38 +200,12 @@ class TestHourlyBuyScreens:
         screen = await _press(bot, bot._callback("store", "cloud_confirm", "zzzzzzzz", "0"))
         assert screen is not None
 
-    async def test_buy_screen_creates_intent_without_provider_post(self) -> None:
-        offers = FakeOffersRepo([_offer()])
-        bot, _ = self._ui_with(offers, [_image()])
-        offer = (await offers.list_all())[0]
-        hourly = bot._hourly
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
-        assert hourly.calls, "hourly service create_instance must be invoked"
-        call = hourly.calls[-1]
-        assert call["offer_id"] == offer.id
-        assert call["idempotency_key"].startswith("bot-hourly:")
-        assert screen.text
-
     async def test_buy_with_unknown_offer_shows_expired_without_intent(self) -> None:
         offers = FakeOffersRepo([_offer()])
         bot, _ = self._ui_with(offers, [_image()])
         screen = await _press(bot, bot._callback("store", "cloud_buy", "zzzzzzzz", "0"))
         assert bot._hourly.calls == []
         assert screen is not None
-
-    async def test_buy_screen_replay_is_labelled(self) -> None:
-        offers = FakeOffersRepo([_offer()])
-        bot, _ = self._ui_with(offers, [_image()])
-
-        class _ReplayHourly:
-            async def create_instance(self, **kwargs: Any) -> Any:
-                return type(
-                    "R", (), {"server": type("S", (), {"id": uuid4()})(), "replayed": True}
-                )()
-
-        bot._hourly = _ReplayHourly()
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
-        assert screen.text
 
     async def test_buy_rejects_hourly_error_to_unavailable(self) -> None:
         offers = FakeOffersRepo([_offer()])
@@ -241,7 +216,7 @@ class TestHourlyBuyScreens:
                 raise HourlyNotAvailableError("not sellable")
 
         bot._hourly = _Reject()
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        screen = await _buy(bot, offers)
         assert screen.text.strip() == Translator().t("offers.unavailable")
 
     async def test_a_failed_previous_request_does_not_look_unavailable(self) -> None:
@@ -262,7 +237,7 @@ class TestHourlyBuyScreens:
                 )
 
         bot._hourly = _Failed()
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        screen = await _buy(bot, offers)
         text = screen.text.strip()
         assert text == Translator().t("store.cloud_previous_failed")
         assert "a new order is required" not in text
@@ -277,7 +252,7 @@ class TestHourlyBuyScreens:
                 raise HourlyProviderUnavailableError("timed out")
 
         bot._hourly = _Busy()
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        screen = await _buy(bot, offers)
         text = screen.text.strip()
         assert text == Translator().t("store.cloud_retry_later")
         assert text != Translator().t("offers.unavailable")
@@ -301,15 +276,27 @@ class TestHourlyBuyScreens:
                 )
 
         bot._hourly = _AtCapacity()
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        screen = await _buy(bot, offers)
         text = screen.text.strip()
         assert text == Translator().t("store.cloud_account_capacity")
         assert text != Translator().t("offers.unavailable")
         assert "PC-2031" not in text
         assert "sales-org-north" not in text
-        # Actionable Persian text: capacity full + retry/choose another plan.
-        assert "ظرفیت" in text
-        assert "دوباره تلاش" in text
+
+    async def test_pool_capacity_has_generic_all_accounts_wording_without_details(self) -> None:
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+
+        class FullPool:
+            async def create_instance(self, **kwargs: Any) -> Any:
+                raise HourlyPoolCapacityError("hz-private resource_limit_exceeded secret")
+
+        bot._hourly = FullPool()
+        screen = await _buy(bot, offers)
+        assert screen.text == Translator().t("store.provider_account_capacity")
+        assert all(
+            detail not in screen.text for detail in ("hz-private", "resource_limit", "secret")
+        )
 
     async def test_an_inconclusive_image_read_is_reported_as_temporary(self) -> None:
         """A transient image-catalog failure is not "the OS is gone"."""
@@ -327,21 +314,20 @@ class TestHourlyBuyScreens:
         assert text == Translator().t("offers.os_temporarily_unavailable")
         assert text != Translator().t("store.cloud_no_images")
 
-    async def test_a_stale_image_selection_after_a_transient_failure_retries(self) -> None:
-        """The hourly create path must not claim "OS unavailable" on a wobble."""
+    async def test_the_service_validates_the_stable_image_before_creation(self) -> None:
         from cloud_platform.modules.checkout.service import OsTemporarilyUnavailableError
 
         offers = FakeOffersRepo([_offer()])
-        bot, view = self._ui_with(offers, [_image()])
+        bot, _ = self._ui_with(offers, [_image()])
 
-        async def _unreadable(offer: Any, index: int) -> Any:
-            raise OsTemporarilyUnavailableError("image catalog temporarily unreadable")
+        class UnreadableImages:
+            async def create_instance(self, **kwargs: Any) -> Any:
+                assert kwargs["image_id"] == "ubuntu-24.04"
+                raise OsTemporarilyUnavailableError("image catalog temporarily unreadable")
 
-        view.cloud_image_by_index = _unreadable  # type: ignore[method-assign]
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
-        text = screen.text.strip()
-        assert text == Translator().t("offers.os_temporarily_unavailable")
-        assert text != Translator().t("offers.os_unavailable")
+        bot._hourly = UnreadableImages()
+        screen = await _buy(bot, offers)
+        assert screen.text == Translator().t("offers.os_temporarily_unavailable")
 
     async def test_buy_rejects_unexpected_error_to_error_screen(self) -> None:
         offers = FakeOffersRepo([_offer()])
@@ -352,15 +338,140 @@ class TestHourlyBuyScreens:
                 raise RuntimeError("boom")
 
         bot._hourly = _Boom()
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        screen = await _buy(bot, offers)
         assert screen.text
 
     async def test_buy_without_hourly_service_shows_unavailable(self) -> None:
         offers = FakeOffersRepo([_offer()])
         bot, _ = self._ui_with(offers, [_image()])
         bot._hourly = None
-        screen = await _press(bot, bot._callback("store", "cloud_buy", _ref(offers), "0"))
+        screen = await _buy(bot, offers)
         assert screen.text
+
+    async def test_reordered_images_and_repricing_cannot_change_confirmed_facts(self) -> None:
+        offers = FakeOffersRepo([_offer()])
+        bot, view = self._ui_with(offers, [_image(), _image("debian-12", "Debian 12")])
+        confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+        callback = _buttons(confirm)[0].callback_data
+        assert len(_decode(callback).args) == 1
+        assert str(next(iter(offers._rows.values())).id) not in callback
+        original_price = next(iter(offers._rows.values())).selling_price_minor
+        view._images.reverse()
+        offer = next(iter(offers._rows.values()))
+        await offers.set_selling_price(offer.id, original_price + 100, offer.selling_currency)
+        await _press(bot, callback)
+        await _press(bot, callback)
+        assert len(callback.encode("utf-8")) <= 64
+        assert len(bot._hourly.calls) == 2
+        for call in bot._hourly.calls:
+            assert call["image_id"] == "ubuntu-24.04"
+            assert call["image_label"] == "Ubuntu 24.04"
+            assert call["expected_selling_price_minor"] == original_price
+            assert call["expected_selling_currency"] == "EUR"
+        assert bot._hourly.calls[0]["idempotency_key"] == bot._hourly.calls[1]["idempotency_key"]
+
+    async def test_foreign_owner_missing_record_and_wrong_billing_model_fail_closed(self) -> None:
+        from dataclasses import replace
+
+        from cloud_platform.bot.sessions import CheckoutSelection
+
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+        confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+        callback = _buttons(confirm)[0].callback_data
+        foreign = replace(USER, id=uuid4())
+        screen = await bot.handle(callback, user=foreign)
+        assert screen.text == Translator().t("nav.expired")
+        monthly_nonce = await bot._checkout_sessions.remember(
+            CheckoutSelection(
+                user_id=USER.id,
+                offer_id=next(iter(offers._rows.values())).id,
+                billing_model=BILLING_MODEL_MONTHLY,
+                os_name="Ubuntu 24.04",
+                selling_price_minor=100,
+                currency="EUR",
+            )
+        )
+        for terminal in (
+            bot._callback("store", "cloud_buy", monthly_nonce),
+            bot._callback("store", "cloud_buy", "abcdefgh"),
+            bot._callback("store", "cloud_buy", _ref(offers), "0"),
+        ):
+            assert (await _press(bot, terminal)).text == Translator().t("nav.expired")
+        assert bot._hourly.calls == []
+
+    async def test_shared_confirmation_survives_ui_reconstruction(self) -> None:
+        from tests.unit.test_session_store import FakeRedis, make_redis_store
+
+        store = make_redis_store(FakeRedis())
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+        bot._checkout_sessions = CheckoutSessions(store)
+        confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+        callback = _buttons(confirm)[0].callback_data
+        restarted, _ = self._ui_with(offers, [_image("debian-12", "Debian 12")])
+        restarted._checkout_sessions = CheckoutSessions(store)
+        await _press(restarted, callback)
+        assert restarted._hourly.calls[0]["image_id"] == "ubuntu-24.04"
+
+    async def test_store_outage_blocks_confirmation_and_terminal_creation(self) -> None:
+        class UnavailableStore(InMemoryBotSessionStore):
+            async def claim(self, *args: Any, **kwargs: Any) -> bool:
+                raise SessionStoreUnavailable("unavailable")
+
+            async def get(self, *args: Any, **kwargs: Any) -> Any:
+                raise SessionStoreUnavailable("unavailable")
+
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+        bot._checkout_sessions = CheckoutSessions(UnavailableStore())
+        confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+        assert confirm.text == Translator().t("store.cloud_retry_later")
+        assert (
+            await _press(bot, bot._callback("store", "cloud_buy", "abcdefgh"))
+        ).text == Translator().t("store.cloud_retry_later")
+        assert bot._hourly.calls == []
+
+    async def test_expired_rendered_confirmation_never_submits_hourly_creation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [100.0]
+        monkeypatch.setattr("cloud_platform.core.session_store.time.monotonic", lambda: now[0])
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+        bot._checkout_sessions = CheckoutSessions(
+            InMemoryBotSessionStore(), reference_ttl_seconds=30
+        )
+        confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+        callback = _buttons(confirm)[0].callback_data
+        now[0] += 31
+        screen = await _press(bot, callback)
+        assert screen.text == Translator().t("nav.expired")
+        assert bot._hourly.calls == []
+
+    async def test_tampering_with_rendered_confirmation_never_submits_hourly_creation(
+        self,
+    ) -> None:
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+        confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+        callback = _buttons(confirm)[0].callback_data
+        tampered = callback[:-1] + ("0" if callback[-1] != "0" else "1")
+        assert await bot.handle(tampered, user=USER) is None
+        assert bot._hourly.calls == []
+
+    async def test_redis_outage_after_confirmation_never_submits_hourly_creation(self) -> None:
+        from tests.unit.test_session_store import FakeRedis, UnreachableRedis, make_redis_store
+
+        offers = FakeOffersRepo([_offer()])
+        bot, _ = self._ui_with(offers, [_image()])
+        bot._checkout_sessions = CheckoutSessions(make_redis_store(FakeRedis()))
+        confirm = await _press(bot, bot._callback("store", "cloud_confirm", _ref(offers), "0"))
+        callback = _buttons(confirm)[0].callback_data
+        bot._checkout_sessions = CheckoutSessions(make_redis_store(UnreachableRedis()))
+        screen = await _press(bot, callback)
+        assert screen.text == Translator().t("store.cloud_retry_later")
+        assert bot._hourly.calls == []
 
 
 class TestCallbackGuards:

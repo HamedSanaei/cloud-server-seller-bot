@@ -128,6 +128,8 @@ def _server_type(
         "cores": cores,
         "memory": memory,
         "disk": disk,
+        "architecture": "x86",
+        "locations": [{"name": location, "available": True}],
         "included_traffic": traffic_bytes,
         "prices": [
             {
@@ -162,9 +164,10 @@ def _responses(
     *,
     failing: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Location page first, then one server-type page per location (in order)."""
+    """Official pricing envelope, location page, then one type page per location."""
     payloads: list[dict[str, Any]] = [
-        {"locations": [{"id": loc} for loc in locations], "meta": {"pagination": {}}}
+        {"pricing": {"currency": "EUR"}},
+        {"locations": [{"id": loc} for loc in locations], "meta": {"pagination": {}}},
     ]
     for location_id, types in locations.items():
         if failing and location_id in failing:
@@ -297,24 +300,6 @@ async def test_products_without_a_monthly_price_are_not_invented(
 
 
 @pytest.mark.asyncio
-async def test_catalog_membership_comes_from_the_list_endpoint(
-    syncer: HetznerCatalogSyncer,
-) -> None:
-    """The list endpoint is authoritative; the per-id detail read is not used."""
-    syncer._request = AsyncMock(
-        side_effect=_responses(
-            {"region-a1": [_server_type("cx-test", location="region-a1", monthly="4.49")]}
-        )
-    )
-    await syncer.sync_offers()
-    paths = [call.args[1] for call in syncer._request.await_args_list]
-    assert paths == ["/locations", "/server_types"]
-    for call in syncer._request.await_args_list:
-        if call.args[1] == "/server_types":
-            assert call.kwargs["params"]["location"] == "region-a1"
-
-
-@pytest.mark.asyncio
 async def test_monthly_and_hourly_same_plan_location_keep_independent_cost_and_cap(
     syncer: HetznerCatalogSyncer, offer_repo: _RecordingOfferRepo
 ) -> None:
@@ -329,7 +314,7 @@ async def test_monthly_and_hourly_same_plan_location_keep_independent_cost_and_c
         }
     ]
     responses = _responses({"fsn1": [item]}) * 2
-    responses[0]["locations"] = responses[2]["locations"] = [{"id": 1, "name": "fsn1"}]
+    responses[1]["locations"] = responses[4]["locations"] = [{"id": 1, "name": "fsn1"}]
     syncer._request = AsyncMock(side_effect=responses)
 
     monthly = await syncer.sync_offers()
@@ -349,9 +334,6 @@ async def test_monthly_and_hourly_same_plan_location_keep_independent_cost_and_c
     assert monthly_spec.billing_parameters["provider_monthly_rate"] == "3.9200000000000"
     assert hourly_spec.traffic == "20 TB"
     assert offer_repo.marked == ("hetzner", {("cx22", "fsn1")}, "hourly")
-    for call in syncer._request.await_args_list:
-        if call.args[1] == "/server_types":
-            assert call.kwargs["params"]["location"] == "fsn1"
 
 
 @pytest.mark.asyncio
@@ -424,6 +406,23 @@ def _json(status: int, payload: dict[str, Any]) -> httpx.Response:
     return httpx.Response(status, json=payload, headers={})
 
 
+def _catalog(key: str, items: list[dict[str, Any]]) -> httpx.Response:
+    return _json(
+        200,
+        {
+            key: items,
+            "meta": {
+                "pagination": {
+                    "page": 1,
+                    "next_page": None,
+                    "last_page": 1,
+                    "total_entries": len(items),
+                }
+            },
+        },
+    )
+
+
 def _create_request() -> CreateServerRequest:
     return CreateServerRequest(
         name="srv-test",
@@ -444,35 +443,45 @@ async def test_create_server_ambiguity_is_never_retryable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_server_success_sends_the_operation_label() -> None:
-    captured: dict[str, Any] = {}
+async def test_initializing_acceptance_has_exact_read_only_recovery_identity() -> None:
+    accepted: dict[str, Any] = {}
 
     def handler(method: str, path: str, kwargs: dict[str, Any]) -> httpx.Response:
-        captured.update(kwargs["json"])
+        if method == "POST":
+            body = kwargs["json"]
+            accepted.update(
+                id=42,
+                name=body["name"],
+                status="initializing",
+                server_type={"name": body["server_type"]},
+                image={"name": body["image"]},
+                datacenter={"location": {"name": body["location"]}},
+                labels=body["labels"],
+                public_net={"ipv4": {"ip": "203.0.113.7"}},
+            )
+            return _json(201, {"server": accepted})
         return _json(
-            201,
+            200,
             {
-                "server": {
-                    "id": 42,
-                    "name": "srv-test",
-                    "status": "initializing",
-                    "public_net": {"ipv4": {"ip": "203.0.113.7"}, "ipv6": {"ip": "2001:db8::1"}},
-                }
+                "servers": [accepted],
+                "meta": {"pagination": {"page": 1, "next_page": None}},
             },
         )
 
     provider = _provider(handler)
     server = await provider.create_server(_create_request(), IdempotencyKey(OP_KEY))
-
-    assert server.id == "42"
-    assert captured["labels"]["platform-operation"] == OP_KEY
+    recovered = await provider.recover_server_by_operation(
+        OP_KEY, legacy_label=False, platform_server_id=str(SERVER_ID)
+    )
+    assert server.status == "initializing"
+    assert recovered.verdict is OrderRecoveryVerdict.MATCHED
+    assert recovered.provider_order_id == server.id == "42"
     assert server.ipv4 == "203.0.113.7"
 
 
 @pytest.mark.asyncio
 async def test_recovery_requires_exactly_one_provable_server() -> None:
     def handler(method: str, path: str, kwargs: dict[str, Any]) -> httpx.Response:
-        assert kwargs["params"]["label_selector"] == f"platform-operation={OP_KEY}"
         return _json(
             200,
             {
@@ -483,7 +492,8 @@ async def test_recovery_requires_exactly_one_provable_server() -> None:
                         "status": "running",
                         "labels": {"platform-operation": OP_KEY},
                     }
-                ]
+                ],
+                "meta": {"pagination": {"page": 1, "next_page": None}},
             },
         )
 
@@ -496,7 +506,17 @@ async def test_recovery_requires_exactly_one_provable_server() -> None:
 
 @pytest.mark.asyncio
 async def test_recovery_reports_no_match_and_ambiguity() -> None:
-    empty = server_recovery_support_of(_provider(lambda *_: _json(200, {"servers": []})))
+    empty = server_recovery_support_of(
+        _provider(
+            lambda *_: _json(
+                200,
+                {
+                    "servers": [],
+                    "meta": {"pagination": {"page": 1, "next_page": None}},
+                },
+            )
+        )
+    )
     several = server_recovery_support_of(
         _provider(
             lambda *_: _json(
@@ -515,7 +535,8 @@ async def test_recovery_reports_no_match_and_ambiguity() -> None:
                             "status": "running",
                             "labels": {"platform-operation": OP_KEY},
                         },
-                    ]
+                    ],
+                    "meta": {"pagination": {"page": 1, "next_page": None}},
                 },
             )
         )
@@ -544,19 +565,51 @@ async def test_recovery_scan_failure_is_transient_not_ambiguous() -> None:
 @pytest.mark.asyncio
 async def test_os_options_only_offer_creatable_system_images() -> None:
     def handler(method: str, path: str, kwargs: dict[str, Any]) -> httpx.Response:
-        if path == "/server_types/cx-test":
-            return _json(200, {"server_type": {"id": 1, "architecture": "x86"}})
-        assert kwargs["params"]["type"] == "system"
-        assert kwargs["params"]["include_deprecated"] == "false"
-        assert kwargs["params"]["architecture"] == "x86"
-        return _json(
-            200,
-            {
-                "images": [
-                    {"id": 11, "name": "ubuntu-24.04"},
-                    {"id": 12, "name": "debian-12"},
-                ]
-            },
+        if path == "/server_types":
+            return _catalog(
+                "server_types",
+                [
+                    _server_type("cx-test", location="region-a1", monthly="9.99"),
+                ],
+            )
+        assert path == "/images" and kwargs["params"]["type"] == "system"
+        return _catalog(
+            "images",
+            [
+                {
+                    "id": 11,
+                    "name": "ubuntu-24.04",
+                    "type": "system",
+                    "status": "available",
+                    "os_flavor": "ubuntu",
+                    "architecture": "x86",
+                },
+                {
+                    "id": 12,
+                    "name": "debian-12",
+                    "type": "system",
+                    "status": "available",
+                    "os_flavor": "debian",
+                    "architecture": "x86",
+                },
+                {
+                    "id": 13,
+                    "name": "ubuntu-arm",
+                    "type": "system",
+                    "status": "available",
+                    "os_flavor": "ubuntu",
+                    "architecture": "arm",
+                },
+                {
+                    "id": 14,
+                    "name": "old",
+                    "type": "system",
+                    "status": "available",
+                    "os_flavor": "ubuntu",
+                    "architecture": "x86",
+                    "deprecated": "2025-01-01",
+                },
+            ],
         )
 
     options = await _provider(handler).get_os_options("region-a1", "cx-test")
@@ -567,18 +620,22 @@ async def test_os_options_only_offer_creatable_system_images() -> None:
 @pytest.mark.asyncio
 async def test_checkout_validation_rejects_price_drift_and_missing_image() -> None:
     def server_types(**_: Any) -> httpx.Response:
-        return _json(
-            200,
-            {
-                "server_types": [
-                    _server_type("cx-test", location="region-a1", monthly="9.99"),
-                ]
-            },
+        return _catalog(
+            "server_types",
+            [
+                _server_type("cx-test", location="region-a1", monthly="9.99"),
+            ],
         )
 
-    images = _json(200, {"images": []})
+    images = _catalog("images", [])
     provider = _provider(
-        lambda method, path, kwargs: server_types() if path == "/server_types" else images
+        lambda method, path, kwargs: (
+            server_types()
+            if path == "/server_types"
+            else _json(200, {"pricing": {"currency": "EUR"}})
+            if path == "/pricing"
+            else images
+        )
     )
 
     with pytest.raises(ProviderConflict):
@@ -768,7 +825,12 @@ class _DirectCreateCloudProvider(_DirectCreateProvider):
         )
 
     async def recover_server_by_operation(
-        self, operation_key: str, since: datetime | None = None
+        self,
+        operation_key: str,
+        since: datetime | None = None,
+        *,
+        legacy_label: bool = True,
+        platform_server_id: str | None = None,
     ) -> OrderRecoveryResult:
         self.recovery_calls += 1
         return self.recovery

@@ -42,6 +42,7 @@ _ALLOWED: dict[ServerLifecycleState, frozenset[ServerLifecycleState]] = {
     ServerLifecycleState.PROVISIONING: frozenset(
         {
             ServerLifecycleState.RUNNING,
+            ServerLifecycleState.DELETE_REQUESTED,
             ServerLifecycleState.ERROR,
             ServerLifecycleState.MANUAL_REVIEW,
         }
@@ -119,6 +120,8 @@ class CloudServer:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     last_accrued_at: datetime | None = None
+    #: Activation anchor; last_accrued_at is the end of the prepaid hour.
+    billing_started_at: datetime | None = None
     deleted_at: datetime | None = None
     low_balance_since: datetime | None = None
     quantum_seconds: int = 3600

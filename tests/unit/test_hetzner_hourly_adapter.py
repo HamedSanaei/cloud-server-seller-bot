@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from cloud_platform.core.idempotency import IdempotencyKey
+from cloud_platform.providers.credentials import CredentialHolder, credential_from_value
 from cloud_platform.providers.errors import (
     ProviderAuthError,
     ProviderCapacityError,
@@ -18,11 +19,12 @@ from cloud_platform.providers.errors import (
     ProviderOutcomeUnknown,
     ProviderUnavailable,
 )
+from cloud_platform.providers.hetzner.client import HetznerCloudProvider, operation_label
 from cloud_platform.providers.hetzner.hourly import HetznerHourlyCloudProvider
 
 
-def envelope(key: str, values: list[dict], next_page: int | None = None) -> dict:
-    return {key: values, "meta": {"pagination": {"page": 1, "next_page": next_page}}}
+def envelope(key: str, values: list[dict], next_page: int | None = None, *, page: int = 1) -> dict:
+    return {key: values, "meta": {"pagination": {"page": page, "next_page": next_page}}}
 
 
 def server(name: str = "srv-123", location: str = "fsn1", image: int = 100) -> dict:
@@ -88,6 +90,8 @@ async def test_authoritative_locations_prices_images_and_validation() -> None:
 
     def handle(request: httpx.Request) -> httpx.Response:
         paths.append(request.url.path)
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
         if request.url.path == "/v1/locations":
             return reply(
                 envelope(
@@ -184,15 +188,7 @@ async def test_existing_reference_recovered_without_second_post() -> None:
 
     provider = adapter(handle)
     try:
-        recovered = await provider.create_instance(
-            instance_type="cx22",
-            image_id="100",
-            region="fsn1",
-            reference="srv-123",
-            root_disk_size_gb=40,
-            root_disk_storage_type="local",
-            idempotency_key=IdempotencyKey("test-key-123"),
-        )
+        recovered = await provider.find_by_reference("fsn1", "srv-123")
         assert (recovered.id, recovered.region, recovered.plan_id, recovered.image_id) == (
             "54321",
             "fsn1",
@@ -215,15 +211,7 @@ async def test_incomplete_or_ambiguous_recovery_never_posts() -> None:
         provider = adapter(handle)
         try:
             with pytest.raises(ProviderError):
-                await provider.create_instance(
-                    instance_type="cx22",
-                    image_id="100",
-                    region="fsn1",
-                    reference="srv-123",
-                    root_disk_size_gb=40,
-                    root_disk_storage_type="local",
-                    idempotency_key=IdempotencyKey("test-key-123"),
-                )
+                await provider.find_by_reference("fsn1", "srv-123")
         finally:
             await provider.close()
 
@@ -238,6 +226,8 @@ async def test_create_posts_only_documented_fields_and_unknown_is_never_retried(
             return reply({"error": {"code": "service_error"}}, 503)
         if request.url.path == "/v1/servers":
             return reply(envelope("servers", []))
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
         if request.url.path == "/v1/server_types":
             return reply(envelope("server_types", [server_type()]))
         if request.url.path == "/v1/locations":
@@ -258,9 +248,14 @@ async def test_create_posts_only_documented_fields_and_unknown_is_never_retried(
                 root_disk_storage_type="local",
                 idempotency_key=IdempotencyKey("test-key-123"),
             )
-        assert posts == [
-            {"name": "srv-123", "server_type": "cx22", "image": "100", "location": "fsn1"}
-        ]
+        assert len(posts) == 1
+        assert posts[0] == {
+            "name": "srv-123",
+            "server_type": "cx22",
+            "image": "100",
+            "location": "fsn1",
+            "labels": {"platform-operation": operation_label("test-key-123")},
+        }
     finally:
         await provider.close()
 
@@ -276,15 +271,7 @@ async def test_failed_recovery_read_and_auth_block_creation() -> None:
         provider = adapter(handle)
         try:
             with pytest.raises(expected):
-                await provider.create_instance(
-                    instance_type="cx22",
-                    image_id="100",
-                    region="fsn1",
-                    reference="srv-123",
-                    root_disk_size_gb=40,
-                    root_disk_storage_type="local",
-                    idempotency_key=IdempotencyKey("test-key-123"),
-                )
+                await provider.find_by_reference("fsn1", "srv-123")
         finally:
             await provider.close()
 
@@ -313,14 +300,20 @@ async def test_create_attaches_proven_provider_identity_and_classifies_quota() -
 
     def handle(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
-            if create_status == 422:
-                return reply({"error": {"code": "resource_limit_exceeded"}}, 422)
+            if create_status == 403:
+                return reply({"error": {"code": "resource_limit_exceeded"}}, 403)
             return reply(
-                {"server": server(), "action": {"status": "running"}, "root_password": None},
+                {
+                    "server": {**server(), "labels": json.loads(request.content)["labels"]},
+                    "action": {"status": "running"},
+                    "root_password": None,
+                },
                 201,
             )
         if request.url.path == "/v1/servers":
             return reply(envelope("servers", []))
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
         if request.url.path == "/v1/server_types":
             return reply(envelope("server_types", [server_type()]))
         if request.url.path == "/v1/locations":
@@ -347,7 +340,7 @@ async def test_create_attaches_proven_provider_identity_and_classifies_quota() -
             "100",
             "cx22",
         )
-        create_status = 422
+        create_status = 403
         with pytest.raises(ProviderCapacityError):
             await provider.create_instance(**kwargs)
     finally:
@@ -364,7 +357,7 @@ async def test_create_password_is_one_time_and_only_from_top_level_without_ssh_k
             posted.append(json.loads(request.content))
             return reply(
                 {
-                    "server": server(),
+                    "server": {**server(), "labels": json.loads(request.content)["labels"]},
                     "action": {"status": "running"},
                     "next_actions": [],
                     "root_password": issued if len(posted) == 1 else None,
@@ -373,6 +366,8 @@ async def test_create_password_is_one_time_and_only_from_top_level_without_ssh_k
             )
         if request.url.path == "/v1/servers":
             return reply(envelope("servers", []))
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
         if request.url.path == "/v1/server_types":
             return reply(envelope("server_types", [server_type()]))
         if request.url.path == "/v1/locations":
@@ -418,7 +413,12 @@ async def test_reference_search_reads_every_page_and_get_by_provider_id() -> Non
         pages.append(page)
         assert request.url.params["name"] == "srv-123"
         return reply(
-            envelope("servers", [] if page == 1 else [server()], next_page=2 if page == 1 else None)
+            envelope(
+                "servers",
+                [] if page == 1 else [server()],
+                next_page=2 if page == 1 else None,
+                page=page,
+            )
         )
 
     provider = adapter(handle)
@@ -440,5 +440,318 @@ async def test_incomplete_pagination_cannot_prove_reference_absence() -> None:
     try:
         with pytest.raises(ProviderError, match="incomplete list envelope"):
             await provider.find_by_reference("fsn1", "srv-123")
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_account_bound_hourly_mutations_share_rotating_credentials() -> None:
+    holder = CredentialHolder("synthetic-initial")
+    monthly = HetznerCloudProvider("synthetic-initial", credential_source=holder, account_id="hz-b")
+    hourly = HetznerHourlyCloudProvider(provider=monthly, account_id="hz-b")
+    mutations: list[str] = []
+    rotated_headers: list[bool] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        rotated_headers.append(request.headers["Authorization"] == "Bearer synthetic-rotated")
+        if request.method == "POST":
+            mutations.append("POST")
+            return reply(
+                {"server": {**server(), "labels": json.loads(request.content)["labels"]}}, 201
+            )
+        if request.method == "DELETE":
+            mutations.append("DELETE")
+            return httpx.Response(204)
+        if request.url.path == "/v1/servers/54321":
+            return reply({"server": server()})
+        if request.url.path == "/v1/servers":
+            return reply(envelope("servers", []))
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
+        if request.url.path == "/v1/server_types":
+            return reply(envelope("server_types", [server_type()]))
+        if request.url.path == "/v1/locations":
+            return reply(envelope("locations", [{"id": 1, "name": "fsn1"}]))
+        if request.url.path == "/v1/images":
+            return reply(envelope("images", [image()]))
+        raise AssertionError(request.url)
+
+    await monthly._client.aclose()
+    monthly._client = httpx.AsyncClient(
+        base_url="https://api.hetzner.cloud/v1", transport=httpx.MockTransport(handle)
+    )
+    try:
+        await holder.swap(credential_from_value("synthetic-rotated"))
+        created = await hourly.create_instance(
+            instance_type="cx22",
+            image_id="100",
+            region="fsn1",
+            reference="srv-123",
+            root_disk_size_gb=40,
+            root_disk_storage_type="local",
+            idempotency_key=IdempotencyKey("shared-provider"),
+        )
+        assert created.account_id == "hz-b"
+        assert (await hourly.get_instance("54321")).account_id == "hz-b"
+        await hourly.delete_instance("54321")
+        await hourly.aclose()
+        # Closing a borrowing hourly adapter must not close the managed provider.
+        assert (await monthly.get_server("54321")).id == "54321"
+        assert mutations == ["POST", "DELETE"]
+        assert rotated_headers and all(rotated_headers)
+    finally:
+        await monthly.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+async def test_shared_mutation_delete_unknown_status_is_never_resent(status: int) -> None:
+    calls: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(status, json={"error": {"code": "unavailable"}})
+
+    provider = adapter(handle)
+    try:
+        with pytest.raises(ProviderOutcomeUnknown):
+            await provider.delete_instance("54321")
+        assert calls == ["DELETE"]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["id", "name", "image", "server_type", "datacenter", "labels", "json", "shape"],
+)
+async def test_unproven_successful_hourly_create_remains_unknown(failure: str) -> None:
+    posts: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append("POST")
+            if failure == "json":
+                return httpx.Response(201, content=b"not-json")
+            if failure == "shape":
+                return httpx.Response(201, json=[])
+            item = {**server(), "labels": json.loads(request.content)["labels"]}
+            item[failure] = None
+            return reply({"server": item}, 201)
+        if request.url.path == "/v1/servers":
+            return reply(envelope("servers", []))
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
+        if request.url.path == "/v1/server_types":
+            return reply(envelope("server_types", [server_type()]))
+        if request.url.path == "/v1/locations":
+            return reply(envelope("locations", [{"id": 1, "name": "fsn1"}]))
+        if request.url.path == "/v1/images":
+            return reply(envelope("images", [image()]))
+        raise AssertionError(request.url)
+
+    provider = adapter(handle)
+    try:
+        with pytest.raises(ProviderOutcomeUnknown):
+            await provider.create_instance(
+                instance_type="cx22",
+                image_id="100",
+                region="fsn1",
+                reference="srv-123",
+                root_disk_size_gb=40,
+                root_disk_storage_type="local",
+                idempotency_key=IdempotencyKey("unknown-response"),
+            )
+        assert posts == ["POST"]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+async def test_create_ambiguous_http_status_sends_once(status: int) -> None:
+    posts = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+            return reply({"error": {"code": "service_error"}}, status)
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
+        if request.url.path == "/v1/server_types":
+            return reply(envelope("server_types", [server_type()]))
+        if request.url.path == "/v1/images":
+            return reply(envelope("images", [image()]))
+        if request.url.path == "/v1/locations":
+            return reply(envelope("locations", [{"id": 1, "name": "fsn1"}]))
+        raise AssertionError(request.url)
+
+    provider = adapter(handle)
+    try:
+        with pytest.raises(ProviderOutcomeUnknown):
+            await provider.create_instance(
+                instance_type="cx22",
+                image_id="100",
+                region="fsn1",
+                reference="srv-123",
+                root_disk_size_gb=40,
+                root_disk_storage_type="LOCAL",
+                idempotency_key=IdempotencyKey("hourly:ambiguous"),
+            )
+        assert len(posts) == 1
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["matched", "duplicate", "foreign", "partial"])
+async def test_exact_operation_recovery_is_read_only_and_fail_closed(mode: str) -> None:
+    key = "server-create:12345678-1234-1234-1234-123456789abc"
+    label = operation_label(key)
+    assert len(label) == 63
+    assert label.startswith("op-")
+    assert all(char in "0123456789abcdef" for char in label[3:])
+    assert label != operation_label(key + "-different")
+    calls = []
+    item = {
+        **server(),
+        "labels": {"platform-operation": label, "platform_server_id": "platform-123"},
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        assert request.method == "GET"
+        if request.url.path == "/v1/servers/54321":
+            return reply({"server": item})
+        assert request.url.path == "/v1/servers"
+        if mode == "partial":
+            return reply({"servers": [item], "meta": {}})
+        rows = [item]
+        if mode == "duplicate":
+            rows.append({**item, "id": 54322})
+        if mode == "foreign":
+            rows = [{**item, "labels": {**item["labels"], "platform_server_id": "other"}}]
+        return reply(envelope("servers", rows))
+
+    provider = adapter(handle)
+    try:
+        if mode == "matched":
+            found = await provider.find_by_operation(key, platform_server_id="platform-123")
+            assert found.id == "54321"
+            assert calls == [("GET", "/v1/servers"), ("GET", "/v1/servers/54321")]
+        else:
+            error = ProviderUnavailable if mode == "partial" else ProviderConflict
+            with pytest.raises(error):
+                await provider.find_by_operation(key, platform_server_id="platform-123")
+            assert calls == [("GET", "/v1/servers")]
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label_key", ["platform-operation", "platform_server_id"])
+async def test_mismatched_acceptance_label_is_unknown(label_key: str) -> None:
+    posts = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            body = json.loads(request.content)
+            posts.append(body)
+            labels = {**body["labels"], label_key: "foreign"}
+            return reply({"server": {**server(), "labels": labels}}, 201)
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "EUR"}})
+        if request.url.path == "/v1/server_types":
+            return reply(envelope("server_types", [server_type()]))
+        if request.url.path == "/v1/images":
+            return reply(envelope("images", [image()]))
+        if request.url.path == "/v1/locations":
+            return reply(envelope("locations", [{"id": 1, "name": "fsn1"}]))
+        raise AssertionError(request.url)
+
+    provider = adapter(handle)
+    try:
+        with pytest.raises(ProviderOutcomeUnknown):
+            await provider.create_instance(
+                instance_type="cx22",
+                image_id="100",
+                region="fsn1",
+                reference="srv-123",
+                root_disk_size_gb=40,
+                root_disk_storage_type="LOCAL",
+                idempotency_key=IdempotencyKey("hourly:labels"),
+                platform_server_id="platform-123",
+            )
+        assert len(posts) == 1
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_currency_mismatch_refuses_before_any_billable_post() -> None:
+    paths: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        assert request.method == "GET"
+        if request.url.path == "/v1/pricing":
+            return reply({"pricing": {"currency": "USD"}})
+        if request.url.path == "/v1/server_types":
+            return reply(envelope("server_types", [server_type()]))
+        if request.url.path == "/v1/locations":
+            return reply(envelope("locations", [{"name": "fsn1"}]))
+        if request.url.path == "/v1/images":
+            return reply(envelope("images", [image()]))
+        raise AssertionError(request.url)
+
+    provider = adapter(handle)
+    try:
+        with pytest.raises(ProviderConflict):
+            await provider.validate_hourly_offer_for_checkout(
+                location_id="fsn1",
+                product_id="cx22",
+                image_id="100",
+                currency="EUR",
+                expected_cost_minor=1,
+                expected_cost_exact="0.0075",
+            )
+        assert paths == ["/v1/pricing"]
+        facts = await provider.validate_hourly_offer_for_checkout(
+            location_id="fsn1",
+            product_id="cx22",
+            image_id="100",
+            currency="USD",
+            expected_cost_minor=1,
+            expected_cost_exact="0.0075",
+        )
+        assert facts.instance_type.currency == "USD"
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{}, {"pricing": {}}, {"pricing": {"currency": "ZZZ"}}])
+async def test_checkout_missing_currency_fails_before_mutation(payload: dict) -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET"
+        assert request.url.path == "/v1/pricing"
+        return reply(payload)
+
+    provider = adapter(handle)
+    try:
+        with pytest.raises(ProviderUnavailable):
+            await provider.validate_hourly_offer_for_checkout(
+                location_id="fsn1",
+                product_id="cx22",
+                image_id="100",
+                currency="EUR",
+                expected_cost_minor=1,
+                expected_cost_exact="0.0075",
+            )
+        assert len(requests) == 1
     finally:
         await provider.close()

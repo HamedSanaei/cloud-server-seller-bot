@@ -120,7 +120,7 @@ class FakeServerRepo:
 
 
 class FakeProvider:
-    key = "hetzner"
+    key = "deduplicating"
     capabilities = frozenset({Capability.COMPUTE})
 
     def __init__(self, images: list[ProviderImage] | None = None) -> None:
@@ -162,7 +162,7 @@ def _server(
     return CloudServer(
         id=server_id,
         user_id=USER_ID,
-        provider_key="hetzner",
+        provider_key="deduplicating",
         provider_account_id=uuid4(),
         state=state,
         idempotency_key=idempotency_key,
@@ -198,6 +198,7 @@ class _Deps:
             wallet_repo=self.wallets,  # type: ignore[arg-type]
             hold_repo=self.holds,  # type: ignore[arg-type]
             audit_repo=self.audit,  # type: ignore[arg-type]
+            prepay_server=AsyncMock(),
         )
 
     def audit_events(self) -> list:
@@ -209,7 +210,7 @@ class _Deps:
             operation_type=OperationType.SERVER_CREATE,
             resource_type="server",
             resource_id=SERVER_ID,
-            provider_key="hetzner",
+            provider_key="deduplicating",
         )
 
 

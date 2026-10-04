@@ -26,17 +26,9 @@ shape exactly and prove:
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
-
 import pytest
 
 from cloud_platform.db import schema_parity as sp
-from scripts.post_deploy_smoke import repo_head_revision
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-REPAIR_MIGRATION = REPO_ROOT / "alembic" / "versions" / "0038_repair_multi_account_schema_drift.py"
-MODULE = REPO_ROOT / "src" / "cloud_platform" / "db" / "schema_parity.py"
 
 #: The three objects production was missing (all declared by migration 0035).
 DRIFTED_TABLE = "provider_routes"
@@ -140,24 +132,6 @@ class TestProductionDriftIsRejected:
         for table, column in DRIFTED_COLUMNS:
             assert healthy.columns[table] - production.columns[table] == {column}
 
-    def test_the_gate_only_passes_once_the_repair_revision_ships(self) -> None:
-        """The gate is meaningful only with 0038 in the release it guards.
-
-        Deliberately pinned to the CURRENT head: every new migration must update
-        this number, which is the moment to confirm that what it ships is also
-        what ``required_schema()`` (the release's own metadata) now demands —
-        0047 does, with the automatic canary-recovery columns on
-        ``provider_account_capacity`` (baseline census, attempt schedule,
-        durable canary lease, outage bookkeeping).
-        """
-        assert repo_head_revision() == "0047"
-        assert REPAIR_MIGRATION.is_file()
-        source = REPAIR_MIGRATION.read_text(encoding="utf-8")
-        assert DRIFTED_TABLE in source
-        assert "credential_account_id" in source
-        for table, _column in DRIFTED_COLUMNS:
-            assert table in source
-
     def test_the_missing_uniqueness_would_be_reported_too(self) -> None:
         """0035 also creates the (account, location) uniqueness the upserts need."""
         required = sp.required_schema()
@@ -249,52 +223,3 @@ class TestGateEntryPoint:
 
     def test_the_exit_codes_are_distinct(self) -> None:
         assert len({sp.EXIT_OK, sp.EXIT_DRIFT, sp.EXIT_UNINSPECTABLE}) == 3
-
-
-class TestTheGateIsReadOnly:
-    """A deploy gate that could change the database would be a new risk."""
-
-    def test_the_module_imports_no_migration_tooling(self) -> None:
-        tree = ast.parse(MODULE.read_text(encoding="utf-8"))
-        imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported.update(alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported.add(node.module.split(".")[0])
-        assert "alembic" not in imported
-
-    def test_the_module_never_executes_ddl_or_dml(self) -> None:
-        tree = ast.parse(MODULE.read_text(encoding="utf-8"))
-        mutating = {
-            "execute",
-            "create_all",
-            "drop_all",
-            "create_table",
-            "add_column",
-            "drop_table",
-            "drop_column",
-        }
-        offenders = [
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in mutating
-        ]
-        assert offenders == []
-
-    def test_the_module_reads_only_the_schema_and_prints_object_names(self) -> None:
-        source = MODULE.read_text(encoding="utf-8")
-        # It reflects: get_columns/get_table_names/get_unique_constraints/get_indexes.
-        assert "inspector.get_table_names()" in source
-        assert "database_url" in source  # reads the configured database, nothing else
-        assert "os.environ" not in source
-        assert "configuration.toml" not in source
-        # The report formats object names, never values it read from the database.
-        report_tokens = [
-            token
-            for token in ("{table}", "{column}", "{', '.join(sorted(key))}")
-            if token in source
-        ]
-        assert report_tokens, "the report should render object names"

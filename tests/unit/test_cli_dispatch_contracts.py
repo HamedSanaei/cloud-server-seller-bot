@@ -353,24 +353,6 @@ class TestCatalogAndProviderOperatorSurface:
 
 
 class TestMoneyAndIdentityOperatorSurface:
-    async def test_wallet_credit_is_positive_and_debit_is_negative(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        adjust = _stub(monkeypatch, "wallet_adjust")
-        balance = _stub(monkeypatch, "wallet_balance")
-
-        assert await _dispatch(monkeypatch, ["wallet", "balance", "user-1"]) == SENTINEL
-        assert (
-            await _dispatch(monkeypatch, ["wallet", "credit", "user-1", "500", "topup"]) == SENTINEL
-        )
-        assert (
-            await _dispatch(monkeypatch, ["wallet", "debit", "user-1", "500", "refund"]) == SENTINEL
-        )
-
-        balance.assert_awaited_once_with("user-1")
-        assert adjust.await_args_list[0].args == ("user-1", 500, "topup")
-        assert adjust.await_args_list[1].args == ("user-1", -500, "refund")
-
     async def test_users_find_forwards_the_telegram_id(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

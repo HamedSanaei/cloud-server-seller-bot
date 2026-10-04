@@ -178,16 +178,15 @@ class TestServiceStateMachine:
         assert fakes.saved == []  # watermark unchanged
         assert s.state is ServerLifecycleState.RUNNING
 
-    async def test_grace_exhausted_requests_deletion(self) -> None:
+    async def test_expired_advisory_grace_cannot_delete_service(self) -> None:
         s = _server(low_balance_since=T0)
         fakes = Fakes([s], {USER_ID: 400})
         report = await _service(fakes).evaluate(CONFIG, now=T0 + timedelta(hours=25))
-
-        assert report.auto_delete == 1
-        assert s.state is ServerLifecycleState.DELETE_REQUESTED  # the saga takes over
-        assert fakes.notified == [(USER_ID, SERVER_ID, LowBalanceDecision.AUTO_DELETE, 400)]
-        assert fakes.episodes == [T0]  # the existing watermark identifies the episode
-        assert len(fakes.saved) == 1
+        assert report.auto_delete == 0
+        assert report.grace == 1
+        assert s.state is ServerLifecycleState.RUNNING
+        assert fakes.notified == []
+        assert fakes.saved == []
 
     async def test_recovery_clears_watermark(self) -> None:
         s = _server(low_balance_since=T0)
@@ -235,9 +234,9 @@ class TestServiceStateMachine:
         assert report.servers_checked == 4
         assert report.none == 1
         assert report.warn == 1
-        assert report.grace == 1
-        assert report.auto_delete == 1
-        assert expired.state is ServerLifecycleState.DELETE_REQUESTED
+        assert report.grace == 2
+        assert report.auto_delete == 0
+        assert expired.state is ServerLifecycleState.RUNNING
         assert warning.state is ServerLifecycleState.RUNNING
         assert in_grace.state is ServerLifecycleState.RUNNING
 

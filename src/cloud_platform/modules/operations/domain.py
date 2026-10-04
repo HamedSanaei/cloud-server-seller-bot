@@ -135,8 +135,16 @@ class Operation:
 
     def complete(self, correlation: dict[str, object]) -> None:
         """Record the provider correlation (IN_FLIGHT -> COMPLETED)."""
+        existing = self.provider_response or {}
+        if "create_routing" in existing and (
+            "create_routing" in correlation
+            and correlation["create_routing"] != existing["create_routing"]
+        ):
+            raise ValueError("completion cannot replace durable create routing proof")
         self._transition_to(OperationStatus.COMPLETED)
         self.provider_response = dict(correlation)
+        if "create_routing" in existing:
+            self.provider_response["create_routing"] = existing["create_routing"]
         self.error = None
 
     def fail(self, error: str) -> None:

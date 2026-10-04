@@ -15,10 +15,10 @@ state can be reconciled to wallet deposits safely:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 
@@ -89,6 +89,7 @@ class PaymentSession:
     fx_proxy_asset: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    payment_details: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.amount_minor <= 0:
@@ -117,6 +118,22 @@ class PaymentSession:
     def effective_credit_currency(self) -> str:
         """Wallet credit currency (frozen; legacy sessions read settlement)."""
         return self.credit_currency if self.credit_currency is not None else self.currency
+
+    def with_payment_intent(
+        self, gateway_payment_id: str, amount_minor: int, details: dict[str, Any]
+    ) -> PaymentSession:
+        """Bind authoritative invoice total and safe metadata without changing credit/FX."""
+        self._require_pending()
+        if self.gateway_payment_id is not None:
+            raise InvalidPaymentSessionTransition("payment invoice is already bound")
+        if not gateway_payment_id:
+            raise ValueError("gateway payment id is required")
+        return replace(
+            self,
+            gateway_payment_id=gateway_payment_id,
+            amount_minor=amount_minor,
+            payment_details=dict(details),
+        )
 
     def _require_pending(self) -> None:
         if self.status is not PaymentSessionStatus.PENDING:
@@ -159,6 +176,7 @@ class PaymentSession:
             fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
+            payment_details=self.payment_details,
         )
 
     def mark_succeeded(self, *, gateway_payment_id: str) -> PaymentSession:
@@ -184,6 +202,7 @@ class PaymentSession:
             fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
+            payment_details=self.payment_details,
         )
 
     def mark_failed(self, *, gateway_payment_id: str) -> PaymentSession:
@@ -209,6 +228,7 @@ class PaymentSession:
             fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
+            payment_details=self.payment_details,
         )
 
     def mark_credited(self, *, at: datetime) -> PaymentSession:
@@ -238,6 +258,7 @@ class PaymentSession:
             fx_proxy_asset=self.fx_proxy_asset,
             created_at=self.created_at,
             updated_at=self.updated_at,
+            payment_details=self.payment_details,
         )
 
 

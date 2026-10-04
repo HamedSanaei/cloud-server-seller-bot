@@ -101,3 +101,52 @@ class TestUniquenessContract:
         """The DB unique constraint on (gateway_key, gateway_payment_id)
         maps to DuplicateExternalIdError in the repository layer."""
         assert issubclass(DuplicateExternalIdError, Exception)
+
+
+class TestProviderInvoiceBinding:
+    def test_binds_total_without_mutating_original_or_credit_snapshot(self) -> None:
+        original = PaymentSession(
+            user_id=uuid4(),
+            gateway_key="atlaspay",
+            amount_minor=250000,
+            currency="IRT",
+            idempotency_key="atlas-domain-snapshot",
+            credit_amount_minor=250,
+            credit_currency="EUR",
+            fx_source="fixture",
+            fx_rate="100000",
+            fx_path="EUR->IRT",
+        )
+        tracking_code = "5c23c12c9fa0c8b3"  # pragma: allowlist secret -- public fixture
+        metadata = {
+            "payment_url": "https://t.me/atlaspaybot/pay?startapp=real",
+            "tracking_code": tracking_code,
+        }
+        bound = original.with_payment_intent("66", 259739, metadata)
+        assert original.gateway_payment_id is None
+        assert original.amount_minor == 250000
+        assert original.payment_details is None
+        assert bound.amount_minor == 259739
+        assert bound.credit_amount_minor == 250
+        assert bound.credit_currency == "EUR"
+        assert bound.fx_rate == "100000"
+        assert bound.payment_details == metadata
+        metadata["tracking_code"] = "changed-at-caller"
+        assert bound.payment_details["tracking_code"] == tracking_code
+
+    def test_customer_metadata_survives_each_terminal_transition(self) -> None:
+        original = PaymentSession(
+            user_id=uuid4(),
+            gateway_key="atlaspay",
+            amount_minor=250000,
+            currency="IRT",
+            idempotency_key="atlas-domain-metadata",
+        )
+        bound = original.with_payment_intent("66", 259739, {"tracking_code": "random-safe-code"})
+        succeeded = bound.mark_succeeded(gateway_payment_id="66")
+        credited = succeeded.mark_credited(at=datetime(2026, 8, 22, tzinfo=UTC))
+        assert credited.payment_details == bound.payment_details
+        another = original.with_payment_intent("67", 259739, {"tracking_code": "other-safe-code"})
+        assert (
+            another.mark_failed(gateway_payment_id="67").payment_details == another.payment_details
+        )

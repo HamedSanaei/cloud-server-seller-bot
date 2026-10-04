@@ -226,6 +226,30 @@ display_name = "Hetzner"
 api_token = "CHANGE_ME"
 base_url = "https://api.hetzner.cloud/v1"
 
+# Optional multi-Project configuration; explicit accounts replace api_token.
+# Each ceiling is operator supplied, NOT an API-discovered account-wide quota.
+# Live GET /servers counts the token's Project, including off/manual servers.
+# Tokens for one Project (or Projects sharing an owning account quota) do not
+# prove independent capacity. Retain an explicit accounts.default using the
+# original token when existing NULL/default resources must stay manageable.
+# [[providers.hetzner.accounts]]
+# id = "hz-main"
+# api_token = "CHANGE_ME"
+# enabled = true
+# priority = 10
+# state = "active"
+# label = "Primary Project"
+# server_limit = 5 # illustrative only; use the ceiling confirmed for this Project
+
+# [[providers.hetzner.accounts]]
+# id = "hz-next"
+# api_token = "CHANGE_ME"
+# enabled = true
+# priority = 20
+# state = "draining" # use active to receive new purchases; management stays pinned
+# label = "Secondary Project"
+# server_limit = 5 # omit when no Project ceiling has been confirmed
+
 # Hetzner monthly VPS and Cloud hourly share one provider but use separate
 # offer families. Keep disabled on a staging/production-shared config: enabling
 # here enables BOTH deployments. First isolate staging configuration and run
@@ -337,6 +361,15 @@ base_url = "https://api.tetraminator.com/v1"
 # Production MUST be https on the real public domain, e.g.
 #   https://your-domain.example/webhooks/payments/tetraminator
 callback_url = "https://example.com/webhooks/payments/tetraminator"
+timeout_seconds = 30
+
+[payments.atlaspay]
+# AtlasPay orders are integer Toman. The exact provider total (including its
+# unique suffix) is shown separately from the frozen wallet credit amount.
+# Pending orders settle by authenticated API polling; no public callback needed.
+enabled = false
+api_key = "CHANGE_ME"  # pragma: allowlist secret
+base_url = "https://api.atlaspay.space/api/v1"
 timeout_seconds = 30
 
 # ---------------------------------------------------------------------------

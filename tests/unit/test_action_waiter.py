@@ -349,6 +349,7 @@ def _worker_with_waiter(
         hold_repo=holds,  # type: ignore[arg-type]
         audit_repo=audit,  # type: ignore[arg-type]
         waiter=waiter,
+        prepay_server=AsyncMock(),
     )
     return op_repo, server_repo, provider, worker, audit
 

@@ -259,7 +259,13 @@ class Fakes:
         @dataclass
         class _ServerRepo:
             async def list_running(self):
-                return list(h.servers)
+                return [s for s in h.servers if s.state is ServerLifecycleState.RUNNING]
+
+            async def list_stopped(self):
+                return [s for s in h.servers if s.state is ServerLifecycleState.STOPPED]
+
+            async def list_provisioning(self):
+                return [s for s in h.servers if s.state is ServerLifecycleState.PROVISIONING]
 
             async def save(self, server):
                 return await h.save(server)
@@ -460,6 +466,8 @@ def _running_server(**kw: object) -> CloudServer:
         state=ServerLifecycleState.RUNNING,
         idempotency_key=IK,
         created_at=T0,
+        billing_started_at=T0,
+        provider_server_id="provider-1",
         quantum_seconds=QUANTUM,
     )
     defaults.update(kw)
@@ -479,11 +487,11 @@ def _hold(key: str, status: HoldStatus = HoldStatus.CREATED) -> Hold:
 
 class TestAccrualCap:
     async def test_cap_settles_excess_periods_as_capped(self) -> None:
-        # cap = 2 quanta per month; 5 complete periods are due
+        # cap = 2 quanta per month; five prepaid periods are due
         server = _running_server()
         fakes = Fakes(servers=[server], snapshot=_snapshot(cap=2 * SELLING))
 
-        report = await fakes.make_job().run(now=T0 + timedelta(hours=5))
+        report = await fakes.make_job().run(now=T0 + timedelta(hours=4))
 
         assert report.periods_posted == 2
         assert report.capped_periods == 3  # the 3rd-5th quanta of the month
@@ -500,10 +508,10 @@ class TestAccrualCap:
     async def test_cap_is_per_usage_month(self) -> None:
         # created at Aug 31 23:00; three periods, all ending in September
         created = datetime(2026, 8, 31, 23, 0, tzinfo=UTC)
-        server = _running_server(created_at=created)
+        server = _running_server(created_at=created, billing_started_at=created)
         fakes = Fakes(servers=[server], snapshot=_snapshot(cap=3 * SELLING))
 
-        report = await fakes.make_job().run(now=datetime(2026, 9, 1, 2, 0, tzinfo=UTC))
+        report = await fakes.make_job().run(now=datetime(2026, 9, 1, 1, 0, tzinfo=UTC))
 
         assert report.periods_posted == 3  # fresh month, fresh cap
         assert report.capped_periods == 0
@@ -514,7 +522,7 @@ class TestAccrualCap:
         server = _running_server()
         fakes = Fakes(servers=[server], snapshot=_snapshot(cap=2 * SELLING))
 
-        report = await fakes.make_job().run(now=T0 + timedelta(hours=2))
+        report = await fakes.make_job().run(now=T0 + timedelta(hours=1))
 
         assert report.periods_posted == 2
         assert report.capped_periods == 0
@@ -524,7 +532,7 @@ class TestAccrualCap:
         server = _running_server()
         fakes = Fakes(servers=[server], snapshot=_snapshot(cap=1 * SELLING))
 
-        await fakes.make_job().run(now=T0 + timedelta(hours=3))
+        await fakes.make_job().run(now=T0 + timedelta(hours=2))
 
         cap_events = [
             c.args[0]
@@ -539,112 +547,34 @@ class TestAccrualCap:
         assert first.metadata["month_start"] == "2026-08-01T00:00:00+00:00"
 
 
-class TestFinalChargeCap:
-    def _seeded_month(self, fakes: Fakes, deleted: datetime) -> None:
-        """A period already billed this month (so the month has used cap room).
-
-        The month cap counts SETTLED money in the canonical selling currency
-        for the same pricing rule, so the seeded row carries the selling
-        currency and the rule key production writes
-        (``provider|plan|location`` of the snapshot's margin rule).
-        """
-        row = AccrualPeriod(
-            server_id=uuid4(),
-            wallet_id=WALLET_ID,
-            period_start=deleted - timedelta(hours=2),
-            period_end=deleted - timedelta(hours=1),
-            selling_minor=SELLING,
-            cost_minor=COST,
-            currency="USD",
-            cost_currency="EUR",
-            selling_currency="USD",
-            cost_amount=Decimal("7.00"),
-            rule_key="hetzner|cx22|fsn1",
-            idempotency_key="seed-1",
-        )
-        fakes.rows.append(row)
-        fakes.rows_by_key[row.idempotency_key] = row
-
-    async def test_capped_final_releases_the_hold(self) -> None:
-        deleted = T0 + timedelta(minutes=30)
+class TestPrepaymentCap:
+    async def test_zero_cap_releases_first_hour_reservation(self) -> None:
+        server = _running_server()
         fakes = Fakes(
-            wallet=Wallet(USER_ID, id=WALLET_ID, balance=100_000),
-            holds={HOLD_KEY: _hold(HOLD_KEY)},
-            snapshot=_snapshot(cap=SELLING),
+            servers=[server], holds={HOLD_KEY: _hold(HOLD_KEY)}, snapshot=_snapshot(cap=0)
         )
-        self._seeded_month(fakes, deleted)  # month already used its one quantum of cap
-        server = _running_server(state=ServerLifecycleState.DELETED)
-
-        result = await fakes.make_final_service().charge_final(server, deleted)
-
-        # nothing may be charged: the cap protects the user
-        assert result.charged_minor == 0
-        assert result.capped is True
-        assert result.captured_hold is False
-        assert fakes.debit_calls == []
+        report = await fakes.make_job().run(now=T0)
+        assert report.capped_periods == 1
+        assert report.charged_minor == 0
         assert fakes.wallet.balance == 100_000
-        # the reserved creation hold is released, not stranded
-        assert fakes.released == [HOLD_KEY]
         assert fakes.holds[HOLD_KEY].status is HoldStatus.RELEASED
-        assert f"release-{HOLD_KEY}" in fakes.entries
-        # the audit trail explains the (single) skipped leg and the final charge:
-        # a 30-minute window covers only the reserved first quantum, so the cap
-        # blocks the capture leg and no flat remainder leg exists at all.
-        cap_audits = [
-            c.args[0]
-            for c in fakes.audit.append.call_args_list
-            if c.args[0].action == "billing.cap_reached"
-        ]
-        assert len(cap_audits) == 1
-        assert "capture leg" in cap_audits[0].reason
-        final = next(
-            c.args[0]
-            for c in fakes.audit.append.call_args_list
-            if c.args[0].action == "billing.final_charge"
-        )
-        assert final.metadata["capped"] == "true"
+        assert server.last_accrued_at == T0 + timedelta(hours=1)
+        again = await fakes.make_job().run(now=T0 + timedelta(minutes=30))
+        assert again.capped_periods == 0
 
-    async def test_final_within_cap_charges_normally(self) -> None:
-        deleted = T0 + timedelta(minutes=90)
+    async def test_final_repair_cannot_charge_beyond_month_cap(self) -> None:
+        server = _running_server()
         fakes = Fakes(
-            holds={HOLD_KEY: _hold(HOLD_KEY)},
-            snapshot=_snapshot(cap=2 * SELLING),
+            servers=[server], holds={HOLD_KEY: _hold(HOLD_KEY)}, snapshot=_snapshot(cap=SELLING)
         )
-        server = _running_server(state=ServerLifecycleState.DELETED)
-
-        result = await fakes.make_final_service().charge_final(server, deleted)
-
-        # 1 captured quantum + 1 flat quantum == exactly the cap
-        assert result.charged_minor == 2 * SELLING
-        assert result.captured_hold is True
-        assert result.capped is False
-        assert fakes.wallet.balance == 100_000 - 2 * SELLING
-
-    async def test_final_flat_leg_capped(self) -> None:
-        deleted = T0 + timedelta(minutes=30)
-        fakes = Fakes(
-            snapshot=_snapshot(cap=SELLING),
-        )
-        self._seeded_month(fakes, deleted)  # no hold: the flat leg must be capped
-        server = _running_server(state=ServerLifecycleState.DELETED)
-
-        result = await fakes.make_final_service().charge_final(server, deleted)
-
-        assert result.charged_minor == 0
-        assert result.capped is True
-        assert fakes.debit_calls == []
-        assert FINAL_KEY not in fakes.entries
-
-    async def test_no_cap_behaves_unchanged(self) -> None:
-        deleted = T0 + timedelta(minutes=30)
-        fakes = Fakes(
-            holds={HOLD_KEY: _hold(HOLD_KEY)},
-            snapshot=_snapshot(cap=None),
-        )
-        server = _running_server(state=ServerLifecycleState.DELETED)
-
-        result = await fakes.make_final_service().charge_final(server, deleted)
-
-        assert result.charged_minor == SELLING
-        assert result.captured_hold is True
-        assert result.capped is False
+        await fakes.make_job().run(now=T0)
+        balance = fakes.wallet.balance
+        server.state = ServerLifecycleState.DELETED
+        for _ in range(2):
+            result = await fakes.make_final_service().charge_final(
+                server, T0 + timedelta(minutes=30)
+            )
+            assert result.charged_minor == 0
+        assert fakes.wallet.balance == balance
+        assert len(fakes.rows) == 1
+        assert fakes.rows[0].idempotency_key == CAPTURE_KEY

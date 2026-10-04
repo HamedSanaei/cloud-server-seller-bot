@@ -20,7 +20,7 @@ provider-neutral path; the older ``offers`` flow is kept for compatibility:
 - ``store.plans:{provider}:{location}`` — plans at that location
 - ``store.os:{offer_id}`` — OS options (live, server-side filtered)
 - ``store.confirm:{offer_id}:{os_index}`` — exact price + wallet balance
-- ``store.buy:{offer_id}:{os_index}`` — terminal: idempotent checkout
+- ``store.buy:{nonce}`` — owner-bound exact-selection checkout
 - ``recharge.amounts`` — top-up amount selector
 - ``recharge.start:{amount_minor}`` — create the pending gateway session
 - ``servers.list:{page}`` — My Servers; every further screen lives in
@@ -43,6 +43,7 @@ list is built from configuration, so no handler contains a provider name.
 from __future__ import annotations
 
 import logging
+import secrets
 from datetime import datetime
 from typing import Any, ClassVar, Protocol
 from uuid import UUID
@@ -54,12 +55,15 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from cloud_platform.bot.payments_ui import render_payment_status
 from cloud_platform.bot.servers_ui import ServerManagementUi
-from cloud_platform.bot.sessions import ServerSessions
+from cloud_platform.bot.sessions import CheckoutSelection, CheckoutSessions, ServerSessions
 from cloud_platform.bot.ui import BotScreen
 from cloud_platform.core.i18n import Translator
+from cloud_platform.core.session_store import InMemoryBotSessionStore
 from cloud_platform.modules.checkout.service import (
     CheckoutError,
+    CheckoutProviderUnavailableError,
     MarketOptionView,
     MonthlyCheckoutResult,
     MonthlyCheckoutService,
@@ -68,12 +72,14 @@ from cloud_platform.modules.checkout.service import (
     OfferUnavailableError,
     OsTemporarilyUnavailableError,
     OsUnavailableError,
+    ProviderAccountCapacityError,
     UserNotActiveError,
 )
 from cloud_platform.modules.compute.domain import ServerLifecycleState, ServerRepository
 from cloud_platform.modules.hourly.service import (
     HourlyAccountCapacityError,
     HourlyNotAvailableError,
+    HourlyPoolCapacityError,
     HourlyProviderUnavailableError,
     HourlyRequestFailedError,
 )
@@ -83,10 +89,12 @@ from cloud_platform.modules.navigation.domain import (
     decode_callback,
     encode_callback,
     encode_offer_ref,
+    encode_telegram_callback,
     resolve_offer_id_arg,
 )
 from cloud_platform.modules.offers.domain import (
     BILLING_MODEL_HOURLY,
+    BILLING_MODEL_MONTHLY,
     HOURLY_MONTHLY_ESTIMATE_HOURS,
     SellableOfferRepository,
     TechnicalSpec,
@@ -104,7 +112,7 @@ from cloud_platform.modules.payments.recharge import (
 )
 from cloud_platform.modules.renewals.domain import RenewalRepository
 from cloud_platform.modules.servers.service import ServerManagementService
-from cloud_platform.modules.users.domain import User
+from cloud_platform.modules.users.domain import Role, User
 from cloud_platform.modules.wallet.domain import InsufficientHoldBalanceError, LedgerEntryType
 from cloud_platform.modules.wallet.service import WalletBalanceView, WalletHistoryService
 
@@ -132,22 +140,17 @@ def recharge_presets(currency: str) -> tuple[int, ...]:
     return RECHARGE_PRESETS_MINOR
 
 
-def build_main_reply_keyboard(t: Translator) -> ReplyKeyboardMarkup:
-    """Build the persistent bottom reply keyboard menu."""
+def build_main_reply_keyboard(t: Translator, user: User | None = None) -> ReplyKeyboardMarkup:
+    """Persistent menu; administrators manage customers instead of topping up."""
+    admin = user is not None and user.role == Role.ADMIN
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text=t.t("menu.buy")),
-                KeyboardButton(text=t.t("menu.servers")),
-            ],
+            [KeyboardButton(text=t.t("menu.buy")), KeyboardButton(text=t.t("menu.servers"))],
             [
                 KeyboardButton(text=t.t("menu.wallet")),
-                KeyboardButton(text=t.t("menu.recharge")),
+                KeyboardButton(text=t.t("menu.admin" if admin else "menu.recharge")),
             ],
-            [
-                KeyboardButton(text=t.t("menu.support")),
-                KeyboardButton(text=t.t("nav.menu")),
-            ],
+            [KeyboardButton(text=t.t("menu.support")), KeyboardButton(text=t.t("nav.menu"))],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -224,6 +227,8 @@ class MonthlyBotUi:
         fx_resolver: object | None = None,
         fx_display_currency: str = "IRT",
         hourly: Any | None = None,
+        checkout_sessions: CheckoutSessions | None = None,
+        payment_inquiry: Any | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
@@ -231,6 +236,11 @@ class MonthlyBotUi:
         self._view = offers_view
         self._checkout = checkout
         self._hourly = hourly
+        self._checkout_sessions = (
+            checkout_sessions
+            if checkout_sessions is not None
+            else CheckoutSessions(InMemoryBotSessionStore())
+        )
         self._servers = servers
         self._orders = orders
         self._renewals = renewals
@@ -239,6 +249,7 @@ class MonthlyBotUi:
         self._power = power
         self._support_contact = support_contact
         self._recharge = recharge
+        self._payment_inquiry = payment_inquiry
         self._t = translator or Translator()
         # Platform FX resolver for DISPLAY conversions (catalog equivalents,
         # never a repricing: the DB selling price is authoritative and is
@@ -298,7 +309,7 @@ class MonthlyBotUi:
 
     # -- main menu ---------------------------------------------------------
 
-    def menu_screen(self) -> BotScreen:
+    def menu_screen(self, user: User | None = None) -> BotScreen:
         """The customer main menu; the first entry is the MARKET selector."""
         rows = [
             [
@@ -321,8 +332,12 @@ class MonthlyBotUi:
             ],
             [
                 InlineKeyboardButton(
-                    text=self._t.t("menu.recharge"),
-                    callback_data=self._callback("recharge", "amounts"),
+                    text=self._t.t(
+                        "menu.admin" if user and user.role == Role.ADMIN else "menu.recharge"
+                    ),
+                    callback_data=self._callback("admin", "menu")
+                    if user and user.role == Role.ADMIN
+                    else self._callback("recharge", "amounts"),
                 )
             ],
             [
@@ -334,9 +349,9 @@ class MonthlyBotUi:
         ]
         return BotScreen(self._t.t("menu.title"), InlineKeyboardMarkup(inline_keyboard=rows))
 
-    def reply_keyboard(self) -> ReplyKeyboardMarkup:
+    def reply_keyboard(self, user: User | None = None) -> ReplyKeyboardMarkup:
         """The persistent bottom ReplyKeyboardMarkup for the storefront."""
-        return build_main_reply_keyboard(self._t)
+        return build_main_reply_keyboard(self._t, user)
 
     async def servers_screen(self, user: User | None) -> BotScreen:
         """The entry screen for My Servers."""
@@ -1082,9 +1097,7 @@ class MonthlyBotUi:
         ]
         return BotScreen("\n".join(header), InlineKeyboardMarkup(inline_keyboard=rows))
 
-    async def store_cloud_buy_screen(
-        self, user: User | None, offer_ref: str, image_index: int, cb_key: str
-    ) -> BotScreen:
+    async def store_cloud_buy_screen(self, user: User | None, nonce: str) -> BotScreen:
         # Hourly creation intent (terminal action): no provider call and no
         # charge here — the worker POSTs once under the operation ledger and
         # accrual bills per quantum from the price snapshot.
@@ -1092,18 +1105,22 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
         if self._hourly is None:
             return BotScreen(self._t.t("offers.unavailable"), self._menu_only())
-        offer_id = self._resolve_offer_id(offer_ref)
-        if offer_id is None:
-            return self._expired_screen()
-        idempotency_key = f"bot-hourly:{cb_key}"
         try:
-            image = await self._resolve_cloud_image(offer_id, image_index)
+            selection = await self._checkout_sessions.resolve(user.id, nonce)
+        except Exception:
+            return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
+        if selection is None or selection.billing_model != BILLING_MODEL_HOURLY:
+            return self._expired_screen()
+        idempotency_key = f"bot-hourly:{nonce}"
+        try:
             result = await self._hourly.create_instance(
                 user=user,
-                offer_id=offer_id,
-                image_id=image.id,
-                image_label=image.label,
+                offer_id=selection.offer_id,
+                image_id=selection.image_id,
+                image_label=selection.image_label,
                 idempotency_key=idempotency_key,
+                expected_selling_price_minor=selection.selling_price_minor,
+                expected_selling_currency=selection.currency,
             )
         except HourlyRequestFailedError as exc:
             # The confirmation belongs to an intent that already ended in
@@ -1111,6 +1128,8 @@ class MonthlyBotUi:
             # both wrong and misleading: the same stale button would loop.
             logger.warning("hourly create rejected (previous request failed): %s", exc)
             return BotScreen(self._t.t("store.cloud_previous_failed"), self._menu_only())
+        except HourlyPoolCapacityError:
+            return BotScreen(self._t.t("store.provider_account_capacity"), self._menu_only())
         except HourlyAccountCapacityError as exc:
             # The provider ACCOUNT has no room for a new instance. The offer is
             # fine, so never say "this offer is unavailable"; tell the customer
@@ -1140,14 +1159,6 @@ class MonthlyBotUi:
             text += "\n" + self._t.t("offers.order_replayed")
         return BotScreen(text, self._menu_only())
 
-    async def _resolve_cloud_image(self, offer_id: UUID, image_index: int) -> Any:
-        from cloud_platform.modules.offers.domain import OfferNotFoundError, SellableOffer
-
-        offer: SellableOffer | None = await self._offers_repo.get(offer_id)
-        if offer is None:
-            raise OfferNotFoundError(f"offer {offer_id} not found")
-        return await self._view.cloud_image_by_index(offer, image_index)
-
     async def store_cloud_confirm_screen(
         self, user: User, offer_ref: str, image_index: int
     ) -> BotScreen:
@@ -1168,6 +1179,20 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError:
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
+        try:
+            nonce = await self._checkout_sessions.remember(
+                CheckoutSelection(
+                    user_id=user.id,
+                    offer_id=offer_id,
+                    billing_model=BILLING_MODEL_HOURLY,
+                    image_id=view.image_id,
+                    image_label=view.image_label,
+                    selling_price_minor=view.hourly_price_minor,
+                    currency=view.currency,
+                )
+            )
+        except Exception:
+            return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
         hourly = self._t.t(
             "store.price_per_hour",
             price=await self._price_label(view.hourly_price_minor, view.currency),
@@ -1206,7 +1231,9 @@ class MonthlyBotUi:
             [
                 InlineKeyboardButton(
                     text=self._t.t("store.cloud_confirm_create"),
-                    callback_data=view.confirm_callback,
+                    callback_data=encode_telegram_callback(
+                        Callback("store", "cloud_buy", (nonce,)), self._key
+                    ),
                 )
             ],
             [
@@ -1367,6 +1394,8 @@ class MonthlyBotUi:
         """recharge.amounts: preset top-up amounts for the wallet currency."""
         if user is None or user.id is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
+        if user.role == Role.ADMIN:
+            return BotScreen(self._t.t("recharge.admin_disabled"), self._menu_only())
         view: WalletBalanceView = await self._wallet.balance(user.id)
         if not view.has_wallet or not view.currency:
             return BotScreen(self._t.t("wallet.no_wallet"), self._menu_only())
@@ -1378,12 +1407,10 @@ class MonthlyBotUi:
         # FX-aware availability: a wallet whose currency needs conversion
         # (e.g. EUR -> Tetraminator IRT) is offered only when the resolver
         # can convert it; sync fast path first, async FX probe second.
-        available = self._recharge.supports_currency(view.currency)
-        if not available and hasattr(self._recharge, "supports_currency_async"):
-            try:
-                available = await self._recharge.supports_currency_async(view.currency)
-            except Exception:
-                available = False
+        try:
+            available = await self._recharge.supports_currency_async(view.currency)
+        except Exception:
+            available = False
         if not available:
             # No online top-up for this currency: say so and point at support
             # instead of offering a button that cannot work.
@@ -1406,7 +1433,9 @@ class MonthlyBotUi:
                         "recharge.amount_row",
                         amount=format_minor(amount, view.currency),
                     ),
-                    callback_data=self._callback("recharge", "start", str(amount)),
+                    callback_data=self._callback(
+                        "recharge", "go", str(amount), secrets.token_urlsafe(6)
+                    ),
                 )
             ]
             for amount in presets
@@ -1426,10 +1455,7 @@ class MonthlyBotUi:
         out: list[int] = []
         for amount in recharge_presets(currency):
             try:
-                if hasattr(self._recharge, "compatible_gateways_async"):
-                    compatible = await self._recharge.compatible_gateways_async(currency, amount)
-                else:
-                    compatible = self._recharge.compatible_gateways(currency, amount)
+                compatible = await self._recharge.compatible_gateways_async(currency, amount)
             except Exception:
                 continue
             if compatible:
@@ -1437,11 +1463,19 @@ class MonthlyBotUi:
         return tuple(out)
 
     async def recharge_start_screen(
-        self, user: User, amount_text: str, gateway_key: str | None = None
+        self,
+        user: User,
+        amount_text: str,
+        gateway_key: str | None = None,
+        *,
+        nonce: str | None = None,
     ) -> BotScreen:
         """recharge.start:{amount}[:{gateway}]: create the pending session, then pay."""
         if user.id is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
+        if user.role == Role.ADMIN:
+            return BotScreen(self._t.t("recharge.admin_disabled"), self._menu_only())
+        nonce = nonce or secrets.token_urlsafe(6)
         if self._recharge is None:
             return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
         try:
@@ -1451,16 +1485,13 @@ class MonthlyBotUi:
         view: WalletBalanceView = await self._wallet.balance(user.id)
         currency = view.currency or ""
         try:
-            if hasattr(self._recharge, "compatible_gateways_async"):
-                compatible = await self._recharge.compatible_gateways_async(currency, amount_minor)
-            else:
-                compatible = self._recharge.compatible_gateways(currency, amount_minor)
+            compatible = await self._recharge.compatible_gateways_async(currency, amount_minor)
         except Exception:
             return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
         if not compatible:
             return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
         if gateway_key is None and len(compatible) > 1:
-            return self.recharge_gateway_screen(amount_minor, currency, compatible)
+            return self.recharge_gateway_screen(amount_minor, currency, compatible, nonce=nonce)
         key = gateway_key or compatible[0]
         if key not in compatible:
             return BotScreen(self._t.t("recharge.unavailable"), self._menu_only())
@@ -1469,9 +1500,9 @@ class MonthlyBotUi:
                 user=user,
                 amount_minor=amount_minor,
                 currency=currency,
-                # Deterministic per (user, amount): a double tap replays the
-                # same session instead of creating a second one.
-                idempotency_key=f"bot-recharge:{user.id}:{amount_minor}",
+                # Stable for one rendered button; a new visit can charge the
+                # same amount again without reusing an old successful invoice.
+                idempotency_key=f"bot-recharge:{user.id}:{amount_minor}:{nonce}",
                 gateway_key=key,
             )
         except RechargeAmountError:
@@ -1488,10 +1519,33 @@ class MonthlyBotUi:
                 ),
             )
         ]
+        details = start.payment_details
+        if details is not None:
+            lines.append(
+                self._t.t(
+                    "recharge.invoice", amount=format_minor(details.amount_minor, details.currency)
+                )
+            )
+            if details.tracking_code:
+                lines.append(self._t.t("recharge.tracking", tracking=details.tracking_code))
+            if details.payment_deadline_at:
+                lines.append(self._t.t("recharge.deadline", deadline=details.payment_deadline_at))
+            lines.append(self._t.t("recharge.exact_warning"))
         rows: list[list[InlineKeyboardButton]] = []
         if start.redirect_url:
             rows.append(
                 [InlineKeyboardButton(text=self._t.t("menu.recharge"), url=start.redirect_url)]
+            )
+        if start.session.id is not None:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=self._t.t("payment.check"),
+                        callback_data=self._callback(
+                            "recharge", "check", encode_offer_ref(start.session.id)
+                        ),
+                    )
+                ]
             )
         rows.append([self._back_button("wallet", "balance"), self._menu_button()])
         return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
@@ -1504,7 +1558,7 @@ class MonthlyBotUi:
             return gateway_key
 
     def recharge_gateway_screen(
-        self, amount_minor: int, currency: str, gateway_keys: list[str]
+        self, amount_minor: int, currency: str, gateway_keys: list[str], *, nonce: str
     ) -> BotScreen:
         """recharge gateway picker: one button per compatible gateway."""
         del currency
@@ -1512,7 +1566,7 @@ class MonthlyBotUi:
             [
                 InlineKeyboardButton(
                     text=self._t.t("recharge.gateway_row", name=self.gateway_display_name(key)),
-                    callback_data=self._callback("recharge", "start", str(amount_minor), key),
+                    callback_data=self._callback("recharge", "go", str(amount_minor), nonce, key),
                 )
             ]
             for key in gateway_keys
@@ -1527,10 +1581,29 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
         if cb.screen == "amounts":
             return await self.recharge_screen(user)
-        if cb.screen == "start" and len(cb.args) == 1:
-            return await self.recharge_start_screen(user, cb.args[0])
-        if cb.screen == "start" and len(cb.args) == 2:
-            return await self.recharge_start_screen(user, cb.args[0], gateway_key=cb.args[1])
+        if cb.screen == "go" and len(cb.args) == 2:
+            return await self.recharge_start_screen(user, cb.args[0], nonce=cb.args[1])
+        if cb.screen == "go" and len(cb.args) == 3:
+            return await self.recharge_start_screen(
+                user, cb.args[0], gateway_key=cb.args[2], nonce=cb.args[1]
+            )
+        if cb.screen == "check" and len(cb.args) == 1 and self._payment_inquiry is not None:
+            session_id = self._resolve_offer_id(cb.args[0])
+            if session_id is None:
+                return self._expired_screen()
+            try:
+                session = await self._payment_inquiry.check_status(user, session_id)
+            except Exception:
+                return BotScreen(self._t.t("payment.still_pending"), self._menu_only())
+            screen = render_payment_status(
+                session,
+                amount_text=format_minor(
+                    session_credit_amount(session), session_credit_currency(session)
+                ),
+                check_callback=self._callback("recharge", "check", cb.args[0]),
+                translator=self._t,
+            )
+            return BotScreen(screen.text, screen.keyboard or self._menu_only())
         return self._menu_screen()
 
     # -- offers flow -------------------------------------------------------
@@ -1642,6 +1715,20 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except OsUnavailableError:
             return BotScreen(self._t.t("offers.os_unavailable"), self._menu_only())
+        try:
+            nonce = await self._checkout_sessions.remember(
+                CheckoutSelection(
+                    user_id=user.id,
+                    offer_id=offer_id,
+                    billing_model=BILLING_MODEL_MONTHLY,
+                    os_name=view.os_name,
+                    panel_name=view.panel_name,
+                    selling_price_minor=view.offer.monthly_price_minor,
+                    currency=view.currency,
+                )
+            )
+        except Exception:
+            return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
         lines = [
             self._t.t("offers.confirm_title"),
             self._t.t("offers.confirm_offer", name=view.offer.name),
@@ -1673,7 +1760,10 @@ class MonthlyBotUi:
         rows = [
             [
                 InlineKeyboardButton(
-                    text=self._t.t("offers.confirm_button"), callback_data=view.confirm_callback
+                    text=self._t.t("offers.confirm_button"),
+                    callback_data=encode_telegram_callback(
+                        Callback("store", "buy", (nonce,)), self._key
+                    ),
                 )
             ],
             [
@@ -1685,27 +1775,30 @@ class MonthlyBotUi:
         ]
         return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
-    async def buy_screen(
-        self,
-        user: User | None,
-        offer_id: UUID,
-        os_index: int,
-        panel_index: int | None,
-        cb_key: str,
-    ) -> BotScreen:
-        """offers.buy: the idempotent checkout command (terminal action)."""
+    async def buy_screen(self, user: User | None, nonce: str) -> BotScreen:
+        """Execute the owner-bound confirmed monthly contract, or replay it."""
         if user is None or user.id is None:
             return BotScreen(self._t.t("buy.no_identity"), self._menu_only())
-        # Deterministic per (signed) callback: a double tap replays the same
-        # order instead of double-charging or double-ordering.
-        idempotency_key = f"bot-monthly:{cb_key}"
+        try:
+            selection = await self._checkout_sessions.resolve(user.id, nonce)
+        except Exception:
+            return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
+        if (
+            selection is None
+            or selection.billing_model != BILLING_MODEL_MONTHLY
+            or not selection.os_name
+        ):
+            return self._expired_screen()
+        idempotency_key = f"bot-monthly:{nonce}"
         try:
             result = await self._checkout.create_order(
                 user=user,
-                offer_id=offer_id,
-                os_name=await self._resolve_os_name(offer_id, os_index),
+                offer_id=selection.offer_id,
+                os_name=selection.os_name,
                 idempotency_key=idempotency_key,
-                panel_name=await self._resolve_panel_name(offer_id, panel_index),
+                panel_name=selection.panel_name,
+                expected_selling_price_minor=selection.selling_price_minor,
+                expected_selling_currency=selection.currency,
             )
         except InsufficientHoldBalanceError as exc:
             return BotScreen(
@@ -1713,6 +1806,10 @@ class MonthlyBotUi:
             )
         except UserNotActiveError:
             return BotScreen(self._t.t("user.frozen"), self._menu_only())
+        except ProviderAccountCapacityError:
+            return BotScreen(self._t.t("store.provider_account_capacity"), self._menu_only())
+        except CheckoutProviderUnavailableError:
+            return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
         except OsTemporarilyUnavailableError:
             return BotScreen(self._t.t("offers.os_temporarily_unavailable"), self._menu_only())
         except (OfferUnavailableError, OsUnavailableError):
@@ -1721,24 +1818,6 @@ class MonthlyBotUi:
             logger.warning("monthly checkout rejected: %s", exc)
             return BotScreen(self._t.t("error.unknown"), self._menu_only())
         return self.order_screen(result)
-
-    async def _resolve_os_name(self, offer_id: UUID, os_index: int) -> str:
-        from cloud_platform.modules.offers.domain import OfferNotFoundError, SellableOffer
-
-        offer: SellableOffer | None = await self._offers_repo.get(offer_id)
-        if offer is None:
-            raise OfferNotFoundError(f"offer {offer_id} not found")
-        return await self._view.os_by_index(offer, os_index)
-
-    async def _resolve_panel_name(self, offer_id: UUID, panel_index: int | None) -> str | None:
-        from cloud_platform.modules.offers.domain import OfferNotFoundError, SellableOffer
-
-        if panel_index is None:
-            return None
-        offer: SellableOffer | None = await self._offers_repo.get(offer_id)
-        if offer is None:
-            raise OfferNotFoundError(f"offer {offer_id} not found")
-        return await self._view.panel_name_by_index(offer, panel_index)
 
     def order_screen(self, result: MonthlyCheckoutResult) -> BotScreen:
         text = self._t.t("offers.order_created", order_id=str(result.order.id)[:8])
@@ -1882,7 +1961,7 @@ class MonthlyBotUi:
             return None
 
         if cb.flow == "main":
-            return self.menu_screen()
+            return self.menu_screen(user)
         if cb.flow == "store":
             return await self._store(cb, user)
         if cb.flow == "recharge":
@@ -1997,16 +2076,10 @@ class MonthlyBotUi:
             except (TypeError, ValueError):
                 return self._expired_screen()
             return await self.confirm_screen(user, offer_id, os_index, panel_index)
-        if cb.screen == "buy" and len(cb.args) in (2, 3):
-            offer_id = self._resolve_offer_id(cb.args[0])
-            if offer_id is None:
+        if cb.screen == "buy":
+            if len(cb.args) != 1:
                 return self._expired_screen()
-            try:
-                os_index = int(cb.args[1])
-                panel_index = int(cb.args[2]) if len(cb.args) == 3 else None
-            except (TypeError, ValueError):
-                return self._expired_screen()
-            return await self.buy_screen(user, offer_id, os_index, panel_index, cb.key)
+            return await self.buy_screen(user, cb.args[0])
         if cb.screen == "cloud_locations" and len(cb.args) == 3:
             try:
                 numbered = int(cb.args[2])
@@ -2037,14 +2110,10 @@ class MonthlyBotUi:
             except (TypeError, ValueError):
                 return self._expired_screen()
             return await self.store_cloud_confirm_screen(user, cb.args[0], image_index)
-        if cb.screen == "cloud_buy" and len(cb.args) == 2:
-            if self._resolve_offer_id(cb.args[0]) is None:
+        if cb.screen == "cloud_buy":
+            if len(cb.args) != 1:
                 return self._expired_screen()
-            try:
-                image_index = int(cb.args[1])
-            except (TypeError, ValueError):
-                return self._expired_screen()
-            return await self.store_cloud_buy_screen(user, cb.args[0], image_index, cb.key)
+            return await self.store_cloud_buy_screen(user, cb.args[0])
         return self._menu_screen()
 
     async def _offers(self, cb: Callback, user: User | None) -> BotScreen:
@@ -2064,11 +2133,8 @@ class MonthlyBotUi:
             if offer_id is None:
                 return self._expired_screen()
             return await self.confirm_screen(user, offer_id, int(cb.args[1]), None)
-        if cb.screen == "buy" and len(cb.args) == 2:
-            offer_id = self._resolve_offer_id(cb.args[0])
-            if offer_id is None:
-                return self._expired_screen()
-            return await self.buy_screen(user, offer_id, int(cb.args[1]), None, cb.key)
+        if cb.screen == "buy":
+            return self._expired_screen()
         return self._menu_screen()
 
     async def _servers_cb(self, cb: Callback, user: User | None) -> BotScreen:

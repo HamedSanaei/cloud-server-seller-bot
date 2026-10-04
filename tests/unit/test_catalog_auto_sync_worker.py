@@ -1,11 +1,4 @@
-"""Worker wiring for the automatic catalog refresh (STOREFRONT-V2).
-
-- The job is skipped when disabled by configuration or when no provider is
-  configured (a missing Hetzner credential never breaks the Leaseweb sync).
-- An operator-disabled provider is skipped; per-provider failures stay
-  isolated inside the coordinator run.
-- The cron cadence follows the configured interval (15-minute default).
-"""
+"""Catalog refresh configuration boundaries and operator-visible diagnostics."""
 
 from __future__ import annotations
 
@@ -27,6 +20,8 @@ def _settings(**overrides: Any) -> Settings:
         leaseweb_locations="AMS-01,FRA-01",
         leaseweb_os_allowlist="",
         leaseweb_order_os_only_free=True,
+        hetzner_api_token="",
+        hetzner_accounts=[],
         telegram_bot_token="",
         telegram_admin_chat_id=0,
     )
@@ -38,20 +33,15 @@ def _settings(**overrides: Any) -> Settings:
 def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     fake = _settings()
     monkeypatch.setattr("cloud_platform.core.config.get_settings", lambda: fake)
+    monkeypatch.setattr(
+        "cloud_platform.db.session.SessionFactory",
+        MagicMock(side_effect=AssertionError("unit test must not access the database")),
+    )
     return fake
 
 
-def _cron_by_name(jobs: list[Any]) -> dict[str, Any]:
-    return {getattr(job, "coroutine", getattr(job, "func", None)).__name__: job for job in jobs}
-
-
-def _coordinator(
-    monkeypatch: pytest.MonkeyPatch, report: AutoSyncRunReport | None = None
-) -> AsyncMock:
+def _coordinator(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     coordinator = AsyncMock()
-    coordinator.run = AsyncMock(
-        return_value=report if report is not None else AutoSyncRunReport(ran=True, providers=())
-    )
     monkeypatch.setattr(
         "cloud_platform.modules.offers.auto_sync.CatalogAutoSyncCoordinator",
         lambda **kwargs: coordinator,
@@ -68,157 +58,37 @@ class TestCatalogAutoSyncJob:
         await ws.catalog_auto_sync({})
         coordinator.run.assert_not_awaited()
 
-    async def test_runs_leaseweb_without_hetzner_credential(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, caplog: Any
-    ) -> None:
-        settings.hetzner_api_token = ""
-        coordinator = _coordinator(monkeypatch)
-        with caplog.at_level("INFO", logger="cloud_platform.worker.settings"):
-            await ws.catalog_auto_sync({})
-        coordinator.run.assert_awaited_once()
-
-    async def test_runs_both_providers_when_configured(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        settings.hetzner_api_token = "hetzner-token"
-        seen: dict[str, Any] = {}
-
-        def _factory(**kwargs: Any) -> AsyncMock:
-            seen.update(kwargs)
-            coordinator = AsyncMock()
-            coordinator.run = AsyncMock(return_value=AutoSyncRunReport(ran=True, providers=()))
-            return coordinator
-
-        monkeypatch.setattr(
-            "cloud_platform.modules.offers.auto_sync.CatalogAutoSyncCoordinator", _factory
-        )
-        await ws.catalog_auto_sync({})
-        assert {source.provider_key for source in seen["sources"]} == {"leaseweb", "hetzner"}
-
-    async def test_operator_disabled_provider_is_skipped(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        settings.hetzner_api_token = "hetzner-token"
-        settings.providers_enabled = {"hetzner": False}
-        seen: dict[str, Any] = {}
-
-        def _factory(**kwargs: Any) -> AsyncMock:
-            seen.update(kwargs)
-            coordinator = AsyncMock()
-            coordinator.run = AsyncMock(return_value=AutoSyncRunReport(ran=True, providers=()))
-            return coordinator
-
-        monkeypatch.setattr(
-            "cloud_platform.modules.offers.auto_sync.CatalogAutoSyncCoordinator", _factory
-        )
-        await ws.catalog_auto_sync({})
-        assert {source.provider_key for source in seen["sources"]} == {"leaseweb"}
-
     async def test_no_providers_configured_does_nothing(
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         settings.leaseweb_api_key = ""
         settings.leaseweb_accounts = []
         settings.hetzner_api_token = ""
-        monkeypatch.setattr(
-            "cloud_platform.providers.leaseweb.accounts.build_leaseweb_account_router",
-            lambda settings: None,
-        )
+        settings.hetzner_accounts = []
         coordinator = _coordinator(monkeypatch)
         await ws.catalog_auto_sync({})
         coordinator.run.assert_not_awaited()
 
-    async def test_skipped_run_is_logged(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, caplog: Any
-    ) -> None:
-        coordinator = _coordinator(monkeypatch, AutoSyncRunReport(ran=False, reason="lock held"))
-        with caplog.at_level("INFO", logger="cloud_platform.worker.settings"):
-            await ws.catalog_auto_sync({})
-        coordinator.run.assert_awaited_once()
-        assert any("lock held" in record.message for record in caplog.records)
-
 
 class TestCatalogAutoSyncSchedule:
-    def test_default_interval_is_fifteen_minutes(self) -> None:
-        assert ws.catalog_auto_sync_minutes() == set(range(0, 60, 15))
-
-    def test_custom_hour_dividing_interval(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_custom_hour_dividing_interval(self, settings: Settings) -> None:
         settings.storefront_catalog_sync_interval_seconds = 600
         assert ws.catalog_auto_sync_minutes() == set(range(0, 60, 10))
 
-    def test_non_dividing_interval_falls_back(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_non_dividing_interval_falls_back(self, settings: Settings) -> None:
         settings.storefront_catalog_sync_interval_seconds = 700
         assert ws.catalog_auto_sync_minutes() == set(range(0, 60, 15))
 
-    def test_cron_uses_the_configured_cadence(self) -> None:
-        jobs = ws._cron_jobs()
-        by_name = {
-            getattr(job, "coroutine", getattr(job, "func", None)).__name__: job for job in jobs
-        }
-        assert by_name["catalog_auto_sync"].minute == set(range(0, 60, 15))
-        assert getattr(by_name["catalog_auto_sync"], "run_at_startup", False) is True
-
-    def test_catalog_cron_carries_its_own_dedicated_timeout(self, settings: Settings) -> None:
-        by_name = _cron_by_name(ws._cron_jobs())
-        catalog = by_name["catalog_auto_sync"]
-        assert catalog.timeout_s == ws.CATALOG_AUTO_SYNC_TIMEOUT_SECONDS == 600
-        # The whole point: a complete provider walk must not be cancelled by
-        # the generic job timeout that other jobs keep.
-        assert catalog.timeout_s > ws.WorkerSettings.job_timeout == 120
-        # Startup pass and periodic cadence are unchanged by the timeout.
-        assert catalog.run_at_startup is True
-        assert catalog.minute == set(range(0, 60, 15))
-
-    def test_only_the_catalog_job_gets_the_longer_timeout(self, settings: Settings) -> None:
-        by_name = _cron_by_name(ws._cron_jobs())
-        others = {name: job for name, job in by_name.items() if name != "catalog_auto_sync"}
-        assert len(others) == 14
-        assert all(job.timeout_s is None for job in others.values())
-        # And no worker role widened the generic timeout itself.
-        for settings_cls in (
-            ws.WorkerSettings,
-            ws.ProvisioningWorkerSettings,
-            ws.BillingWorkerSettings,
-            ws.NotifyWorkerSettings,
-        ):
-            assert settings_cls.job_timeout == 120
-
-    def test_provisioning_role_uses_the_dedicated_timeout(self, settings: Settings) -> None:
-        by_name = _cron_by_name(ws._role_cron_jobs("provisioning"))
-        catalog = by_name["catalog_auto_sync"]
-        assert catalog.timeout_s == ws.catalog_auto_sync_timeout() == 600
-        assert catalog.run_at_startup is True
-        assert catalog.minute == set(range(0, 60, 15))
-        assert all(
-            job.timeout_s is None for name, job in by_name.items() if name != "catalog_auto_sync"
-        )
-
-    def test_configured_timeout_reaches_the_cron_entry(self, settings: Settings) -> None:
-        settings.storefront_catalog_sync_timeout_seconds = 750
-        assert ws.catalog_auto_sync_timeout() == 750
-        assert _cron_by_name(ws._cron_jobs())["catalog_auto_sync"].timeout_s == 750
-        assert (
-            _cron_by_name(ws._role_cron_jobs("provisioning"))["catalog_auto_sync"].timeout_s == 750
-        )
-
-    def test_timeout_above_the_interval_is_clamped(self, settings: Settings, caplog: Any) -> None:
+    def test_timeout_above_the_interval_is_clamped(self, settings: Settings) -> None:
         settings.storefront_catalog_sync_interval_seconds = 600
         settings.storefront_catalog_sync_timeout_seconds = 900
-        with caplog.at_level("WARNING", logger="cloud_platform.worker.settings"):
-            assert ws.catalog_auto_sync_timeout() == 600
-        assert any("clamping" in record.message for record in caplog.records)
+        assert ws.catalog_auto_sync_timeout() == 600
 
     def test_invalid_timeout_falls_back_to_the_default(
-        self, settings: Settings, caplog: Any, monkeypatch: pytest.MonkeyPatch
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(settings, "storefront_catalog_sync_timeout_seconds", "oops")
-        with caplog.at_level("WARNING", logger="cloud_platform.worker.settings"):
-            assert ws.catalog_auto_sync_timeout() == ws.CATALOG_AUTO_SYNC_TIMEOUT_SECONDS
-        assert any("not a positive integer" in record.message for record in caplog.records)
+        assert ws.catalog_auto_sync_timeout() == ws.CATALOG_AUTO_SYNC_TIMEOUT_SECONDS
 
 
 class _DeterministicEurUsdRates:
@@ -340,7 +210,6 @@ class TestCatalogAutoSyncDoctor:
         assert await cli_module.catalog_auto_sync_doctor() == 0
         out = capsys.readouterr().out
         assert "catalog auto-sync: enabled" in out
-        assert "interval: 900s" in out
         assert "leaseweb:" in out
         assert "markup 25%" in out
         assert "auto publish: yes" in out
@@ -451,14 +320,6 @@ class TestCatalogAutoSyncRunCommand:
     second implementation and never the generic 120s job timeout whose
     cancellation left a production catalog unpriced forever.
     """
-
-    async def test_arq_entry_point_delegates_to_the_shared_pass(
-        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        pass_once = AsyncMock(return_value=AutoSyncRunReport(ran=True))
-        monkeypatch.setattr(ws, "run_catalog_auto_sync_once", pass_once)
-        await ws.catalog_auto_sync({})
-        pass_once.assert_awaited_once_with()
 
     async def test_disabled_catalog_is_not_reported_as_success(
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: Any

@@ -41,6 +41,7 @@ from cloud_platform.providers.leaseweb.cloud import (
     validate_root_disk,
 )
 from cloud_platform.providers.routing import CredentialAccountState
+from tests.unit.hourly_money import hourly_money
 
 PROVIDER = "leaseweb"
 SIGNING_KEY = "hourly-multi-account-signing-key"
@@ -52,6 +53,9 @@ USER = User(
     status=UserStatus.ACTIVE,
     role=Role.USER,
     telegram_user_id=12345,
+    phone_number="+989123456789",
+    phone_verified_at=datetime.now(UTC),
+    national_id="1234567891",
 )
 
 
@@ -1095,7 +1099,13 @@ class TestHourlyProvenanceAndDispatch:
             async def get(self, user_id: UUID) -> Any:
                 from types import SimpleNamespace
 
-                return SimpleNamespace(id=uuid4())
+                from cloud_platform.modules.wallet.domain import WalletStatus
+
+                return SimpleNamespace(
+                    id=uuid4(),
+                    currency="USD",
+                    status=WalletStatus.ACTIVE,
+                )
 
         class _Snapshots:
             def __init__(self) -> None:
@@ -1145,6 +1155,7 @@ class TestHourlyProvenanceAndDispatch:
                         claimed = _NS(
                             id=oid,
                             operation_key=operation_key,
+                            provider_response=None,
                             mark_outcome_unknown=lambda e: None,
                             complete=lambda meta: setattr(claimed, "meta", meta),
                             fail=lambda e: None,
@@ -1175,6 +1186,7 @@ class TestHourlyProvenanceAndDispatch:
             audit_repo=audit,
             cloud_providers={PROVIDER: north},
             cloud_resolver=_resolver(north, uk),
+            **hourly_money(),
         )
         # Image reads use the OWNING account (uk), not the dict default.
         # Images resolve by stable provider id, never by list position.
@@ -1233,7 +1245,13 @@ class TestHourlyProvenanceAndDispatch:
             async def get(self, user_id: UUID) -> Any:
                 from types import SimpleNamespace
 
-                return SimpleNamespace(id=uuid4(), currency="USD")
+                from cloud_platform.modules.wallet.domain import WalletStatus
+
+                return SimpleNamespace(
+                    id=uuid4(),
+                    currency="USD",
+                    status=WalletStatus.ACTIVE,
+                )
 
         class _Snapshots:
             def __init__(self) -> None:
@@ -1275,6 +1293,7 @@ class TestHourlyProvenanceAndDispatch:
                         claimed = _NS(
                             id=oid,
                             operation_key=kwargs["operation_key"],
+                            provider_response=None,
                             mark_outcome_unknown=lambda e: None,
                             complete=lambda meta: meta,
                             fail=lambda e: None,
@@ -1306,6 +1325,7 @@ class TestHourlyProvenanceAndDispatch:
             audit_repo=AsyncMock(),
             cloud_providers={PROVIDER: north},
             cloud_resolver=_resolver(north, uk),
+            **hourly_money(),
         )
         created = await service.create_instance(
             user=USER,

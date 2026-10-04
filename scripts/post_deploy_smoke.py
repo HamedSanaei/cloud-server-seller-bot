@@ -24,6 +24,10 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cloud_platform.core.config import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -126,39 +130,60 @@ def check_worker(base_url: str) -> CheckResult:
 
 
 def check_provider_read_only(
-    provider_key: str, base_url_env: str | None, token: str | None
+    provider_key: str, base_url_env: str | None, settings: Settings
 ) -> CheckResult:
-    """One token-scoped READ call: list images. Never a mutation."""
+    """Read each managed token's Project catalog and complete inventory only."""
     import asyncio
 
-    if not token:
+    from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
+
+    async def _read() -> CheckResult:
+        configured = settings
+        if base_url_env:
+            configured = settings.model_copy(update={"hetzner_api_base_url": base_url_env})
+        router = build_hetzner_account_router(configured)
+        if router is None or not router.providers:
+            if router is not None:
+                await router.aclose()
+            return CheckResult(
+                f"provider {provider_key} read",
+                True,
+                "skipped: no managed provider credential accounts configured",
+            )
+        details: list[str] = []
+        ok = True
+        try:
+            for account_id, provider in router.providers.items():
+                state = router.account_states[account_id].value
+                try:
+                    images = await provider.list_images()
+                    usage = await router.server_usage(account_id)
+                except Exception as exc:
+                    ok = False
+                    details.append(
+                        f"account {account_id} ({state}): FAILED ({type(exc).__name__}); "
+                        "Project availability unknown"
+                    )
+                    continue
+                ceiling = str(usage.server_limit) if usage.server_limit is not None else "unknown"
+                details.append(
+                    f"account {account_id} ({state}): {len(images)} images; "
+                    f"Project servers={usage.server_count}; "
+                    f"operator-configured server ceiling={ceiling}"
+                )
+        finally:
+            await router.aclose()
         return CheckResult(
-            f"provider {provider_key} read",
-            True,
-            "skipped: no provider token configured",
+            f"provider {provider_key} read (Project inventory)", ok, "; ".join(details)
         )
-    from cloud_platform.providers.hetzner.client import HetznerCloudProvider
-
-    provider = HetznerCloudProvider(
-        token=token, base_url=base_url_env or "https://api.hetzner.cloud/v1"
-    )
-
-    async def _list() -> int:
-        images = await provider.list_images()
-        return len(images)
 
     try:
-        count = asyncio.run(_list())
-        return CheckResult(
-            f"provider {provider_key} read (list_images)",
-            True,
-            f"ok: {count} images",
-        )
+        return asyncio.run(_read())
     except Exception as exc:
         return CheckResult(
-            f"provider {provider_key} read (list_images)",
+            f"provider {provider_key} read",
             False,
-            f"FAILED: {type(exc).__name__}: {str(exc)[:160]}",
+            f"FAILED: {type(exc).__name__}",
         )
 
 
@@ -179,8 +204,9 @@ def main(argv: list[str] | None = None) -> int:
         from cloud_platform.core.config import get_settings
 
         settings = get_settings()
-        token = settings.hetzner_api_token if args.provider_key == "hetzner" else None
-        results.append(check_provider_read_only(args.provider_key, args.provider_base_url, token))
+        results.append(
+            check_provider_read_only(args.provider_key, args.provider_base_url, settings)
+        )
 
     all_ok = True
     for result in results:

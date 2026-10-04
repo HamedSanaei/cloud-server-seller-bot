@@ -13,13 +13,15 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from decimal import Decimal
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.core.money import Money
+from cloud_platform.db.base import AuditEvent as _AuditModel
+from cloud_platform.db.base import BusinessLogEvent as _BusinessLogModel
 from cloud_platform.db.base import Hold as _HoldModel
 from cloud_platform.db.base import LedgerEntry as _LEModel
 from cloud_platform.db.base import Wallet as SQLAlchemyWallet
@@ -28,6 +30,7 @@ from cloud_platform.db.timestamps import (
     to_db_utc,
     utc_now,
 )
+from cloud_platform.modules.businesslog.domain import STATUS_PENDING, BusinessEvent
 from cloud_platform.modules.wallet.domain import (
     DEFAULT_WALLET_CURRENCY,
     DuplicateIdempotencyError,
@@ -160,13 +163,21 @@ class SqlAlchemyWalletRepository:
         reference_type: str = "",
         reference_id: str = "",
         description: str = "",
+        audit_actor_id: UUID | None = None,
+        business_event_factory: Callable[[Wallet], BusinessEvent | None] | None = None,
     ) -> tuple[Wallet, bool]:
         """Atomically mutate a wallet and append the matching ledger entry."""
         if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
             raise ValueError("wallet adjustment delta must be a non-zero integer")
+        if not -(2**63) < delta <= 2**63 - 1:
+            raise ValueError("wallet and ledger amounts must fit signed int64 bounds")
+        if entry_type == LedgerEntryType.ADJUSTMENT and audit_actor_id is None:
+            raise ValueError("administrator adjustments require an audited actor")
         new_key = str(idempotency_key).strip()
         if not new_key:
             raise ValueError("idempotency_key must not be empty")
+        if audit_actor_id is not None and not description.strip():
+            raise ValueError("administrator wallet adjustment requires a reason")
 
         async with self._session_factory() as session:
             stmt = (
@@ -203,6 +214,10 @@ class SqlAlchemyWalletRepository:
                     reference_id=reference_id,
                     description=description,
                 )
+                if entry_type == LedgerEntryType.ADJUSTMENT:
+                    await self._check_adjustment_direction(
+                        session, wallet_id, new_key, delta, audit_actor_id
+                    )
                 await session.rollback()
                 refreshed = await session.get(SQLAlchemyWallet, wallet_id)
                 assert refreshed is not None
@@ -213,6 +228,8 @@ class SqlAlchemyWalletRepository:
             new_balance = balance + delta
             if new_balance < 0:
                 raise InsufficientBalanceError(f"balance {balance} < required {-delta}")
+            if new_balance > 2**63 - 1:
+                raise ValueError("wallet balance exceeds signed int64 bounds")
             cast(Any, row).balance = new_balance
             session.add(
                 _LEModel(
@@ -226,6 +243,38 @@ class SqlAlchemyWalletRepository:
                     description=description,
                 )
             )
+            if audit_actor_id is not None:
+                session.add(
+                    _AuditModel(
+                        id=uuid4(),
+                        actor_type="admin",
+                        actor_id=audit_actor_id,
+                        action="wallet.adjust",
+                        resource_type="wallet",
+                        resource_id=str(wallet_id),
+                        reason=description,
+                        event_metadata={
+                            "amount": str(delta),
+                            "currency": str(_attr(row, "currency")),
+                            "idempotency_key": new_key,
+                        },
+                        occurred_at=to_db_utc(utc_now()),
+                    )
+                )
+            if business_event_factory is not None:
+                event = business_event_factory(_wallet_to_domain(row))
+                if event is not None:
+                    session.add(
+                        _BusinessLogModel(
+                            id=uuid4(),
+                            event_key=event.event_key,
+                            event_type=event.event_type.value,
+                            payload=event.sanitized_payload(),
+                            status=STATUS_PENDING,
+                            created_at=event.created_at,
+                            attempts=0,
+                        )
+                    )
             try:
                 await session.commit()
             except IntegrityError as exc:
@@ -253,6 +302,10 @@ class SqlAlchemyWalletRepository:
                             reference_id=reference_id,
                             description=description,
                         )
+                        if entry_type == LedgerEntryType.ADJUSTMENT:
+                            await self._check_adjustment_direction(
+                                session, wallet_id, new_key, delta, audit_actor_id
+                            )
                         refreshed = await session.get(SQLAlchemyWallet, wallet_id)
                         assert refreshed is not None
                         await session.refresh(refreshed)
@@ -261,6 +314,28 @@ class SqlAlchemyWalletRepository:
 
             await session.refresh(row)
             return _wallet_to_domain(row), True
+
+    @staticmethod
+    async def _check_adjustment_direction(
+        session: AsyncSession, wallet_id: UUID, key: str, delta: int, actor_id: UUID | None
+    ) -> None:
+        # Legacy adjustment ledger amounts are unsigned. The new atomic audit
+        # carries the signed fact and key; without that proof, replay fails
+        # closed rather than confusing a credit with an equal-sized debit.
+        result = await session.execute(
+            select(_AuditModel).where(
+                _AuditModel.action == "wallet.adjust",
+                _AuditModel.resource_id == str(wallet_id),
+                _AuditModel.event_metadata["idempotency_key"].astext == key,
+            )
+        )
+        audit = result.scalar_one_or_none()
+        if (
+            audit is None
+            or _attr(audit, "actor_id") != actor_id
+            or _attr(audit, "event_metadata").get("amount") != str(delta)
+        ):
+            raise DuplicateIdempotencyError("wallet adjustment replay has different signed facts")
 
     @staticmethod
     def _check_adjust_replay(

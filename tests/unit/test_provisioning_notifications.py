@@ -374,6 +374,7 @@ class _WorkerDeps:
             hold_repo=self.holds,  # type: ignore[arg-type]
             audit_repo=self.audit,  # type: ignore[arg-type]
             progress=progress,
+            prepay_server=AsyncMock(),
         )
 
 

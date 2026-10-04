@@ -8,6 +8,7 @@ scripts, so the *atomicity* semantics are what the tests actually exercise.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -15,6 +16,8 @@ from uuid import UUID, uuid4
 import pytest
 
 from cloud_platform.bot.sessions import (
+    CheckoutSelection,
+    CheckoutSessions,
     PendingAction,
     PendingInput,
     ServerSessions,
@@ -35,6 +38,7 @@ from cloud_platform.core.session_store import (
     encode_session_value,
     session_key,
 )
+from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY, BILLING_MODEL_MONTHLY
 from cloud_platform.modules.servers.confirmations import (
     ConfirmationBinding,
     ConfirmationStatus,
@@ -569,3 +573,89 @@ class TestKeyCollisionSafety:
         ref = await sessions.ref_for(CUSTOMER, SERVER_ID)
         assert len(ref) == 8
         assert set(ref) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+
+class TestCheckoutSessions:
+    @staticmethod
+    def selection(*, hourly: bool = False) -> CheckoutSelection:
+        return CheckoutSelection(
+            user_id=CUSTOMER,
+            offer_id=SERVER_ID,
+            billing_model=BILLING_MODEL_HOURLY if hourly else BILLING_MODEL_MONTHLY,
+            selling_price_minor=1299,
+            currency="EUR",
+            image_id="ubuntu-24.04" if hourly else None,
+            image_label="Ubuntu 24.04" if hourly else None,
+            os_name=None if hourly else "Ubuntu 24.04",
+            panel_name=None if hourly else "Webmin",
+        )
+
+    @pytest.mark.parametrize("hourly", [False, True])
+    async def test_json_safe_owner_bound_and_replay_readable_across_replicas(
+        self, hourly: bool
+    ) -> None:
+        client = FakeRedis()
+        first = CheckoutSessions(make_redis_store(client), reference_ttl_seconds=120)
+        selection = self.selection(hourly=hourly)
+        nonce = await first.remember(selection)
+        replica = CheckoutSessions(make_redis_store(client), reference_ttl_seconds=120)
+        assert len(nonce) == 8
+        assert json.loads(json.dumps(selection.to_record())) == selection.to_record()
+        assert await replica.resolve(CUSTOMER, nonce) == selection
+        assert await first.resolve(CUSTOMER, nonce) == selection
+        assert await replica.resolve(OTHER_CUSTOMER, nonce) is None
+        assert list(client.expiries.values()) == [120]
+        stored = next(iter(client.values.values()))
+        assert "api_token" not in stored and "password" not in stored
+
+    async def test_collision_claim_cannot_overwrite_an_existing_confirmation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = InMemoryBotSessionStore()
+        sessions = CheckoutSessions(store)
+        refs = iter(["AAAAAAAA", "AAAAAAAA", "BBBBBBBB"])
+        monkeypatch.setattr("cloud_platform.bot.sessions._mint_ref", lambda: next(refs))
+        original = self.selection()
+        first = await sessions.remember(original)
+        second = await sessions.remember(replace(original, selling_price_minor=2000))
+        assert (first, second) == ("AAAAAAAA", "BBBBBBBB")
+        assert await sessions.resolve(CUSTOMER, first) == original
+        assert (await sessions.resolve(CUSTOMER, second)).selling_price_minor == 2000
+
+    async def test_expired_confirmation_is_not_revived_on_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [100.0]
+        monkeypatch.setattr("cloud_platform.core.session_store.time.monotonic", lambda: now[0])
+        sessions = CheckoutSessions(InMemoryBotSessionStore(), reference_ttl_seconds=30)
+        nonce = await sessions.remember(self.selection())
+        now[0] += 29
+        assert await sessions.resolve(CUSTOMER, nonce) is not None
+        now[0] += 2
+        assert await sessions.resolve(CUSTOMER, nonce) is None
+
+    async def test_unavailable_shared_store_never_falls_back_to_local_state(self) -> None:
+        sessions = CheckoutSessions(make_redis_store(UnreachableRedis()))
+        with pytest.raises(SessionStoreUnavailable):
+            await sessions.remember(self.selection())
+        with pytest.raises(SessionStoreUnavailable):
+            await sessions.resolve(CUSTOMER, "AAAAAAAA")
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            {"billing_model": "invalid"},
+            {"selling_price_minor": True},
+            {"currency": None},
+            {"offer_id": "not-a-uuid"},
+            {"os_name": None},
+            {"image_id": "ubuntu"},
+            {"panel_name": {"untrusted": "object"}},
+        ],
+    )
+    async def test_malformed_record_fails_closed(self, mutation: dict[str, Any]) -> None:
+        store = InMemoryBotSessionStore()
+        sessions = CheckoutSessions(store)
+        record = self.selection().to_record() | mutation
+        await store.put("checkout", "AAAAAAAA", record, ttl_seconds=60)
+        assert await sessions.resolve(CUSTOMER, "AAAAAAAA") is None
