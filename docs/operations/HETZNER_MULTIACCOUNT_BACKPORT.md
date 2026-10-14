@@ -54,3 +54,23 @@ failures and must not be described as a fully green baseline.
 - Local source is committed on fix/hetzner-multi-account-production. The image was
   built on the deployment host; this task did not publish it to GHCR or push the
   branch. Provider credentials remain exclusively in private configuration.
+
+## Recharge hotfix (2026-10-15, Asia/Tehran)
+
+- Current deployed release: 836cd0ffb5975348badd7f38f495e897083dcac9.
+- Bot logs confirmed BUTTON_DATA_INVALID when a custom recharge amount opened
+  the gateway picker. The Tetraminator callback unnecessarily included the
+  AtlasPay nonce, exceeding Telegram's 64-byte limit for a six-digit amount.
+- Recharge start now has a compact, reversible route alias with the same
+  canonical HMAC. Existing literal callbacks still verify. Only AtlasPay carries
+  its attempt nonce; neither the amount nor the signature is truncated.
+- 158 targeted navigation, UI, recharge, FX and AtlasPay tests passed. Ruff lint
+  and formatting passed. The production runtime rendered both gateways for
+  100000, 275000 and int64-max amounts; maximum callback size was 63 bytes.
+- API readiness/health passed; API, worker and bot run the same release with zero
+  restarts. Checked startup logs contained no errors or Telegram polling conflicts.
+- No schema, credentials or dependency changes; no real payment was initiated.
+- Rollback image: f88176993abc5eeb302f0d7e6c2b1325779a97ba. Private environment
+  backup: /opt/cloud-server-seller/deploy.env.before-recharge-20261014T232005Z.
+- Source remains on fix/hetzner-multi-account-production; image is built locally
+  on the host, not published to GHCR. This hotfix does not push the branch.
