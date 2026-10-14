@@ -29,3 +29,28 @@ Verification includes synthetic monthly/hourly/legacy failover tests, production
 IRT reservation tests, and the opt-in scratch PostgreSQL receipt tests. Full test
 and typecheck results must be compared to b6778310: that base has pre-existing
 failures and must not be described as a fully green baseline.
+
+## Deployment evidence (2026-10-14)
+
+- Host: Nethederland (95.211.62.26), application path /opt/cloud-server-seller.
+- Running release: f88176993abc5eeb302f0d7e6c2b1325779a97ba.
+- API, worker and bot use that same image/revision. API health/readiness passed;
+  all three remained running with zero restarts and no ERROR/TelegramConflictError
+  entries in the checked post-rollout logs.
+- Active credential routes: default and peru; six eligible locations per account.
+  NULL/default resource ownership still resolves to the original credential.
+- Image preflight constructed both billing paths, account routing, order recovery,
+  provisioning and management. Both Projects authenticated and returned EUR.
+- Physical schema: 41 tables verified. Database and release head remain 0053.
+- Dedicated Hetzner/unit checks: 282 passed. Production IRT/failover/repair checks
+  after the last source change: 49 passed. Ruff lint and format checks passed.
+- Isolated real PostgreSQL receipt/fencing tests: 71 passed. The disposable test
+  PostgreSQL container and its SSH tunnel were removed after verification.
+- Full suite comparison: backport 5406 passed / 52 failed / 179 skipped; production
+  base 5178 passed / 53 failed / 108 skipped. No new failing test IDs. The 42 mypy
+  errors and five provider-branching gate findings also exist in the base.
+- Rollback keeps the original b6778310 image. Owner-only environment backup:
+  /opt/cloud-server-seller/deploy.env.before-hetzner-20261014T183215Z.
+- Local source is committed on fix/hetzner-multi-account-production. The image was
+  built on the deployment host; this task did not publish it to GHCR or push the
+  branch. Provider credentials remain exclusively in private configuration.
