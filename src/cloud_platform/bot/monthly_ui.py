@@ -86,6 +86,7 @@ from cloud_platform.modules.navigation.domain import (
     decode_callback,
     encode_callback,
     encode_offer_ref,
+    ensure_telegram_callback_size,
     resolve_offer_id_arg,
 )
 from cloud_platform.modules.offers.domain import (
@@ -1669,12 +1670,14 @@ class MonthlyBotUi:
             [
                 InlineKeyboardButton(
                     text=self._t.t("recharge.gateway_row", name=self.gateway_display_name(key)),
-                    callback_data=self._callback(
-                        "recharge",
-                        "start",
-                        str(amount_minor),
-                        key,
-                        *([attempt_nonce] if attempt_nonce else []),
+                    callback_data=ensure_telegram_callback_size(
+                        self._callback(
+                            "recharge",
+                            "start",
+                            str(amount_minor),
+                            key,
+                            *([attempt_nonce] if attempt_nonce and key == "atlaspay" else []),
+                        )
                     ),
                 )
             ]

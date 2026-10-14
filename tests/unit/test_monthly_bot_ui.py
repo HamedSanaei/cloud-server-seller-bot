@@ -13,6 +13,8 @@ from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pytest
+
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.sessions import ServerSessions
 from cloud_platform.core.i18n import Locale, Translator
@@ -670,6 +672,34 @@ class TestCustomRechargeAmount:
         recharge = TomanRecharge()
         ui, _ = _ui(recharge=recharge, wallet_history=TomanWallet(), sessions=ServerSessions(store))
         return ui, recharge, store
+
+    @pytest.mark.parametrize("amount", [100_000, 275_000, 9_223_372_036_854_775_807])
+    async def test_custom_amount_gateway_keyboard_fits_telegram(self, amount: int) -> None:
+        ui, recharge, _ = self.setup()
+
+        async def both_gateways(currency: str, value: int) -> list[str]:
+            assert currency == "IRT"
+            return list(recharge.gateway_keys)
+
+        recharge.compatible_gateways_async = both_gateways
+        await ui.handle(ui._callback("recharge", "custom"), user=USER_A)
+        picker = await ui.handle_text(str(amount), USER_A)
+        assert picker is not None
+        assert recharge.starts == []
+        callbacks = []
+        for row in picker.keyboard.inline_keyboard:
+            for button in row:
+                if button.callback_data:
+                    assert len(button.callback_data.encode("utf-8")) <= 64
+                    callback = decode_callback(button.callback_data, KEY)
+                    if callback.flow == "recharge" and callback.screen == "start":
+                        callbacks.append(callback)
+        assert len(callbacks) == 2
+        tetra = next(cb for cb in callbacks if cb.args[1] == "tetraminator")
+        atlas = next(cb for cb in callbacks if cb.args[1] == "atlaspay")
+        assert tetra.args == (str(amount), "tetraminator")
+        assert atlas.args[:2] == (str(amount), "atlaspay")
+        assert len(atlas.args[2]) == 10
 
     @patch(
         "cloud_platform.bot.monthly_ui.secrets.token_hex",

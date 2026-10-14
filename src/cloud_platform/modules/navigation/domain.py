@@ -24,6 +24,8 @@ Wire aliases (Telegram's 64-byte button limit):
   The codec maps long screens to compact wire aliases on encode and back on
   decode, so navigation semantics never change while ``callback_data`` stays
   within :data:`TELEGRAM_CALLBACK_DATA_LIMIT_BYTES`.
+- Recharge start uses a compact flow/screen pair as well, leaving room for
+  the full amount, gateway and AtlasPay attempt nonce.
 - The HMAC always covers the CANONICAL key, so an aliased callback and its
   literal pre-alias form verify identically: callbacks signed before an
   alias existed keep working, and no signature strength is lost.
@@ -68,6 +70,11 @@ _SCREEN_WIRE_ALIASES: dict[str, str] = {
 _WIRE_SCREEN_CANONICAL: dict[str, str] = {
     wire: canonical for canonical, wire in _SCREEN_WIRE_ALIASES.items()
 }
+
+# Recharge buttons also carry an amount and an idempotency nonce. Alias the
+# route, not those values or their signature, so even int64 amounts fit.
+_ROUTE_WIRE_ALIASES = {("recharge", "start"): ("r", "s")}
+_WIRE_ROUTE_CANONICAL = {wire: canonical for canonical, wire in _ROUTE_WIRE_ALIASES.items()}
 
 for _wire_alias in _SCREEN_WIRE_ALIASES.values():
     if not _CALLBACK_FIELD.fullmatch(_wire_alias):
@@ -156,8 +163,11 @@ def encode_callback(callback: Callback, signing_key: str) -> str:
     for value in (callback.flow, callback.screen, *callback.args):
         if not value or not _CALLBACK_FIELD.fullmatch(value):
             raise CallbackError(f"invalid callback field: {value!r}")
-    wire_screen = _SCREEN_WIRE_ALIASES.get(callback.screen, callback.screen)
-    wire_key = ":".join((callback.flow, wire_screen, *callback.args))
+    wire_flow, wire_screen = _ROUTE_WIRE_ALIASES.get(
+        (callback.flow, callback.screen),
+        (callback.flow, _SCREEN_WIRE_ALIASES.get(callback.screen, callback.screen)),
+    )
+    wire_key = ":".join((wire_flow, wire_screen, *callback.args))
     return f"{CALLBACK_VERSION}|{wire_key}|{_sign(callback.key, signing_key)}"
 
 
@@ -248,8 +258,11 @@ def decode_callback(data: str, signing_key: str) -> Callback:
     fields = wire_key.split(":")
     if len(fields) < 2:
         raise CallbackError("callback needs flow and screen")
-    flow, wire_screen, *args = fields
-    screen = _WIRE_SCREEN_CANONICAL.get(wire_screen, wire_screen)
+    wire_flow, wire_screen, *args = fields
+    flow, screen = _WIRE_ROUTE_CANONICAL.get(
+        (wire_flow, wire_screen),
+        (wire_flow, _WIRE_SCREEN_CANONICAL.get(wire_screen, wire_screen)),
+    )
     for field in (flow, screen, *args):
         if not field or not _CALLBACK_FIELD.fullmatch(field):
             raise CallbackError(f"invalid callback field: {field!r}")

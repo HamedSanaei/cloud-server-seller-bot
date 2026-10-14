@@ -542,6 +542,22 @@ class TestRepresentativeScreensInvariant:
 class TestCallbackAudit:
     """Central audit: bounded navigation fits; report the overall maximum."""
 
+    @pytest.mark.parametrize("amount", ["100000", "275000", "9223372036854775807"])
+    @pytest.mark.parametrize("gateway", ["atlaspay", "tetraminator"])
+    def test_recharge_buttons_preserve_signed_payment_arguments(
+        self, amount: str, gateway: str
+    ) -> None:
+        args = (amount, gateway) + (("n-1234abcd",) if gateway == "atlaspay" else ())
+        callback = Callback("recharge", "start", args)
+        encoded = encode_telegram_callback(callback, SIGNING_KEY)
+        assert _size(encoded) <= TELEGRAM_CALLBACK_DATA_LIMIT_BYTES
+        assert decode_callback(encoded, SIGNING_KEY) == callback
+        # A callback already issued in the literal format remains valid.
+        signature = encoded.rsplit("|", 1)[1]
+        assert decode_callback(f"v1|{callback.key}|{signature}", SIGNING_KEY) == callback
+        with pytest.raises(CallbackError, match="signature mismatch"):
+            decode_callback(encoded.replace(amount, "1", 1), SIGNING_KEY)
+
     def test_bounded_navigation_shapes_fit(self) -> None:
         ref = encode_offer_ref(UUID(OFFER_UUID))
         shapes = {
