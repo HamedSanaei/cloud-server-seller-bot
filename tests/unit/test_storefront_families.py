@@ -315,6 +315,9 @@ class FakeCheckout:
 
 
 class FakeServers:
+    async def get_by_idempotency_key(self, key: str) -> None:
+        return None
+
     async def list_by_user(self, user_id: UUID) -> list[Any]:
         return []
 

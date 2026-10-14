@@ -169,11 +169,15 @@ def _has_order_provider_credentials(settings: object) -> bool:
         for name in ("leaseweb_api_key", "hetzner_api_token", "arvancloud_api_key")
     ):
         return True
-    accounts = getattr(settings, "leaseweb_accounts", ())
-    try:
-        return any(bool(getattr(account, "usable", False)) for account in accounts)
-    except TypeError:
-        return bool(accounts)
+    for name in ("leaseweb_accounts", "hetzner_accounts"):
+        accounts = getattr(settings, name, ())
+        try:
+            if any(bool(getattr(account, "usable", False)) for account in accounts):
+                return True
+        except TypeError:
+            if accounts:
+                return True
+    return False
 
 
 async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
@@ -213,6 +217,7 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
                 wallet_repo=container.wallet_repository(),
                 hold_repo=hold_repo,
                 audit_repo=audit_repo,
+                create_attempts=container.create_account_attempt_repository(),
             )
             create_report = await create_reconciler.reconcile()
             state_report = await ServerStateReconciler(
@@ -528,15 +533,15 @@ async def _process_deletes_impl(ctx: dict[str, object], owned_resources: list[An
 
         settings = get_settings()
         registry = ProviderRegistry()
-        if settings.hetzner_api_token:
-            from cloud_platform.providers.hetzner.client import HetznerCloudProvider
+        from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
 
-            hetzner_provider = HetznerCloudProvider(
-                token=settings.hetzner_api_token,
-                base_url=settings.hetzner_api_base_url,
-            )
-            owned_resources.append(hetzner_provider)
-            registry.register(hetzner_provider)
+        hetzner_router = build_hetzner_account_router(settings)
+        registry.disable_default_account_fallback("hetzner")
+        if hetzner_router is not None:
+            owned_resources.append(hetzner_router)
+            for account_id, hetzner_provider in hetzner_router.providers.items():
+                registry.register_route("hetzner", account_id, hetzner_provider)
+            registry.register_account_views("hetzner", hetzner_router.views())
         # LEASEWEB-MULTIACCOUNT: every configured credential account registers
         # as its own ROUTE under the ONE logical ``leaseweb`` key, each with its
         # own transport, so this worker resolves a server's pinned account
@@ -1005,14 +1010,21 @@ async def run_catalog_auto_sync_once() -> Any:
                         "skipping hourly sync (VPS ordering is unaffected)"
                     )
             if settings.providers_enabled.get("hetzner", True):
-                if settings.hetzner_api_token:
+                if settings.hetzner_new_order_accounts:
+                    from cloud_platform.providers.hetzner.accounts import (
+                        build_hetzner_account_router,
+                    )
                     from cloud_platform.providers.hetzner.auto_sync import (
                         HetznerCatalogSyncSource,
                     )
                     from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
 
+                    hetzner_router = build_hetzner_account_router(settings)
+                    if hetzner_router is not None:
+                        owned_resources.append(hetzner_router)
                     hetzner_syncer = HetznerCatalogSyncer(
                         SessionFactory,
+                        account_router=hetzner_router,
                         catalog_currency=settings.fx_catalog_pricing_currency,
                         catalog_stale_limit_seconds=(
                             settings.fx_frankfurter_catalog_max_stale_seconds
@@ -1097,6 +1109,8 @@ async def process_cloud_creates(ctx: dict[str, object]) -> None:
             await container.initialize()
             service = container.hourly_cloud_service()
             outcomes: dict[str, int] = {}
+            legacy = container.provisioning_worker()
+            await legacy.process_pending_creates()
             for server in await service.servers_requested():
                 try:
                     outcome = await service.process_server(server.id)

@@ -369,9 +369,17 @@ class TestProcessDeletes:
             "cloud_platform.providers.hetzner.client.HetznerCloudProvider",
             lambda **k: fake_provider,
         )
+        fake_router = MagicMock(
+            providers={"default": fake_provider},
+            aclose=AsyncMock(side_effect=fake_provider.aclose),
+        )
+        monkeypatch.setattr(
+            "cloud_platform.providers.hetzner.accounts.build_hetzner_account_router",
+            lambda settings: fake_router,
+        )
         fake_worker, _ = self._patch_deletes(monkeypatch)
         await ws.process_deletes({})
-        fake_registry.register.assert_called_once_with(fake_provider)
+        fake_registry.register_route.assert_called_once_with("hetzner", "default", fake_provider)
         fake_worker.process_pending_deletes.assert_awaited_once()
         fake_provider.aclose.assert_awaited_once()
 

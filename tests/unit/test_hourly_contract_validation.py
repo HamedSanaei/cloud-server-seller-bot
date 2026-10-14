@@ -145,7 +145,7 @@ class TestFingerprintShapeViolations:
             _validate_hourly_contract(server, snapshot)
 
     def test_wrong_fingerprint_version_fails_closed(self) -> None:
-        server, snapshot = _contract(fingerprint_version=3)
+        server, snapshot = _contract(fingerprint_version=4)
 
         with pytest.raises(HourlyNotAvailableError, match="no versioned offer fingerprint"):
             _validate_hourly_contract(server, snapshot)

@@ -1,0 +1,5 @@
+# Reuse the exact production dependency/runtime image. Only Python source changes.
+FROM ghcr.io/hamedsanaei/cloud-server-seller-bot@sha256:5c00743907570bdfdff5a6a99a6f4a292e54ca346961dc68d6325225b51933fc
+ARG RELEASE_REVISION
+LABEL org.opencontainers.image.revision=$RELEASE_REVISION
+COPY --chown=app:app src /app/src

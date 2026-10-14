@@ -40,8 +40,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+from cloud_platform.providers.routing import CredentialAccountState, normalize_account_id
 
 #: Bootstrap variable naming the configuration file. Never a secret.
 CONFIG_FILE_ENV = "CLOUD_PLATFORM_CONFIG_FILE"
@@ -390,6 +392,60 @@ class LeasewebAccountSettings(BaseModel):
         return bool(self.api_key.strip())
 
 
+class HetznerAccountSettings(BaseModel):
+    """Operator-configured credential/Project; the ceiling is not API-discovered."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    api_token: str = Field(default="", repr=False, exclude=True)
+    enabled: bool = True
+    priority: int = Field(default=100, ge=0, le=1_000_000)
+    state: CredentialAccountState = CredentialAccountState.ACTIVE
+    label: str = ""
+    server_limit: int | None = Field(default=None, strict=True, gt=0)
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _normalize_state(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _normalize(self) -> HetznerAccountSettings:
+        if not self.id.strip():
+            raise ValueError("hetzner account id must not be empty")
+        self.id = normalize_account_id(self.id)
+        if not _ACCOUNT_ID_PATTERN.fullmatch(self.id):
+            raise ValueError("hetzner account id must use 1-63 safe characters")
+        self.api_token = self.api_token.strip()
+        if self.api_token and any(character.isspace() for character in self.api_token):
+            raise ValueError(f"hetzner account {self.id!r} has an unusable api_token")
+        self.label = self.label.strip()
+        if self.enabled and self.state != CredentialAccountState.DISABLED and not self.api_token:
+            raise ValueError(f"hetzner account {self.id!r} has no api_token")
+        return self
+
+    @property
+    def display_name(self) -> str:
+        return self.label or self.id
+
+    @property
+    def normalized_state(self) -> str:
+        return self.state.value
+
+    @property
+    def accepts_new_orders(self) -> bool:
+        return self.enabled and self.state == CredentialAccountState.ACTIVE
+
+    @property
+    def usable(self) -> bool:
+        return self.enabled and self.state != CredentialAccountState.DISABLED
+
+    @property
+    def has_credential(self) -> bool:
+        return bool(self.api_token)
+
+
 def _dig(data: Mapping[str, Any], path: tuple[str, ...]) -> Any:
     """Read a nested path, returning None when any level is missing."""
     node: Any = data
@@ -453,6 +509,29 @@ def _leaseweb_account_entries(raw: Any) -> list[dict[str, Any]]:
     return entries
 
 
+def _hetzner_accounts_toml(data: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    raw = _dig(data, ("providers", "hetzner", "accounts"))
+    if raw is None:
+        return None
+    if isinstance(raw, list | tuple):
+        if not all(isinstance(entry, Mapping) for entry in raw):
+            raise ValueError("hetzner accounts must be tables")
+        return [dict(entry) for entry in raw]
+    if not isinstance(raw, Mapping):
+        raise ValueError("hetzner accounts must be an array or keyed table")
+    entries: list[dict[str, Any]] = []
+    for key, value in raw.items():
+        if not isinstance(value, Mapping):
+            raise ValueError("hetzner account entries must be tables")
+        entry = dict(value)
+        account_id = normalize_account_id(str(key))
+        if "id" in entry and normalize_account_id(str(entry["id"])) != account_id:
+            raise ValueError(f"hetzner account table {key!r} declares a different id")
+        entry["id"] = account_id
+        entries.append(entry)
+    return entries
+
+
 def _provider_sections(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     providers = data.get("providers")
     if not isinstance(providers, Mapping):
@@ -479,6 +558,9 @@ def toml_to_settings(data: Mapping[str, Any]) -> dict[str, Any]:
     accounts = _leaseweb_accounts_toml(data)
     if accounts is not None:
         values["leaseweb_accounts"] = accounts
+    hetzner_accounts = _hetzner_accounts_toml(data)
+    if hetzner_accounts is not None:
+        values["hetzner_accounts"] = hetzner_accounts
 
     markets: dict[str, str] = {}
     display_names: dict[str, str] = {}
@@ -635,6 +717,7 @@ class Settings(BaseSettings):
     callback_signing_key: str = ""
     hetzner_api_token: str = ""
     hetzner_api_base_url: str = "https://api.hetzner.cloud/v1"
+    hetzner_accounts: list[HetznerAccountSettings] = Field(default_factory=list)
     #: DEPRECATED single-credential form. Still supported: it is normalized
     #: into one credential account with :data:`DEFAULT_CREDENTIAL_ACCOUNT` as
     #: its id, so existing deployments (and rows they already created) keep
@@ -926,6 +1009,32 @@ class Settings(BaseSettings):
 
     #: Flat values read from ``configuration.toml`` (introspection/tests).
     toml_values: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @model_validator(mode="after")
+    def _normalize_hetzner_accounts(self) -> Settings:
+        if "hetzner_accounts" not in self.model_fields_set and self.hetzner_api_token.strip():
+            self.hetzner_accounts = [
+                HetznerAccountSettings(
+                    id=DEFAULT_CREDENTIAL_ACCOUNT_ID, api_token=self.hetzner_api_token
+                )
+            ]
+        seen: set[str] = set()
+        for account in self.hetzner_accounts:
+            if account.id in seen:
+                raise ValueError(f"duplicate hetzner account id: {account.id!r}")
+            seen.add(account.id)
+        return self
+
+    @property
+    def hetzner_new_order_accounts(self) -> list[HetznerAccountSettings]:
+        return sorted(
+            (account for account in self.hetzner_accounts if account.accepts_new_orders),
+            key=lambda account: (account.priority, account.id),
+        )
+
+    @property
+    def hetzner_managed_accounts(self) -> list[HetznerAccountSettings]:
+        return [account for account in self.hetzner_accounts if account.usable]
 
     @model_validator(mode="after")
     def _normalize_leaseweb_accounts(self) -> Settings:

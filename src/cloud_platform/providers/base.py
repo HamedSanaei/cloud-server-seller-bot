@@ -10,6 +10,40 @@ from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.providers.errors import ProviderError
 
 
+@dataclass(frozen=True, slots=True)
+class AccountServerUsage:
+    """Complete credential-scoped inventory and an operator-supplied ceiling."""
+
+    credential_account_id: str
+    server_count: int
+    server_limit: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.credential_account_id
+            or isinstance(self.server_count, bool)
+            or not isinstance(self.server_count, int)
+            or self.server_count < 0
+        ):
+            raise ValueError("usage requires a credential identity and nonnegative integer count")
+        if self.server_limit is not None and (
+            isinstance(self.server_limit, bool)
+            or not isinstance(self.server_limit, int)
+            or self.server_limit <= 0
+        ):
+            raise ValueError("configured ceiling must be a positive integer")
+
+    @property
+    def full(self) -> bool:
+        return self.server_limit is not None and self.server_count >= self.server_limit
+
+
+class AccountServerUsageReader(Protocol):
+    def accepts_new_orders(self, credential_account_id: str) -> bool: ...
+
+    async def server_usage(self, credential_account_id: str) -> AccountServerUsage: ...
+
+
 class Capability(StrEnum):
     COMPUTE = "compute"
     POWER = "power"
@@ -386,7 +420,12 @@ class DirectServerRecoveryProvider(Protocol):
     """Optional capability: read-only server recovery for ambiguous direct create."""
 
     async def recover_server_by_operation(
-        self, operation_key: str, since: datetime | None = None
+        self,
+        operation_key: str,
+        since: datetime | None = None,
+        *,
+        legacy_label: bool = True,
+        platform_server_id: str | None = None,
     ) -> OrderRecoveryResult: ...
 
 

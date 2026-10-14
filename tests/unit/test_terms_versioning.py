@@ -198,7 +198,7 @@ class TestProvisioningGate:
 
         catalog = AsyncMock()
         service = CreateServerService(
-            server_repo=AsyncMock(),  # type: ignore[arg-type]
+            server_repo=AsyncMock(get_by_idempotency_key=AsyncMock(return_value=None)),
             account_repo=AsyncMock(),  # type: ignore[arg-type]
             catalog_repo=catalog,  # type: ignore[arg-type]
             price_book_service=AsyncMock(),  # type: ignore[arg-type]
@@ -252,7 +252,7 @@ class TestProvisioningGate:
 
         catalog = AsyncMock()
         service = CreateServerService(
-            server_repo=AsyncMock(),  # type: ignore[arg-type]
+            server_repo=AsyncMock(get_by_idempotency_key=AsyncMock(return_value=None)),
             account_repo=AsyncMock(),  # type: ignore[arg-type]
             catalog_repo=catalog,  # type: ignore[arg-type]
             price_book_service=AsyncMock(),  # type: ignore[arg-type]

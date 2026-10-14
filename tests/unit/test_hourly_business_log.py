@@ -123,8 +123,7 @@ class _CapacityRefusal(ProviderCapacityError):
     """The provider's account-limit refusal, with its documented evidence."""
 
     def __init__(self, message: str, *, error_code: str, correlation_id: str) -> None:
-        super().__init__(message)
-        self.error_code = error_code
+        super().__init__(message, error_code=error_code)
         self.correlation_id = correlation_id
 
 

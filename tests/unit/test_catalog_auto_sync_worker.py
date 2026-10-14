@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import cloud_platform.worker.settings as ws
-from cloud_platform.core.config import Settings
+from cloud_platform.core.config import HetznerAccountSettings, Settings
 from cloud_platform.modules.offers.auto_sync import AutoSyncRunReport, ProviderAutoSyncReport
 from cloud_platform.modules.offers.domain import CatalogSyncState
 
@@ -81,6 +81,9 @@ class TestCatalogAutoSyncJob:
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         settings.hetzner_api_token = "hetzner-token"
+        settings.hetzner_accounts = [
+            HetznerAccountSettings(id="default", api_token="hetzner-token")
+        ]
         seen: dict[str, Any] = {}
 
         def _factory(**kwargs: Any) -> AsyncMock:

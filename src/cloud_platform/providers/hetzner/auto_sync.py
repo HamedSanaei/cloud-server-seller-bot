@@ -73,7 +73,7 @@ class HetznerCatalogSyncSource:
         ok = not offers_result.persistence_failures and (
             offers_result.offers_written > 0 or (not location_failed and not no_view)
         )
-        complete = bool(offers_result.locations) and not location_failed
+        complete = offers_result.availability_reconciled
         errors = [
             f"{report.location_id}: {report.error}"
             for report in offers_result.locations
@@ -93,4 +93,6 @@ class HetznerCatalogSyncSource:
             warnings=tuple(warnings),
             errors=tuple(errors),
             verified=offers_result.verified,
+            verified_accounts=offers_result.verified_accounts,
+            account_aware=offers_result.account_aware,
         )

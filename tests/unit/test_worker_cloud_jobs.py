@@ -42,6 +42,8 @@ def _fake_container(service: Any) -> MagicMock:
     container.initialize = AsyncMock()
     container.close = AsyncMock()
     container.hourly_cloud_service = MagicMock(return_value=service)
+    legacy = MagicMock(process_pending_creates=AsyncMock())
+    container.provisioning_worker = MagicMock(return_value=legacy)
     return container
 
 
@@ -61,6 +63,7 @@ class TestProcessCloudCreates:
         container = container_patch(service)
         await ws.process_cloud_creates({})
         container.initialize.assert_awaited_once()
+        container.provisioning_worker().process_pending_creates.assert_awaited_once()
         container.hourly_cloud_service.assert_called_once()
         service.process_server.assert_not_awaited()
         container.close.assert_awaited_once()

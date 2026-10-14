@@ -36,6 +36,7 @@ class ProviderRegistry:
         self._providers: dict[str, CloudProvider] = {}
         self._routes: dict[str, dict[str, CloudProvider]] = {}
         self._account_views: dict[str, tuple[CredentialAccountView, ...]] = {}
+        self._strict_default_accounts: set[str] = set()
 
     def register(self, provider: CloudProvider) -> None:
         if provider.key in self._providers:
@@ -58,6 +59,10 @@ class ProviderRegistry:
         routes[account_id] = provider
         self._providers.setdefault(provider_key, provider)
 
+    def disable_default_account_fallback(self, provider_key: str) -> None:
+        """Require the original default credential for NULL/default ownership."""
+        self._strict_default_accounts.add(provider_key)
+
     def get(self, key: str) -> CloudProvider:
         try:
             return self._providers[key]
@@ -67,26 +72,28 @@ class ProviderRegistry:
     def get_for(self, key: str, credential_account_id: str | None = None) -> CloudProvider:
         """Resolve the adapter for a RESOURCE pinned to a credential account.
 
-        ``None`` (legacy rows, credential-agnostic callers) resolves to the
-        logical adapter, which is exactly what a single-credential deployment
-        registered.
+        Providers opting out of the legacy alias resolve NULL/default only to
+        an explicitly registered default account, never the preferred route.
 
         Raises:
             KeyError: unknown provider key.
             UnknownCredentialAccountError: the provider is registered but the
                 pinned account is not — fail closed.
         """
-        if credential_account_id is None:
+        strict = key in self._strict_default_accounts
+        if credential_account_id is None and not strict:
             return self.get(key)
         routes = self._routes.get(key)
         if not routes:
-            # Single-credential provider: any account id maps to the one
-            # adapter. Legacy rows keep working without a backfill.
+            if strict:
+                raise UnknownCredentialAccountError(
+                    key, normalize_account_id(credential_account_id)
+                )
             return self.get(key)
         account_id = normalize_account_id(credential_account_id)
         provider = routes.get(account_id)
         if provider is None:
-            if account_id == DEFAULT_CREDENTIAL_ACCOUNT:
+            if account_id == DEFAULT_CREDENTIAL_ACCOUNT and not strict:
                 # ``default`` is a RESERVED alias for "the provider's pre-
                 # multi-account credential". Migration 0035 backfills every
                 # pre-existing Leaseweb row with exactly this id, so an

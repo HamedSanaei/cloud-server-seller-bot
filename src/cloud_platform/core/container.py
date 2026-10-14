@@ -64,7 +64,6 @@ from cloud_platform.providers.allocator import BaseProviderAllocator, CompositeA
 from cloud_platform.providers.arvancloud.client import ArvanCloudProvider
 from cloud_platform.providers.arvancloud.sync import ArvanCloudCatalogSyncer
 from cloud_platform.providers.credentials import CredentialHolder
-from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 from cloud_platform.providers.hetzner.sync import HetznerCatalogSyncer
 from cloud_platform.providers.leaseweb.client import LeaseWebProvider
 from cloud_platform.providers.leaseweb.ordering import (
@@ -100,6 +99,10 @@ class _CredentialHolderRegistry:
     _holders: dict[tuple[str, str | None], CredentialHolder] = field(
         default_factory=dict, init=False, repr=False
     )
+    _strict_default_accounts: set[str] = field(default_factory=set, init=False, repr=False)
+
+    def disable_default_account_fallback(self, provider_key: str) -> None:
+        self._strict_default_accounts.add(provider_key)
 
     def register(
         self,
@@ -114,6 +117,8 @@ class _CredentialHolderRegistry:
         self, provider_key: str, credential_account_id: str | None = None
     ) -> CredentialHolderLike | None:
         account_id = (credential_account_id or "").strip() or None
+        if provider_key in self._strict_default_accounts:
+            return self._holders.get((provider_key, account_id or "default"))
         holder = self._holders.get((provider_key, account_id))
         if holder is None and account_id is None:
             # Legacy callers may address a multi-account provider without an
@@ -156,6 +161,7 @@ class Container:
     #: when several Leaseweb API keys are configured; ``None`` means the legacy
     #: single-credential deployment, where the logical adapter is the only one.
     leaseweb_account_router: Any | None = None
+    hetzner_account_router: Any | None = None
     #: Hourly-cloud per-credential-account adapters (Public Cloud is account
     #: scoped like ordering). ``None`` means no hourly credential is
     #: configured; callers skip the hourly product instead of failing.
@@ -174,9 +180,6 @@ class Container:
     #: syncers through these fields).
     owned_resources: tuple[Any, ...] = field(default=(), repr=False)
     _global_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
-    _hetzner_hourly_provider: Any | None = field(
-        default=None, init=False, repr=False, compare=False
-    )
     _domestic_fx_resolver: Any | None = field(default=None, init=False, repr=False, compare=False)
     _server_credentials: Any | None = field(default=None, init=False, repr=False, compare=False)
     # Lifecycle guard: :meth:`initialize` registers provider adapters, and
@@ -324,6 +327,7 @@ class Container:
             hold_repo=SqlAlchemyHoldRepository(self.session_factory),
             audit_repo=self.audit_repository(),
             book_name=settings.price_book_name,
+            fulfillment_routes=self.provider_route_selector(),
         )
 
     def user_repository(self) -> SqlAlchemyUserRepository:
@@ -457,9 +461,8 @@ class Container:
             provider_registry=self.provider_registry,
             event_sink=self.business_event_sink(),
             event_market_lookup=self.provider_market,
-            # LEASEWEB-MULTIACCOUNT: resolve and PIN the fulfillment credential
-            # account before anything is persisted, so the worker never has to
-            # re-decide whose API key to bill for this order.
+            # Select before persistence; an unaccepted create may move only
+            # under the durable refusal/attempt fence, never after acceptance.
             fulfillment_routes=self.provider_route_selector(),
         )
 
@@ -467,7 +470,10 @@ class Container:
         """Durable, provider-neutral fulfillment-account resolver."""
         from cloud_platform.modules.provider_routes.service import ProviderRouteSelector
 
-        return ProviderRouteSelector(self.session_factory)
+        router = self._hetzner_accounts()
+        return ProviderRouteSelector(
+            self.session_factory, usage_readers={"hetzner": router} if router else None
+        )
 
     def offer_catalog_view_service(self) -> Any:
         """Customer-facing monthly offer screens (LEASEWEB-MVP)."""
@@ -488,19 +494,30 @@ class Container:
 
     def hourly_cloud_resolver(self) -> Any | None:
         """Resolve hourly adapters by provider and pinned credential account."""
+        hetzner_router = self._hetzner_accounts()
         router = self.leaseweb_cloud_account_router
         fallback = self.hourly_cloud_providers()
-        if router is None and not fallback:
+        if router is None and hetzner_router is None and not fallback:
             return None
 
         class _Resolver:
-            def __init__(self, cloud_router: Any, providers: dict[str, Any]) -> None:
+            def __init__(
+                self, cloud_router: Any, hetzner_router: Any, providers: dict[str, Any]
+            ) -> None:
                 self._router = cloud_router
+                self._hetzner = hetzner_router
                 self._fallback = providers
 
             def adapter_for(
                 self, provider_key: str, credential_account_id: str | None = None
             ) -> Any | None:
+                if provider_key == "hetzner":
+                    if self._hetzner is None:
+                        return None
+                    try:
+                        return self._hetzner.hourly_for(credential_account_id)
+                    except KeyError:
+                        return None
                 if provider_key != "leaseweb" or self._router is None:
                     if credential_account_id not in (None, ""):
                         return None
@@ -524,7 +541,7 @@ class Container:
                             return next(iter(providers.values()))
                     return None
 
-        return _Resolver(router, fallback)
+        return _Resolver(router, hetzner_router, fallback)
 
     def hourly_cloud_provider(self) -> Any | None:
         """Hourly cloud adapter for live image reads (None when unconfigured).
@@ -557,18 +574,22 @@ class Container:
         if leaseweb is not None:
             providers["leaseweb"] = leaseweb
         settings = get_settings()
-        if settings.providers_enabled.get("hetzner", False) and settings.hetzner_api_token:
-            adapter = self._hetzner_hourly_provider
-            if adapter is None:
-                from cloud_platform.providers.hetzner.hourly import HetznerHourlyCloudProvider
-
-                adapter = HetznerHourlyCloudProvider(
-                    token=settings.hetzner_api_token,
-                    base_url=settings.hetzner_api_base_url,
-                )
-                object.__setattr__(self, "_hetzner_hourly_provider", adapter)
-            providers["hetzner"] = adapter
+        if settings.providers_enabled.get("hetzner", False):
+            router = self._hetzner_accounts()
+            if router is not None:
+                clients = router.new_order_clients()
+                if clients:
+                    providers["hetzner"] = router.hourly_for(clients[0][0])
         return providers
+
+    def _hetzner_accounts(self) -> Any | None:
+        router = self.hetzner_account_router
+        if router is None:
+            from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
+
+            router = build_hetzner_account_router(get_settings())
+            object.__setattr__(self, "hetzner_account_router", router)
+        return router
 
     def capacity_republisher(self) -> Any | None:
         """Reacts to a NEW capacity refusal by refreshing future publication.
@@ -720,6 +741,49 @@ class Container:
             )
         return self._server_credentials
 
+    def create_account_attempt_repository(self) -> Any:
+        from cloud_platform.modules.operations.create_attempts_repository import (
+            SqlAlchemyCreateAccountAttemptRepository,
+        )
+
+        return SqlAlchemyCreateAccountAttemptRepository(self.session_factory)
+
+    def provisioning_worker(self) -> Any:
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.operations.service import (
+            FirstLinuxImageSelector,
+            ProvisioningWorker,
+        )
+        from cloud_platform.modules.wallet.repository import SqlAlchemyHoldRepository
+
+        return ProvisioningWorker(
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            server_repo=self.server_repository(),
+            provider_registry=self.provider_registry,
+            image_selector=FirstLinuxImageSelector(),
+            wallet_repo=self.wallet_repository(),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            audit_repo=self.audit_repository(),
+            create_attempts=self.create_account_attempt_repository(),
+            fulfillment_routes=self.provider_route_selector(),
+        )
+
+    def order_settlement_service(self) -> Any:
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.orders.service import OrderSettlementService
+        from cloud_platform.modules.wallet.repository import SqlAlchemyHoldRepository
+
+        return OrderSettlementService(
+            wallet_repo=self.wallet_repository(),
+            hold_repo=SqlAlchemyHoldRepository(self.session_factory),
+            hold_service=self.hold_service(),
+            ledger_repo=self.ledger_repository(),
+            orders_repo=self.provider_order_repository(),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            audit_repo=self.audit_repository(),
+            create_attempts=self.create_account_attempt_repository(),
+        )
+
     def admin_wallet_service(self) -> Any:
         """Sole Telegram owner credit path with locked IRT ledger settlement."""
         from cloud_platform.modules.wallet.admin import AdminWalletService
@@ -829,6 +893,8 @@ class Container:
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
             credential_store=self.server_credential_store(),
+            create_attempts=self.create_account_attempt_repository(),
+            fulfillment_routes=self.provider_route_selector(),
         )
 
     def order_worker(self, delivery_notifier: Any | None = None) -> Any:
@@ -856,6 +922,8 @@ class Container:
             delivery_notifier=delivery_notifier,
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
+            create_attempts=self.create_account_attempt_repository(),
+            fulfillment_routes=self.provider_route_selector(),
         )
 
     def order_reconciler(self, delivery_notifier: Any | None = None) -> Any:
@@ -883,6 +951,7 @@ class Container:
             delivery_notifier=delivery_notifier,
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
+            create_attempts=self.create_account_attempt_repository(),
         )
 
     def order_recovery(self) -> Any:
@@ -907,6 +976,8 @@ class Container:
             provider_registry=self.provider_registry,
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
+            create_attempts=self.create_account_attempt_repository(),
+            settlement=self.order_settlement_service(),
         )
 
     def order_manual_resolution(self) -> Any:
@@ -1507,16 +1578,17 @@ class Container:
 
         settings = get_settings()
         holders = self.credential_holders
-        if settings.hetzner_api_token:
-            hetzner_holder = CredentialHolder(settings.hetzner_api_token)
+        hetzner_router = self._hetzner_accounts()
+        self.provider_registry.disable_default_account_fallback("hetzner")
+        if hetzner_router is not None:
             if holders is not None:
-                holders.register("hetzner", hetzner_holder)
-            hetzner = HetznerCloudProvider(
-                token=settings.hetzner_api_token,
-                base_url=settings.hetzner_api_base_url,
-                credential_source=hetzner_holder,
-            )
-            self.provider_registry.register(hetzner)
+                holders.disable_default_account_fallback("hetzner")
+                for account_id, holder in hetzner_router.credential_holders.items():
+                    holders.register("hetzner", holder, account_id)
+            active = dict(hetzner_router.new_order_clients())
+            for account_id, provider in {**active, **hetzner_router.providers}.items():
+                self.provider_registry.register_route("hetzner", account_id, provider)
+            self.provider_registry.register_account_views("hetzner", hetzner_router.views())
         if settings.arvancloud_api_key:
             arvancloud_holder = CredentialHolder(settings.arvancloud_api_key)
             if holders is not None:
@@ -1633,7 +1705,7 @@ class Container:
         # containers without being listed in ``owned_resources``.
         await close_resource(self.leaseweb_account_router)
         await close_resource(self.leaseweb_cloud_account_router)
-        await close_resource(self._hetzner_hourly_provider)
+        await close_resource(self.hetzner_account_router)
 
         if self.engine is not None and id(self.engine) not in seen:
             engine_id = id(self.engine)
@@ -1728,13 +1800,20 @@ def create_container() -> Container:
     # manual catalog scripts release them as well.
     owned_resources: list[Any] = []
 
-    # Create Hetzner syncer if token available
+    from cloud_platform.providers.hetzner.accounts import build_hetzner_account_router
+
+    hetzner_account_router = build_hetzner_account_router(settings)
+    if hetzner_account_router is not None:
+        owned_resources.append(hetzner_account_router)
+    # Catalog reads share account-bound transports and rotated credential holders.
     hetzner_syncer = None
-    if settings.hetzner_api_token:
+    if hetzner_account_router is not None:
         hetzner_syncer = HetznerCatalogSyncer(
             session_factory=session_factory,
-            token=settings.hetzner_api_token,
             base_url=settings.hetzner_api_base_url,
+            account_router=hetzner_account_router,
+            catalog_currency=settings.fx_catalog_pricing_currency,
+            catalog_stale_limit_seconds=settings.fx_frankfurter_catalog_max_stale_seconds,
         )
         owned_resources.append(hetzner_syncer)
 
@@ -1850,6 +1929,7 @@ def create_container() -> Container:
         leaseweb_ordering_syncer=leaseweb_ordering_syncer,
         leaseweb_ordering_provider=leaseweb_ordering_provider,
         leaseweb_account_router=leaseweb_account_router,
+        hetzner_account_router=hetzner_account_router,
         leaseweb_cloud_account_router=leaseweb_cloud_account_router,
         owned_resources=tuple(owned_resources),
         credential_holders=holders,

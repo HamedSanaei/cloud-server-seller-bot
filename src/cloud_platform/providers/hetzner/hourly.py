@@ -33,25 +33,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import Any
-
-import httpx
+from typing import TYPE_CHECKING, Any
 
 from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.catalog.image_compatibility import image_compatible
 from cloud_platform.modules.fx.domain import SUPPORTED_CURRENCIES, currency_exponent
+from cloud_platform.providers.base import OrderRecoveryVerdict
 from cloud_platform.providers.errors import (
-    ProviderAuthError,
-    ProviderCapacityError,
     ProviderConflict,
     ProviderError,
     ProviderNotFound,
     ProviderOutcomeUnknown,
+    ProviderUnavailable,
 )
+from cloud_platform.providers.routing import normalize_account_id
 
-#: Hetzner's identity and billing currency. Provider metadata, not prices --
-#: all price values are ingested from the API payload (M04-005).
-CURRENCY = "EUR"
+if TYPE_CHECKING:
+    from cloud_platform.providers.hetzner.client import HetznerCloudProvider
+
 
 #: The provider's own price keys on each ``prices[]`` entry (verified live).
 HOURLY_PRICE_KEY = "price_hourly"
@@ -73,6 +72,16 @@ REASON_DEPRECATED = "deprecated"
 REASON_UNAVAILABLE_AT_LOCATION = "unavailable-at-location"
 REASON_MISSING_IDENTITY = "missing-identity"
 REASON_UNKNOWN_CURRENCY = "unknown-currency"
+
+
+def pricing_currency(payload: Any) -> str:
+    """Read the documented Project-owner currency; never infer it from prices."""
+    pricing = payload.get("pricing") if isinstance(payload, dict) else None
+    currency = pricing.get("currency") if isinstance(pricing, dict) else None
+    if not isinstance(currency, str) or currency not in SUPPORTED_CURRENCIES:
+        raise ProviderUnavailable("Hetzner pricing currency is unproven")
+    currency_exponent(currency)
+    return currency
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +212,7 @@ class HetznerHourlyInstance:
         return self.reference
 
 
-def minor_units(value: Decimal, currency: str = CURRENCY) -> int:
+def minor_units(value: Decimal, currency: str) -> int:
     """Exact major-unit decimal -> integer minor units (audited exponent).
 
     ``HALF_UP`` on the currency's real exponent, never a hardcoded *100: a
@@ -309,7 +318,7 @@ def _reject(plan_id: str, location_id: str, reason: str) -> HetznerHourlyRejecti
 
 
 def parse_hourly_plan(
-    item: dict[str, Any], location_id: str
+    item: dict[str, Any], location_id: str, *, currency: str
 ) -> HetznerHourlyPlan | HetznerHourlyRejection:
     """Normalize one ``/server_types`` entry into an hourly plan -- or reject it.
 
@@ -320,7 +329,7 @@ def parse_hourly_plan(
     plan_id = str(item.get("name") or item.get("id") or "").strip()
     if not plan_id:
         return _reject("", location_id, REASON_MISSING_IDENTITY)
-    if CURRENCY not in SUPPORTED_CURRENCIES:
+    if not isinstance(currency, str) or currency not in SUPPORTED_CURRENCIES:
         return _reject(plan_id, location_id, REASON_UNKNOWN_CURRENCY)
     if bool(item.get("deprecated", False)) or item.get("deprecation"):
         return _reject(plan_id, location_id, REASON_DEPRECATED)
@@ -352,10 +361,10 @@ def parse_hourly_plan(
         server_type_id=str(item.get("id") or ""),
         location_id=location_id,
         hourly_rate_exact=exact_text(hourly),
-        hourly_cost_minor=minor_units(hourly),
+        hourly_cost_minor=minor_units(hourly, currency),
         monthly_rate_exact=exact_text(monthly),
-        monthly_cap_minor=minor_units(monthly),
-        currency=CURRENCY,
+        monthly_cap_minor=minor_units(monthly, currency),
+        currency=currency,
         vcpu=int(item.get("cores") or 0),
         ram_gb=memory_gb(raw_memory),
         memory_gb_exact=str(raw_memory) if raw_memory is not None else "",
@@ -368,7 +377,7 @@ def parse_hourly_plan(
     )
 
 
-def parse_hourly_plans(items: Any, location_id: str) -> HourlyPlansRead:
+def parse_hourly_plans(items: Any, location_id: str, *, currency: str) -> HourlyPlansRead:
     """Parse one location-scoped ``/server_types`` payload (fail closed).
 
     A non-list payload yields an empty read rather than an exception: an
@@ -383,7 +392,7 @@ def parse_hourly_plans(items: Any, location_id: str) -> HourlyPlansRead:
         if not isinstance(item, dict):
             rejected.append(_reject("", location_id, REASON_MISSING_IDENTITY))
             continue
-        parsed = parse_hourly_plan(item, location_id)
+        parsed = parse_hourly_plan(item, location_id, currency=currency)
         if isinstance(parsed, HetznerHourlyRejection):
             rejected.append(parsed)
         else:
@@ -402,7 +411,9 @@ def parse_hourly_instance(
     """
     if not isinstance(payload, dict):
         return None
-    raw_id = payload.get("id")
+    from cloud_platform.providers.hetzner.client import _resource_id
+
+    raw_id = _resource_id(payload.get("id"))
     if raw_id is None:
         return None
     reference = str(payload.get("name") or "").strip()
@@ -533,22 +544,36 @@ class HetznerHourlyCheckoutFacts:
 class HetznerHourlyCloudProvider:
     """Application-facing hourly server port; monthly provider is unchanged.
 
-    Hetzner has no generic POST idempotency key: deterministic server name and
-    read-only, exhaustively paginated lookup are the recovery identity. The
-    caller's durable operation ledger serializes competing creates.
+    Hetzner has no generic POST idempotency key. The durable caller serializes
+    creates and the exact bounded operation label identifies read-only recovery;
+    a similar or matching server name is never authority for a new contract.
     """
 
     key = "hetzner"
     issues_password_on_create = True
 
-    def __init__(self, token: str, base_url: str = "https://api.hetzner.cloud/v1") -> None:
+    def __init__(
+        self,
+        token: str = "",
+        base_url: str = "https://api.hetzner.cloud/v1",
+        *,
+        provider: HetznerCloudProvider | None = None,
+        account_id: str = "default",
+    ) -> None:
         # Deferred import avoids the legacy client -> sync -> hourly import cycle.
         from cloud_platform.providers.hetzner.client import HetznerCloudProvider
 
-        self._provider = HetznerCloudProvider(token=token, base_url=base_url)
+        self.account_id = normalize_account_id(account_id)
+        if provider is not None and provider.account_id != self.account_id:
+            raise ValueError("hourly adapter account does not match its monthly provider")
+        self._owns_provider = provider is None
+        self._provider = provider or HetznerCloudProvider(
+            token=token, base_url=base_url, account_id=self.account_id
+        )
 
     async def close(self) -> None:
-        await self._provider.close()
+        if self._owns_provider:
+            await self._provider.close()
 
     async def aclose(self) -> None:
         await self.close()
@@ -556,28 +581,7 @@ class HetznerHourlyCloudProvider:
     async def _pages(
         self, path: str, key: str, params: dict[str, Any] | None = None
     ) -> list[dict[str, Any]]:
-        """Consume documented meta.pagination.next_page; never search partial data."""
-        items: list[dict[str, Any]] = []
-        page = 1
-        for _ in range(1000):
-            payload = await self._provider._request(
-                "GET", path, params={**(params or {}), "page": page, "per_page": 50}
-            )
-            raw = payload.get(key)
-            meta = payload.get("meta")
-            pagination = meta.get("pagination") if isinstance(meta, dict) else None
-            if not isinstance(raw, list) or not isinstance(pagination, dict):
-                raise ProviderError(f"{path} returned an incomplete list envelope")
-            if any(not isinstance(item, dict) for item in raw):
-                raise ProviderError(f"{path} returned an invalid list entry")
-            items.extend(raw)
-            next_page = pagination.get("next_page")
-            if next_page is None:
-                return items
-            if isinstance(next_page, bool) or not isinstance(next_page, int) or next_page <= page:
-                raise ProviderError(f"{path} returned invalid pagination")
-            page = next_page
-        raise ProviderError(f"{path} exceeded safe pagination limit")
+        return await self._provider._pages(path, key, params)
 
     async def read_locations(self) -> tuple[HetznerHourlyLocation, ...]:
         items = await self._pages("/locations", "locations")
@@ -600,8 +604,9 @@ class HetznerHourlyCloudProvider:
         return list(await self.read_locations())
 
     async def read_instance_types(self, location: str) -> HourlyPlansRead:
+        currency = await self._provider.get_pricing_currency()
         items = await self._pages("/server_types", "server_types", {"location": location})
-        return parse_hourly_plans(items, location)
+        return parse_hourly_plans(items, location, currency=currency)
 
     async def list_instance_types(self, location: str) -> list[HetznerHourlyPlan]:
         return list((await self.read_instance_types(location)).plans)
@@ -651,12 +656,17 @@ class HetznerHourlyCloudProvider:
         root_disk_size_gb: int | None = None,
         root_disk_storage_type: str | None = None,
     ) -> HetznerHourlyCheckoutFacts:
-        if currency != CURRENCY:
-            raise ProviderConflict(f"Hetzner hourly currency changed from {currency!r}")
+        actual_currency = await self._provider.get_pricing_currency()
+        if currency != actual_currency:
+            raise ProviderConflict("Hetzner hourly native currency changed")
         plan = next(
             (
                 item
-                for item in await self.list_instance_types(location_id)
+                for item in parse_hourly_plans(
+                    await self._pages("/server_types", "server_types", {"location": location_id}),
+                    location_id,
+                    currency=actual_currency,
+                ).plans
                 if item.plan_id == product_id
             ),
             None,
@@ -709,8 +719,8 @@ class HetznerHourlyCloudProvider:
             payload = await self._provider._request("GET", f"/servers/{instance_id}")
         except ProviderNotFound:
             return None
-        instance = parse_hourly_instance(payload.get("server"))
-        if instance is None:
+        instance = parse_hourly_instance(payload.get("server"), account_id=self.account_id)
+        if instance is None or instance.provider_server_id != instance_id:
             raise ProviderError("GET /servers/{id} returned an incomplete server identity")
         return instance
 
@@ -720,7 +730,7 @@ class HetznerHourlyCloudProvider:
         for raw in await self._pages("/servers", "servers", {"name": reference}):
             if raw.get("name") != reference:
                 continue
-            instance = parse_hourly_instance(raw)
+            instance = parse_hourly_instance(raw, account_id=self.account_id)
             if instance is None:
                 raise ProviderError("reference matched a server without complete identity")
             matches.append(instance)
@@ -731,6 +741,25 @@ class HetznerHourlyCloudProvider:
         if matches[0].region != region:
             raise ProviderConflict("server reference is already used in a different location")
         return matches[0]
+
+    async def find_by_operation(
+        self,
+        operation_key: str,
+        *,
+        platform_server_id: str,
+    ) -> HetznerHourlyInstance | None:
+        result = await self._provider.recover_server_by_operation(
+            operation_key,
+            legacy_label=False,
+            platform_server_id=platform_server_id,
+        )
+        if result.verdict is OrderRecoveryVerdict.SCAN_FAILED:
+            raise ProviderUnavailable("operation inventory scan is unreadable")
+        if result.verdict is OrderRecoveryVerdict.AMBIGUOUS:
+            raise ProviderConflict("operation correlation is ambiguous")
+        if result.verdict is not OrderRecoveryVerdict.MATCHED or not result.provider_order_id:
+            return None
+        return await self.get_instance(result.provider_order_id)
 
     async def create_instance(
         self,
@@ -745,13 +774,11 @@ class HetznerHourlyCloudProvider:
         ssh_key_id: str | None = None,
         image_label: str | None = None,
         os_family: str | None = None,
+        platform_server_id: str | None = None,
     ) -> HetznerHourlyInstance:
-        del idempotency_key, image_label, os_family
-        existing = await self.find_by_reference(region, reference)
-        if existing is not None:
-            if existing.plan_id != instance_type or existing.image_id != image_id:
-                raise ProviderConflict("server reference belongs to a different pinned contract")
-            return existing
+        from cloud_platform.providers.hetzner.client import operation_label
+
+        del image_label, os_family
         plan = next(
             (p for p in await self.list_instance_types(region) if p.plan_id == instance_type),
             None,
@@ -766,47 +793,25 @@ class HetznerHourlyCloudProvider:
             "server_type": instance_type,
             "image": image_id,
             "location": region,
+            "labels": {"platform-operation": operation_label(idempotency_key.value)},
         }
+        if platform_server_id is not None:
+            body["labels"]["platform_server_id"] = platform_server_id
         if ssh_key_id is not None:
             body["ssh_keys"] = [ssh_key_id]
-        # No _provider._request: its 429 retry is appropriate for GET but not
-        # for a billable POST without provider-supported idempotency.
-        try:
-            response = await self._provider._client.request("POST", "/servers", json=body)
-        except httpx.RequestError as exc:
-            raise ProviderOutcomeUnknown("Hetzner create transport outcome unknown") from exc
-        if response.status_code == 429 or response.status_code >= 500:
-            raise ProviderOutcomeUnknown(
-                f"Hetzner create outcome unknown (HTTP {response.status_code})"
-            )
-        if response.status_code == 422:
-            try:
-                error = response.json().get("error", {})
-            except (ValueError, AttributeError):
-                error = {}
-            if isinstance(error, dict) and error.get("code") == "resource_limit_exceeded":
-                raise ProviderCapacityError("Hetzner account resource limit exceeded")
-        if response.status_code in {401, 403}:
-            raise ProviderAuthError(f"Hetzner create refused (HTTP {response.status_code})")
-        if response.status_code == 404:
-            raise ProviderNotFound("Hetzner create resource not found")
-        if response.status_code in {409, 423}:
-            raise ProviderConflict(f"Hetzner create conflict (HTTP {response.status_code})")
-        if response.is_error:
-            raise ProviderError(f"Hetzner create refused (HTTP {response.status_code})")
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise ProviderOutcomeUnknown("Hetzner create returned invalid JSON") from exc
-        instance = parse_hourly_instance(
-            payload.get("server") if isinstance(payload, dict) else None
-        )
+        payload = await self._provider._mutation_request("POST", "/servers", json=body)
+        instance = parse_hourly_instance(payload.get("server"), account_id=self.account_id)
         if (
             instance is None
             or instance.region != region
             or instance.reference != reference
             or instance.plan_id != instance_type
             or instance.image_id != image_id
+            or not isinstance(payload.get("server", {}).get("labels"), dict)
+            or any(
+                payload["server"]["labels"].get(key) != value
+                for key, value in body["labels"].items()
+            )
         ):
             raise ProviderOutcomeUnknown("Hetzner create response identity not proven")
         if ssh_key_id is None:
@@ -830,25 +835,12 @@ class HetznerHourlyCloudProvider:
     ) -> None:
         del idempotency_key
         try:
-            response = await self._provider._client.request("DELETE", f"/servers/{instance_id}")
-        except httpx.RequestError as exc:
-            raise ProviderOutcomeUnknown("Hetzner delete transport outcome unknown") from exc
-        if response.status_code == 404:
+            await self._provider._mutation_request("DELETE", f"/servers/{instance_id}")
+        except ProviderNotFound:
             return
-        if response.status_code == 429 or response.status_code >= 500:
-            raise ProviderOutcomeUnknown(
-                f"Hetzner delete outcome unknown (HTTP {response.status_code})"
-            )
-        if response.status_code in {401, 403}:
-            raise ProviderAuthError(f"Hetzner delete refused (HTTP {response.status_code})")
-        if response.status_code in {409, 423}:
-            raise ProviderConflict(f"Hetzner delete conflict (HTTP {response.status_code})")
-        if response.is_error:
-            raise ProviderError(f"Hetzner delete refused (HTTP {response.status_code})")
 
 
 __all__ = [
-    "CURRENCY",
     "HOURLY_PRICE_KEY",
     "MONTHLY_PRICE_KEY",
     "HetznerHourlyCheckoutFacts",
@@ -866,5 +858,6 @@ __all__ = [
     "parse_hourly_instance",
     "parse_hourly_plan",
     "parse_hourly_plans",
+    "pricing_currency",
     "traffic_label",
 ]

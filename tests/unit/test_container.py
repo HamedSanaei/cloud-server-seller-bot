@@ -59,15 +59,14 @@ async def test_close_container():
 
 @pytest.mark.asyncio
 async def test_hetzner_hourly_adapter_is_configured_only_when_enabled(monkeypatch):
-    from types import SimpleNamespace
-
     from cloud_platform.core import container as container_module
+    from cloud_platform.core.config import Settings
 
     container = create_container()
     monkeypatch.setattr(
         container_module,
         "get_settings",
-        lambda: SimpleNamespace(
+        lambda: Settings(
             providers_enabled={"hetzner": False},
             hetzner_api_token="fixture-token",
             hetzner_api_base_url="https://api.hetzner.cloud/v1",
@@ -79,7 +78,7 @@ async def test_hetzner_hourly_adapter_is_configured_only_when_enabled(monkeypatc
     monkeypatch.setattr(
         container_module,
         "get_settings",
-        lambda: SimpleNamespace(
+        lambda: Settings(
             providers_enabled={"hetzner": True},
             hetzner_api_token="fixture-token",
             hetzner_api_base_url="https://api.hetzner.cloud/v1",

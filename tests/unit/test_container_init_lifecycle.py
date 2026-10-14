@@ -79,6 +79,8 @@ class TestContainerInitializeIdempotency:
             # under test is "three providers, each registered once".
             nonlocal calls
             calls += 1
+            if calls == 1:
+                raise RuntimeError("boom")
             real_register_route(provider_key, account_id, provider)
 
         monkeypatch.setattr(container.provider_registry, "register", _flaky)
@@ -113,7 +115,9 @@ class TestRegistryStillRejectsDuplicates:
     def test_double_register_providers_without_initialize_guard_raises(self) -> None:
         container = create_container()
         container._register_providers()
-        with pytest.raises(ValueError, match="provider already registered: hetzner"):
+        with pytest.raises(
+            ValueError, match="credential account already registered: hetzner/default"
+        ):
             container._register_providers()
 
 

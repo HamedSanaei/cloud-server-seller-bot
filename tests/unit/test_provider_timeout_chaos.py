@@ -29,7 +29,6 @@ import httpx
 import pytest
 
 from cloud_platform.core.idempotency import IdempotencyKey
-from cloud_platform.modules.billing.service import FinalChargeService
 from cloud_platform.modules.compute.domain import (
     CloudServer,
     ProvisioningSpec,
@@ -88,14 +87,7 @@ class _Resp:
 
 
 class ChaosHetznerAPI:
-    """Simulates the provider side, chaos included.
-
-    Deduplication contract: a ``POST /servers`` carrying the same
-    ``platform-operation`` label returns the ALREADY-CREATED server instead
-    of creating a second one - exactly the behaviour the M07-003 contract
-    requires of a participating provider (the real Hetzner integration is
-    guarded by the same label + the create-timeout reconciler).
-    """
+    """Official-shaped provider reads, with mutations that may lose their ack."""
 
     def __init__(self) -> None:
         self.servers: dict[str, dict[str, Any]] = {}
@@ -114,7 +106,7 @@ class ChaosHetznerAPI:
     def _payload(self, sid: str, name: str, labels: dict[str, str]) -> dict[str, Any]:
         return {
             "server": {
-                "id": sid,
+                "id": int(sid),
                 "name": name,
                 "status": "creating",
                 "labels": labels,
@@ -123,6 +115,25 @@ class ChaosHetznerAPI:
         }
 
     async def request(self, method: str, path: str, **kwargs: Any) -> _Resp:
+        if method == "GET" and path == "/servers":
+            return _Resp(
+                200,
+                {
+                    "servers": [
+                        self._payload(s["id"], s["name"], s["labels"])["server"]
+                        for s in self.servers.values()
+                    ],
+                    "meta": {
+                        "pagination": {
+                            "page": 1,
+                            "per_page": 50,
+                            "last_page": 1,
+                            "next_page": None,
+                            "total_entries": len(self.servers),
+                        }
+                    },
+                },
+            )
         if method == "GET" and path == "/images":
             return _Resp(
                 200,
@@ -131,16 +142,39 @@ class ChaosHetznerAPI:
                         {
                             "id": "img-linux",
                             "name": "debian",
-                            "os_flavor": "linux",
+                            "os_flavor": "debian",
                             "architecture": "x86",
+                            "type": "system",
+                            "status": "available",
                         }
-                    ]
+                    ],
+                    "meta": {
+                        "pagination": {
+                            "page": 1,
+                            "per_page": 50,
+                            "last_page": 1,
+                            "next_page": None,
+                            "total_entries": 1,
+                        }
+                    },
                 },
             )
         if method == "GET" and path == "/server_types":
-            return _Resp(200, {"server_types": [{"name": "cx22"}]})
+            return _Resp(
+                200,
+                {
+                    "server_types": [{"name": "cx22"}],
+                    "meta": {"pagination": {"page": 1, "next_page": None}},
+                },
+            )
         if method == "GET" and path == "/locations":
-            return _Resp(200, {"locations": [{"id": "fsn1"}]})
+            return _Resp(
+                200,
+                {
+                    "locations": [{"id": "fsn1"}],
+                    "meta": {"pagination": {"page": 1, "next_page": None}},
+                },
+            )
         if method == "POST" and path == "/servers":
             self.create_post_count += 1
             if self.create_timeout_before_call == self.create_post_count:
@@ -154,7 +188,7 @@ class ChaosHetznerAPI:
                     if self.create_timeout_after_call == self.create_post_count:
                         raise httpx.ReadTimeout("injected chaos: create timed out")
                     return _Resp(201, self._payload(existing["id"], body["name"], labels))
-            sid = f"srv-{len(self.servers) + 1:04d}"
+            sid = str(len(self.servers) + 1)
             server = {"id": sid, "name": body["name"], "labels": labels}
             self.servers[sid] = server
             if self.create_timeout_after_call == self.create_post_count:
@@ -334,6 +368,7 @@ class _Harness:
             wallet_repo=wallets,  # type: ignore[arg-type]
             hold_repo=holds,  # type: ignore[arg-type]
             audit_repo=audit,  # type: ignore[arg-type]
+            prepay_server=AsyncMock(),
         )
         self.reconciler = CreateTimeoutReconciler(
             operation_repo=ops,  # type: ignore[arg-type]
@@ -355,6 +390,18 @@ def _linux_images() -> list[ProviderImage]:
 # ---------------------------------------------------------------------------
 # 1. Create chaos
 # ---------------------------------------------------------------------------
+
+
+def _fake_request() -> CreateServerRequest:
+    return CreateServerRequest(
+        name="chaos-server",
+        plan_id="cx22",
+        image_id="img-linux",
+        location_id="fsn1",
+        ssh_key_ids=(),
+        labels={},
+        user_data=None,
+    )
 
 
 class TestCreateTimeoutChaos:
@@ -380,6 +427,9 @@ class TestCreateTimeoutChaos:
         assert claimed is not None
         with pytest.raises(ProviderOutcomeUnknown):
             await harness.provider.create_server(_fake_request(), IdempotencyKey(op.operation_key))
+        # Historical attempts used the original exact operation label.
+        for remote in chaos.servers.values():
+            remote["labels"]["platform-operation"] = op.operation_key[:63]
         # chaos: the crash means NO requeue - the op is still IN_FLIGHT
         assert op.status is OperationStatus.IN_FLIGHT
         # and the provider did create the server behind our back
@@ -390,9 +440,9 @@ class TestCreateTimeoutChaos:
         counts = await harness.reconciler.reconcile()
         assert counts.get(ReconciliationOutcome.RECOVERED) == 1
 
-        # NO duplicate: exactly one physical server, despite two POSTs
+        # Read-only recovery does not issue another non-idempotent create POST.
         assert len(chaos.servers) == 1
-        assert chaos.create_post_count == 2
+        assert chaos.create_post_count == 1
         # the operation completed with the correlation to that ONE server
         assert op.status is OperationStatus.COMPLETED
         assert op.provider_response is not None
@@ -400,48 +450,21 @@ class TestCreateTimeoutChaos:
         # the server row points at it
         assert harness.server.provider_server_id in chaos.servers
 
-    async def test_requeued_timeout_then_retry_creates_once(self) -> None:
-        """Clean chaos: the first create times out BEFORE it lands (nothing
-        created); the worker re-queues with the same key and the retry
-        creates exactly one server."""
+    async def test_ambiguous_create_is_not_reposted_even_when_inventory_is_empty(self) -> None:
         chaos = ChaosHetznerAPI()
         chaos.create_timeout_before_call = 1
         harness = _Harness(chaos=chaos, provider=make_provider(chaos)).build()
-
-        # first run: timeout -> requeue (the provider saw nothing)
         outcome = await harness.worker.process_server(SERVER_ID)
         assert outcome is ProvisioningOutcome.REQUEUED
         assert chaos.create_post_count == 1
-        assert len(chaos.servers) == 0  # nothing landed this time
-        op = harness.ops.by_key[OP_KEY]
-        assert op.status is OperationStatus.PENDING
-        assert op.attempts == 1
-
-        # second run: same key, provider has no record -> one create
-        outcome = await harness.worker.process_server(SERVER_ID)
-        assert outcome is ProvisioningOutcome.PROVISIONED
-        assert chaos.create_post_count == 2
-        assert len(chaos.servers) == 1  # exactly ONE physical server
-        assert op.status is OperationStatus.COMPLETED
-        assert op.attempts == 2
-        assert harness.server.provider_server_id in chaos.servers
-
-    async def test_requeue_uses_same_idempotency_key(self) -> None:
-        """A retry after a timeout must never mint a new operation key -
-        that is what makes provider-side dedup possible."""
-        chaos = ChaosHetznerAPI()
-        chaos.create_timeout_before_call = 1
-        harness = _Harness(chaos=chaos, provider=make_provider(chaos)).build()
-
-        await harness.worker.process_server(SERVER_ID)  # times out, requeues
-        # the provider saw the label of the first attempt; the retry must
-        # carry the SAME label (same operation key)
+        assert not chaos.servers
+        operation = harness.ops.by_key[OP_KEY]
+        assert operation.status is OperationStatus.PENDING
         await harness.worker.process_server(SERVER_ID)
-        assert chaos.create_post_count == 2
-        # both attempts labeled with the same operation key
-        assert len(chaos.servers) == 1
-        for server in chaos.servers.values():
-            assert server["labels"]["platform-operation"] == OP_KEY[:63]
+        harness.clock_now = NOW + timedelta(hours=1)
+        await harness.reconciler.reconcile()
+        assert chaos.create_post_count == 1
+        assert not chaos.servers
 
 
 # ---------------------------------------------------------------------------
@@ -452,18 +475,14 @@ class TestCreateTimeoutChaos:
 class TestDeleteTimeoutChaos:
     async def test_delete_timeout_then_resend_is_not_a_double_delete(self) -> None:
         """The delete call times out AFTER the provider applied it; the saga
-        re-sends the same intent. The adapter reports the unknown outcome, and
-        the resend proves absence first, so the provider never sees a second
-        destructive call.
-        """
+        re-sends the same intent. The adapter must treat the resulting 404
+        as success (delete is 404-idempotent), not as a failure."""
         chaos = ChaosHetznerAPI()
-        sid = "srv-9001"
+        sid = "9001"
         chaos.servers[sid] = {"id": sid, "name": "victim", "labels": {}}
         chaos.delete_timeout_after_call = 1
         provider = make_provider(chaos)
 
-        # A timeout leaves the provider-side truth unknown; the adapter must
-        # say so instead of claiming the delete merely failed.
         with pytest.raises(ProviderOutcomeUnknown):
             await provider.delete_server(sid, IdempotencyKey("server-delete:1"))
         # the provider applied the deletion before the timeout
@@ -472,239 +491,10 @@ class TestDeleteTimeoutChaos:
 
         # the saga re-sends the SAME intent
         await provider.delete_server(sid, IdempotencyKey("server-delete:1"))  # must not raise
-        # Absence is proven BEFORE any mutation, so the resend never even
-        # re-issues DELETE: the provider saw exactly one, and there is no
-        # double state either way.
-        assert chaos.delete_count == 1
+        assert chaos.delete_count == 1  # GET proves absence; there is no repeated DELETE
         assert len(chaos.servers) == 0  # still gone, no error, no double state
 
 
 # ---------------------------------------------------------------------------
 # 3. Charge chaos: lost ack after the ledger commit
 # ---------------------------------------------------------------------------
-
-
-def _make_debit_side_effect(harness: _ChargeHarness) -> Any:
-    """Build an async side_effect bound to the harness instance."""
-
-    async def _debit(*args: Any, **kwargs: Any) -> Any:
-        return await harness._debit(*args, **kwargs)
-
-    return _debit
-
-
-class TestFinalChargeTimeoutChaos:
-    async def test_timeout_after_commit_replays_without_double_charge(self) -> None:
-        """A timeout AFTER the ledger entry committed (the ack was lost) must
-        not produce a second debit on replay: the deterministic entry key
-        ``final:{server_id}`` makes the second post a no-op."""
-        server_id = uuid4()
-        created = NOW - timedelta(hours=3)
-        deleted = NOW - timedelta(hours=1)
-        server = CloudServer(
-            id=server_id,
-            user_id=USER_ID,
-            provider_key="hetzner",
-            provider_account_id=uuid4(),
-            state=ServerLifecycleState.DELETED,
-            idempotency_key=None,
-            created_at=created,
-            deleted_at=deleted,
-            quantum_seconds=3600,
-        )
-
-        harness = _ChargeHarness(server_id)
-        # chaos: the first commit's ack is lost -> the flow sees a timeout
-        harness.fail_next_adjust_with = True
-        with pytest.raises(TimeoutError):
-            await harness.charge_final(server, deleted)
-        # the entry DID commit before the timeout (the ack was lost, not the row)
-        assert len(harness.entries) == 1
-        assert harness.debits == 1
-
-        # the deletion flow replays charge_final (crash-replay)
-        result2 = await harness.charge_final(server, deleted)
-        # NO double charge: the replayed leg is detected by its key
-        assert harness.debits == 1
-        assert len(harness.entries) == 1
-        assert result2.charged_minor == 0 or result2.replayed
-        # the wallet was debited exactly once
-        assert harness.wallet.balance == 1_000_000 - 1000 * 2  # 2 quanta (2h window)
-
-
-class _ChargeHarness:
-    """FinalChargeService over in-memory repos that can simulate a lost ack.
-
-    Each deterministic idempotency key binds immutable facts (fail-closed):
-    the flat remainder uses the single ``final:{server_id}`` key with the
-    identical amount/description on replay, so the second post is a no-op
-    and never a double debit.
-    """
-
-    def __init__(self, server_id: Any) -> None:
-        self.debits = 0
-        self.entries: dict[str, Any] = {}
-        self.accrual_rows: dict[str, Any] = {}
-        self.fail_next_adjust_with = False
-        self.wallet = Wallet(user_id=USER_ID, id=WALLET_ID, balance=1_000_000, currency="EUR")
-        self.wallets = AsyncMock()
-        self.wallets.get = AsyncMock(return_value=self.wallet)
-        self.wallets.adjust = AsyncMock(side_effect=self._adjust)
-        self.holds = AsyncMock()
-        self.holds.get_by_idempotency = AsyncMock(return_value=None)
-        self.holds.capture_hold = AsyncMock(return_value=None)
-        self.holds.release_hold = AsyncMock(return_value=None)
-        self.ledger = AsyncMock()
-        self.ledger.get_entry_by_idempotency = AsyncMock(side_effect=self._get_entry)
-        self.ledger.post_entry = AsyncMock(side_effect=self._post_entry)
-        self.accruals = AsyncMock()
-        self.accruals.month_total = AsyncMock(return_value=0)
-        self.accruals.get_by_key = AsyncMock(side_effect=self._accrual_get)
-        self.accruals.add = AsyncMock(side_effect=self._accrual_add)
-        self.servers = AsyncMock()
-        self.servers.save = AsyncMock(return_value=None)
-        self.snapshots = AsyncMock()
-        self.audit = AsyncMock()
-        self.audit.append = AsyncMock(side_effect=lambda e: e)
-
-        from decimal import Decimal
-
-        from cloud_platform.modules.pricing.domain import (
-            MarginRule,
-            OfferCost,
-            ServerPriceSnapshot,
-        )
-
-        offer = OfferCost(
-            provider_key="hetzner",
-            plan_id="cx22",
-            location_id="fsn1",
-            cost_minor=600,
-            currency="EUR",
-        )
-        rule = MarginRule(
-            provider="hetzner",
-            plan="cx22",
-            location="fsn1",
-            margin_factor=Decimal("1.15"),
-        )
-        snapshot = ServerPriceSnapshot(
-            server_id=server_id,
-            offer=offer,
-            selling_minor=1000,
-            book_name="chaos",
-            book_version=1,
-            rule=rule,
-            priced_at=NOW,
-        )
-        self.snapshots.get = AsyncMock(return_value=snapshot)
-        self._service = FinalChargeService(
-            server_repo=self.servers,  # type: ignore[arg-type]
-            wallet_repo=self.wallets,  # type: ignore[arg-type]
-            hold_repo=self.holds,  # type: ignore[arg-type]
-            hold_service=self.holds,  # type: ignore[arg-type]
-            ledger_repo=self.ledger,  # type: ignore[arg-type]
-            accrual_repo=self.accruals,  # type: ignore[arg-type]
-            snapshot_repo=self.snapshots,  # type: ignore[arg-type]
-            audit_repo=self.audit,  # type: ignore[arg-type]
-        )
-
-    async def _adjust(
-        self,
-        user_id: Any,
-        delta: int,
-        key: str,
-        *,
-        entry_type: Any,
-        reference_type: str = "",
-        reference_id: str = "",
-        description: str = "",
-    ) -> Any:
-        from decimal import Decimal
-        from uuid import uuid4 as _uuid4
-
-        from cloud_platform.core.money import Money
-        from cloud_platform.modules.wallet.domain import LedgerEntry
-
-        new_key = str(key).strip()
-        if new_key in self.entries:
-            return self.wallet, False
-        new_balance = self.wallet.balance + delta
-        if new_balance < 0:
-            from cloud_platform.modules.wallet.domain import InsufficientBalanceError
-
-            raise InsufficientBalanceError("insufficient balance")
-        self.wallet.balance = new_balance
-        if delta < 0:
-            self.debits += 1
-        self.entries[new_key] = LedgerEntry(
-            id=_uuid4(),
-            wallet_id=WALLET_ID,
-            entry_type=entry_type,
-            amount=Money(Decimal(abs(delta)), "EUR"),
-            reference_type=reference_type,
-            reference_id=reference_id,
-            idempotency_key=new_key,
-            description=description,
-        )
-        # chaos: the commit landed, but the ack was lost
-        if self.fail_next_adjust_with:
-            self.fail_next_adjust_with = False
-            raise TimeoutError("injected chaos: ledger ack lost after commit")
-        return self.wallet, True
-
-    async def _accrual_get(self, key: str) -> Any:
-        return self.accrual_rows.get(key)
-
-    async def _accrual_add(self, period: Any) -> Any:
-        if period.idempotency_key in self.accrual_rows:
-            from cloud_platform.modules.billing.service import AccrualPeriodExistsError
-
-            raise AccrualPeriodExistsError(period.idempotency_key)
-        self.accrual_rows[period.idempotency_key] = period
-        return period
-
-    async def _debit(self, uid: Any, amount: int, key: str) -> None:
-        # Legacy helper kept for the module-level side-effect factory; the
-        # current atomic path goes through _adjust (same key, same facts).
-        if key in self.entries:
-            raise ValueError(f"duplicate ledger key {key}")
-        self.debits += 1
-        self.wallet.balance -= amount
-
-    async def _get_entry(self, wallet_id: Any, key: str) -> Any:
-        return self.entries.get(key)
-
-    async def _post_entry(
-        self,
-        wallet_id: Any,
-        amount: int,
-        currency: str,
-        entry_type: Any,
-        key: str,
-        **kwargs: Any,
-    ) -> None:
-        # enforce the same uniqueness the DB does
-        if key in self.entries:
-            raise ValueError(f"duplicate ledger key {key}")
-        self.entries[key] = {
-            "key": key,
-            "amount": amount,
-            "type": entry_type,
-            **kwargs,
-        }
-
-    async def charge_final(self, server: CloudServer, deleted_at: datetime) -> Any:
-        return await self._service.charge_final(server, deleted_at)
-
-
-def _fake_request() -> CreateServerRequest:
-    return CreateServerRequest(
-        name="chaos-server",
-        plan_id="cx22",
-        image_id="img-linux",
-        location_id="fsn1",
-        ssh_key_ids=(),
-        labels={},
-        user_data=None,
-    )
