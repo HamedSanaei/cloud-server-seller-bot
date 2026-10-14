@@ -444,6 +444,29 @@ def _assert_callback_target(data: str, flow: str, screen: str) -> None:
     assert cb.screen == screen
 
 
+@pytest.mark.parametrize("amount", [100_000, 275_000, 1_000_000_000])
+async def test_recharge_gateway_buttons_fit_and_keep_idempotency_nonce(amount: int) -> None:
+    ui, _ = _ui()
+    nonce = "nonce123"
+    picker = ui.recharge_gateway_screen(amount, "IRT", ["tetraminator", "atlaspay"], nonce=nonce)
+    start = AsyncMock(return_value=picker)
+    ui.recharge_start_screen = start
+    for row in picker.keyboard.inline_keyboard:
+        for button in row:
+            if not button.callback_data:
+                continue
+            assert len(button.callback_data.encode("utf-8")) <= 64
+            callback = decode_callback(button.callback_data, KEY)
+            if callback.screen != "go":
+                continue
+            assert callback.args[:2] == (str(amount), nonce)
+            await ui._recharge_cb(callback, USER_A)
+            start.assert_awaited_with(
+                USER_A, str(amount), gateway_key=callback.args[2], nonce=nonce
+            )
+    assert start.await_count == 2
+
+
 class TestBuyFlow:
     async def test_full_flow_to_order(self) -> None:
         ui, deps = _ui()
