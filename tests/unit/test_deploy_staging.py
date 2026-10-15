@@ -38,7 +38,7 @@ def test_only_staging_pushes_and_explicit_dispatches_enter_the_staging_lane() ->
     assert triggers["push"]["branches"] == ["staging"]
     assert set(triggers) == {"push", "workflow_dispatch"}
     production = _triggers(_workflow("deploy-production.yml"))
-    assert set(production) == {"workflow_dispatch"}
+    assert set(production) == {"workflow_dispatch", "workflow_run"}
 
 
 def test_no_image_build_or_host_mutation_can_bypass_staging_checks() -> None:
@@ -47,7 +47,9 @@ def test_no_image_build_or_host_mutation_can_bypass_staging_checks() -> None:
     assert jobs["deploy"]["needs"] == "build"
     assert jobs["deploy"]["environment"] == "production"
     assert not jobs["build"].get("if")
-    assert not jobs["deploy"].get("if")
+    assert jobs["deploy"]["if"] == (
+        "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging'"
+    )
     permissions = _workflow()["permissions"]
     assert permissions == {"contents": "read", "packages": "write"}
 
@@ -107,7 +109,9 @@ def test_production_sha_input_is_data_and_must_be_a_full_hex_commit(
         for step in _workflow("deploy-production.yml")["jobs"]["build"]["steps"]
         if step.get("id") == "resolve"
     )
-    assert resolve["env"]["REQUESTED_SHA"] == "${{ inputs.sha }}"
+    assert resolve["env"]["REQUESTED_SHA"] == (
+        "${{ github.event.workflow_run.head_sha || inputs.sha }}"
+    )
     command = _render(
         resolve["run"],
         {

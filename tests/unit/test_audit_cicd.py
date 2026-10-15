@@ -63,6 +63,149 @@ def test_required_aggregate_dependency_skip_is_only_allowed_on_push(event: str) 
     assert (_required_result(results, event).returncode == 0) is (event == "push")
 
 
+_RELEASE_SHA = "a" * 40
+_GH_RELEASE_STUB = r"""
+import json
+import os
+import re
+import sys
+
+endpoint = sys.argv[2]
+query = sys.argv[4]
+if "/git/ref/heads/main" in endpoint:
+    assert query == ".object.sha"
+    print(os.environ["TEST_MAIN_SHA"])
+elif "/actions/workflows/ci.yml/runs?" in endpoint:
+    assert "head_sha=" + os.environ["RELEASE_SHA"] in endpoint
+    assert "&branch=main&event=push&per_page=1" in endpoint
+    print("123")
+else:
+    assert endpoint.endswith("/actions/runs/123")
+    run = json.loads(os.environ["TEST_CI_RUN"])
+    # Interpret the shipped query's equality conjunctions without requiring
+    # jq on Windows. Every term must parse; dropped terms also fail below.
+    seen = set()
+    trusted = True
+    for term in query.strip("()").split(" and "):
+        match = re.fullmatch(r'\.([a-z_.]+) == "([^"]+)"', term)
+        assert match, term
+        field, expected = match.groups()
+        seen.add(field)
+        value = run
+        for part in field.split("."):
+            value = value.get(part, {})
+        trusted = trusted and value == expected
+    assert seen == {
+        "path", "status", "conclusion", "event", "head_branch", "head_sha",
+        "repository.full_name", "head_repository.full_name",
+    }
+    print(str(trusted).lower())
+"""
+
+
+@pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")
+@pytest.mark.parametrize("job", ["build", "deploy"])
+@pytest.mark.parametrize(
+    "override",
+    [
+        {},
+        {"conclusion": "failure"},
+        {"conclusion": "cancelled"},
+        {"status": "in_progress"},
+        {"event": "pull_request"},
+        {"head_branch": "staging"},
+        {"path": ".github/workflows/untrusted.yml"},
+        {"head_sha": "b" * 40},
+        {"repository": {"full_name": "attacker/platform"}},
+        {"head_repository": {"full_name": "attacker/platform"}},
+        {"stale_main": True},
+    ],
+)
+def test_release_guards_reject_untrusted_failed_pr_and_stale_runs(
+    job: str, override: dict, tmp_path: Path
+) -> None:
+    """Execute both shipped API guards, not a duplicated acceptance predicate."""
+    run = {
+        "path": ".github/workflows/ci.yml",
+        "status": "completed",
+        "conclusion": "success",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": _RELEASE_SHA,
+        "repository": {"full_name": "example/platform"},
+        "head_repository": {"full_name": "example/platform"},
+        **override,
+    }
+    steps = workflow("deploy-production.yml")["jobs"][job]["steps"]
+    guard = next(step for step in steps if step.get("id") == "ci") if job == "build" else steps[0]
+    command = 'gh() { "$TEST_PYTHON" -c "$GH_RELEASE_STUB" "$@"; }\n' + guard["run"]
+    result = subprocess.run(
+        [BASH, "-c", command],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "TEST_PYTHON": Path(sys.executable).as_posix(),
+            "GH_RELEASE_STUB": _GH_RELEASE_STUB,
+            "TEST_CI_RUN": json.dumps(run),
+            "TEST_MAIN_SHA": "b" * 40 if override.get("stale_main") else _RELEASE_SHA,
+            "GITHUB_REPOSITORY": "example/platform",
+            "RELEASE_SHA": _RELEASE_SHA,
+            "SOURCE_RUN_ID": "123",
+            "CI_RUN_ID": "123",
+            "GITHUB_OUTPUT": "outputs",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert (result.returncode == 0) is (not override), result.stderr
+    if job == "build":
+        assert (tmp_path / "outputs").exists() is (not override)
+
+
+@pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")
+def test_manual_release_finds_exact_main_push_ci_without_bypassing_guards(tmp_path: Path) -> None:
+    run = {
+        "path": ".github/workflows/ci.yml",
+        "status": "completed",
+        "conclusion": "success",
+        "event": "push",
+        "head_branch": "main",
+        "head_sha": _RELEASE_SHA,
+        "repository": {"full_name": "example/platform"},
+        "head_repository": {"full_name": "example/platform"},
+    }
+    guard = next(
+        step
+        for step in workflow("deploy-production.yml")["jobs"]["build"]["steps"]
+        if step.get("id") == "ci"
+    )
+    result = subprocess.run(
+        [
+            BASH,
+            "-c",
+            'gh() { "$TEST_PYTHON" -c "$GH_RELEASE_STUB" "$@"; }\n' + guard["run"],
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "TEST_PYTHON": Path(sys.executable).as_posix(),
+            "GH_RELEASE_STUB": _GH_RELEASE_STUB,
+            "TEST_CI_RUN": json.dumps(run),
+            "TEST_MAIN_SHA": _RELEASE_SHA,
+            "GITHUB_REPOSITORY": "example/platform",
+            "RELEASE_SHA": _RELEASE_SHA,
+            "SOURCE_RUN_ID": "",
+            "GITHUB_OUTPUT": "outputs",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "outputs").read_text().strip() == "ci_run_id=123"
+
+
 @pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")
 @pytest.mark.parametrize("name", ["deploy-staging.yml", "deploy-production.yml"])
 @pytest.mark.parametrize("login_exit,deploy_exit", [(0, 0), (23, 0), (0, 29)])
