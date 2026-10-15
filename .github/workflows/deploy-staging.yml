@@ -1,7 +1,7 @@
 name: deploy-staging
 
-# Pushes validate/build only. Only explicit dispatch can replace the shared
-# production host/bot with staging, after all financial/migration gates pass.
+# Pushes to staging automatically validate/build and deploy to the shared
+# production host/bot after all financial/migration gates pass.
 #
 # Reused infrastructure configuration (no duplicates, no second stack):
 #   * the existing environment secrets/variables: PROD_SSH_KEY,
@@ -137,8 +137,8 @@ jobs:
         id: resolve
         run: |
           set -Eeuo pipefail
-          # Only staging validates/builds through this lane. Pushes never
-          # deploy; an explicit dispatch can deploy this checked staging SHA.
+          # Pushes and manual dispatches on staging deploy the exact
+          # validated staging SHA after the financial/migration gates pass.
           # A feature branch is never deployable here.
           [ "${{ github.ref }}" = "refs/heads/staging" ] \
             || { echo "deploy-staging only runs on refs/heads/staging"; exit 1; }
@@ -201,7 +201,7 @@ jobs:
   deploy:
     name: Deploy to the current server
     needs: build
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging'
+    if: github.ref == 'refs/heads/staging' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # The existing `production` environment is where PROD_SSH_KEY,
