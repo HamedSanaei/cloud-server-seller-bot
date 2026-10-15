@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from cloud_platform.modules.users.domain import (
-    Permission,
-    PermissionChecker,
     PermissionDeniedError,
     UserNotFound,
     UserRepository,
 )
+from cloud_platform.modules.users.superadmins import require_superadmin, validate_telegram_user_ids
 from cloud_platform.modules.wallet.domain import LedgerEntryType, WalletRepository
-
-SUPERADMIN_TELEGRAM_ID = 85758085
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,9 +29,12 @@ class AdminWalletService:
         self,
         user_repo: UserRepository,
         wallet_repo: WalletRepository,
+        *,
+        configured_ids: Iterable[int] = (),
     ) -> None:
         self._users = user_repo
         self._wallets = wallet_repo
+        self._configured_ids = validate_telegram_user_ids(tuple(configured_ids))
 
     async def credit_admin_toman(
         self,
@@ -41,8 +42,10 @@ class AdminWalletService:
         target_telegram_id: int,
         amount_toman: int,
         idempotency_key: str,
+        *,
+        reason: str,
     ) -> AdminWalletCreditResult:
-        if type(actor_telegram_id) is not int or actor_telegram_id != SUPERADMIN_TELEGRAM_ID:
+        if type(actor_telegram_id) is not int or actor_telegram_id not in self._configured_ids:
             raise PermissionDeniedError("only the Telegram superadmin may credit wallets")
         if type(target_telegram_id) is not int or target_telegram_id <= 0:
             raise ValueError("target_telegram_id must be a positive integer")
@@ -56,9 +59,11 @@ class AdminWalletService:
         actor = await self._users.get_by_telegram_user_id(actor_telegram_id)
         if actor is None or actor.id is None:
             raise PermissionDeniedError("a persisted administrator is required")
-        checker = PermissionChecker(actor)
-        checker.require(Permission.WALLET_ADJUST)
-        checker.require_active()
+        actor = require_superadmin(actor, self._configured_ids)
+        if actor.telegram_user_id != actor_telegram_id:
+            raise PermissionDeniedError("persisted Telegram identity does not match actor")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("adjustment reason must not be empty")
         if target_telegram_id == actor_telegram_id:
             raise ValueError("superadmin self top-up is not available")
 
@@ -77,10 +82,12 @@ class AdminWalletService:
             entry_type=LedgerEntryType.ADJUSTMENT,
             reference_type="admin_telegram_credit",
             description=(
-                f"Telegram admin {actor_telegram_id} credited Telegram user {target_telegram_id}"
+                f"Telegram admin {actor_telegram_id} credited Telegram user {target_telegram_id}: "
+                f"{reason.strip()}"
             ),
             expected_currency="IRT",
             audit_actor_id=actor.id,
+            admin_configured_ids=self._configured_ids,
         )
         return AdminWalletCreditResult(
             target_telegram_id=target_telegram_id,

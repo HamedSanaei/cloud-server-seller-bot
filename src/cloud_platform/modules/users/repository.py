@@ -8,11 +8,13 @@ from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import AuditEvent as SQLAlchemyAuditEvent
 from cloud_platform.db.base import TermsVersion as SQLAlchemyTermsVersion
 from cloud_platform.db.base import User as SQLAlchemyUser
+from cloud_platform.db.base import Wallet as SQLAlchemyWallet
 from cloud_platform.db.timestamps import (
     from_db_utc,
     from_db_utc_or_none,
@@ -101,6 +103,63 @@ class SqlAlchemyUserRepository:
     ) -> None:
         self._session_factory = session_factory
 
+    async def onboard_telegram(self, telegram_user_id: int, username: str, email: str) -> User:
+        """Resolve a verified bot sender and its wallet in ONE transaction.
+
+        This is a trusted bot-edge operation, not a public registration API.
+        Never resolve identity by a mutable username/email or overwrite a wallet.
+        The shared lock orders registration with concurrent policy revocations.
+        """
+        from cloud_platform.modules.users.superadmin_repository import (
+            apply_configured_superadmin,
+            lock_superadmin_reconciliation,
+        )
+        from cloud_platform.modules.users.superadmins import validate_telegram_user_ids
+        from cloud_platform.modules.wallet.domain import DEFAULT_WALLET_CURRENCY
+
+        validate_telegram_user_ids([telegram_user_id])
+        async with self._session_factory() as session, session.begin():
+            await lock_superadmin_reconciliation(session)
+            row = (
+                await session.execute(
+                    select(SQLAlchemyUser)
+                    .where(SQLAlchemyUser.telegram_user_id == telegram_user_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                # A reused/missing Telegram username is not an account link.
+                # Preserve an unrelated existing account and use a fresh alias.
+                alias = username.strip() or f"telegram_{telegram_user_id}"
+                collision = (
+                    await session.execute(
+                        select(SQLAlchemyUser.id).where(SQLAlchemyUser.username == alias)
+                    )
+                ).scalar_one_or_none()
+                if collision is not None:
+                    from uuid import uuid4
+
+                    alias = f"telegram_{telegram_user_id}_{uuid4().hex}"
+                row = SQLAlchemyUser(
+                    username=alias,
+                    email=email,
+                    telegram_user_id=telegram_user_id,
+                    role=Role.USER.value,
+                    status=UserStatus.ACTIVE.value,
+                )
+                session.add(row)
+                await session.flush()
+            await apply_configured_superadmin(session, row, onboarding=True)
+            # DO NOTHING preserves wallet identity, balances, currency and all
+            # immutable history, also after an interrupted historical signup.
+            await session.execute(
+                insert(SQLAlchemyWallet)
+                .values(user_id=_attr(row, "id"), balance=0, currency=DEFAULT_WALLET_CURRENCY)
+                .on_conflict_do_nothing(index_elements=[SQLAlchemyWallet.user_id])
+            )
+            await session.flush()
+            return _to_domain(row)
+
     async def create(self, user: User) -> User:
         """Create a new user. Commits and returns the refreshed aggregate."""
         row = _to_row(user)
@@ -173,6 +232,7 @@ class SqlAlchemyUserRepository:
         actor_id: UUID,
         idempotency_key: str,
         reason: str,
+        admin_configured_ids: tuple[int, ...] | None = None,
     ) -> UserStatus:
         """Atomically persist status and its actor-scoped immutable audit receipt.
 
@@ -192,6 +252,12 @@ class SqlAlchemyUserRepository:
             signed=True,
         )
         async with self._session_factory() as session, session.begin():
+            if admin_configured_ids is not None:
+                from cloud_platform.modules.users.superadmin_repository import (
+                    authorize_superadmin_transaction,
+                )
+
+                await authorize_superadmin_transaction(session, actor_id, admin_configured_ids)
             await session.execute(
                 text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key}
             )

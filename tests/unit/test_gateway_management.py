@@ -14,7 +14,9 @@ from aiogram.types import User as TelegramUser
 
 from cloud_platform.bot.admin_ui import AdminBotUi
 from cloud_platform.bot.main import register_handlers
+from cloud_platform.bot.monthly_ui import build_main_reply_keyboard
 from cloud_platform.bot.ui import BotScreen
+from cloud_platform.core.i18n import Translator
 from cloud_platform.core.session_store import InMemoryBotSessionStore
 from cloud_platform.modules.payments.domain import PaymentSession, PaymentSessionStatus
 from cloud_platform.modules.payments.gateway_repository import SqlAlchemyGatewaySettingsRepository
@@ -41,7 +43,14 @@ class Settings:
     async def list(self) -> dict[str, bool]:
         return dict(self.values)
 
-    async def set_enabled(self, key: str, enabled: bool, actor_id: object) -> None:
+    async def set_enabled(
+        self,
+        key: str,
+        enabled: bool,
+        actor_id: object,
+        *,
+        configured_ids: tuple[int, ...] | None = None,
+    ) -> None:
         self.values[key] = enabled
         self.actor_id = actor_id
 
@@ -58,12 +67,13 @@ async def test_unauthorized_gateway_toggle_and_listing_are_rejected(
     role: Role, status: UserStatus
 ) -> None:
     repository = Settings()
-    management = GatewayManagementService(repository, ["atlaspay"])
+    management = GatewayManagementService(repository, ["atlaspay"], configured_ids=(42,))
     user = User(
         username="fixture-customer",
         email="fixture@example.test",
         id=uuid4(),
         role=role,
+        telegram_user_id=42,
         status=status,
     )
     with pytest.raises(PermissionDeniedError):
@@ -75,9 +85,13 @@ async def test_unauthorized_gateway_toggle_and_listing_are_rejected(
 
 async def test_management_defaults_and_durable_toggle_attribution() -> None:
     repository = Settings()
-    service = GatewayManagementService(repository, ["atlaspay", "zarinpal"])
+    service = GatewayManagementService(repository, ["atlaspay", "zarinpal"], configured_ids=(42,))
     admin = User(
-        username="fixture-customer", email="fixture@example.test", id=uuid4(), role=Role.ADMIN
+        username="fixture-customer",
+        email="fixture@example.test",
+        id=uuid4(),
+        role=Role.ADMIN,
+        telegram_user_id=42,
     )
     assert [(s.key, s.enabled) for s in await service.list(admin)] == [
         ("atlaspay", True),
@@ -85,7 +99,7 @@ async def test_management_defaults_and_durable_toggle_attribution() -> None:
     ]
     await service.set_enabled(admin, "atlaspay", False)
     # Reconstructing the application service does not reset durable policy.
-    reopened = GatewayManagementService(repository, ["atlaspay", "zarinpal"])
+    reopened = GatewayManagementService(repository, ["atlaspay", "zarinpal"], configured_ids=(42,))
     assert [(s.key, s.enabled) for s in await reopened.list(admin)] == [
         ("atlaspay", False),
         ("zarinpal", True),
@@ -95,6 +109,42 @@ async def test_management_defaults_and_durable_toggle_attribution() -> None:
         await reopened.set_enabled(admin, "unconfigured", True)
     with pytest.raises(ValueError, match="boolean"):
         await reopened.set_enabled(admin, "atlaspay", "false")
+
+
+async def test_gateway_management_denies_unconfigured_forged_and_stale_admin() -> None:
+    repository = Settings()
+    actor = User(
+        id=uuid4(),
+        username="admin",
+        email="admin@example.test",
+        role=Role.ADMIN,
+        telegram_user_id=42,
+    )
+    for service, identity in (
+        (GatewayManagementService(repository, ["atlaspay"]), actor),
+        (
+            GatewayManagementService(repository, ["atlaspay"], configured_ids=(42,)),
+            SimpleNamespace(
+                id=actor.id, role=Role.ADMIN, status=UserStatus.ACTIVE, telegram_user_id=42
+            ),
+        ),
+        (
+            GatewayManagementService(
+                repository,
+                ["atlaspay"],
+                configured_ids=(42,),
+                user_repo=SimpleNamespace(
+                    get=AsyncMock(return_value=replace(actor, role=Role.USER))
+                ),
+            ),
+            actor,
+        ),
+    ):
+        with pytest.raises(PermissionDeniedError):
+            await service.set_enabled(identity, "atlaspay", False)
+        with pytest.raises(PermissionDeniedError):
+            await service.list(identity)
+    assert repository.values == {}
 
 
 def _gateway() -> SimpleNamespace:
@@ -150,10 +200,14 @@ async def test_disabled_gateway_blocks_new_orders_but_pending_inquiry_still_cred
         credit_deposit=AsyncMock(return_value=(SimpleNamespace(balance=50000), True)),
     )
     settings, gateway = Settings(), _gateway()
-    management = GatewayManagementService(settings, [gateway.key])
+    management = GatewayManagementService(settings, [gateway.key], configured_ids=(42,))
     recharge = WalletRechargeService(payments_repo=repo, gateway=gateway, gateway_settings=settings)
     admin = User(
-        username="fixture-customer", email="fixture@example.test", id=uuid4(), role=Role.ADMIN
+        username="fixture-customer",
+        email="fixture@example.test",
+        id=uuid4(),
+        role=Role.ADMIN,
+        telegram_user_id=42,
     )
     assert await recharge.supports_currency_async("IRT")
     await management.set_enabled(admin, gateway.key, False)
@@ -241,6 +295,24 @@ async def test_gateway_repository_upsert_commits_actor_and_setting_atomically() 
     db.commit.assert_awaited_once()
 
 
+async def test_gateway_transaction_guard_rejects_before_any_setting_write(monkeypatch) -> None:
+    guard = AsyncMock(side_effect=PermissionDeniedError("grant revoked"))
+    monkeypatch.setattr(
+        "cloud_platform.modules.users.superadmin_repository.authorize_superadmin_transaction",
+        guard,
+    )
+    db = AsyncMock()
+    db.__aenter__.return_value = db
+    db.__aexit__.return_value = None
+    actor_id = uuid4()
+    repository = SqlAlchemyGatewaySettingsRepository(lambda: db)
+    with pytest.raises(PermissionDeniedError):
+        await repository.set_enabled("atlaspay", False, actor_id, configured_ids=(42,))
+    guard.assert_awaited_once_with(db, actor_id, (42,))
+    db.execute.assert_not_awaited()
+    db.commit.assert_not_awaited()
+
+
 @pytest.fixture
 def gateway_admin_route(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     admin = User(
@@ -259,7 +331,7 @@ def gateway_admin_route(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     users = {42: admin, 43: customer}
     repository = Settings()
     gateway = _gateway()
-    management = GatewayManagementService(repository, [gateway.key])
+    management = GatewayManagementService(repository, [gateway.key], configured_ids=(42,))
     recharge = WalletRechargeService(
         payments_repo=SimpleNamespace(create=AsyncMock()),
         gateway=gateway,
@@ -267,7 +339,11 @@ def gateway_admin_route(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     key = "gateway-behavior-signing-key"
     user_repo = SimpleNamespace(
-        get_by_telegram_user_id=AsyncMock(side_effect=lambda tid: users.get(tid))
+        get_by_telegram_user_id=AsyncMock(side_effect=lambda tid: users.get(tid)),
+        onboard_telegram=AsyncMock(side_effect=lambda tid, username, email: users.get(tid)),
+        get=AsyncMock(
+            side_effect=lambda uid: next((u for u in users.values() if u.id == uid), None)
+        ),
     )
     container = MagicMock()
     container.user_repository.return_value = user_repo
@@ -278,19 +354,22 @@ def gateway_admin_route(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         wallets=None,
         wallet_admin=None,
         store=InMemoryBotSessionStore(),
+        configured_ids=(42,),
     )
     screen = BotScreen("menu", InlineKeyboardMarkup(inline_keyboard=[]))
     fallback = SimpleNamespace(
         handle=AsyncMock(return_value=screen),
         menu_screen=lambda user: screen,
+        reply_keyboard=lambda user: build_main_reply_keyboard(Translator(), user),
     )
     dp = Dispatcher()
     register_handlers(dp, fallback, fallback, container, admin_ui=ui)
     monkeypatch.setattr(Message, "edit_text", AsyncMock())
+    monkeypatch.setattr(Message, "answer", AsyncMock())
     monkeypatch.setattr(CallbackQuery, "answer", AsyncMock())
     monkeypatch.setattr(
         "cloud_platform.bot.main.get_settings",
-        lambda: SimpleNamespace(callback_signing_key=key),
+        lambda: SimpleNamespace(callback_signing_key=key, telegram_superadmin_user_ids=[42]),
     )
     return SimpleNamespace(
         admin=admin,

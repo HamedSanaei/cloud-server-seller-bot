@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 async def startup(ctx: dict[str, object]) -> None:
     ctx["service"] = "cloud-platform-worker"
+    from cloud_platform.core.container import get_container
+
+    container = await get_container()
+    await container.reconcile_superadmins()
     # M11-002: install tracing for the worker process (no-op when a provider
     # is already installed; in-process spans without OTLP when no endpoint).
     from cloud_platform.core.config import get_settings
@@ -161,6 +165,9 @@ async def reconcile_cloud_capacity(ctx: dict[str, object]) -> None:
 
 
 async def shutdown(ctx: dict[str, object]) -> None:
+    from cloud_platform.core.container import close_container
+
+    await close_container()
     ctx.clear()
 
 

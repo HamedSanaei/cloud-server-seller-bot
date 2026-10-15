@@ -26,10 +26,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from cloud_platform.core.config import get_settings
 from cloud_platform.modules.audit.domain import AuditEvent
 from cloud_platform.modules.tokens.domain import TokenScope
-from cloud_platform.modules.users.domain import Permission, Role, User
+from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+from cloud_platform.modules.users.superadmins import is_superadmin
 
 from .common import esc, page, session_token
 
@@ -37,6 +39,10 @@ router = APIRouter(prefix="/web/admin", include_in_schema=False)
 
 AuditFeedLoader = Callable[[int], Awaitable[list[AuditEvent]]]
 ProvidersLoader = Callable[[], Awaitable[list[tuple[str, str]]]]
+
+
+def _configured_superadmin_ids() -> tuple[int, ...]:
+    return tuple(get_settings().telegram_superadmin_user_ids)
 
 
 async def _user_repo() -> SqlAlchemyUserRepository:
@@ -49,6 +55,7 @@ async def _user_repo() -> SqlAlchemyUserRepository:
 async def _admin_identity(
     request: Request,
     repo: Annotated[SqlAlchemyUserRepository, Depends(_user_repo)],
+    configured_ids: Annotated[tuple[int, ...], Depends(_configured_superadmin_ids)],
 ) -> User | None:
     """The ACTIVE ADMIN behind this cookie, or None."""
     raw = await session_token(request)
@@ -64,9 +71,7 @@ async def _admin_identity(
     if auth is None or not auth.has(TokenScope.ADMIN_READ):
         return None
     user = await repo.get(auth.user_id)
-    if user is None or user.role is not Role.ADMIN or not user.is_active:
-        return None
-    if not user.has_permission(Permission.ADMIN_MANAGE_SETTINGS):
+    if not is_superadmin(user, configured_ids):
         return None
     return user
 

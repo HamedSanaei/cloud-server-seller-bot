@@ -133,6 +133,7 @@ class SqlAlchemyWalletRepository:
         business_event_factory: Callable[[Wallet], BusinessEvent | None] | None = None,
         expected_currency: str | None = None,
         expected_running_server_id: UUID | None = None,
+        admin_configured_ids: tuple[int, ...] | None = None,
     ) -> tuple[Wallet, bool]:
         """Atomically post a delta and ledger, fencing first prepaid charges under row locks."""
         if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
@@ -148,6 +149,17 @@ class SqlAlchemyWalletRepository:
             raise ValueError("administrator wallet adjustment requires a reason")
 
         async with self._session_factory() as session:
+            if admin_configured_ids is not None:
+                from cloud_platform.modules.users.domain import PermissionDeniedError
+                from cloud_platform.modules.users.superadmin_repository import (
+                    authorize_superadmin_transaction,
+                )
+
+                if audit_actor_id is None:
+                    raise PermissionDeniedError("an audited Super Admin actor is required")
+                await authorize_superadmin_transaction(
+                    session, audit_actor_id, admin_configured_ids
+                )
             stmt = (
                 select(SQLAlchemyWallet)
                 .where(SQLAlchemyWallet.user_id == user_id)

@@ -86,6 +86,7 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("telegram", "bot_token"): "telegram_bot_token",
     ("telegram", "callback_signing_key"): "callback_signing_key",
     ("telegram", "admin_chat_id"): "telegram_admin_chat_id",
+    ("telegram", "superadmin_user_ids"): "telegram_superadmin_user_ids",
     ("telegram", "support_contact"): "support_contact",
     ("telegram", "logger", "enabled"): "telegram_logger_enabled",
     ("telegram", "logger", "chat_id"): "telegram_logger_chat_id",
@@ -784,6 +785,16 @@ class Settings(BaseSettings):
     leaseweb_cloud_capacity_outage_reminder_interval_seconds: int = Field(default=21600, ge=60)
     # Telegram admin alert chat for renewals/attention items (0 = unset).
     telegram_admin_chat_id: int = 0
+    # User identities, never notification destinations. Empty denies management.
+    telegram_superadmin_user_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("telegram_superadmin_user_ids", mode="before")
+    @classmethod
+    def _validate_superadmin_user_ids(cls, value: object) -> list[int]:
+        from cloud_platform.modules.users.superadmins import validate_telegram_user_ids
+
+        return list(validate_telegram_user_ids(value))
+
     # Optional support contact shown on the support screen (e.g. @handle).
     support_contact: str = ""
     # --- Private Telegram business logger channel -------------------------

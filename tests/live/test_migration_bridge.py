@@ -38,7 +38,7 @@ def _run_probe(start: str) -> None:
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ["0054"]
+    assert scripts.get_heads() == ["0055"]
     engine = sa.create_engine(
         os.environ["CLOUD_PLATFORM_TEST_POSTGRES_URL"].replace(
             "postgresql+asyncpg://", "postgresql://"

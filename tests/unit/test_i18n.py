@@ -131,7 +131,7 @@ class TestBotHandlerUsesCatalog:
         message = Message(
             message_id=1,
             date=1,
-            chat=Chat(id=100, type="private"),
+            chat=Chat(id=10, type="private"),
             from_user=TelegramUser(id=10, is_bot=False, first_name="T"),
             text="/start",
         )

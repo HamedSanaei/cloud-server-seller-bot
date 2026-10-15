@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import re
 import secrets
+from collections.abc import Iterable
 from decimal import Decimal, localcontext
 from typing import Any
 from uuid import UUID
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from cloud_platform.bot.ui import BotScreen
 from cloud_platform.core.i18n import Translator
@@ -17,12 +23,11 @@ from cloud_platform.modules.fx.domain import currency_exponent
 from cloud_platform.modules.fx.formatting import format_minor
 from cloud_platform.modules.navigation.domain import Callback, encode_telegram_callback
 from cloud_platform.modules.users.domain import (
-    Permission,
-    PermissionChecker,
     Role,
     User,
     UserRepository,
 )
+from cloud_platform.modules.users.superadmins import require_superadmin
 from cloud_platform.modules.wallet.domain import WalletRepository
 from cloud_platform.modules.wallet.service import WalletAdminService
 
@@ -40,6 +45,7 @@ class AdminBotUi:
         wallet_admin: WalletAdminService,
         store: BotSessionStore,
         ttl_seconds: int = 900,
+        configured_ids: Iterable[int] = (),
     ) -> None:
         self._key = signing_key
         self._gateways = gateways
@@ -49,14 +55,23 @@ class AdminBotUi:
         self._store = store
         self._ttl = ttl_seconds
         self._t = Translator()
+        self._configured_ids = tuple(configured_ids)
 
-    @staticmethod
-    def _authorize(admin: User) -> None:
-        checker = PermissionChecker(admin)
-        checker.require_active()
-        checker.require(Permission.ADMIN_MANAGE_SETTINGS)
-        if admin.id is None:
-            raise ValueError("persisted administrator required")
+    def _authorize(self, admin: User) -> None:
+        require_superadmin(admin, self._configured_ids)
+
+    def reply_keyboard(self, admin: User) -> ReplyKeyboardMarkup:
+        """Dedicated management controls, installed only in authenticated private chats."""
+        self._authorize(admin)
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=self._t.t("admin.gateways"))],
+                [KeyboardButton(text=self._t.t("admin.credit"))],
+                [KeyboardButton(text=self._t.t("nav.menu"))],
+            ],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
 
     def _button(self, text: str, screen: str, *args: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(
@@ -149,6 +164,7 @@ class AdminBotUi:
                 amount=record["amount"],
                 reason=record["reason"],
                 idempotency_key=f"admin-credit:{admin.id}:{cb.args[0]}",
+                expected_currency=record["currency"],
             )
             # Keep the frozen confirmation until TTL so double-click/restart
             # replays the same immutable ledger fact rather than minting a key.

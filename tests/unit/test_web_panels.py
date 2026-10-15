@@ -25,28 +25,24 @@ from fastapi.testclient import TestClient
 
 from cloud_platform.api.app import create_app
 from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
-from cloud_platform.modules.users.domain import Role, UserStatus
+from cloud_platform.modules.users.domain import Role, User, UserStatus
 
 RAW_TOKEN = "cpt_testtoken123"
 
 
-class FakeUser:
+class FakeUser(User):
     def __init__(self, *, role: Role = Role.USER, status: UserStatus = UserStatus.ACTIVE):
         from uuid import uuid4
 
-        self.id = uuid4()
-        self.username = f"user-{self.id.hex[:6]}"
-        self.email = f"{self.username}@example.com"
-        self.role = role
-        self.status = status
-
-    @property
-    def is_active(self) -> bool:
-        return self.status is UserStatus.ACTIVE
-
-    def has_permission(self, permission: object) -> bool:
-        del permission  # admins hold every admin permission in this fake
-        return self.role is Role.ADMIN
+        identity = uuid4()
+        super().__init__(
+            id=identity,
+            username=f"user-{identity.hex[:6]}",
+            email=f"user-{identity.hex[:6]}@example.com",
+            role=role,
+            status=status,
+            telegram_user_id=77110022 if role is Role.ADMIN else 77110023,
+        )
 
 
 class FakeServerRow:
@@ -151,6 +147,7 @@ def web():
     app.dependency_overrides[customer_web._authenticator] = _authenticator
     app.dependency_overrides[customer_web._servers_view] = _servers_view
     app.dependency_overrides[customer_web._wallet_view] = _wallet_view
+    app.dependency_overrides[admin_web._configured_superadmin_ids] = lambda: (77110022,)
     app.dependency_overrides[admin_web._user_repo] = _user_repo
     app.dependency_overrides[admin_web._user_search] = _user_search
     app.dependency_overrides[admin_web._audit_feed] = _audit_feed
@@ -346,6 +343,24 @@ class TestCustomerPanelM14004:
 
 
 class TestAdminPanelM14005:
+    def test_config_removal_revokes_existing_admin_session(self, web):
+        from cloud_platform.api.web import admin as admin_web
+
+        web.register_token(RAW_TOKEN, web.users.admin)
+        web.cookies.set("platform_session", RAW_TOKEN)
+        assert web.get("/web/admin").status_code == 200
+        web.app.dependency_overrides[admin_web._configured_superadmin_ids] = lambda: ()
+        assert web.get("/web/admin", follow_redirects=False).status_code == 303
+
+    def test_forged_telegram_header_cannot_elevate_customer_session(self, web):
+        web.register_token(RAW_TOKEN, web.users.plain)
+        web.cookies.set("platform_session", RAW_TOKEN)
+        response = web.get(
+            "/web/admin", headers={"X-Telegram-User-Id": "77110022"}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        assert web.reads["users"] == []
+
     def test_anonymous_redirected_like_customer(self, web):  # type: ignore[no-untyped-def]
         response = web.get("/web/admin", follow_redirects=False)
         assert response.status_code == 303

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -14,8 +15,18 @@ from cloud_platform.modules.wallet.admin import AdminWalletCreditResult, AdminWa
 from cloud_platform.modules.wallet.domain import DuplicateIdempotencyError, LedgerEntryType
 from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 
-ADMIN = 85758085
+ADMIN = 77110022
 TARGET = 224466
+
+
+@pytest.fixture(autouse=True)
+def transactional_actor_guard(monkeypatch: pytest.MonkeyPatch) -> None:
+    # This fake SQL session exercises money atomicity only. Real PostgreSQL
+    # contracts below prove authorization inside the mutation transaction.
+    monkeypatch.setattr(
+        "cloud_platform.modules.users.superadmin_repository.authorize_superadmin_transaction",
+        AsyncMock(),
+    )
 
 
 class _Result:
@@ -115,16 +126,20 @@ class _Users:
 
 
 def _service(db: _Session, users: _Users) -> AdminWalletService:
-    return AdminWalletService(users, SqlAlchemyWalletRepository(lambda: db))  # type: ignore[arg-type]
+    return AdminWalletService(
+        users, SqlAlchemyWalletRepository(lambda: db), configured_ids=(ADMIN,)
+    )  # type: ignore[arg-type]
 
 
 async def test_only_superadmin_may_attempt_credit() -> None:
     db = _Session()
     users = _Users(db.wallet.user_id)
     service = _service(db, users)
-    for actor in (123, True, "85758085"):
+    for actor in (123, True, "77110022"):
         with pytest.raises(PermissionDeniedError):
-            await service.credit_admin_toman(actor, TARGET, 25, "admin-credit-1")  # type: ignore[arg-type]
+            await service.credit_admin_toman(
+                actor, TARGET, 25, "admin-credit-1", reason="customer support correction"
+            )  # type: ignore[arg-type]
     assert users.lookups == 0
     assert db.wallet.balance == 100
     assert db.ledger == {}
@@ -133,8 +148,12 @@ async def test_only_superadmin_may_attempt_credit() -> None:
 async def test_credit_posts_one_irt_fact_and_replay_preserves_balance() -> None:
     db = _Session()
     service = _service(db, _Users(db.wallet.user_id))
-    first = await service.credit_admin_toman(ADMIN, TARGET, 25, "admin-credit-1")
-    second = await service.credit_admin_toman(ADMIN, TARGET, 25, "admin-credit-1")
+    first = await service.credit_admin_toman(
+        ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
+    )
+    second = await service.credit_admin_toman(
+        ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
+    )
     assert first == AdminWalletCreditResult(TARGET, 25, 125, True)
     assert second == AdminWalletCreditResult(TARGET, 25, 125, False)
     assert db.commits == 1
@@ -153,12 +172,18 @@ async def test_credit_posts_one_irt_fact_and_replay_preserves_balance() -> None:
 async def test_key_reused_with_different_amount_or_ledger_facts_fails_closed() -> None:
     db = _Session()
     service = _service(db, _Users(db.wallet.user_id))
-    await service.credit_admin_toman(ADMIN, TARGET, 25, "admin-credit-1")
+    await service.credit_admin_toman(
+        ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
+    )
     with pytest.raises(DuplicateIdempotencyError):
-        await service.credit_admin_toman(ADMIN, TARGET, 26, "admin-credit-1")
+        await service.credit_admin_toman(
+            ADMIN, TARGET, 26, "admin-credit-1", reason="customer support correction"
+        )
     db.ledger["admin-credit-1"].description = "different actor or target"
     with pytest.raises(DuplicateIdempotencyError):
-        await service.credit_admin_toman(ADMIN, TARGET, 25, "admin-credit-1")
+        await service.credit_admin_toman(
+            ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
+        )
     assert db.commits == 1
     assert db.wallet.balance == 125
     assert len(db.ledger) == 1
@@ -167,10 +192,14 @@ async def test_key_reused_with_different_amount_or_ledger_facts_fails_closed() -
 async def test_replay_with_historical_different_currency_fails_closed() -> None:
     db = _Session()
     service = _service(db, _Users(db.wallet.user_id))
-    await service.credit_admin_toman(ADMIN, TARGET, 25, "admin-credit-1")
+    await service.credit_admin_toman(
+        ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
+    )
     db.ledger["admin-credit-1"].currency = "USD"
     with pytest.raises(DuplicateIdempotencyError):
-        await service.credit_admin_toman(ADMIN, TARGET, 25, "admin-credit-1")
+        await service.credit_admin_toman(
+            ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
+        )
     assert db.commits == 1
     assert db.wallet.balance == 125
 
@@ -179,21 +208,21 @@ async def test_non_irt_or_missing_user_does_not_credit() -> None:
     usd = _Session(currency="USD")
     with pytest.raises(ValueError, match="wallet currency must be IRT"):
         await _service(usd, _Users(usd.wallet.user_id)).credit_admin_toman(
-            ADMIN, TARGET, 25, "admin-credit-1"
+            ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
         )
     assert usd.wallet.balance == 100 and not usd.ledger
 
     missing = _Session()
     with pytest.raises(UserNotFound):
         await _service(missing, _Users(missing.wallet.user_id, found=False)).credit_admin_toman(
-            ADMIN, TARGET, 25, "admin-credit-1"
+            ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
         )
     assert missing.wallet.balance == 100 and not missing.ledger
 
     no_wallet = _Session(wallet_present=False)
     with pytest.raises(ValueError, match="no wallet"):
         await _service(no_wallet, _Users(no_wallet.wallet.user_id)).credit_admin_toman(
-            ADMIN, TARGET, 25, "admin-credit-1"
+            ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
         )
     assert no_wallet.wallet.balance == 100 and not no_wallet.ledger
 
@@ -203,10 +232,14 @@ async def test_invalid_amount_and_key_never_credit() -> None:
     service = _service(db, _Users(db.wallet.user_id))
     for amount in (0, -1, True, 2.5):
         with pytest.raises(ValueError):
-            await service.credit_admin_toman(ADMIN, TARGET, amount, "admin-credit-1")  # type: ignore[arg-type]
+            await service.credit_admin_toman(
+                ADMIN, TARGET, amount, "admin-credit-1", reason="customer support correction"
+            )  # type: ignore[arg-type]
     for key in ("", "  ", " admin-credit-1"):
         with pytest.raises(ValueError):
-            await service.credit_admin_toman(ADMIN, TARGET, 25, key)
+            await service.credit_admin_toman(
+                ADMIN, TARGET, 25, key, reason="customer support correction"
+            )
     assert db.wallet.balance == 100 and not db.ledger
 
 
@@ -214,7 +247,7 @@ async def test_failed_ledger_insert_rolls_back_wallet_credit() -> None:
     db = _Session(fail_commit=True)
     with pytest.raises(IntegrityError):
         await _service(db, _Users(db.wallet.user_id)).credit_admin_toman(
-            ADMIN, TARGET, 25, "admin-credit-1"
+            ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
         )
     assert db.wallet.balance == 100
     assert db.ledger == {}
@@ -226,8 +259,23 @@ async def test_superadmin_id_does_not_bypass_persisted_role_or_self_top_up_polic
     users = _Users(db.wallet.user_id)
     users.actor.role = Role.USER
     with pytest.raises(PermissionDeniedError):
-        await _service(db, users).credit_admin_toman(ADMIN, TARGET, 25, "admin-credit-1")
+        await _service(db, users).credit_admin_toman(
+            ADMIN, TARGET, 25, "admin-credit-1", reason="customer support correction"
+        )
     users.actor.role = Role.ADMIN
     with pytest.raises(ValueError, match="self top-up"):
-        await _service(db, users).credit_admin_toman(ADMIN, ADMIN, 25, "admin-credit-1")
+        await _service(db, users).credit_admin_toman(
+            ADMIN, ADMIN, 25, "admin-credit-1", reason="customer support correction"
+        )
+    assert not db.ledger and db.audit is None and db.wallet.balance == 100
+
+
+async def test_legacy_credit_requires_configured_actor_and_nonempty_reason() -> None:
+    db = _Session()
+    users = _Users(db.wallet.user_id)
+    denied = AdminWalletService(users, SqlAlchemyWalletRepository(lambda: db))  # type: ignore[arg-type]
+    with pytest.raises(PermissionDeniedError):
+        await denied.credit_admin_toman(ADMIN, TARGET, 25, "no-config", reason="correction")
+    with pytest.raises(ValueError, match="reason"):
+        await _service(db, users).credit_admin_toman(ADMIN, TARGET, 25, "reason", reason=" ")
     assert not db.ledger and db.audit is None and db.wallet.balance == 100
