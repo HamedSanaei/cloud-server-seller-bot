@@ -227,12 +227,24 @@ api + worker + one bot, and health-checks before declaring success.
 
 ## 4. GitHub configuration the operator must set manually
 
+Repository settings:
+
+* Enable **Dependency graph** and **Dependabot alerts** under Advanced Security.
+  Repository administrators can enable both with
+  `PUT /repos/{owner}/{repo}/vulnerability-alerts`. A disabled graph makes the
+  dependency-review API return HTTP 403; fix the repository setting rather
+  than skipping or weakening the dependency review check.
+* Protect `main`: require a pull request, resolved conversations and the
+  up-to-date **Required CI checks** status from the GitHub Actions application.
+  Enforce these rules for administrators and disallow force pushes and branch
+  deletion. Do not merge or dispatch a release before owner approval.
+
 Environment **`production`** (repository → Settings → Environments):
 
 | Type | Name | Value |
 | --- | --- | --- |
 | Secret | `PROD_SSH_KEY` | private OpenSSH key matching the server's `authorized_keys` |
-| Secret | `PROD_KNOWN_HOSTS` | `ssh-keyscan -p <port> <host>` output (never disable host verification) |
+| Secret | `PROD_KNOWN_HOSTS` | operator-verified `known_hosts` entries; authenticate fingerprints out-of-band before accepting `ssh-keyscan` output, and never disable host verification |
 | Variable | `PROD_HOST` | production hostname or IP |
 | Variable | `PROD_PORT` | SSH port (default `22` when unset) |
 | Variable | `PROD_USER` | `deploy` |
