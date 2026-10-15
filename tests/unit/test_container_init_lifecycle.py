@@ -118,6 +118,7 @@ class TestBotMainLifecycle:
 
         container = MagicMock()
         container.initialize = AsyncMock()
+        container.reconcile_superadmins = AsyncMock()
         container.payment_gateway = MagicMock(return_value=None)
         container.close = AsyncMock()
 
@@ -140,4 +141,5 @@ class TestBotMainLifecycle:
         await bot_main.main()
 
         container.initialize.assert_not_awaited()
+        container.reconcile_superadmins.assert_awaited_once()
         dispatcher.start_polling.assert_awaited_once()

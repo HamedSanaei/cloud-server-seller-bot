@@ -85,6 +85,7 @@ async def test_bot_process_builds_once_reuses_and_closes_once(
     gateways = {"tetraminator": tetra, "zarinpal": zarin}
 
     container = MagicMock()
+    container.reconcile_superadmins = AsyncMock()
     container.payment_gateways = MagicMock(return_value=gateways)
     container.wallet_recharge_service = MagicMock(return_value=MagicMock())
 
@@ -112,6 +113,7 @@ async def test_bot_process_builds_once_reuses_and_closes_once(
     dispatcher.start_polling.assert_awaited_once()
     # ONE collection for the process: no orphaned second set of HTTP clients.
     container.payment_gateways.assert_called_once()
+    container.reconcile_superadmins.assert_awaited_once()
     # The recharge service got exactly those instances...
     assert container.wallet_recharge_service.call_args.kwargs["gateways"] is gateways
     # ...and shutdown closed each of them exactly once.
