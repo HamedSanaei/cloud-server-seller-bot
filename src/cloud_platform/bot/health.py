@@ -14,42 +14,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from aiogram import Bot
-from aiogram.client.session.middlewares.base import BaseRequestMiddleware, NextRequestMiddlewareType
-from aiogram.methods import GetUpdates, Response, TelegramMethod
-from aiogram.methods.base import TelegramType
-
 HEARTBEAT_PATH = Path(tempfile.gettempdir()) / "cloud-platform-bot-polling.json"
 MAX_POLL_AGE_SECONDS = 90
-
-
-class PollingHeartbeat(BaseRequestMiddleware):
-    def __init__(self, path: Path = HEARTBEAT_PATH) -> None:
-        self._path = path
-        self._last_write = float("-inf")
-        self.clear()
-
-    def clear(self) -> None:
-        self._path.unlink(missing_ok=True)
-
-    async def __call__(
-        self,
-        make_request: NextRequestMiddlewareType[TelegramType],
-        bot: Bot,
-        method: TelegramMethod[TelegramType],
-    ) -> Response[TelegramType]:
-        response = await make_request(bot, method)
-        if isinstance(method, GetUpdates):
-            now = time.monotonic()
-            # Bound local I/O during bursts; long-poll failures never refresh it.
-            if now - self._last_write >= 5:
-                temporary = self._path.with_suffix(".tmp")
-                temporary.write_text(
-                    json.dumps({"pid": os.getpid(), "last_poll": now}), encoding="utf-8"
-                )
-                temporary.replace(self._path)
-                self._last_write = now
-        return response
 
 
 def polling_healthy(path: Path = HEARTBEAT_PATH, *, now: float | None = None) -> bool:
@@ -74,3 +40,41 @@ if __name__ == "__main__":
     healthy = polling_healthy()
     print("Telegram polling healthy" if healthy else "Telegram polling heartbeat unavailable/stale")
     raise SystemExit(0 if healthy else 1)
+else:
+    # Healthcheck subprocesses need only the read-only stdlib probe above.
+    # Import the Telegram SDK only for the existing poller's middleware.
+    from aiogram import Bot
+    from aiogram.client.session.middlewares.base import (
+        BaseRequestMiddleware,
+        NextRequestMiddlewareType,
+    )
+    from aiogram.methods import GetUpdates, Response, TelegramMethod
+    from aiogram.methods.base import TelegramType
+
+    class PollingHeartbeat(BaseRequestMiddleware):
+        def __init__(self, path: Path = HEARTBEAT_PATH) -> None:
+            self._path = path
+            self._last_write = float("-inf")
+            self.clear()
+
+        def clear(self) -> None:
+            self._path.unlink(missing_ok=True)
+
+        async def __call__(
+            self,
+            make_request: NextRequestMiddlewareType[TelegramType],
+            bot: Bot,
+            method: TelegramMethod[TelegramType],
+        ) -> Response[TelegramType]:
+            response = await make_request(bot, method)
+            if isinstance(method, GetUpdates):
+                now = time.monotonic()
+                # Bound local I/O during bursts; long-poll failures never refresh it.
+                if now - self._last_write >= 5:
+                    temporary = self._path.with_suffix(".tmp")
+                    temporary.write_text(
+                        json.dumps({"pid": os.getpid(), "last_poll": now}), encoding="utf-8"
+                    )
+                    temporary.replace(self._path)
+                    self._last_write = now
+            return response

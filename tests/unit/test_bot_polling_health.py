@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
+import runpy
+import tempfile
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -77,3 +81,29 @@ def test_corrupt_or_invalid_heartbeat_fails_closed(tmp_path, record):
     path = tmp_path / "heartbeat.json"
     path.write_text(record)
     assert not health.polling_healthy(path, now=100)
+
+
+@pytest.mark.parametrize("last_poll,expected_exit", [(100, 0), (10, 0), (9, 1), (101, 1)])
+def test_cli_checks_heartbeat_without_importing_telegram_sdk_or_network(
+    tmp_path, monkeypatch, capsys, last_poll, expected_exit
+):
+    path = tmp_path / "cloud-platform-bot-polling.json"
+    record = json.dumps({"pid": os.getpid(), "last_poll": last_poll})
+    path.write_text(record)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+    real_import = builtins.__import__
+
+    def import_without_sdk_or_network(name, *args, **kwargs):
+        if name.split(".", 1)[0] in {"aiogram", "socket"}:
+            raise AssertionError(f"CLI probe must not import {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_sdk_or_network)
+    with pytest.raises(SystemExit) as result:
+        runpy.run_path(health.__file__, run_name="__main__")
+    assert result.value.code == expected_exit
+    output = capsys.readouterr().out
+    assert ("Telegram polling healthy" in output) is (expected_exit == 0)
+    # The CLI can neither refresh nor replace the poller's heartbeat.
+    assert path.read_text() == record
