@@ -414,6 +414,7 @@ def _ui(
     recharge: Any = None,
     wallet_history: Any = None,
     sessions: Any = None,
+    configured_ids: tuple[int, ...] = (),
 ) -> tuple[MonthlyBotUi, dict[str, Any]]:
     checkout = checkout or FakeCheckout()
     servers = servers or FakeServers()
@@ -435,6 +436,7 @@ def _ui(
         sessions=sessions,
         server_management=management,  # type: ignore[arg-type]
         checkout_sessions=checkout_sessions,
+        configured_ids=configured_ids,
     )
     deps = {
         "checkout": checkout,
@@ -445,6 +447,31 @@ def _ui(
         "management": management,
     }
     return ui, deps
+
+
+@pytest.mark.parametrize(
+    "telegram_id,status,configured,expected",
+    [
+        (42, UserStatus.ACTIVE, (42, 44), True),
+        (44, UserStatus.ACTIVE, (42, 44), True),
+        (45, UserStatus.ACTIVE, (42, 44), False),
+        (42, UserStatus.ACTIVE, (), False),
+        (42, UserStatus.FROZEN, (42, 44), False),
+        (42, UserStatus.BANNED, (42, 44), False),
+    ],
+)
+def test_inline_management_entry_uses_same_configured_active_policy_as_reply_keyboard(
+    telegram_id, status, configured, expected
+):
+    ui, _ = _ui(configured_ids=configured)
+    user = replace(USER_A, role=Role.ADMIN, telegram_user_id=telegram_id, status=status)
+    screen = ui.menu_screen(user)
+    flows = [
+        decode_callback(button.callback_data, KEY).flow
+        for row in screen.keyboard.inline_keyboard
+        for button in row
+    ]
+    assert ("admin" in flows) is expected
 
 
 def _assert_callback_target(data: str, flow: str, screen: str) -> None:
@@ -794,6 +821,7 @@ async def test_dispatcher_uses_current_admin_role_to_block_customer_recharge_ent
     admin = replace(USER_A, role=Role.ADMIN, telegram_user_id=42)
     container = MagicMock()
     container.user_repository.return_value.get_by_telegram_user_id = AsyncMock(return_value=admin)
+    container.user_repository.return_value.onboard_telegram = AsyncMock(return_value=admin)
     answer, edit = AsyncMock(), AsyncMock()
     monkeypatch.setattr(Message, "answer", answer)
     monkeypatch.setattr(Message, "edit_text", edit)

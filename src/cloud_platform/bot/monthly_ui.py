@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, ClassVar, Protocol
 from uuid import UUID
@@ -115,6 +116,7 @@ from cloud_platform.modules.payments.recharge import (
 from cloud_platform.modules.renewals.domain import RenewalRepository
 from cloud_platform.modules.servers.service import ServerManagementService
 from cloud_platform.modules.users.domain import Role, User
+from cloud_platform.modules.users.superadmins import is_superadmin
 from cloud_platform.modules.wallet.domain import InsufficientHoldBalanceError, LedgerEntryType
 from cloud_platform.modules.wallet.service import WalletBalanceView, WalletHistoryService
 
@@ -145,9 +147,11 @@ def recharge_presets(currency: str) -> tuple[int, ...]:
     return RECHARGE_PRESETS_MINOR
 
 
-def build_main_reply_keyboard(t: Translator, user: User | None = None) -> ReplyKeyboardMarkup:
+def build_main_reply_keyboard(
+    t: Translator, user: User | None = None, *, configured_ids: Iterable[int] = ()
+) -> ReplyKeyboardMarkup:
     """Persistent menu; administrators manage customers instead of topping up."""
-    admin = user is not None and user.role == Role.ADMIN
+    admin = is_superadmin(user, configured_ids)
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=t.t("menu.buy")), KeyboardButton(text=t.t("menu.servers"))],
@@ -234,10 +238,12 @@ class MonthlyBotUi:
         hourly: Any | None = None,
         checkout_sessions: CheckoutSessions | None = None,
         payment_inquiry: Any | None = None,
+        configured_ids: Iterable[int] = (),
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
         self._key = signing_key
+        self._configured_ids = tuple(configured_ids)
         self._view = offers_view
         self._checkout = checkout
         self._hourly = hourly
@@ -317,6 +323,7 @@ class MonthlyBotUi:
 
     def menu_screen(self, user: User | None = None) -> BotScreen:
         """The customer main menu; the first entry is the MARKET selector."""
+        admin = is_superadmin(user, self._configured_ids)
         rows = [
             [
                 InlineKeyboardButton(
@@ -338,11 +345,9 @@ class MonthlyBotUi:
             ],
             [
                 InlineKeyboardButton(
-                    text=self._t.t(
-                        "menu.admin" if user and user.role == Role.ADMIN else "menu.recharge"
-                    ),
+                    text=self._t.t("menu.admin" if admin else "menu.recharge"),
                     callback_data=self._callback("admin", "menu")
-                    if user and user.role == Role.ADMIN
+                    if admin
                     else self._callback("recharge", "amounts"),
                 )
             ],
@@ -357,7 +362,7 @@ class MonthlyBotUi:
 
     def reply_keyboard(self, user: User | None = None) -> ReplyKeyboardMarkup:
         """The persistent bottom ReplyKeyboardMarkup for the storefront."""
-        return build_main_reply_keyboard(self._t, user)
+        return build_main_reply_keyboard(self._t, user, configured_ids=self._configured_ids)
 
     async def servers_screen(self, user: User | None) -> BotScreen:
         """The entry screen for My Servers."""

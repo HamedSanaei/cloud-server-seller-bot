@@ -334,6 +334,16 @@ class Container:
         """User persistence (Telegram onboarding lookups, M02-002)."""
         return SqlAlchemyUserRepository(self.session_factory)
 
+    async def reconcile_superadmins(self) -> None:
+        """Application-startup policy sync; never invoked by read-only CLI setup."""
+        from cloud_platform.modules.users.superadmin_repository import (
+            SqlAlchemySuperadminRepository,
+        )
+
+        await SqlAlchemySuperadminRepository(self.session_factory).reconcile(
+            get_settings().telegram_superadmin_user_ids
+        )
+
     def wallet_repository(self) -> WalletRepository:
         """Wallet persistence (bot confirmation screen, M08-005)."""
         from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
@@ -790,7 +800,9 @@ class Container:
         from cloud_platform.modules.wallet.admin import AdminWalletService
 
         return AdminWalletService(
-            user_repo=self.user_repository(), wallet_repo=self.wallet_repository()
+            user_repo=self.user_repository(),
+            wallet_repo=self.wallet_repository(),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
         )
 
     def prepaid_hourly_billing_service(self) -> Any:
@@ -1056,6 +1068,7 @@ class Container:
             self.ledger_repository(),
             event_sink=self.business_event_sink(),
             user_repo=self.user_repository(),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
         )
 
     # -- storefront markets ------------------------------------------------
@@ -1202,7 +1215,12 @@ class Container:
     def gateway_management_service(self, configured_keys: Any) -> Any:
         from cloud_platform.modules.payments.gateways import GatewayManagementService
 
-        return GatewayManagementService(self.gateway_settings_repository(), configured_keys)
+        return GatewayManagementService(
+            self.gateway_settings_repository(),
+            configured_keys,
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+            user_repo=self.user_repository(),
+        )
 
     def payment_inquiry_service(self, gateways: dict[str, Any]) -> Any:
         from cloud_platform.modules.payments.inquiry import PaymentInquiryService

@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
-from cloud_platform.modules.wallet.domain import DEFAULT_WALLET_CURRENCY, WalletRepository
+from cloud_platform.modules.wallet.domain import WalletRepository
 
 logger = logging.getLogger(__name__)
 
@@ -45,32 +45,14 @@ async def handle_start(
     Returns:
         The resolved or newly-created User aggregate.
     """
-    # --- Returning user path ---
-    existing = await user_repo.get_by_telegram_user_id(telegram_user_id)
-    if existing is not None:
-        logger.info("Returning user %s logged in via Telegram", existing.username)
-        return existing
-
-    # --- New user path ---
-    resolved_email = email or _generate_email(username)
-    try:
-        user = await user_repo.create(
-            User(username=username, email=resolved_email, telegram_user_id=telegram_user_id)
-        )
-    except Exception as exc:
-        # Handle unique constraint violations (username/email already taken)
-        if isinstance(exc, ValueError | OnboardingConflict):
-            raise
-        # sqlalchemy IntegrityError → parse into domain error
-        raise OnboardingError(f"failed to create user: {exc}") from exc
-
-    # Create wallet for new user in the canonical storefront currency: the
-    # catalog sells USD amounts, so an EUR wallet could only settle a purchase
-    # by relabelling money. Domestic (IRT/IRR) recharges convert at credit time.
-    assert user.id is not None
-    await wallet_repo.get_or_create(user.id, currency=DEFAULT_WALLET_CURRENCY)
-    logger.info("Created user %s with wallet", username)
-    return user
+    # Keep the public service signature, but the user, pending grant, wallet
+    # and immutable audit now commit atomically in the identity repository.
+    del wallet_repo
+    return await user_repo.onboard_telegram(
+        telegram_user_id,
+        username,
+        email or _generate_email(username or f"telegram_{telegram_user_id}"),
+    )
 
 
 async def ensure_telegram_link(

@@ -18,6 +18,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
+from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import get_container
 from cloud_platform.modules.audit.domain import AuditRepository
 from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
@@ -26,7 +27,6 @@ from cloud_platform.modules.users.domain import (
     Permission,
     PermissionChecker,
     PermissionDeniedError,
-    Role,
     User,
     UserNotFound,
     UserStatus,
@@ -35,6 +35,7 @@ from cloud_platform.modules.users.repository import (
     SqlAlchemyUserRepository,
     UserStatusIdempotencyConflict,
 )
+from cloud_platform.modules.users.superadmins import require_superadmin
 
 from .dependencies import get_token_authentication, require_idempotency_key
 from .errors import ApiError, ErrorCode
@@ -52,24 +53,27 @@ async def _audit_repo() -> AuditRepository:
     return SqlAlchemyAuditRepository(container.session_factory)
 
 
+def _configured_superadmin_ids() -> tuple[int, ...]:
+    return tuple(get_settings().telegram_superadmin_user_ids)
+
+
 def _admin_auth(
     permission: Permission,
     scope: TokenScope,
-) -> Callable[[Any, SqlAlchemyUserRepository], Awaitable[User]]:
+) -> Callable[[Any, SqlAlchemyUserRepository, tuple[int, ...]], Awaitable[User]]:
     """Dependency factory enforcing token capability AND active admin RBAC."""
 
     async def _checker(
         auth: Annotated[Any, Depends(get_token_authentication)],
         repo: Annotated[SqlAlchemyUserRepository, Depends(_user_repo)],
+        configured_ids: Annotated[tuple[int, ...], Depends(_configured_superadmin_ids)],
     ) -> User:
         if not auth.has(scope):
             raise ApiError(ErrorCode.FORBIDDEN, f"token scope {scope.value} required")
         user = await repo.get(auth.user_id)
-        if user is None or user.role is not Role.ADMIN:
-            # identical envelope whether or not the id exists - no leak
-            raise ApiError(ErrorCode.FORBIDDEN, "admin privileges required")
-        checker = PermissionChecker(user)
         try:
+            user = require_superadmin(user, configured_ids)
+            checker = PermissionChecker(user)
             checker.require_active()
             checker.require(permission)
         except PermissionDeniedError as exc:
@@ -146,6 +150,7 @@ async def set_user_status(
     ],
     repo: Annotated[SqlAlchemyUserRepository, Depends(_user_repo)],
     key: Annotated[str, Depends(require_idempotency_key)],
+    configured_ids: Annotated[tuple[int, ...], Depends(_configured_superadmin_ids)],
 ) -> dict[str, Any]:
     status_raw = str(body.get("status") or "")
     reason = str(body.get("reason") or "").strip()
@@ -161,8 +166,15 @@ async def set_user_status(
     assert actor.id is not None  # The authentication dependency fetched a persisted admin.
     try:
         outcome = await repo.change_status_idempotently(
-            user_id, status, actor_id=actor.id, idempotency_key=key, reason=reason
+            user_id,
+            status,
+            actor_id=actor.id,
+            idempotency_key=key,
+            reason=reason,
+            admin_configured_ids=configured_ids,
         )
+    except PermissionDeniedError as exc:
+        raise ApiError(ErrorCode.FORBIDDEN, str(exc)) from None
     except UserNotFound:
         raise ApiError(ErrorCode.NOT_FOUND, f"user {user_id} not found") from None
     except UserStatusIdempotencyConflict as exc:

@@ -20,14 +20,20 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from cloud_platform.db.base import AuditEvent, BusinessLogEvent, GatewaySetting, LedgerEntry
+from cloud_platform.db.base import (
+    AuditEvent,
+    BusinessLogEvent,
+    GatewaySetting,
+    LedgerEntry,
+    TelegramSuperadminAssignment,
+)
 from cloud_platform.modules.businesslog.domain import BusinessLogPolicy, OutboxBusinessEventSink
 from cloud_platform.modules.businesslog.repository import SqlAlchemyBusinessLogRepository
 from cloud_platform.modules.payments.gateway_repository import SqlAlchemyGatewaySettingsRepository
 from cloud_platform.modules.payments.gateways import GatewayManagementService
 from cloud_platform.modules.payments.recharge import RechargeError, WalletRechargeService
 from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
-from cloud_platform.modules.users.domain import Role, User
+from cloud_platform.modules.users.domain import PermissionDeniedError, Role, User
 from cloud_platform.modules.users.identity import IdentityService, require_verified_identity
 from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
 from cloud_platform.modules.wallet.domain import DuplicateIdempotencyError, LedgerEntryType
@@ -80,6 +86,18 @@ async def make_user(factory, *, admin=False, currency="USD"):
             role=Role.ADMIN if admin else Role.USER,
         )
     )
+    if admin:
+        # Financial contracts seed a legitimately configured grant without
+        # reconciling away other tests' independent administrative fixtures.
+        async with factory() as session:
+            session.add(
+                TelegramSuperadminAssignment(
+                    telegram_user_id=user.telegram_user_id,
+                    user_id=user.id,
+                    enabled=True,
+                )
+            )
+            await session.commit()
     await SqlAlchemyWalletRepository(factory).get_or_create(user.id, currency=currency)
     return user
 
@@ -112,7 +130,9 @@ async def test_gateway_switch_persists_actor_and_aware_timestamp(factory):
     admin = await make_user(factory, admin=True)
     key = "verify-" + uuid4().hex[:16]
     repository = SqlAlchemyGatewaySettingsRepository(factory)
-    management = GatewayManagementService(repository, [key])
+    management = GatewayManagementService(
+        repository, [key], configured_ids=(admin.telegram_user_id,)
+    )
     assert (await management.list(admin))[0].enabled is True
     await management.set_enabled(admin, key, False)
     assert await repository.get(key) is False
@@ -121,7 +141,59 @@ async def test_gateway_switch_persists_actor_and_aware_timestamp(factory):
         assert row.updated_by == admin.id
         assert row.updated_at.tzinfo is not None
     await management.set_enabled(admin, key, True)
-    assert (await GatewayManagementService(repository, [key]).list(admin))[0].enabled is True
+    assert (
+        await GatewayManagementService(
+            repository, [key], configured_ids=(admin.telegram_user_id,)
+        ).list(admin)
+    )[0].enabled is True
+
+
+async def test_privileged_mutations_reject_stale_revoked_actor_under_transaction_lock(factory):
+    from sqlalchemy import update
+
+    from cloud_platform.db.base import User as UserRow
+
+    admin = await make_user(factory, admin=True)
+    customer = await make_user(factory)
+    wallets = SqlAlchemyWalletRepository(factory)
+    service = WalletAdminService(
+        wallets, SqlAlchemyLedgerRepository(factory), configured_ids=(admin.telegram_user_id,)
+    )
+    key = "revoked-gateway:" + uuid4().hex
+    gateways = GatewayManagementService(
+        SqlAlchemyGatewaySettingsRepository(factory),
+        [key],
+        configured_ids=(admin.telegram_user_id,),
+    )
+    # The caller's object remains privileged. The mutation's own transaction
+    # must reject the fresh persisted identity before touching wallet data.
+    async with factory() as session:
+        await session.execute(
+            update(UserRow).where(UserRow.id == admin.id).values(role=Role.USER.value)
+        )
+        await session.commit()
+    with pytest.raises(PermissionDeniedError):
+        await service.adjust_balance(
+            admin=admin,
+            user_id=customer.id,
+            amount=100,
+            reason="stale actor",
+            idempotency_key="revoked-credit:" + uuid4().hex,
+        )
+    with pytest.raises(PermissionDeniedError):
+        await gateways.set_enabled(admin, key, False)
+    wallet = await wallets.get(customer.id)
+    assert wallet.balance == 0
+    assert await SqlAlchemyGatewaySettingsRepository(factory).get(key) is None
+    async with factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(LedgerEntry)
+                .where(LedgerEntry.wallet_id == wallet.id)
+            )
+            == 0
+        )
 
 
 async def test_manual_credit_commits_wallet_ledger_audit_and_outbox_once(factory):
@@ -136,6 +208,7 @@ async def test_manual_credit_commits_wallet_ledger_audit_and_outbox_once(factory
         ledger_repository,
         event_sink=sink,
         user_repo=SqlAlchemyUserRepository(factory),
+        configured_ids=(admin.telegram_user_id,),
     )
     key = "verify-credit:" + uuid4().hex
     outcomes = await asyncio.gather(
@@ -303,7 +376,9 @@ async def test_manual_credit_normalizes_key_before_atomic_replay(factory):
     admin = await make_user(factory, admin=True)
     user = await make_user(factory)
     service = WalletAdminService(
-        SqlAlchemyWalletRepository(factory), SqlAlchemyLedgerRepository(factory)
+        SqlAlchemyWalletRepository(factory),
+        SqlAlchemyLedgerRepository(factory),
+        configured_ids=(admin.telegram_user_id,),
     )
     key = "verify-spaces:" + uuid4().hex
     first = await service.adjust_balance(
@@ -325,7 +400,9 @@ async def test_admin_confirmation_restart_replay_and_cancel_isolation(factory):
     user = await make_user(factory)
     users = SqlAlchemyUserRepository(factory)
     wallets = SqlAlchemyWalletRepository(factory)
-    credit = WalletAdminService(wallets, SqlAlchemyLedgerRepository(factory))
+    credit = WalletAdminService(
+        wallets, SqlAlchemyLedgerRepository(factory), configured_ids=(admin.telegram_user_id,)
+    )
     store = InMemoryBotSessionStore()
     signing_key = "fixture-signing-key"
 
@@ -333,13 +410,16 @@ async def test_admin_confirmation_restart_replay_and_cancel_isolation(factory):
         return AdminBotUi(
             signing_key,
             gateways=GatewayManagementService(
-                SqlAlchemyGatewaySettingsRepository(factory), ["atlaspay"]
+                SqlAlchemyGatewaySettingsRepository(factory),
+                ["atlaspay"],
+                configured_ids=(admin.telegram_user_id,),
             ),
             users=users,
             wallets=wallets,
             wallet_admin=credit,
             store=store,
             ttl_seconds=600,
+            configured_ids=(admin.telegram_user_id,),
         )
 
     await ui().handle(Callback("admin", "credit"), admin)
@@ -581,7 +661,9 @@ async def seed_hourly_contract(factory):
     user = await make_user(factory)
     wallets, ledger = SqlAlchemyWalletRepository(factory), SqlAlchemyLedgerRepository(factory)
     suffix = uuid4().hex
-    await WalletAdminService(wallets, ledger).adjust_balance(
+    await WalletAdminService(
+        wallets, ledger, configured_ids=(admin.telegram_user_id,)
+    ).adjust_balance(
         admin=admin,
         user_id=user.id,
         amount=300,
@@ -780,6 +862,7 @@ async def test_application_gateway_disable_keeps_exact_pending_credit(factory, m
             session.expunge(original_switch)
     try:
         admin = await make_user(factory, admin=True)
+        settings.telegram_superadmin_user_ids = [admin.telegram_user_id]
         user = await make_user(factory, currency="IRT")
         management = container.gateway_management_service(gateways)
         await management.set_enabled(admin=admin, key="atlaspay", enabled=True)
@@ -853,7 +936,11 @@ async def test_real_worker_preserves_paid_hour_then_requests_expiry_delete(facto
     server.transition_to(ServerLifecycleState.RUNNING)
     await contract.servers.save(server)
     boundary = server.last_accrued_at
-    admin_service = WalletAdminService(contract.wallets, SqlAlchemyLedgerRepository(factory))
+    admin_service = WalletAdminService(
+        contract.wallets,
+        SqlAlchemyLedgerRepository(factory),
+        configured_ids=(contract.admin.telegram_user_id,),
+    )
     await admin_service.adjust_balance(
         admin=contract.admin,
         user_id=contract.user.id,
@@ -1012,7 +1099,9 @@ async def test_verified_application_checkout_reserves_one_frozen_hour_without_po
         admin = await make_user(factory, admin=True)
         user = await make_user(factory)
         wallets = container.wallet_repository()
-        await WalletAdminService(wallets, container.ledger_repository()).adjust_balance(
+        await WalletAdminService(
+            wallets, container.ledger_repository(), configured_ids=(admin.telegram_user_id,)
+        ).adjust_balance(
             admin=admin,
             user_id=user.id,
             amount=100,

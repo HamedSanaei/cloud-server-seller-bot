@@ -16,7 +16,9 @@ from aiogram.types import User as TelegramUser
 
 from cloud_platform.bot.admin_ui import AdminBotUi
 from cloud_platform.bot.main import _admin_credit, _admin_dump, register_handlers
+from cloud_platform.bot.monthly_ui import build_main_reply_keyboard
 from cloud_platform.bot.ui import BotScreen
+from cloud_platform.core.i18n import Translator
 from cloud_platform.core.session_store import InMemoryBotSessionStore, SessionStoreUnavailable
 from cloud_platform.modules.navigation.domain import Callback, decode_callback, encode_callback
 from cloud_platform.modules.users.domain import Role, User, UserStatus
@@ -36,8 +38,10 @@ def _message(text: str, *, actor: int = 42, chat: int = 42) -> Message:
 def _container() -> MagicMock:
     container = MagicMock()
     repo = MagicMock()
-    admin = SimpleNamespace(
+    admin = User(
         id=uuid4(),
+        username="configured-admin",
+        email="configured-admin@example.test",
         role=Role.ADMIN,
         status=UserStatus.ACTIVE,
         telegram_user_id=42,
@@ -55,23 +59,22 @@ def _container() -> MagicMock:
     return container
 
 
-def test_credit_requires_configured_private_admin_and_uses_message_idempotency(
+def test_credit_command_cannot_bypass_management_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     container = _container()
     answer = AsyncMock()
     monkeypatch.setattr(Message, "answer", answer)
     monkeypatch.setattr(
-        "cloud_platform.bot.main.get_settings", lambda: SimpleNamespace(telegram_admin_chat_id=42)
+        "cloud_platform.bot.main.get_settings",
+        lambda: SimpleNamespace(telegram_superadmin_user_ids=[42]),
     )
     target = uuid4()
     asyncio.run(_admin_credit(_message(f"/admin_credit {target} 300 courtesy"), container))
-    kwargs = container.wallet_admin_service.return_value.adjust_balance.await_args.kwargs
-    assert kwargs["user_id"] == target
-    assert kwargs["amount"] == 300
-    assert kwargs["reason"] == "courtesy"
-    assert kwargs["idempotency_key"] == "telegram-admin-credit:42:7"
-    assert "800" in answer.await_args.args[0]
+    container.wallet_admin_service.return_value.adjust_balance.assert_not_awaited()
+    from cloud_platform.core.i18n import Translator
+
+    assert answer.await_args.args[0] == Translator().t("admin.credit_use_management")
 
     container.wallet_admin_service.return_value.adjust_balance.reset_mock()
     asyncio.run(
@@ -89,7 +92,8 @@ def test_dump_sends_encrypted_file_only_to_admin(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(Message, "answer_document", send)
     monkeypatch.setattr(Message, "answer", answer)
     monkeypatch.setattr(
-        "cloud_platform.bot.main.get_settings", lambda: SimpleNamespace(telegram_admin_chat_id=42)
+        "cloud_platform.bot.main.get_settings",
+        lambda: SimpleNamespace(telegram_superadmin_user_ids=[42]),
     )
 
     class Job:
@@ -146,6 +150,11 @@ def admin_flow(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     }
     repository = SimpleNamespace(
         get=AsyncMock(side_effect=lambda uid: users.get(uid)),
+        onboard_telegram=AsyncMock(
+            side_effect=lambda tid, _username, _email: next(
+                (u for u in users.values() if u.telegram_user_id == tid), None
+            )
+        ),
         get_by_telegram_user_id=AsyncMock(
             side_effect=lambda tid: next(
                 (u for u in users.values() if u.telegram_user_id == tid), None
@@ -163,6 +172,7 @@ def admin_flow(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         wallet_admin=credit,
         store=store,
         ttl_seconds=30,
+        configured_ids=(42, 44),
     )
     container = MagicMock()
     container.user_repository.return_value = repository
@@ -174,13 +184,15 @@ def admin_flow(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(CallbackQuery, "answer", ack)
     monkeypatch.setattr(
         "cloud_platform.bot.main.get_settings",
-        lambda: SimpleNamespace(callback_signing_key=key),
+        lambda: SimpleNamespace(callback_signing_key=key, telegram_superadmin_user_ids=[42, 44]),
     )
     fallback = SimpleNamespace(
         handle=AsyncMock(return_value=None),
         handle_text=AsyncMock(return_value=None),
         menu_screen=lambda user: BotScreen("menu", InlineKeyboardMarkup(inline_keyboard=[])),
-        reply_keyboard=lambda user: None,
+        reply_keyboard=lambda user: build_main_reply_keyboard(
+            Translator(), user, configured_ids=(42, 44)
+        ),
     )
     dp = Dispatcher()
     register_handlers(dp, fallback, fallback, container, admin_ui=ui)
@@ -198,6 +210,7 @@ def admin_flow(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         answer=answer,
         edit=edit,
         ack=ack,
+        repository=repository,
     )
 
 
@@ -467,4 +480,143 @@ async def test_admin_credit_command_without_audit_reason_cannot_adjust_wallet(
 ) -> None:
     flow = admin_flow
     await _admin_update(flow, f"/admin_credit {flow.customer.id} 100    ")
+    flow.credit.adjust_balance.assert_not_awaited()
+
+
+@pytest.mark.parametrize("actor", [42, 44])
+async def test_each_configured_superadmin_gets_dedicated_persistent_management_keyboard(
+    admin_flow: SimpleNamespace, actor: int
+) -> None:
+    from cloud_platform.core.i18n import Translator
+
+    flow = admin_flow
+    await _admin_update(flow, "/admin", actor=actor)
+    first, second = flow.answer.await_args_list
+    keyboard = first.kwargs["reply_markup"]
+    assert keyboard.is_persistent is True
+    assert keyboard.resize_keyboard is True
+    assert [button.text for row in keyboard.keyboard for button in row] == [
+        Translator().t("admin.gateways"),
+        Translator().t("admin.credit"),
+        Translator().t("nav.menu"),
+    ]
+    assert second.kwargs["reply_markup"].inline_keyboard
+    flow.credit.adjust_balance.assert_not_awaited()
+
+
+@pytest.mark.parametrize("actor", [42, 44])
+async def test_management_reply_button_enters_existing_credit_confirmation_flow(
+    admin_flow: SimpleNamespace, actor: int
+) -> None:
+    from cloud_platform.core.i18n import Translator
+
+    flow = admin_flow
+    await _admin_update(flow, Translator().t("menu.admin"), actor=actor)
+    await _admin_update(flow, Translator().t("admin.credit"), actor=actor)
+    owner = flow.admin if actor == 42 else flow.second_admin
+    assert await flow.store.get("admin-credit", str(owner.id)) == {"step": "target"}
+    flow.credit.adjust_balance.assert_not_awaited()
+
+
+@pytest.mark.parametrize("configured", [[], [44]])
+async def test_active_database_admin_is_denied_without_matching_config(
+    admin_flow: SimpleNamespace, monkeypatch, configured
+) -> None:
+    flow = admin_flow
+    monkeypatch.setattr(
+        "cloud_platform.bot.main.get_settings",
+        lambda: SimpleNamespace(
+            callback_signing_key=flow.key,
+            telegram_superadmin_user_ids=configured,
+            telegram_admin_chat_id=42,
+        ),
+    )
+    await _admin_update(flow, "/admin")
+    keyboard = flow.answer.await_args.kwargs["reply_markup"]
+    assert Translator().t("menu.admin") not in [
+        button.text for row in keyboard.keyboard for button in row
+    ]
+    flow.credit.adjust_balance.assert_not_awaited()
+    assert await flow.store.get("admin-credit", str(flow.admin.id)) is None
+
+
+@pytest.mark.parametrize("context", ["group", "bot", "anonymous", "chat_mismatch", "sender_chat"])
+async def test_untrusted_start_never_onboards_or_exposes_management(
+    admin_flow: SimpleNamespace, context: str
+) -> None:
+    flow = admin_flow
+    message = _message("/start")
+    if context == "group":
+        message = message.model_copy(update={"chat": Chat(id=-100, type="supergroup")})
+    elif context == "bot":
+        actor = TelegramUser(id=42, is_bot=True, first_name="Not a human")
+        message = message.model_copy(update={"from_user": actor})
+    elif context == "anonymous":
+        message = message.model_copy(update={"from_user": None})
+    elif context == "sender_chat":
+        message = message.model_copy(update={"sender_chat": Chat(id=-100, type="supergroup")})
+    else:
+        message = message.model_copy(update={"chat": Chat(id=44, type="private")})
+    flow.repository.get_by_telegram_user_id.reset_mock()
+    await flow.dp.feed_update(MagicMock(spec=Bot), Update(update_id=1, message=message))
+    flow.repository.get_by_telegram_user_id.assert_not_awaited()
+    flow.repository.onboard_telegram.assert_not_awaited()
+    assert "reply_markup" not in flow.answer.await_args.kwargs
+    flow.credit.adjust_balance.assert_not_awaited()
+
+
+async def test_second_configured_admin_cannot_claim_another_admins_confirmation(admin_flow) -> None:
+    flow = admin_flow
+    apply, _ = await _credit_confirmation(flow)
+    await _admin_callback(flow, apply, actor=44)
+    flow.credit.adjust_balance.assert_not_awaited()
+    assert flow.wallets[flow.customer.id].balance == 700
+
+
+async def test_confirmation_reloads_authority_even_when_resolved_identity_is_stale(
+    admin_flow, monkeypatch
+) -> None:
+    flow = admin_flow
+    apply, _ = await _credit_confirmation(flow)
+    monkeypatch.setattr("cloud_platform.bot.main._resolve_user", AsyncMock(return_value=flow.admin))
+    flow.users[flow.admin.id] = replace(flow.admin, status=UserStatus.FROZEN)
+    await _admin_callback(flow, apply)
+    flow.credit.adjust_balance.assert_not_awaited()
+    assert flow.wallets[flow.customer.id].balance == 700
+
+
+@pytest.mark.parametrize("revocation", ["demoted", "frozen", "config_removed"])
+@pytest.mark.parametrize(
+    "entrypoint", ["menu.admin", "admin.credit", "admin.gateways", "/admin", "callback"]
+)
+async def test_revoked_management_entry_replaces_persistent_privileged_keyboard(
+    admin_flow, monkeypatch, revocation, entrypoint
+) -> None:
+    flow = admin_flow
+    await _admin_update(flow, "/admin")
+    assert flow.answer.await_args_list[0].kwargs["reply_markup"].is_persistent is True
+    flow.answer.reset_mock()
+    if revocation == "config_removed":
+        # Even a UI instance holding old configuration must render no admin
+        # keyboard when the authoritative edge has rejected the identity.
+        monkeypatch.setattr(
+            "cloud_platform.bot.main.get_settings",
+            lambda: SimpleNamespace(callback_signing_key=flow.key, telegram_superadmin_user_ids=[]),
+        )
+    elif revocation == "demoted":
+        flow.users[flow.admin.id] = replace(flow.admin, role=Role.USER)
+    else:
+        flow.users[flow.admin.id] = replace(flow.admin, status=UserStatus.FROZEN)
+    if entrypoint == "callback":
+        data = encode_callback(Callback("admin", "menu"), flow.key)
+        await _admin_callback(flow, data)
+    else:
+        text = entrypoint if entrypoint.startswith("/") else Translator().t(entrypoint)
+        await _admin_update(flow, text)
+    keyboard = flow.answer.await_args.kwargs["reply_markup"]
+    assert keyboard.is_persistent is True
+    texts = [button.text for row in keyboard.keyboard for button in row]
+    assert not any(
+        Translator().t(key) in texts for key in ("menu.admin", "admin.credit", "admin.gateways")
+    )
     flow.credit.adjust_balance.assert_not_awaited()

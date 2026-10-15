@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from cloud_platform.modules.users.domain import PermissionDeniedError, Role, User, UserStatus
-from cloud_platform.modules.wallet.domain import Hold, HoldStateConflictError, HoldStatus
+from cloud_platform.modules.wallet.domain import Hold, HoldStateConflictError, HoldStatus, Wallet
 from cloud_platform.modules.wallet.service import HoldAdminService, WalletAdminService
 
 ADMIN_ID = uuid4()
@@ -17,7 +19,9 @@ WALLET_ID = uuid4()
 
 
 def _admin(role: Role = Role.ADMIN) -> User:
-    return User(id=ADMIN_ID, username="boss", email="boss@example.com", role=role)
+    return User(
+        id=ADMIN_ID, username="boss", email="boss@example.com", role=role, telegram_user_id=77110022
+    )
 
 
 @pytest.mark.parametrize(
@@ -32,7 +36,7 @@ async def test_wallet_adjustment_requires_active_admin(role: Role, status: UserS
     admin = _admin(role)
     admin.status = status
     wallet = AsyncMock()
-    service = WalletAdminService(wallet, AsyncMock())
+    service = WalletAdminService(wallet, AsyncMock(), configured_ids=(77110022,))
     with pytest.raises(PermissionDeniedError):
         await service.adjust_balance(
             admin=admin, user_id=USER_ID, amount=500, reason="credit", idempotency_key="guard"
@@ -42,7 +46,7 @@ async def test_wallet_adjustment_requires_active_admin(role: Role, status: UserS
 
 async def test_superadmin_cannot_credit_own_account() -> None:
     wallet = AsyncMock()
-    service = WalletAdminService(wallet, AsyncMock())
+    service = WalletAdminService(wallet, AsyncMock(), configured_ids=(77110022,))
     with pytest.raises(ValueError, match="self top-up"):
         await service.adjust_balance(
             admin=_admin(), user_id=ADMIN_ID, amount=500, reason="credit", idempotency_key="self"
@@ -53,7 +57,7 @@ async def test_superadmin_cannot_credit_own_account() -> None:
 @pytest.mark.parametrize("amount", [0, True, 1.5, 2**63, -(2**63) - 1])
 async def test_invalid_adjustment_amount_is_rejected_before_money(amount: object) -> None:
     wallet = AsyncMock()
-    service = WalletAdminService(wallet, AsyncMock())
+    service = WalletAdminService(wallet, AsyncMock(), configured_ids=(77110022,))
     with pytest.raises(ValueError):
         await service.adjust_balance(
             admin=_admin(), user_id=USER_ID, amount=amount, reason="credit", idempotency_key="bad"
@@ -63,12 +67,71 @@ async def test_invalid_adjustment_amount_is_rejected_before_money(amount: object
 
 async def test_empty_adjustment_reason_is_rejected() -> None:
     wallet = AsyncMock()
-    service = WalletAdminService(wallet, AsyncMock())
+    service = WalletAdminService(wallet, AsyncMock(), configured_ids=(77110022,))
     with pytest.raises(ValueError, match="reason"):
         await service.adjust_balance(
             admin=_admin(), user_id=USER_ID, amount=100, reason=" ", idempotency_key="reason"
         )
     wallet.adjust.assert_not_awaited()
+
+
+async def test_unconfigured_legacy_admin_and_forged_actor_never_adjust_wallet() -> None:
+    wallet = AsyncMock()
+    for actor in (
+        _admin(),
+        SimpleNamespace(
+            id=ADMIN_ID, role=Role.ADMIN, status=UserStatus.ACTIVE, telegram_user_id=77110022
+        ),
+    ):
+        with pytest.raises(PermissionDeniedError):
+            await WalletAdminService(wallet, AsyncMock()).adjust_balance(
+                admin=actor, user_id=USER_ID, amount=100, reason="review", idempotency_key="guard"
+            )
+    wallet.adjust.assert_not_awaited()
+
+
+@pytest.mark.parametrize("change", ["revoked", "identity", "missing"])
+async def test_fresh_actor_recheck_rejects_stale_privileges(change: str) -> None:
+    actor = _admin()
+    fresh = {
+        "revoked": replace(actor, role=Role.USER),
+        "identity": replace(actor, telegram_user_id=99110022),
+        "missing": None,
+    }[change]
+    users = SimpleNamespace(get=AsyncMock(return_value=fresh))
+    wallet = AsyncMock()
+    service = WalletAdminService(wallet, AsyncMock(), user_repo=users, configured_ids=(77110022,))
+    with pytest.raises(PermissionDeniedError):
+        await service.adjust_balance(
+            admin=actor, user_id=USER_ID, amount=100, reason="review", idempotency_key="guard"
+        )
+    wallet.adjust.assert_not_awaited()
+
+
+async def test_confirmed_currency_reason_actor_and_policy_reach_atomic_repository() -> None:
+    result = Wallet(id=WALLET_ID, user_id=USER_ID, currency="USD", balance=100)
+    wallets = AsyncMock()
+    wallets.adjust.return_value = (result, True)
+    ledger = AsyncMock()
+    ledger.get_entry_by_idempotency.return_value = object()
+    actor = _admin()
+    users = SimpleNamespace(
+        get=AsyncMock(side_effect=lambda uid: actor if uid == ADMIN_ID else None)
+    )
+    service = WalletAdminService(wallets, ledger, user_repo=users, configured_ids=(77110022,))
+    await service.adjust_balance(
+        admin=actor,
+        user_id=USER_ID,
+        amount=100,
+        reason="support case 42",
+        idempotency_key="confirmed",
+        expected_currency="USD",
+    )
+    kwargs = wallets.adjust.await_args.kwargs
+    assert kwargs["expected_currency"] == "USD"
+    assert kwargs["description"] == "support case 42"
+    assert kwargs["audit_actor_id"] == ADMIN_ID
+    assert kwargs["admin_configured_ids"] == (77110022,)
 
 
 class TestForceRelease:

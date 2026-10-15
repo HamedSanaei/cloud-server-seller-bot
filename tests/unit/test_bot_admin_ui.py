@@ -48,6 +48,7 @@ class Accounts:
         self.wallet = Wallet(id=uuid4(), user_id=self.customer.id, currency="IRT")
         self.entries = {}
         self.fail_next = False
+        self.currency_before_adjust = None
         self.lock = asyncio.Lock()
 
     async def get(self, identity):
@@ -65,6 +66,10 @@ class Accounts:
 
     async def adjust(self, user_id, amount, key, **facts):
         async with self.lock:
+            if self.currency_before_adjust is not None:
+                self.wallet.currency = self.currency_before_adjust
+            if facts.get("expected_currency") != self.wallet.currency:
+                raise ValueError("wallet currency differs from frozen confirmation")
             if self.fail_next:
                 self.fail_next = False
                 raise ValueError("temporary unavailable wallet")
@@ -95,6 +100,7 @@ def route(monkeypatch):
     users = SimpleNamespace(
         get=accounts.get_user,
         get_by_telegram_user_id=accounts.get_by_telegram_user_id,
+        onboard_telegram=lambda tid, _username, _email: accounts.get_by_telegram_user_id(tid),
     )
     store = InMemoryBotSessionStore()
     admin = AdminBotUi(
@@ -102,8 +108,11 @@ def route(monkeypatch):
         gateways=SimpleNamespace(list=AsyncMock(return_value=[])),
         users=users,
         wallets=accounts,
-        wallet_admin=WalletAdminService(accounts, accounts, user_repo=users),
+        wallet_admin=WalletAdminService(
+            accounts, accounts, user_repo=users, configured_ids=(ADMIN_TID,)
+        ),
         store=store,
+        configured_ids=(ADMIN_TID,),
     )
     monthly = MonthlyBotUi(
         KEY,
@@ -114,6 +123,7 @@ def route(monkeypatch):
         renewals=MagicMock(),
         offers_repo=MagicMock(),
         wallet_history=MagicMock(),
+        configured_ids=(ADMIN_TID,),
     )
     container = SimpleNamespace(user_repository=lambda: users, wallet_repository=lambda: accounts)
     answer, edit, ack = AsyncMock(), AsyncMock(), AsyncMock()
@@ -121,7 +131,8 @@ def route(monkeypatch):
     monkeypatch.setattr(Message, "edit_text", edit)
     monkeypatch.setattr(CallbackQuery, "answer", ack)
     monkeypatch.setattr(
-        "cloud_platform.bot.main.get_settings", lambda: SimpleNamespace(callback_signing_key=KEY)
+        "cloud_platform.bot.main.get_settings",
+        lambda: SimpleNamespace(callback_signing_key=KEY, telegram_superadmin_user_ids=[ADMIN_TID]),
     )
     dp = Dispatcher()
     register_handlers(dp, MagicMock(), monthly, container, admin_ui=admin)
@@ -147,13 +158,13 @@ async def _text(route, value, actor=ADMIN_TID):
     await route.dp.feed_update(MagicMock(spec=Bot), Update(update_id=1, message=message))
 
 
-async def _click(route, data, *, actor=ADMIN_TID, chat=None):
+async def _click(route, data, *, actor=ADMIN_TID, chat=None, is_bot=False):
     message = Message(
         message_id=5, date=1, chat=Chat(id=actor if chat is None else chat, type="private")
     )
     query = CallbackQuery(
         id="credit-action",
-        from_user=TelegramUser(id=actor, is_bot=False, first_name="Test"),
+        from_user=TelegramUser(id=actor, is_bot=is_bot, first_name="Test"),
         chat_instance="private",
         message=message,
         data=data,
@@ -185,7 +196,9 @@ async def test_confirmed_credit_is_authorized_auditable_and_concurrently_replay_
     assert entry.description == "Refund approved by support"
 
 
-@pytest.mark.parametrize("denial", ["customer", "frozen", "cross_chat", "tampered"])
+@pytest.mark.parametrize(
+    "denial", ["customer", "frozen", "cross_chat", "tampered", "bot", "unconfigured_admin"]
+)
 async def test_credit_confirmation_never_grants_privilege_to_a_different_actor(route, denial):
     keyboard = await _confirmation(route)
     confirm = keyboard.inline_keyboard[0][0].callback_data
@@ -196,9 +209,19 @@ async def test_credit_confirmation_never_grants_privilege_to_a_different_actor(r
         route.accounts.admin.status = UserStatus.FROZEN
     elif denial == "cross_chat":
         chat = CUSTOMER_TID
-    else:
+    elif denial == "tampered":
         confirm = confirm[:-1] + ("0" if confirm[-1] != "0" else "1")
-    await _click(route, confirm, actor=actor, chat=chat)
+    elif denial == "unconfigured_admin":
+        actor = chat = 303
+        unconfigured = User(
+            id=uuid4(),
+            username="unconfigured",
+            email="unconfigured@example.test",
+            role=Role.ADMIN,
+            telegram_user_id=actor,
+        )
+        route.accounts.users[unconfigured.id] = unconfigured
+    await _click(route, confirm, actor=actor, chat=chat, is_bot=denial == "bot")
     assert route.accounts.wallet.balance == 0
     assert route.accounts.entries == {}
 
@@ -248,3 +271,12 @@ async def test_confirmation_freezes_wallet_denomination_and_decimal_precision(ro
     assert route.accounts.wallet.balance == 1050
     (entry,) = route.accounts.entries.values()
     assert entry.amount == Money(Decimal(1050), "USD")
+
+
+async def test_confirmation_currency_is_fenced_when_wallet_changes_after_ui_read(route):
+    keyboard = await _confirmation(route)
+    confirm = keyboard.inline_keyboard[0][0].callback_data
+    route.accounts.currency_before_adjust = "USD"
+    await _click(route, confirm)
+    assert route.accounts.wallet.balance == 0
+    assert route.accounts.entries == {}

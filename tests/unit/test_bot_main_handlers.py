@@ -10,6 +10,8 @@ methods are patched at the class level.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -23,6 +25,7 @@ from cloud_platform.bot.main import _send_ssh_password, register_handlers
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.ui import BotUi
 from cloud_platform.modules.navigation.domain import Callback, encode_callback
+from cloud_platform.modules.users.domain import Role, User, UserStatus
 
 SCREEN = MagicMock(text="screen", keyboard=MagicMock())
 
@@ -45,6 +48,7 @@ def fakes() -> dict[str, Any]:
     container = MagicMock()
     user_repo = AsyncMock()
     user_repo.get_by_telegram_user_id = AsyncMock(return_value=MagicMock())
+    user_repo.onboard_telegram = AsyncMock(return_value=MagicMock())
     wallet_repo = AsyncMock()
     container.user_repository = MagicMock(return_value=user_repo)
     container.wallet_repository = MagicMock(return_value=wallet_repo)
@@ -74,7 +78,7 @@ def _message(text: str, *, user_id: int = 10, username: str | None = None) -> Me
     return Message(
         message_id=1,
         date=1,
-        chat=Chat(id=100, type="private"),
+        chat=Chat(id=user_id, type="private"),
         from_user=TelegramUser(id=user_id, is_bot=False, first_name="T", username=username),
         text=text,
     )
@@ -160,7 +164,9 @@ def test_start_command_shows_greeting_plus_menu(
     assert menu_call.args[0] == "screen"
     fakes["monthly_ui"].menu_screen.assert_called_once()
     # Onboarding ran for the new contact.
-    fakes["container"].user_repository().get_by_telegram_user_id.assert_awaited_once_with(10)
+    onboard = fakes["container"].user_repository().onboard_telegram
+    onboard.assert_awaited_once()
+    assert onboard.await_args.args[:2] == (10, "")
 
 
 def test_menu_command_renders_menu(
@@ -201,7 +207,7 @@ def test_callback_routes_to_monthly_ui_first(
         from_user=TelegramUser(id=7, is_bot=False, first_name="B"),
         chat_instance="ci",
         data="lsw:offers:list",
-        message=_message("/menu"),
+        message=_message("/menu", user_id=7),
     )
     fakes["monthly_ui"].handle.return_value = SCREEN
     _dispatch(dp, Update(update_id=4, callback_query=query))
@@ -231,7 +237,7 @@ def test_callback_falls_back_to_legacy_ui(
         from_user=TelegramUser(id=7, is_bot=False, first_name="B"),
         chat_instance="ci",
         data=data,
-        message=_message("/menu"),
+        message=_message("/menu", user_id=7),
     )
     _dispatch(dp, Update(update_id=5, callback_query=query))
     fakes["monthly_ui"].handle.assert_awaited_once()
@@ -252,7 +258,7 @@ def test_foreign_callback_renders_menu_with_notice(
         from_user=TelegramUser(id=7, is_bot=False, first_name="B"),
         chat_instance="ci",
         data="not-a-signed-callback!!!",
-        message=_message("/menu"),
+        message=_message("/menu", user_id=7),
     )
     _dispatch(dp, Update(update_id=9, callback_query=query))
     fakes["ui"].handle.assert_not_awaited()
@@ -272,7 +278,7 @@ def test_callback_edit_failure_is_tolerated(
         from_user=TelegramUser(id=7, is_bot=False, first_name="B"),
         chat_instance="ci",
         data="lsw:offers:list",
-        message=_message("/menu"),
+        message=_message("/menu", user_id=7),
     )
     _patch_outgoing["edit"].side_effect = RuntimeError("message too old")
     fakes["monthly_ui"].handle.return_value = SCREEN
@@ -292,19 +298,19 @@ def test_menu_shows_same_canonical_menu_as_start(
     fakes["monthly_ui"].menu_screen.assert_called_once()
 
 
-def test_start_creates_user_and_wallet_for_new_contact(
+def test_start_delegates_user_and_wallet_creation_to_atomic_onboarding(
     fakes: dict[str, Any],
     _patch_outgoing: dict[str, AsyncMock],
 ) -> None:
     user_repo = fakes["container"].user_repository()
-    user_repo.get_by_telegram_user_id = AsyncMock(return_value=None)
     wallet_repo = fakes["container"].wallet_repository()
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=12, message=_message("/start", user_id=99, username="newbie")))
-    user_repo.get_by_telegram_user_id.assert_awaited_once_with(99)
-    user_repo.create.assert_awaited_once()
-    wallet_repo.get_or_create.assert_awaited_once()
+    user_repo.onboard_telegram.assert_awaited_once()
+    assert user_repo.onboard_telegram.await_args.args[:2] == (99, "newbie")
+    user_repo.create.assert_not_awaited()
+    wallet_repo.get_or_create.assert_not_awaited()
     assert _patch_outgoing["answer"].await_count == 2
 
 
@@ -343,7 +349,7 @@ def _media_message(*, user_id: int = 10) -> Message:
     return Message(
         message_id=2,
         date=2,
-        chat=Chat(id=100, type="private"),
+        chat=Chat(id=user_id, type="private"),
         from_user=TelegramUser(id=user_id, is_bot=False, first_name="T"),
         photo=[PhotoSize(file_id="p", file_unique_id="u", width=1, height=1)],
         caption=None,
@@ -434,3 +440,70 @@ def test_build_main_reply_keyboard() -> None:
     assert [btn.text for btn in kb.keyboard[0]] == [t.t("menu.buy"), t.t("menu.servers")]
     assert [btn.text for btn in kb.keyboard[1]] == [t.t("menu.wallet"), t.t("menu.recharge")]
     assert [btn.text for btn in kb.keyboard[2]] == [t.t("menu.support"), t.t("nav.menu")]
+
+
+@pytest.mark.parametrize(
+    "telegram_id,status,configured,expected",
+    [
+        (42, UserStatus.ACTIVE, (42, 44), True),
+        (44, UserStatus.ACTIVE, (42, 44), True),
+        (45, UserStatus.ACTIVE, (42, 44), False),
+        (42, UserStatus.ACTIVE, (), False),
+        (42, UserStatus.FROZEN, (42, 44), False),
+        (42, UserStatus.BANNED, (42, 44), False),
+    ],
+)
+def test_management_keyboard_requires_configured_active_persisted_admin(
+    telegram_id, status, configured, expected
+) -> None:
+    from cloud_platform.bot.monthly_ui import build_main_reply_keyboard
+    from cloud_platform.core.i18n import Translator
+
+    admin = User(
+        id=uuid4(),
+        username="keyboard-admin",
+        email="keyboard@example.test",
+        role=Role.ADMIN,
+        status=status,
+        telegram_user_id=telegram_id,
+    )
+    translator = Translator()
+    keyboard = build_main_reply_keyboard(translator, admin, configured_ids=configured)
+    texts = [button.text for row in keyboard.keyboard for button in row]
+    assert (translator.t("menu.admin") in texts) is expected
+    customer = replace(admin, role=Role.USER)
+    keyboard = build_main_reply_keyboard(translator, customer, configured_ids=configured)
+    assert translator.t("menu.admin") not in [
+        button.text for row in keyboard.keyboard for button in row
+    ]
+
+
+@pytest.mark.parametrize("sync_fails", [False, True])
+async def test_startup_reconciles_configured_superadmins_before_constructing_telegram_client(
+    monkeypatch, sync_fails
+) -> None:
+    import cloud_platform.bot.main as entrypoint
+
+    events = []
+
+    async def reconcile():
+        events.append("reconcile")
+        if sync_fails:
+            raise RuntimeError("reconciliation unavailable")
+
+    async def container():
+        events.append("container")
+        return SimpleNamespace(reconcile_superadmins=reconcile)
+
+    def client(**_kwargs):
+        events.append("telegram-client")
+        raise RuntimeError("client construction reached after reconciliation")
+
+    monkeypatch.setattr(
+        entrypoint, "get_settings", lambda: SimpleNamespace(telegram_bot_token="fixture-token")
+    )
+    monkeypatch.setattr(entrypoint, "get_container", container)
+    monkeypatch.setattr(entrypoint, "Bot", client)
+    with pytest.raises(RuntimeError):
+        await entrypoint.main()
+    assert events == ["container", "reconcile"] + ([] if sync_fails else ["telegram-client"])

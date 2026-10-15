@@ -25,7 +25,6 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
-from uuid import UUID
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatType
@@ -42,10 +41,11 @@ from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import Container, close_container, get_container
 from cloud_platform.core.i18n import Locale, Translator, get_catalog
 from cloud_platform.core.session_store import SessionStoreUnavailable
-from cloud_platform.modules.navigation.domain import CallbackError, decode_callback
-from cloud_platform.modules.users.domain import PermissionDeniedError, Role, User, UserStatus
+from cloud_platform.modules.navigation.domain import Callback, CallbackError, decode_callback
+from cloud_platform.modules.users.domain import PermissionDeniedError, User
 from cloud_platform.modules.users.identity import IdentityService
 from cloud_platform.modules.users.onboarding import handle_start
+from cloud_platform.modules.users.superadmins import is_superadmin
 
 if TYPE_CHECKING:
     from aiogram.types import User as TelegramUser
@@ -57,9 +57,27 @@ _t = Translator()
 dp = Dispatcher()
 
 
+def _configured_superadmins() -> tuple[int, ...]:
+    return tuple(getattr(get_settings(), "telegram_superadmin_user_ids", ()))
+
+
+def _trusted_sender(message: Message, actor: TelegramUser | None = None) -> bool:
+    """Telegram's authenticated human sender, never a group/chat/forwarded identity."""
+    sender = actor if actor is not None else message.from_user
+    return (
+        sender is not None
+        and not sender.is_bot
+        and type(sender.id) is int
+        and 0 < sender.id <= 2**63 - 1
+        and message.sender_chat is None
+        and message.chat.type == ChatType.PRIVATE
+        and message.chat.id == sender.id
+    )
+
+
 async def _resolve_user(container: Container, from_user: TelegramUser | None) -> User | None:
     """Map a Telegram user to a platform user, creating one on first contact."""
-    if from_user is None:
+    if from_user is None or from_user.is_bot or from_user.id <= 0:
         return None
     return await handle_start(
         container.user_repository(),
@@ -82,7 +100,12 @@ async def _show_main_menu(
     the customer always lands on the same InlineKeyboard menu and no
     parallel navigation system can drift from it.
     """
+    if not _trusted_sender(message):
+        await message.answer(_t.t("admin.denied"))
+        return
     user = await _resolve_user(container, message.from_user)
+    if is_superadmin(user, _configured_superadmins()):
+        await message.answer(_t.t("menu.title"), reply_markup=monthly_ui.reply_keyboard(user))
     screen = monthly_ui.menu_screen(user)
     text = f"{_t.t('greeting.start')}\n\n{screen.text}" if include_greeting else screen.text
     await message.answer(text, reply_markup=screen.keyboard)
@@ -164,18 +187,16 @@ async def _send_ssh_password(
 
 async def _super_admin(message: Message, container: Container) -> User | None:
     """Require a private account with an active database administrator role."""
-    actor = message.from_user
-    # Database role is the authority; admin_chat_id is an alert destination,
-    # not a restriction to a single privileged account.
-    if (
-        actor is None
-        or message.chat.type != ChatType.PRIVATE
-        or message.chat.id != actor.id
-        or actor.is_bot
-    ):
+    if not _trusted_sender(message):
         return None
+    actor = message.from_user
+    assert actor is not None
     user = await container.user_repository().get_by_telegram_user_id(actor.id)
-    if user is None or user.role != Role.ADMIN or user.status != UserStatus.ACTIVE:
+    if (
+        user is None
+        or not is_superadmin(user, _configured_superadmins())
+        or user.telegram_user_id != actor.id
+    ):
         return None
     return user
 
@@ -185,46 +206,9 @@ async def _admin_credit(message: Message, container: Container) -> None:
     if admin is None:
         await message.answer("دسترسی مجاز نیست.")
         return
-    parts = (message.text or "").split(maxsplit=3)
-    try:
-        if len(parts) != 4:
-            raise ValueError("missing fields")
-        target_ref = parts[1]
-        amount = int(parts[2])
-        reason = parts[3].strip()
-        if amount <= 0 or amount > 2**63 - 1 or not reason:
-            raise ValueError("invalid amount or reason")
-    except ValueError:
-        await message.answer("فرمت: /admin_credit <شناسه تلگرام یا UUID مشتری> <واحد خرد> <دلیل>")
-        return
-    try:
-        target = (
-            await container.user_repository().get_by_telegram_user_id(int(target_ref))
-            if target_ref.isascii() and target_ref.isdigit() and 0 < int(target_ref) <= 2**63 - 1
-            else await container.user_repository().get(UUID(target_ref))
-        )
-    except ValueError:
-        target = None
-    if target is None:
-        await message.answer("کاربر پیدا نشد.")
-        return
-    if target.id == admin.id or getattr(target, "role", Role.USER) == Role.ADMIN:
-        await message.answer(_t.t("recharge.admin_disabled"))
-        return
-    user_id = target.id
-    try:
-        wallet, _ = await container.wallet_admin_service().adjust_balance(
-            admin=admin,
-            user_id=user_id,
-            amount=amount,
-            reason=reason,
-            idempotency_key=f"telegram-admin-credit:{message.chat.id}:{message.message_id}",
-        )
-    except ValueError:
-        logger.warning("admin credit rejected")
-        await message.answer("شارژ انجام نشد؛ کیف پول یا مبلغ را بررسی کنید.")
-        return
-    await message.answer(f"شارژ انجام شد. موجودی: {wallet.balance} {wallet.currency}")
+    # Historical direct credits bypassed the audited confirmation screen.
+    # Keep a safe explanatory command, never a second money-mutation path.
+    await message.answer(_t.t("admin.credit_use_management"))
 
 
 async def _admin_dump(message: Message, container: Container) -> None:
@@ -265,8 +249,23 @@ def register_handlers(
         if admin_ui is not None and (admin := await _super_admin(message, container)) is not None:
             await admin_ui.clear_prompt(admin)
 
+    async def show_admin_menu(message: Message, admin: User) -> None:
+        assert admin_ui is not None
+        await admin_ui.clear_prompt(admin)
+        screen = admin_ui.menu(admin)
+        await message.answer(screen.text, reply_markup=admin_ui.reply_keyboard(admin))
+        await message.answer(screen.text, reply_markup=screen.keyboard)
+
+    async def private_message(message: Message) -> bool:
+        if _trusted_sender(message):
+            return True
+        await message.answer(_t.t("admin.denied"))
+        return False
+
     @dp.message(CommandStart())
     async def _start(message: Message) -> None:
+        if not await private_message(message):
+            return
         await clear_admin_prompt(message)
         user = await _resolve_user(container, message.from_user)
         await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard(user))
@@ -285,19 +284,26 @@ def register_handlers(
     async def _admin_command(message: Message) -> None:
         admin = await _super_admin(message, container)
         if admin is None or admin_ui is None:
-            await message.answer(_t.t("admin.denied"))
+            if _trusted_sender(message):
+                await message.answer(
+                    _t.t("admin.denied"), reply_markup=monthly_ui.reply_keyboard(None)
+                )
+            else:
+                await message.answer(_t.t("admin.denied"))
             return
-        await admin_ui.clear_prompt(admin)
-        screen = admin_ui.menu(admin)
-        await message.answer(screen.text, reply_markup=screen.keyboard)
+        await show_admin_menu(message, admin)
 
     @dp.message(Command("menu"))
     async def _menu(message: Message) -> None:
+        if not await private_message(message):
+            return
         await clear_admin_prompt(message)
         await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
+        if not await private_message(message):
+            return
         await clear_admin_prompt(message)
         user = await _resolve_user(container, message.from_user)
         await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard(user))
@@ -310,6 +316,8 @@ def register_handlers(
         sticker, voice, ...) all resolve to the canonical main menu instead
         of being silently ignored.
         """
+        if not await private_message(message):
+            return
         user = await _resolve_user(container, message.from_user)
         try:
             if identity_flow is not None and user is not None:
@@ -323,6 +331,20 @@ def register_handlers(
                         await message.answer(screen.text, reply_markup=screen.keyboard)
                     return
             admin = await _super_admin(message, container)
+            if (
+                admin is None
+                and message.text
+                and any(
+                    _button_matches(message.text, key)
+                    for key in ("menu.admin", "admin.credit", "admin.gateways")
+                )
+            ):
+                # Telegram keeps reply keyboards until explicitly replaced.
+                # A revoked actor must not retain stale management controls.
+                await message.answer(
+                    _t.t("admin.denied"), reply_markup=monthly_ui.reply_keyboard(None)
+                )
+                return
             if admin_ui is not None and admin is not None and message.text:
                 navigation = any(
                     _button_matches(message.text, key)
@@ -335,12 +357,17 @@ def register_handlers(
                         "nav.menu",
                     )
                 )
+                if _button_matches(message.text, "menu.admin"):
+                    await show_admin_menu(message, admin)
+                    return
                 if navigation:
                     await admin_ui.clear_prompt(admin)
                     screen = None
-                elif _button_matches(message.text, "menu.admin"):
+                elif _button_matches(message.text, "admin.gateways"):
                     await admin_ui.clear_prompt(admin)
-                    screen = admin_ui.menu(admin)
+                    screen = await admin_ui.gateway_screen(admin)
+                elif _button_matches(message.text, "admin.credit"):
+                    screen = await admin_ui.handle(Callback("admin", "credit"), admin)
                 else:
                     screen = await admin_ui.handle_text(message.text, admin)
                 if screen is not None:
@@ -390,6 +417,11 @@ def register_handlers(
 
     @dp.callback_query()
     async def _callback(query: CallbackQuery) -> None:
+        if not isinstance(query.message, Message) or not _trusted_sender(
+            query.message, query.from_user
+        ):
+            await query.answer(_t.t("admin.denied"), show_alert=True)
+            return
         user = await _resolve_user(container, query.from_user)
         chat_id = query.message.chat.id if isinstance(query.message, Message) else None
         data = query.data or ""
@@ -402,32 +434,46 @@ def register_handlers(
         if cb is not None and isinstance(query.message, Message):
             try:
                 if cb.flow == "admin":
-                    actor = query.from_user
-                    private = query.message.chat.type == ChatType.PRIVATE
-                    if (
-                        admin_ui is None
-                        or user is None
-                        or user.role != Role.ADMIN
-                        or user.status != UserStatus.ACTIVE
-                        or not private
-                        or actor is None
-                        or query.message.chat.id != actor.id
-                    ):
+                    if admin_ui is None or not is_superadmin(user, _configured_superadmins()):
+                        await query.message.answer(
+                            _t.t("admin.denied"), reply_markup=monthly_ui.reply_keyboard(None)
+                        )
                         await query.answer(_t.t("admin.denied"), show_alert=True)
                         return
-                    admin_screen = await admin_ui.handle(cb, user)
+                    assert user is not None
+                    # Reload the authorization record for every privileged action;
+                    # a stale screen or callback never carries its own authority.
+                    current = await container.user_repository().get_by_telegram_user_id(
+                        query.from_user.id
+                    )
+                    if (
+                        current is None
+                        or not is_superadmin(current, _configured_superadmins())
+                        or current.telegram_user_id != query.from_user.id
+                    ):
+                        await query.message.answer(
+                            _t.t("admin.denied"), reply_markup=monthly_ui.reply_keyboard(None)
+                        )
+                        await query.answer(_t.t("admin.denied"), show_alert=True)
+                        return
+                    assert isinstance(current, User)
+                    admin_screen = await admin_ui.handle(cb, current)
+                    if cb.screen == "menu":
+                        await query.message.answer(
+                            admin_screen.text, reply_markup=admin_ui.reply_keyboard(current)
+                        )
                     await query.message.edit_text(
                         admin_screen.text, reply_markup=admin_screen.keyboard
                     )
                     await query.answer()
                     return
-                if (
-                    admin_ui is not None
-                    and user is not None
-                    and user.role == Role.ADMIN
-                    and user.status == UserStatus.ACTIVE
-                ):
+                if admin_ui is not None and is_superadmin(user, _configured_superadmins()):
+                    assert user is not None
                     await admin_ui.clear_prompt(user)
+                    if cb.flow == "main" and cb.screen == "menu":
+                        await query.message.answer(
+                            _t.t("menu.title"), reply_markup=monthly_ui.reply_keyboard(user)
+                        )
                 purchase = (
                     (
                         cb.flow == "store"
@@ -486,6 +532,8 @@ async def main() -> None:
     # (providers registered); initializing again would register every
     # adapter a second time and fail at the registry boundary.
     container = await get_container()
+    # Apply configured grants/revocations before Telegram can receive any update.
+    await container.reconcile_superadmins()
     bot = Bot(token=settings.telegram_bot_token)
     heartbeat = PollingHeartbeat()
     bot.session.middleware(heartbeat)
@@ -530,6 +578,7 @@ async def main() -> None:
         # AbanTether + one cache client per process, closed once below.
         fx_resolver=fx_resolver,
         fx_display_currency=settings.fx_default_display_currency,
+        configured_ids=settings.telegram_superadmin_user_ids,
     )
     admin_ui = AdminBotUi(
         settings.callback_signing_key,
@@ -539,6 +588,7 @@ async def main() -> None:
         wallet_admin=container.wallet_admin_service(),
         store=container.session_store(),
         ttl_seconds=settings.telegram_sessions_prompt_ttl_seconds,
+        configured_ids=settings.telegram_superadmin_user_ids,
     )
     identity_flow = IdentityFlow(
         IdentityService(container.user_repository()),

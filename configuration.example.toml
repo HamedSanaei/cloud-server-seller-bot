@@ -66,6 +66,12 @@ callback_signing_key = "CHANGE_ME"
 #   admin_chat_id    renewals / attention alerts, 0 = unset
 #   support_contact  shown to customers as the support handle
 admin_chat_id = 0                  # renewals / attention alerts (0 = unset)
+# Telegram USER identities allowed to manage the platform, NOT chat/channel IDs.
+# Empty = no Telegram management access. Use your own verified user IDs, e.g.
+# superadmin_user_ids = [123456789, 987654321]
+# Startup reconciles existing accounts; first /start grants pending accounts.
+# See docs/operations/TELEGRAM_SUPERADMINS.md for removal and deployment safety.
+superadmin_user_ids = []
 support_contact = "@support"
 
 # Telegram TRANSIENT state: callback references, remembered selections,

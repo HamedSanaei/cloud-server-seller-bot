@@ -28,7 +28,14 @@ class SqlAlchemyGatewaySettingsRepository:
             value = result.scalar_one_or_none()
             return None if value is None else bool(value)
 
-    async def set_enabled(self, key: str, enabled: bool, actor_id: UUID) -> None:
+    async def set_enabled(
+        self,
+        key: str,
+        enabled: bool,
+        actor_id: UUID,
+        *,
+        configured_ids: tuple[int, ...] | None = None,
+    ) -> None:
         moment = utc_now()
         statement = insert(GatewaySetting).values(
             key=key, enabled=enabled, updated_by=actor_id, created_at=moment, updated_at=moment
@@ -38,6 +45,12 @@ class SqlAlchemyGatewaySettingsRepository:
             set_={"enabled": enabled, "updated_by": actor_id, "updated_at": moment},
         )
         async with self._session_factory() as db:
+            if configured_ids is not None:
+                from cloud_platform.modules.users.superadmin_repository import (
+                    authorize_superadmin_transaction,
+                )
+
+                await authorize_superadmin_transaction(db, actor_id, configured_ids)
             await db.execute(statement)
             await db.commit()
 

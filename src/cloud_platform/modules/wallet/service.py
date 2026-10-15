@@ -11,6 +11,7 @@ auditing uses :class:`~cloud_platform.modules.audit.service.AuditTrail`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -18,7 +19,13 @@ from cloud_platform.modules.audit.domain import ActorType, AuditRepository
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.businesslog.domain import BusinessEvent, BusinessEventSink
 from cloud_platform.modules.businesslog.events import admin_adjustment_event
-from cloud_platform.modules.users.domain import Permission, PermissionChecker, User
+from cloud_platform.modules.users.domain import (
+    Permission,
+    PermissionChecker,
+    PermissionDeniedError,
+    User,
+)
+from cloud_platform.modules.users.superadmins import require_superadmin, validate_telegram_user_ids
 from cloud_platform.modules.wallet.domain import (
     DEFAULT_WALLET_CURRENCY,
     Hold,
@@ -52,11 +59,14 @@ class WalletAdminService:
         ledger_repo: LedgerRepository,
         event_sink: BusinessEventSink | None = None,
         user_repo: object | None = None,
+        *,
+        configured_ids: Iterable[int] = (),
     ) -> None:
         self._wallet_repo = wallet_repo
         self._ledger_repo = ledger_repo
         self._events = event_sink
         self._users = user_repo
+        self._configured_ids = validate_telegram_user_ids(tuple(configured_ids))
 
     async def adjust_balance(
         self,
@@ -66,6 +76,7 @@ class WalletAdminService:
         amount: int,
         reason: str,
         idempotency_key: str,
+        expected_currency: str | None = None,
     ) -> tuple[Wallet, LedgerEntry]:
         """Credit (positive) or debit (negative) a user's wallet.
 
@@ -78,11 +89,13 @@ class WalletAdminService:
             ValueError: On empty reason, zero amount, or missing wallet.
             InsufficientBalanceError: On debits beyond the balance.
         """
-        checker = PermissionChecker(admin)
-        checker.require(Permission.WALLET_ADJUST)
-        checker.require_active()
-        if admin.id is None:
-            raise ValueError("a persisted administrator is required")
+        admin = require_superadmin(admin, self._configured_ids)
+        if self._users is not None:
+            fresh = await self._users.get(admin.id)  # type: ignore[attr-defined]
+            fresh = require_superadmin(fresh, self._configured_ids)
+            if fresh.id != admin.id or fresh.telegram_user_id != admin.telegram_user_id:
+                raise PermissionDeniedError("persisted Telegram identity does not match actor")
+            admin = fresh
         if (
             isinstance(amount, bool)
             or not isinstance(amount, int)
@@ -125,6 +138,8 @@ class WalletAdminService:
             description=reason,
             audit_actor_id=admin.id,
             business_event_factory=business_fact,
+            expected_currency=expected_currency,
+            admin_configured_ids=self._configured_ids,
         )
         assert updated.id is not None
         wallet_id: UUID = updated.id

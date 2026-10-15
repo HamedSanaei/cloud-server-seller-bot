@@ -36,7 +36,7 @@ class TestHandleStartReturningUser:
         )
 
         user_repo = AsyncMock()
-        user_repo.get_by_telegram_user_id = AsyncMock(return_value=existing)
+        user_repo.onboard_telegram = AsyncMock(return_value=existing)
 
         result = await handle_start(
             user_repo,
@@ -46,7 +46,8 @@ class TestHandleStartReturningUser:
         )
 
         assert result is existing
-        user_repo.get_by_telegram_user_id.assert_awaited_once_with(12345)
+        user_repo.onboard_telegram.assert_awaited_once()
+        assert user_repo.onboard_telegram.await_args.args[:2] == (12345, "alice")
 
 
 class TestHandleStartNewUser:
@@ -62,8 +63,7 @@ class TestHandleStartNewUser:
         )
 
         user_repo = AsyncMock()
-        user_repo.get_by_telegram_user_id = AsyncMock(return_value=None)
-        user_repo.create = AsyncMock(return_value=new_user)
+        user_repo.onboard_telegram = AsyncMock(return_value=new_user)
 
         wallet_repo = AsyncMock()
         wallet_repo.get_or_create = AsyncMock(return_value=MagicMock())
@@ -76,9 +76,10 @@ class TestHandleStartNewUser:
         )
 
         assert result is new_user
-        user_repo.get_by_telegram_user_id.assert_awaited_once_with(99999)
-        user_repo.create.assert_awaited_once()
-        wallet_repo.get_or_create.assert_awaited_once()
+        user_repo.onboard_telegram.assert_awaited_once()
+        assert user_repo.onboard_telegram.await_args.args[:2] == (99999, "bob")
+        # The repository now owns atomic account/wallet creation, proven on PG.
+        wallet_repo.get_or_create.assert_not_awaited()
 
     async def test_no_email_generates_from_username(
         self,
@@ -92,8 +93,7 @@ class TestHandleStartNewUser:
         )
 
         user_repo = AsyncMock()
-        user_repo.get_by_telegram_user_id = AsyncMock(return_value=None)
-        user_repo.create = AsyncMock(return_value=new_user)
+        user_repo.onboard_telegram = AsyncMock(return_value=new_user)
         wallet_repo = AsyncMock()
 
         result = await handle_start(

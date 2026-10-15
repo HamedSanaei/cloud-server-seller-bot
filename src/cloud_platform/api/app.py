@@ -1,5 +1,6 @@
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST
@@ -80,7 +81,18 @@ async def _observe_api(
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Cloud Server Platform API", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        from cloud_platform.core.container import close_container, get_container
+
+        try:
+            container = await get_container()
+            await container.reconcile_superadmins()
+            yield
+        finally:
+            await close_container()
+
+    app = FastAPI(title="Cloud Server Platform API", version="0.1.0", lifespan=lifespan)
     _setup_otel(app)
     app.middleware("http")(_observe_api)
     app.include_router(health_router)

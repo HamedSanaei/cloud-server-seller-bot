@@ -19,13 +19,20 @@ from fastapi.testclient import TestClient
 from cloud_platform.api.v1 import router as v1_router
 from cloud_platform.api.v1.admin import (
     _audit_repo,
+    _configured_superadmin_ids,
     _user_repo,
 )
 from cloud_platform.api.v1.dependencies import get_token_authentication
 from cloud_platform.modules.audit.domain import ActorType, AuditEvent
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
-from cloud_platform.modules.users.domain import Role, User, UserNotFound, UserStatus
+from cloud_platform.modules.users.domain import (
+    PermissionDeniedError,
+    Role,
+    User,
+    UserNotFound,
+    UserStatus,
+)
 from cloud_platform.modules.users.repository import UserStatusIdempotencyConflict
 
 ADMIN_ID = uuid4()
@@ -77,6 +84,7 @@ def make_admin() -> User:
         email="root@example.com",
         status=UserStatus.ACTIVE,
         role=Role.ADMIN,
+        telegram_user_id=77110022,
     )
 
 
@@ -96,6 +104,7 @@ def build_app(
 
     install_error_handlers(app)
 
+    app.dependency_overrides[_configured_superadmin_ids] = lambda: (77110022,)
     users = FakeUserRepo()
     audits = FakeAuditRepo()
     auth = token_auth(ADMIN_ID, scopes)
@@ -114,6 +123,46 @@ def token_auth(
 
 
 class TestRbacGate:
+    def test_configuration_removal_revokes_legacy_admin_immediately(self) -> None:
+        client, users, _ = build_app()
+        client.app.dependency_overrides[_configured_superadmin_ids] = lambda: ()
+        assert client.get("/v1/admin/users").status_code == 403
+        assert (
+            client.post(
+                f"/v1/admin/users/{TARGET_ID}/status",
+                headers={"Idempotency-Key": "removed"},
+                json={"status": "active", "reason": "reviewed"},
+            ).status_code
+            == 403
+        )
+        users.change_status_idempotently.assert_not_awaited()
+
+    def test_telegram_identity_headers_and_payload_cannot_elevate_token_user(self) -> None:
+        client, users, _ = build_app()
+        users.users[USER_ID] = make_plain()
+        client.app.dependency_overrides[get_token_authentication] = lambda: token_auth(USER_ID)
+        headers = {
+            "X-Telegram-User-Id": "77110022",
+            "X-User-Id": str(ADMIN_ID),
+            "Idempotency-Key": "forged",
+        }
+        assert client.get("/v1/admin/users", headers=headers).status_code == 403
+        assert (
+            client.post(
+                f"/v1/admin/users/{TARGET_ID}/status",
+                headers=headers,
+                json={
+                    "status": "active",
+                    "reason": "reviewed",
+                    "role": "admin",
+                    "telegram_user_id": 77110022,
+                    "actor_id": str(ADMIN_ID),
+                },
+            ).status_code
+            == 403
+        )
+        users.change_status_idempotently.assert_not_awaited()
+
     def test_non_admin_is_forbidden_envelope(self) -> None:
         client, users, _audits = build_app()
         users.users[TARGET_ID] = User(
@@ -231,6 +280,17 @@ class TestSearchAndDetail:
 
 
 class TestStatusActionAudited:
+    def test_revocation_during_command_returns_forbidden(self) -> None:
+        client, users, _ = build_app()
+        users.change_status_idempotently.side_effect = PermissionDeniedError("grant revoked")
+        response = client.post(
+            f"/v1/admin/users/{TARGET_ID}/status",
+            headers={"Idempotency-Key": "revoked"},
+            json={"status": "active", "reason": "reviewed"},
+        )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "forbidden"
+
     def test_status_change_requires_reason_and_delegates_atomic_audit(self) -> None:
         client, users, audits = build_app()
         users.users[TARGET_ID] = User(
@@ -258,6 +318,7 @@ class TestStatusActionAudited:
             actor_id=ADMIN_ID,
             idempotency_key="a2",
             reason="fraud report",
+            admin_configured_ids=(77110022,),
         )
         # The endpoint must not append an independently committed second audit.
         assert audits.events == []

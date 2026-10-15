@@ -68,6 +68,24 @@ class User(Base):
     servers = relationship("Server", back_populates="user")
 
 
+class TelegramSuperadminAssignment(Base):
+    """Durable configuration grants, including identities not yet registered.
+
+    Revoked rows are retained. This is authorization state, not a replacement
+    user account; wallets and immutable financial records are never touched.
+    """
+
+    __tablename__ = "telegram_superadmin_assignments"
+
+    telegram_user_id = Column(BigInteger, primary_key=True, autoincrement=False)
+    enabled = Column(Boolean, nullable=False, server_default=sa.true())
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    updated_at = Column(DateTime, nullable=False, server_default=sa.text("CURRENT_TIMESTAMP"))
+    __table_args__ = (
+        sa.CheckConstraint("telegram_user_id > 0", name="ck_superadmin_telegram_user_id_positive"),
+    )
+
+
 class Wallet(Base):
     """Immutable ledger for user balances (in minor currency units).
 
