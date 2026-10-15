@@ -1,7 +1,7 @@
 # Deployment (GHCR image + SSH)
 
-How a commit reaches the server — the fast `staging` development lane and the
-manual `main` release lane — plus the one-time server bootstrap an operator
+How a commit reaches the server — the fast `staging` validation/build lane and
+automatic `main` release lane — plus the one-time server bootstrap an operator
 performs first. Companion documents:
 [`PRODUCTION_HARDENING.md`](PRODUCTION_HARDENING.md) (topology and guarantees),
 [`RUNBOOK.md`](RUNBOOK.md) (day-2 operations), [`PRODUCTION_RUNBOOK.md`](PRODUCTION_RUNBOOK.md).
@@ -9,36 +9,38 @@ performs first. Companion documents:
 ## 1. Pipeline overview
 
 ```text
-DEVELOPMENT LANE (active): push to `staging`
+DEVELOPMENT LANE: push to `staging`
   -> deploy-staging workflow: fast static/import checks, targeted financial and
      deployment regressions, historical/fresh PostgreSQL migration contracts
   -> cached Docker build of the EXACT pushed SHA -> GHCR
-  -> SSH deploy with scripts/deploy-production.sh DEPLOY_PROFILE=staging
-  -> migrations -> api/worker/single-bot -> health + storefront readiness
-  -> atomic compose promotion; the SAME Telegram bot is replaced in place
+  -> STOP (no automatic host mutation)
+  -> optional explicit deploy-staging dispatch on staging: checked SHA deploys
+     through scripts/deploy-production.sh DEPLOY_PROFILE=staging
 
-RELEASE LANE (manual while `staging` is the active lane): push to `main`
-  -> `ci` workflow ONLY (ruff, mypy, secrets, pytest+coverage, migration,
+RELEASE LANE (automatic): push to `main`
+  -> `ci` workflow (ruff, mypy, secrets, pytest+coverage, migration,
      provider-branching, task, migration-smoke, leaseweb-contract gates)
-  -> NO automatic deployment
-  -> an operator dispatches `deploy-production` with a full 40-char SHA that
-     must be an ancestor of `main`
-       1. resolve that SHA (workflow input `sha`)
-       2. check out that exact SHA
+  -> completed successful same-repository push CI triggers deploy-production
+       1. resolve the CI head SHA (not the workflow_run default-branch SHA)
+       2. verify ci.yml run provenance and current main HEAD before checkout
        3. build the Dockerfile, push ghcr.io/<org>/<repo>:<full-sha>
           (an existing SHA tag is never rebuilt or overwritten)
        4. verify the pushed image (entrypoint smoke + production compose config)
-       5. SSH to the server, log in to GHCR with the short-lived GITHUB_TOKEN
+       5. recheck main HEAD/CI, SSH with verified host key, log in to GHCR
        6. run scripts/deploy-production.sh with that exact image
        7. report; fail the workflow when health checks fail (even after rollback)
 ```
 
-`main` deliberately does NOT deploy automatically: `staging` currently owns the
-server and the single Telegram bot token, and a green `main` has no release
-meaning during this phase. Automatic release delivery may only be restored
-together with a server/bot of its own (a second token or a second environment);
-until then both lanes would fight over one single-consumer token. Pull-request
-CI runs never deploy.
+`main` owns automatic delivery to the existing server and single Telegram bot.
+Staging pushes cannot overwrite production; only an explicit staging dispatch
+can replace it. Pull-request, fork, failed, cancelled, incomplete, wrong-workflow
+and stale-main CI runs never release. The exact successful CI run is verified
+through GitHub's API before source checkout/build and again before host access.
+Manual production dispatch remains available on `main`, with a full SHA equal
+to current `main` HEAD and the same successful push-CI proof; it is not a bypass
+or a historical rollback mechanism. No manual dispatch/approval is required by
+the workflow for normal successful main pushes (environment protection rules
+can still add an administrator-configured approval).
 
 Both lanes disable cancellation of active runs and use the same deploy-job
 concurrency group, `telegram-shared-host-deploy`. Builds for one SHA are also
@@ -50,14 +52,14 @@ interrupt an active deployment.
 
 ### The staging lane in one screen
 
-* **Trigger**: every push to `staging` (plus `workflow_dispatch`, which
-  redeploys the current `staging` HEAD; a feature branch is never deployable
-  through this lane).
+* **Trigger**: every push to `staging` validates/builds only. `workflow_dispatch`
+  on `staging` additionally deploys that dispatch's checked SHA; a feature
+  branch is never deployable through this lane.
 * **Checks**: `uv sync --locked --all-groups`, the canonical staging
   static/import gate, targeted financial/worker/deployment regressions, the
   historical migration bridge, fresh physical-schema parity and live
   PostgreSQL contracts. A PostgreSQL 17 service and matching backup/restore
-  clients are provided. Build/deploy depends on this job succeeding.
+  clients are provided. Build and optional manual deploy depend on this job succeeding.
   The full release suite, coverage, mypy and pre-commit remain release gates;
   the staging pipeline does not substitute for them.
 * **Image**: only `ghcr.io/<org>/<repo>:<pushed full SHA>`, never rebuilt or
@@ -119,8 +121,8 @@ whole release against it, and atomically promotes it to the canonical path
 only after all health/stability/revision/financial gates pass. Promotion is the
 last fallible step. A failure leaves the previous canonical compose untouched;
 it is used for automatic image rollback only when the database remains
-compatible under §6. A manual older-SHA dispatch is not approval to undo a
-financial/schema transition.
+compatible under §6. Manual dispatch cannot select an older main SHA or undo
+a financial/schema transition.
 
 * `deploy.env` holds ONLY `PLATFORM_IMAGE`, `POSTGRES_PASSWORD`, `API_PORT`
   and optionally `CONFIGURATION_PATH`. Automated deploys rewrite a single
@@ -221,8 +223,9 @@ ufw --force enable
 #    short-lived GITHUB_TOKEN over the SSH session (never printed or saved).
 ```
 
-First deployment: push to `staging` (or dispatch `deploy-production` with a
-specific `main` SHA). The workflow pulls the image, runs migrations, starts
+First deployment: push/merge to `main` and let successful CI trigger production
+(or dispatch `deploy-production` with current `main` SHA after its successful
+push CI). The workflow pulls the image, runs migrations, starts
 api + worker + one bot, and health-checks before declaring success.
 
 ## 4. GitHub configuration the operator must set manually
@@ -237,7 +240,8 @@ Repository settings:
 * Protect `main`: require a pull request, resolved conversations and the
   up-to-date **Required CI checks** status from the GitHub Actions application.
   Enforce these rules for administrators and disallow force pushes and branch
-  deletion. Do not merge or dispatch a release before owner approval.
+  deletion. Merging to `main` now authorizes an automatic production release
+  after successful push CI; review and approve that release intent before merge.
 
 Environment **`production`** (repository → Settings → Environments):
 

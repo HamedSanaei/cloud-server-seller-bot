@@ -1,33 +1,19 @@
 name: deploy-production
 
-# Release delivery (MANUAL while `staging` is the active development lane).
-#
-# `staging` deploys automatically on every push (deploy-staging.yml) to the
-# CURRENT server and the SAME Telegram bot, so `main` must NOT auto-deploy:
-# two lanes racing one Telegram token / host is exactly what serialization
-# cannot fix, and during this phase a green `main` has no release meaning.
-# Pushing to `main` therefore runs `ci` and nothing else.
-#
-# An operator deploys explicitly with `workflow_dispatch` and a full 40-char
-# SHA (an ancestor of `main`): GHCR build of that EXACT SHA -> compose
-# candidate delivery from the exact checkout (SHA-256 verified on the server)
-# -> SSH deploy of that exact image with that exact compose -> migrations ->
-# api/worker/single-bot -> health checks -> atomic compose promotion
-# (rollback on failure).
-#
-# Restoring automatic release delivery later is a deliberate change: re-add
-# the `workflow_run` trigger for a green `push` to `main` AND give the release
-# lane a server/bot of its own first, because until then `main` and `staging`
-# would fight over the same single-consumer Telegram bot token.
-#
-# Deployments never cancel an active mutating run. GitHub may replace pending
-# runs; both lanes additionally share one host-level deployment concurrency key.
+# Successful same-repository push CI on the CURRENT main HEAD releases
+# automatically. PR/fork/failed/stale runs cannot build or touch the host.
+# Staging pushes only validate/build; shared-host staging deploys are manual.
+# Both lanes serialize host mutations and never cancel an active deployment.
 
 on:
+  workflow_run:
+    workflows: [ci]
+    branches: [main]
+    types: [completed]
   workflow_dispatch:
     inputs:
       sha:
-        description: "Full 40-char commit SHA to deploy (must be an ancestor of main)"
+        description: "Full 40-char commit SHA to deploy (must be current main HEAD with successful CI)"
         required: true
         type: string
 
@@ -50,21 +36,27 @@ jobs:
     timeout-minutes: 30
     # Both lanes can build the same commit; serialize the inspect/push pair.
     concurrency:
-      group: immutable-image-${{ inputs.sha }}
+      group: immutable-image-${{ github.event.workflow_run.head_sha || inputs.sha }}
       cancel-in-progress: false
-    # Manual dispatch only: while `staging` owns the development server and
-    # the single Telegram bot, NO push - not even a green push to `main` -
-    # deploys anything from this workflow.
-    if: github.event_name == 'workflow_dispatch'
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.status == 'completed' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.repository.full_name == github.repository &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       image: ${{ steps.resolve.outputs.image }}
       head: ${{ steps.revision.outputs.head }}
+      ci_run_id: ${{ steps.ci.outputs.ci_run_id }}
     steps:
       - name: Resolve deployment SHA
         id: resolve
         env:
-          REQUESTED_SHA: ${{ inputs.sha }}
+          REQUESTED_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
         run: |
           set -Eeuo pipefail
           sha="${REQUESTED_SHA}"
@@ -78,33 +70,35 @@ jobs:
           echo "image=${image}" >> "${GITHUB_OUTPUT}"
           echo "deploying commit ${sha} as ${image}:${sha}"
 
+      - name: Require successful release CI for the exact SHA
+        id: ci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ steps.resolve.outputs.sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -Eeuo pipefail
+          # API proof precedes checkout: never execute source from an untrusted run.
+          current_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [ "$RELEASE_SHA" = "$current_main" ] || {
+            echo "Release SHA is stale: only current main HEAD may deploy"
+            exit 1
+          }
+          run_id="${SOURCE_RUN_ID}"
+          if [ -z "$run_id" ]; then
+            run_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${RELEASE_SHA}&branch=main&event=push&per_page=1" --jq '.workflow_runs[0].id // empty')"
+          fi
+          [[ "$run_id" =~ ^[0-9]+$ ]] || { echo "No exact release CI run found"; exit 1; }
+          trusted="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq \
+            '(.path == ".github/workflows/ci.yml" and .status == "completed" and .conclusion == "success" and .event == "push" and .head_branch == "main" and .head_sha == "'"$RELEASE_SHA"'" and .repository.full_name == "'"$GITHUB_REPOSITORY"'" and .head_repository.full_name == "'"$GITHUB_REPOSITORY"'")')"
+          [ "$trusted" = true ] || { echo "Release CI is not a trusted successful main push"; exit 1; }
+          echo "ci_run_id=${run_id}" >> "${GITHUB_OUTPUT}"
+
       - name: Check out the exact tested commit
         uses: actions/checkout@v7
         with:
           ref: ${{ steps.resolve.outputs.sha }}
-          fetch-depth: 0
-
-      - name: Refuse SHAs outside main
-        run: |
-          set -Eeuo pipefail
-          git merge-base --is-ancestor \
-            "${{ steps.resolve.outputs.sha }}" origin/main \
-            || { echo "SHA is not an ancestor of origin/main; refusing to deploy"; exit 1; }
-          echo "SHA is on main; continuing"
-
-      - name: Require successful release CI for the exact SHA
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_SHA: ${{ steps.resolve.outputs.sha }}
-        run: |
-          set -Eeuo pipefail
-          conclusion="$(gh run list --repo '${{ github.repository }}' --workflow ci.yml \
-            --commit "$RELEASE_SHA" --branch main --event push --limit 1 \
-            --json conclusion --jq '.[0].conclusion // "missing"')"
-          [ "$conclusion" = success ] || {
-            echo "Exact release SHA has no successful completed main CI ($conclusion)"
-            exit 1
-          }
+          fetch-depth: 1
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -186,6 +180,20 @@ jobs:
       group: telegram-shared-host-deploy
       cancel-in-progress: false
     steps:
+      - name: Recheck current main and release CI before host access
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ needs.build.outputs.sha }}
+          CI_RUN_ID: ${{ needs.build.outputs.ci_run_id }}
+        run: |
+          set -Eeuo pipefail
+          current_main="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [ "$RELEASE_SHA" = "$current_main" ] || { echo "Release SHA is stale; refusing host access"; exit 1; }
+          [[ "$CI_RUN_ID" =~ ^[0-9]+$ ]] || { echo "Missing validated CI run"; exit 1; }
+          trusted="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}" --jq \
+            '(.path == ".github/workflows/ci.yml" and .status == "completed" and .conclusion == "success" and .event == "push" and .head_branch == "main" and .head_sha == "'"$RELEASE_SHA"'" and .repository.full_name == "'"$GITHUB_REPOSITORY"'" and .head_repository.full_name == "'"$GITHUB_REPOSITORY"'")')"
+          [ "$trusted" = true ] || { echo "Release CI proof is no longer valid"; exit 1; }
+
       - name: Check out the exact tested commit
         uses: actions/checkout@v7
         with:
@@ -214,9 +222,9 @@ jobs:
           set -Eeuo pipefail
           # The exact compose file from the exact tested checkout travels
           # with the release: image, compose contract, and migration
-          # expectation always share one SHA. A manual dispatch of an older
-          # approved SHA therefore ships THAT SHA's compose, never the
-          # current main file — a mixed image/compose release is impossible.
+          # expectation always share one validated SHA. Workflow-run's
+          # default-branch context cannot silently supply a different compose:
+          # a mixed image/compose release is impossible.
           sha="${{ needs.build.outputs.sha }}"
           candidate=".docker-compose.${sha}.candidate.yml"
           compose_sha="$(sha256sum deploy/production/docker-compose.yml | awk '{print $1}')"

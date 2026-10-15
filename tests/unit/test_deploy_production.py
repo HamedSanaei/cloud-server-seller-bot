@@ -1,8 +1,8 @@
 """Tests for the production CD pipeline (GHCR build + SSH deploy).
 
-Acceptance: `main` no longer deploys automatically while `staging` is the
-active development lane; a release is an explicit `workflow_dispatch` with a
-full SHA that is an ancestor of `main`, built into an immutable GHCR image and
+Acceptance: successful same-repository push CI releases current `main`
+automatically; manual dispatch uses the same exact-SHA CI and freshness gates.
+The validated SHA is built into an immutable GHCR image and
 deployed with migrations-first ordering, health gates, single-bot enforcement
 and image rollback (never a database downgrade).
 
@@ -90,16 +90,13 @@ class TestWorkflowTriggersAndGates:
     def test_workflow_file_is_valid_yaml(self) -> None:
         assert _workflow()["name"] == "deploy-production"
 
-    def test_main_never_deploys_automatically(self) -> None:
-        """While `staging` owns the bot, a green push to `main` deploys NOTHING.
-
-        Two lanes racing one Telegram bot token on one host is exactly what
-        serialization cannot fix, so the automatic `workflow_run` trigger is
-        gone. Restoring it is a deliberate change that must bring its own
-        server/bot first (see docs/operations/PRODUCTION_DEPLOY.md).
-        """
+    def test_main_deploys_only_after_completed_release_ci(self) -> None:
         on = _on(_workflow())
-        assert "workflow_run" not in on
+        assert on["workflow_run"] == {
+            "workflows": ["ci"],
+            "branches": ["main"],
+            "types": ["completed"],
+        }
         assert "push" not in on
         assert "workflow_dispatch" in on
         assert "sha" in on["workflow_dispatch"]["inputs"]
@@ -127,12 +124,35 @@ class TestWorkflowTriggersAndGates:
         assert permissions["contents"] == "read"
         assert permissions["packages"] == "write"
 
-    def test_build_job_is_manual_dispatch_only(self) -> None:
+    def test_build_job_accepts_only_main_dispatch_or_trusted_successful_push_ci(self) -> None:
         jobs = _workflow()["jobs"]
-        assert jobs["build"]["if"] == "github.event_name == 'workflow_dispatch'"
-        text = WORKFLOW.read_text(encoding="utf-8")
-        # A green CI run is no longer a deployment trigger of any kind.
-        assert "github.event.workflow_run" not in text
+        gate = jobs["build"]["if"]
+        for condition in (
+            "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'",
+            "github.event_name == 'workflow_run'",
+            "github.event.workflow_run.status == 'completed'",
+            "github.event.workflow_run.conclusion == 'success'",
+            "github.event.workflow_run.event == 'push'",
+            "github.event.workflow_run.head_branch == 'main'",
+            "github.event.workflow_run.repository.full_name == github.repository",
+            "github.event.workflow_run.head_repository.full_name == github.repository",
+        ):
+            assert condition in gate
+
+    def test_image_lock_uses_the_same_effective_sha_as_the_resolver(self) -> None:
+        build = _workflow()["jobs"]["build"]
+        source = "${{ github.event.workflow_run.head_sha || inputs.sha }}"
+        assert build["concurrency"]["group"] == f"immutable-image-{source}"
+        resolve = next(step for step in build["steps"] if step.get("id") == "resolve")
+        assert resolve["env"]["REQUESTED_SHA"] == source
+
+    def test_ci_proof_precedes_checkout_and_is_rechecked_before_ssh(self) -> None:
+        jobs = _workflow()["jobs"]
+        steps = jobs["build"]["steps"]
+        guard = next(index for index, step in enumerate(steps) if step.get("id") == "ci")
+        checkout = next(index for index, step in enumerate(steps) if "uses" in step)
+        assert guard < checkout
+        assert "current main" in jobs["deploy"]["steps"][0]["name"]
 
     def test_deploy_job_uses_the_production_environment(self) -> None:
         jobs = _workflow()["jobs"]

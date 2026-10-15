@@ -81,8 +81,9 @@ by convenience.
 `staging` runs `.github/workflows/deploy-staging.yml`: fast checks (`ruff
 check`, `ruff format --check`, `compileall` over `src`, api/worker/bot import
 smoke), targeted financial/deployment regressions and real PostgreSQL migration
-contracts -> cached Docker build -> deploy of the exact pushed SHA to the
-CURRENT server and SAME Telegram bot. It does not wait for `ci`, run the full
+contracts -> cached Docker build. A staging push does NOT deploy to the shared
+production server; staging deployment requires an explicit dispatch. It does not
+wait for `ci`, run the full
 suite, compute coverage or run `pre-commit run --all-files`. The local staging
 contract below remains targeted; these shared-host CI guards are not a mandate
 to reproduce the release suite on the workstation.
@@ -95,7 +96,8 @@ Normal feature development is therefore:
 3. run the staging gate locally: `make staging-check`;
 4. inspect `git status --short` and the diff;
 5. commit when the owner has asked for commits;
-6. push to `staging` and let the deploy expose the behavior in Telegram.
+6. push to `staging`; use a validated PR into `main` for automatic production
+   delivery. Keep only `main` and `staging` branches unless the owner asks otherwise.
 
 An agent may report exactly:
 
@@ -161,10 +163,11 @@ release runner.
 
 **`main` — the stable/release lane.** `ci` runs in full (static gates,
 pre-commit, full pytest with the coverage floor, migration/provider/artifact
-gates, live PostgreSQL contracts). `deploy-production` no longer deploys
-automatically: a release is an explicit `workflow_dispatch` with a full SHA
-that is an ancestor of `main`. Automatic release delivery may only be restored
-together with a server/bot of its own (see `docs/operations/PRODUCTION_DEPLOY.md`).
+gates, live PostgreSQL contracts). A successful push CI run on the latest `main`
+automatically triggers `deploy-production` for that exact SHA. Pull-request,
+fork, failed CI and superseded main runs must never deploy. The manual fallback
+is optional, not the normal delivery path. Both lanes keep the shared host lock;
+staging pushes cannot replace the production bot automatically.
 
 Full validation (and the coverage floor) applies ONLY to `main`/release work:
 
@@ -479,10 +482,10 @@ Do not repeatedly run expensive commands after every small edit. Expensive check
 
 ## Production Server Access
 
-The production environment of this product runs on the server/service
-identified as:
-
-- Production service: `Leaseweb (DE rep for fin)`
+The production target is owned by the GitHub `production` environment's
+`PROD_HOST`, `PROD_USER`, `PROD_PORT` and `PROD_DEPLOY_PATH` values. Resolve the
+owner-confirmed OpenSSH alias and compare it with these settings before using
+the server. Historical provider names are not deployment-host authority.
 
 When an issue is production-only (runtime behavior, logs, container/service
 state, deployed revision, connectivity) and the local repository cannot
@@ -494,7 +497,7 @@ assumptions alone.
 ### SSH usage
 
 - Prefer the existing OpenSSH configuration under the current user's `~/.ssh/`
-  directory, and resolve the host entry for `Leaseweb (DE rep for fin)` from it.
+  directory and the host entry the owner identified for this deployment.
 - NEVER guess or invent an IP address, hostname, username, password, port or
   private-key path. If the host does not resolve from the configuration, stop
   and ask instead of guessing.
@@ -560,7 +563,7 @@ deploy over an ad-hoc edit on the server.
 For production-related failures, use this order when appropriate:
 
 1. Inspect the local code/configuration.
-2. Connect to `Leaseweb (DE rep for fin)` through the configured OpenSSH host.
+2. Connect to the owner-confirmed production host through configured OpenSSH.
 3. Inspect the relevant production logs/status/runtime state.
 4. Correlate the production evidence with the source code.
 5. Identify the actual root cause.
