@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from cloud_platform.core.config import Settings
 from cloud_platform.core.secrets import FernetSecretBox, MasterKey, SecretBoxError
@@ -83,7 +83,7 @@ def _scrub(text: str, dsn: str) -> str:
     except ValueError:
         password = None
     if password:
-        scrubbed = scrubbed.replace(password, "***")
+        scrubbed = scrubbed.replace(password, "***").replace(unquote(password), "***")
     return scrubbed.strip()
 
 
@@ -139,7 +139,7 @@ class PostgresBackupJob:
             try:
                 proc = await self._runner(command)
             except Exception as exc:
-                raise BackupError(f"pg_dump could not be executed: {type(exc).__name__}") from exc
+                raise BackupError(f"pg_dump could not be executed: {type(exc).__name__}") from None
             if proc.returncode != 0:
                 stderr = proc.stderr.decode("utf-8", "replace") if proc.stderr else ""
                 raise BackupError(
@@ -236,9 +236,20 @@ def build_pg_restore_command(dsn: str) -> list[str]:
     """The psql command that applies a plain-format dump to the DSN.
 
     The dump is plain SQL (``pg_dump --format=plain``), so ``psql`` is the
-    restore vehicle; ``--single-transaction`` makes the restore all-or-nothing.
+    restore vehicle. Stop on the first SQL error so the single transaction
+    rolls back, ignore user startup files, and never prompt for credentials.
+    Explicit stdin file mode enables psql's single-transaction handling.
     """
-    return ["psql", "--single-transaction", "--quiet", dsn]
+    return [
+        "psql",
+        "--no-psqlrc",
+        "--no-password",
+        "--set=ON_ERROR_STOP=on",
+        "--single-transaction",
+        "--file=-",
+        "--quiet",
+        dsn,
+    ]
 
 
 class PostgresRestoreJob:
@@ -342,7 +353,7 @@ class PostgresRestoreJob:
         try:
             proc = await self._runner(command, sql)
         except Exception as exc:
-            raise RestoreError(f"psql could not be executed: {type(exc).__name__}") from exc
+            raise RestoreError(f"psql could not be executed: {type(exc).__name__}") from None
         if proc.returncode != 0:
             stderr = proc.stderr.decode("utf-8", "replace") if proc.stderr else ""
             raise RestoreError(

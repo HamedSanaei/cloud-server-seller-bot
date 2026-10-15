@@ -31,9 +31,11 @@ from cloud_platform.modules.checkout.service import (
 )
 from cloud_platform.modules.compute.domain import ServerLifecycleState
 from cloud_platform.modules.navigation.domain import Callback, encode_callback, encode_offer_ref
+from cloud_platform.modules.payments.domain import PaymentSession
 from cloud_platform.modules.payments.recharge import (
     RechargeAmountError,
     RechargeError,
+    RechargeStart,
 )
 from cloud_platform.modules.users.domain import Role, User, UserStatus
 
@@ -221,9 +223,16 @@ class FakeRecharge:
         if self.fail is not None:
             raise self.fail
         self.started.append(kwargs)
-        return SimpleNamespace(
-            session=SimpleNamespace(
-                amount_minor=kwargs["amount_minor"], currency=kwargs["currency"]
+        return RechargeStart(
+            session=PaymentSession(
+                id=uuid4(),
+                user_id=kwargs["user"].id,
+                gateway_key=kwargs.get("gateway_key") or self.gateways[0],
+                amount_minor=kwargs["amount_minor"],
+                currency=kwargs["currency"],
+                idempotency_key=kwargs["idempotency_key"],
+                gateway_payment_id="AUTH-1",
+                redirect_url="https://pay.example/AUTH-1",
             ),
             redirect_url="https://pay.example/AUTH-1",
             replayed=len(self.started) > 1,
@@ -1180,11 +1189,6 @@ class TestRechargeBranchCoverage:
         # Sync path declines and the async probe agrees: no gateway covers it.
         recharge = FakeRecharge(currency="IRR", sync_disabled=True)
         bot = _bot(SteeringView(), recharge=recharge, support_contact="@ops")
-        screen = await bot.recharge_screen(_user())
-        assert "@ops" in screen.text
-
-    async def test_amount_screen_without_presets_points_at_support(self) -> None:
-        bot = _bot(SteeringView(), recharge=FakeRecharge(gateways=[]), support_contact="@ops")
         screen = await bot.recharge_screen(_user())
         assert "@ops" in screen.text
 

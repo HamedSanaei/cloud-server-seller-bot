@@ -26,7 +26,7 @@ repos:
   # Invariants:
   #   * the lockfile (uv.lock) is the single source of truth for this project,
   #     including mypy and the libraries it introspects;
-  #   * `--frozen` refuses to silently re-resolve if pyproject.toml and
+  #   * `--locked` refuses to silently re-resolve if pyproject.toml and
   #     uv.lock drift apart;
   #   * the checked scope is exactly `src`, identical to the repository gate
   #     (`uv run mypy src`); staged filenames are never appended, which would
@@ -36,7 +36,7 @@ repos:
     hooks:
       - id: mypy
         name: mypy
-        entry: uv run --frozen mypy
+        entry: uv run --locked mypy
         args: [src]
         language: system
         pass_filenames: false
@@ -46,6 +46,8 @@ repos:
     rev: v1.5.0
     hooks:
       - id: detect-secrets
+        # Concurrent hook batches overwrite each other's shared baseline updates.
+        require_serial: true
         args: ["--baseline", ".secrets.baseline"]
         exclude: ^(.*\.lock|uv\.lock|.*\.pyc|.*\.png|.*\.jpg|.*\.gif)
 

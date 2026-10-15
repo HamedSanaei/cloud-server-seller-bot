@@ -174,7 +174,9 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.detail_header": "🖥 مشخصات سرور",
         "servers.spec_location": "🌍 لوکیشن: {value}",
         "servers.spec_ip": "🌐 IP: {value}",
+        "servers.spec_ssh_port": "🔌 پورت پیش‌فرض SSH: {value}",
         "servers.spec_os": "💿 سیستم‌عامل: {value}",
+        "servers.spec_os_unknown": "💿 سیستم‌عامل: نامشخص (برای به‌روزرسانی دوباره تلاش کنید)",
         "servers.spec_plan": "⚙️ پلن: {value}",
         "servers.spec_ram": "🧠 RAM: {value}",
         "servers.spec_cpu": "🧮 CPU: {value}",
@@ -219,9 +221,25 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.reinstall_text": "این عملیات باعث حذف اطلاعات فعلی سرور می‌شود و قابل بازگشت نیست.",
         "servers.reinstall_confirm_button": "✅ نصب مجدد",
         "servers.reinstall_empty": "سیستم‌عاملی برای نصب مجدد در دسترس نیست.",
+        "servers.reinstall_accepted": (
+            "⏳ درخواست نصب مجدد پذیرفته شد؛ نصب سیستم‌عامل هنوز تأیید نشده است.\n"
+            "پس از پایان عملیات، «بروزرسانی» را بزنید تا وضعیت و سیستم‌عامل واقعی نمایش داده شود.\n"
+            "رمز جدید را یک‌بار از «مدیریت سرور» در گفت‌وگوی خصوصی ببینید."
+        ),
+        "servers.delete_button": "🗑 حذف دائمی سرور",
+        "servers.delete_title": "⚠️ حذف سرور",
+        "servers.delete_warning": "حذف سرور برگشت‌ناپذیر است و پس از تأیید نبودن آن نزد ارائه‌دهنده، هزینه نهایی مصرف تسویه می‌شود. برای ادامه یک بار دیگر تأیید کنید.",  # noqa: E501
+        "servers.delete_continue": "⚠️ ادامه به تأیید نهایی",
+        "servers.delete_final": "تمام داده‌های سرور حذف می‌شود؛ هزینه مصرف تا زمان حذف نهایی محاسبه خواهد شد. آیا مطمئن هستید؟",  # noqa: E501
+        "servers.delete_pending": (
+            "⏳ درخواست حذف ثبت شد؛ تسویه نهایی تا تأیید حذف نزد ارائه‌دهنده در انتظار است."
+        ),
+        "servers.delete_done": "✅ حذف سرور نزد ارائه‌دهنده تأیید و تسویه نهایی انجام شد.",
+        "servers.op.delete": "حذف سرور",
         "servers.password_button": "🔑 بازنشانی رمز",
         "servers.password_title": "⚠️ بازنشانی رمز",
         "servers.password_text": "رمز جدید توسط سرویس‌دهنده ساخته می‌شود و رمز فعلی از کار می‌افتد.",
+        "servers.password_reset_accepted": "✅ رمز جدید ساخته و ذخیره شد. از «مدیریت سرور» گزینه «نمایش یک‌باره رمز SSH» را در گفت‌وگوی خصوصی انتخاب کنید.",  # noqa: E501
         "servers.ips_button": "🌐 مدیریت IP",
         "servers.ips_title": "🌐 مدیریت IP",
         "servers.ip_row": "{ip} — {kind}",
@@ -323,6 +341,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 IP هنوز اختصاص نیافته",
         "servers.list_os": "💿 {os}",
+        "servers.list_os_unknown": "💿 سیستم‌عامل نامشخص (برای به‌روزرسانی دوباره تلاش کنید)",
         "servers.list_state": "{state}",
         "servers.failure_reason": "❌ دلیل خطای ساخت: {reason}",
         "servers.failure_generic": "ساخت سرور ناموفق بود؛ برای بررسی با پشتیبانی تماس بگیرید.",
@@ -451,6 +470,11 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.price_unavailable": "قیمت تبدیل‌شده لحظه‌ای در دسترس نیست؛ قیمت اصلی اعمال می‌شود.",
         "recharge.title": "⬆️ شارژ کیف پول",
         "recharge.amount_row": "{amount}",
+        "recharge.custom_button": "✏️ مبلغ دلخواه",
+        "recharge.custom_prompt_irt": "مبلغ دلخواه شارژ را به تومان (عدد صحیح مثبت) وارد کنید.",
+        "recharge.custom_prompt_integer": "مبلغ شارژ به {currency} (عدد صحیح مثبت)؟",
+        "recharge.custom_prompt": "مبلغ شارژ به {currency} (مثبت، حداکثر دو رقم اعشار)؟",
+        "recharge.retry_button": "🔄 تلاش دوباره",
         "recharge.gateway_title": "روش پرداخت را انتخاب کنید:",
         "recharge.gateway_row": "پرداخت با {name}",
         "payments.gateway.tetraminator": "تترامیناتور",
@@ -510,6 +534,10 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "payment.success": "پرداخت موفق بود! مبلغ {amount} به کیف پول شما اضافه شد.",
         "payment.failed": "پرداخت ناموفق بود. دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
         "payment.still_pending": "پرداخت هنوز تأیید نشده است. چند لحظه دیگر دوباره بررسی کنید.",
+        "payment.manual_review": (
+            "مبلغ پرداخت‌شده در حال بررسی توسط اپراتور است؛ شارژ خودکار انجام نمی‌شود. "
+            "لطفاً با پشتیبانی تماس بگیرید."
+        ),
         "payment.topup_title": "شارژ کیف پول — مبلغ (تومان):",
     }
 )
@@ -635,7 +663,9 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.detail_header": "🖥 Server details",
         "servers.spec_location": "🌍 Location: {value}",
         "servers.spec_ip": "🌐 IP: {value}",
+        "servers.spec_ssh_port": "🔌 Default SSH port: {value}",
         "servers.spec_os": "💿 OS: {value}",
+        "servers.spec_os_unknown": "💿 OS: unknown (try refreshing later)",
         "servers.spec_plan": "⚙️ Plan: {value}",
         "servers.spec_ram": "🧠 RAM: {value}",
         "servers.spec_cpu": "🧮 CPU: {value}",
@@ -680,9 +710,25 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.reinstall_text": "This erases the current server content and cannot be undone.",
         "servers.reinstall_confirm_button": "✅ Reinstall",
         "servers.reinstall_empty": "No image is available for reinstall right now.",
+        "servers.reinstall_accepted": (
+            "⏳ Reinstall request accepted; OS installation is not yet confirmed.\n"
+            "After it finishes, refresh to see the provider-reported state and operating system.\n"
+            "Reveal any newly issued password once in private chat from Manage server."
+        ),
+        "servers.delete_button": "🗑 Delete server",
+        "servers.delete_title": "⚠️ Delete server",
+        "servers.delete_warning": "Deletion is irreversible. Final usage is settled after provider absence is confirmed. Confirm once more to continue.",  # noqa: E501
+        "servers.delete_continue": "⚠️ Continue to final confirmation",
+        "servers.delete_final": "All server data will be deleted, and usage is charged through final deletion. Are you sure?",  # noqa: E501
+        "servers.delete_pending": (
+            "⏳ Deletion requested; final settlement awaits confirmed provider removal."
+        ),
+        "servers.delete_done": "✅ Provider deletion confirmed and final usage settled.",
+        "servers.op.delete": "delete server",
         "servers.password_button": "🔑 Reset password",
         "servers.password_title": "⚠️ Reset password",
         "servers.password_text": "The provider generates a new password and the current one stops working.",  # noqa: E501  # pragma: allowlist secret
+        "servers.password_reset_accepted": "✅ New password issued and encrypted. In a private chat, open Manage server → Show SSH password once.",  # noqa: E501
         "servers.ips_button": "🌐 IP management",
         "servers.ips_title": "🌐 IP management",
         "servers.ip_row": "{ip} — {kind}",
@@ -784,6 +830,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "servers.list_ip": "🌐 {ip}",
         "servers.list_ip_pending": "🌐 no IP assigned yet",
         "servers.list_os": "💿 {os}",
+        "servers.list_os_unknown": "💿 OS unknown (try refreshing later)",
         "servers.list_state": "{state}",
         "servers.failure_reason": "❌ Creation failed: {reason}",
         "servers.failure_generic": "Server creation failed; contact support for details.",
@@ -910,6 +957,11 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.price_unavailable": "The live converted price is temporarily unavailable; the native price applies.",  # noqa: E501
         "recharge.title": "⬆️ Wallet top-up",
         "recharge.amount_row": "{amount}",
+        "recharge.custom_button": "✏️ Custom amount",
+        "recharge.custom_prompt_irt": "Enter a positive whole number of toman.",
+        "recharge.custom_prompt_integer": "Enter a positive whole number of {currency}.",
+        "recharge.custom_prompt": "Enter a positive {currency} amount (up to two decimal places).",
+        "recharge.retry_button": "🔄 Try again",
         "recharge.gateway_title": "Choose a payment method:",
         "recharge.gateway_row": "Pay with {name}",
         "payments.gateway.tetraminator": "Tetraminator",
@@ -971,6 +1023,10 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "payment.success": "Payment succeeded! {amount} was added to your wallet.",
         "payment.failed": "Payment failed. Please try again or contact support.",
         "payment.still_pending": "Payment is not confirmed yet. Please check again shortly.",
+        "payment.manual_review": (
+            "The paid amount is under operator review; your wallet will not be "
+            "credited automatically. Please contact support."
+        ),
         "payment.topup_title": "Top up wallet — amount (Toman):",
     }
 )

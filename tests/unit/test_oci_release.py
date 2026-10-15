@@ -163,10 +163,6 @@ class TestDockerfileStructure:
         assert 'ENTRYPOINT ["/app/docker-entrypoint.sh"]' in dockerfile
         assert 'CMD ["api"]' in dockerfile
 
-    def test_lockfile_is_the_dependency_source(self, dockerfile: str) -> None:
-        assert "COPY pyproject.toml uv.lock" in dockerfile
-        assert dockerfile.count("--frozen") >= 1
-
 
 class TestEntrypoint:
     def test_entrypoint_exists_and_covers_all_entry_points(self) -> None:

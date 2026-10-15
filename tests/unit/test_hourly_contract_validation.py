@@ -144,6 +144,13 @@ class TestFingerprintShapeViolations:
         with pytest.raises(HourlyNotAvailableError, match="no versioned offer fingerprint"):
             _validate_hourly_contract(server, snapshot)
 
+    @pytest.mark.parametrize("version", [4, 2.0, True, False, [], {}, None, "2"])
+    def test_wrong_fingerprint_version_fails_closed(self, version: object) -> None:
+        server, snapshot = _contract(fingerprint_version=version)
+
+        with pytest.raises(HourlyNotAvailableError):
+            _validate_hourly_contract(server, snapshot)
+
     def test_a_legacy_version_one_contract_is_still_readable(self) -> None:
         """Pre-root-disk contracts stay valid; the create worker refuses them."""
         server, snapshot = _contract(

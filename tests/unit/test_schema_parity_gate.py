@@ -27,6 +27,7 @@ shape exactly and prove:
 from __future__ import annotations
 
 import pytest
+import sqlalchemy as sa
 
 from cloud_platform.db import schema_parity as sp
 
@@ -69,6 +70,7 @@ def _at_head(
         tables=frozenset(columns),
         columns=columns,
         unique_keys=unique_keys,
+        unique_predicates=dict(required.unique_predicates),
     )
 
 
@@ -157,12 +159,20 @@ class TestDriftDetection:
         # A database that spells the key differently still enforces it.
         assert sp.evaluate(_at_head(rename_unique=True)).ok
 
-    def test_a_superset_key_enforces_the_required_one(self) -> None:
+    def test_a_superset_key_does_not_enforce_the_required_one(self) -> None:
         required = sp.required_schema()
         table = DRIFTED_TABLE
         key = next(iter(required.unique_keys[table]))
         observed = _at_head(drop_unique=frozenset({(table, key)}))
         observed.unique_keys[table] = frozenset({key | {"account_state"}})
+        assert (table, key) in sp.evaluate(observed).missing_unique_keys
+
+    def test_a_subset_key_enforces_the_required_one(self) -> None:
+        required = sp.required_schema()
+        table = DRIFTED_TABLE
+        key = next(iter(required.unique_keys[table]))
+        observed = _at_head(drop_unique=frozenset({(table, key)}))
+        observed.unique_keys[table] = frozenset({frozenset({sorted(key)[0]})})
         assert sp.evaluate(observed).ok
 
     def test_a_table_that_exists_without_its_columns_is_drift(self) -> None:
@@ -192,6 +202,74 @@ class TestDriftDetection:
         drift = sp.evaluate(_production_shape())
         assert drift.missing_tables == [DRIFTED_TABLE]
         assert all(table != DRIFTED_TABLE for table, _ in drift.missing_columns)
+
+
+class TestPartialUniqueness:
+    @staticmethod
+    def _schemas(required_predicate, observed_predicate):
+        key = frozenset({"gateway_key", "idempotency_key"})
+        metadata = sa.MetaData()
+        table = sa.Table(
+            "payments",
+            metadata,
+            sa.Column("gateway_key", sa.Text),
+            sa.Column("idempotency_key", sa.Text),
+        )
+        sa.Index(
+            "required_key",
+            table.c.gateway_key,
+            table.c.idempotency_key,
+            unique=True,
+            postgresql_where=(
+                sa.text(required_predicate) if required_predicate is not None else None
+            ),
+        )
+
+        class Inspector:
+            def get_table_names(self):
+                return ["payments"]
+
+            def get_columns(self, name):
+                return [{"name": column} for column in key]
+
+            def get_unique_constraints(self, name):
+                return []
+
+            def get_indexes(self, name):
+                return [
+                    {
+                        "name": "different_name",
+                        "unique": True,
+                        "column_names": list(key),
+                        "dialect_options": {"postgresql_where": observed_predicate},
+                    }
+                ]
+
+        return sp.required_schema(metadata), sp.observe_schema(Inspector())
+
+    @pytest.mark.parametrize(
+        ("required", "observed", "compatible"),
+        [
+            (None, "gateway_key = 'atlaspay'", False),
+            ("gateway_key = 'atlaspay'", "gateway_key = 'other'", False),
+            ("gateway_key = 'atlaspay'", None, True),
+            ("gateway_key = 'atlaspay'", "(gateway_key = 'atlaspay'::text)", True),
+            ("gateway_key = 'atlaspay'", "(gateway_key = 'atlaspay'::character varying)", True),
+            ("gateway_key = 'atlaspay'", "((gateway_key)::text = 'atlaspay'::text)", True),
+            ("lower(gateway_key) = 'atlaspay'", "lowergateway_key = 'atlaspay'", False),
+            ("gateway_key = 'atlaspay'", "gateway_key = 'ATLASPAY'", False),
+            ("gateway_key = 'a b'", "gateway_key = 'ab'", False),
+            ("gateway_key = 'x::text'", "gateway_key = 'x'", False),
+            ("a AND b", "aandb", False),
+            ('"Gateway" = 1', '"gateway" = 1', False),
+            ("(a=1 OR b=2) AND c=3", "a=1 OR (b=2 AND c=3)", False),
+        ],
+    )
+    def test_only_matching_or_stronger_predicates_satisfy_uniqueness(
+        self, required, observed, compatible
+    ):
+        expected, actual = self._schemas(required, observed)
+        assert sp.evaluate(actual, expected).ok is compatible
 
 
 class TestGateEntryPoint:

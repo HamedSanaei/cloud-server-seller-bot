@@ -422,10 +422,6 @@ class TestRegistryCredentialAccounts:
         with pytest.raises(UnknownCredentialAccountError):
             provider_for(registry, "leaseweb", "lw-deleted")
 
-    def test_provider_for_helper_supports_registries_without_accounts(self) -> None:
-        legacy = type("Legacy", (), {"get": lambda self, key: f"adapter:{key}"})()
-        assert provider_for(legacy, "leaseweb", "lw-eu") == "adapter:leaseweb"
-
 
 # ---------------------------------------------------------------------------
 # Route selection

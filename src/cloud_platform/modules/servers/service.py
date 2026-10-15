@@ -33,6 +33,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -55,6 +56,11 @@ from cloud_platform.modules.compute.domain import (
 )
 from cloud_platform.modules.operations.domain import OperationRepository, OperationStatus
 from cloud_platform.modules.operations.service import (
+    DeleteActionNotAllowedError,
+    DeleteCommandService,
+    DeleteNotOwnerError,
+    DeleteOperationFailedError,
+    DeleteOperationInProgressError,
     NotServerOwnerError,
     PowerActionNotAllowedError,
     PowerCommandError,
@@ -159,6 +165,12 @@ class RenewalCollector(Protocol):
 
 
 class ServerCredentialStore(Protocol):
+    async def replace_issued(
+        self, *, server_id: UUID, provider_server_id: str, password: str, username: str
+    ) -> None: ...
+    async def invalidate_for_owner(
+        self, *, server_id: UUID, user_id: UUID, provider_server_id: str
+    ) -> None: ...
     async def has_for_owner(self, *, server_id: UUID, user_id: UUID) -> bool: ...
     async def claim_for_owner(self, *, server_id: UUID, user_id: UUID) -> Any | None: ...
     async def ack_for_owner(self, *, server_id: UUID, user_id: UUID, claim_id: UUID) -> bool: ...
@@ -241,6 +253,7 @@ class ServerManagementService:
         clock: Callable[[], datetime] | None = None,
         operations: OperationRepository | None = None,
         credential_store: ServerCredentialStore | None = None,
+        delete_command: DeleteCommandService | None = None,
     ) -> None:
         self._servers = servers
         self._registry = registry
@@ -250,6 +263,7 @@ class ServerManagementService:
         self._power = power
         self._operations = operations
         self._credential_store = credential_store
+        self._delete_command = delete_command
         self._events = event_sink
         # The commercial collector (RenewalChecker) is optional: a deployment
         # that exposes no billing capability simply renders no commercial lines.
@@ -287,13 +301,52 @@ class ServerManagementService:
                 limit=page_size,
                 hide_failed_before=self._clock() - timedelta(hours=1),
             )
-        items = tuple([await self._with_failure_reason(self._local_view(row)) for row in rows])
+        # List inventory once per credential account; individual GETs would
+        # multiply provider calls by the number of servers on the page.
+        account_groups: dict[tuple[str, str | None], list[CloudServer]] = {}
+        for row in rows:
+            if row.provider_server_id:
+                account_groups.setdefault((row.provider_key, row.credential_account_id), []).append(
+                    row
+                )
+        unverified: set[UUID] = set()
+        for account_rows in account_groups.values():
+            context = await self._context(account_rows[0])
+            if context is None or not context.capabilities.authoritative_inventory:
+                continue
+            snapshots: dict[str, VpsInfo] = {}
+            try:
+                snapshots = {info.id: info for info in await context.provider.list_vps_info()}
+            except ProviderError:
+                pass
+            for row in account_rows:
+                info = snapshots.get(_provider_id(row))
+                if info is None:
+                    unverified.add(row.id)
+                else:
+                    await self._apply_provider_info(row, info, authoritative_inventory=True)
+        items = tuple(
+            [
+                await self._with_failure_reason(
+                    replace(self._local_view(row), operating_system=None, display_name=None)
+                    if row.id in unverified
+                    else self._local_view(row)
+                )
+                for row in rows
+            ]
+        )
         return CustomerServerPage(items=items, page=requested, page_size=page_size, total=total)
 
     async def get_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         """The customer-safe view of one owned server (local state)."""
         server = await self._owned(customer_id, server_id)
-        return await self._with_failure_reason(await self._detail_view(server))
+        context = await self._context(server) if server.provider_server_id else None
+        view = (
+            await self.refresh_server(customer_id, server_id)
+            if context is not None and context.capabilities.authoritative_inventory
+            else await self._detail_view(server)
+        )
+        return await self._with_failure_reason(view)
 
     async def _with_failure_reason(self, view: CustomerServerView) -> CustomerServerView:
         if view.state is not CustomerServerState.ERROR or self._operations is None:
@@ -358,7 +411,9 @@ class ServerManagementService:
         unchanged local row plus a ``refresh_error`` on the view.
         """
         server = await self._owned(customer_id, server_id)
+        info: VpsInfo | None = None
         error: str | None = None
+        context: _ProviderContext | None = None
         if server.provider_server_id:
             context = await self._context(server)
             if context is not None and context.capabilities.inventory:
@@ -368,9 +423,15 @@ class ServerManagementService:
                     error = _safe_reason(exc)
                     info = None
                 if info is not None:
-                    await self._apply_provider_info(server, info)
+                    await self._apply_provider_info(
+                        server,
+                        info,
+                        authoritative_inventory=context.capabilities.authoritative_inventory,
+                    )
                     await self._apply_provider_ips(server, context)
         view = await self._detail_view(server)
+        if context is not None and context.capabilities.authoritative_inventory and info is None:
+            view = replace(view, operating_system=None, display_name=None)
         if error is not None:
             view = _with_refresh_error(view, error)
         return view
@@ -404,7 +465,7 @@ class ServerManagementService:
                 _provider_id(server)
             )
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         await self._audit.record_mutation(
             actor_type=ActorType.USER,
             action="server.console_requested",
@@ -430,7 +491,7 @@ class ServerManagementService:
         try:
             rows = await context.provider.list_vps_snapshots(_provider_id(server))
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         return [
             ServerSnapshotView(
                 ref=_snapshot_ref(row.id),
@@ -450,7 +511,7 @@ class ServerManagementService:
         try:
             rows = await context.provider.list_vps_reinstall_images(_provider_id(server))
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         images = [
             ReinstallImageView(ref=str(row.id), name=row.name, family=row.family) for row in rows
         ]
@@ -464,7 +525,7 @@ class ServerManagementService:
         try:
             rows = await context.provider.list_vps_ips(_provider_id(server))
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         return [_ip_view(row) for row in rows]
 
     async def monitoring(self, customer_id: UUID, server_id: UUID) -> MonitoringView:
@@ -474,7 +535,7 @@ class ServerManagementService:
         try:
             record = await context.provider.get_vps_monitoring(_provider_id(server))
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         allowed = (
             policies.operation_allowed(
                 ServerOperation.MONITORING_ENABLE,
@@ -500,7 +561,7 @@ class ServerManagementService:
         try:
             rows = await context.provider.list_vps_isos()
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         return [(str(row.id), row.name) for row in rows]
 
     # ------------------------------------------------------------------
@@ -598,16 +659,16 @@ class ServerManagementService:
         except PowerCommandError as exc:
             if _is_ambiguous(exc):
                 await self._record_ambiguous(server, customer_id, operation)
-                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from exc
-            raise ServerProviderError(_safe_reason(exc)) from exc
+                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from None
+            raise ServerProviderError(_safe_reason(exc)) from None
         except ProviderError as exc:
             # Defensive: the ledger converts provider failures into its own
             # errors, but an ambiguous one must never be reported as a
             # definitive rejection if it reaches here directly.
             if _is_ambiguous(exc):
                 await self._record_ambiguous(server, customer_id, operation)
-                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from exc
-            raise ServerProviderError(_safe_reason(exc)) from exc
+                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from None
+            raise ServerProviderError(_safe_reason(exc)) from None
 
         event_type = {
             ServerOperation.START: BusinessEventType.SERVER_STARTED,
@@ -643,6 +704,8 @@ class ServerManagementService:
         """Reinstall with a provider-fetched image (destructive, confirmed)."""
         server = await self._owned(customer_id, server_id)
         context = await self._require(server, ServerOperation.REINSTALL)
+        if self._credential_store is None:
+            raise ServerUnavailableError("encrypted credential storage is unavailable")
         arguments = {"image": str(image_ref)}
         consumed = await self._consume(
             confirmation_token,
@@ -654,13 +717,28 @@ class ServerManagementService:
         )
         if consumed is not None:
             return consumed
-        await self._call(
-            context.provider.reinstall_vps(_provider_id(server), str(image_ref)),
-            operation=ServerOperation.REINSTALL,
-            server=server,
-            customer_id=customer_id,
-            arguments=arguments,
-        )
+        images = await self.reinstall_images(customer_id, server_id)
+        selected = next((image for image in images if image.ref == str(image_ref)), None)
+        if selected is None:
+            raise ServerUnavailableError("selected reinstall image is no longer available")
+        try:
+            response = await self._call(
+                context.provider.reinstall_vps(_provider_id(server), str(image_ref)),
+                operation=ServerOperation.REINSTALL,
+                server=server,
+                customer_id=customer_id,
+                arguments=arguments,
+            )
+        except ServerAmbiguousOutcomeError:
+            # The provider may already be rebuilding; the old image is no
+            # longer evidence of the OS currently installed.
+            server.os = None
+            await self._servers.save(server)
+            raise
+        # Acceptance confirms only an action, not the installed image.
+        server.os = None
+        await self._servers.save(server)
+        await self._save_provider_password(server, customer_id, response, required=False)
         await self._emit(
             BusinessEventType.SERVER_REINSTALL_REQUESTED,
             server,
@@ -671,6 +749,83 @@ class ServerManagementService:
         )
         return ServerActionOutcome(operation=ServerOperation.REINSTALL, accepted=True)
 
+    async def _save_provider_password(
+        self, server: CloudServer, customer_id: UUID, response: Any, *, required: bool
+    ) -> None:
+        """Never report a changed password unless its one-time value is encrypted."""
+        secret = getattr(response, "root_password", None)
+        if self._credential_store is None:
+            raise ServerAmbiguousOutcomeError("provider password cannot be stored")
+        try:
+            if secret is None:
+                if required:
+                    raise ServerAmbiguousOutcomeError("provider did not return a password")
+                await self._credential_store.invalidate_for_owner(
+                    server_id=server.id,
+                    user_id=customer_id,
+                    provider_server_id=_provider_id(server),
+                )
+                return
+            password = secret.reveal()
+            if not password:
+                raise ServerAmbiguousOutcomeError("provider password was already consumed")
+            await self._credential_store.replace_issued(
+                server_id=server.id,
+                provider_server_id=_provider_id(server),
+                password=password,
+                username="root",
+            )
+        except ServerAmbiguousOutcomeError:
+            raise
+        except Exception:
+            # Database/provider exceptions can contain the returned secret.
+            raise ServerAmbiguousOutcomeError("provider password storage outcome unknown") from None
+
+    async def delete_server(
+        self,
+        customer_id: UUID,
+        server_id: UUID,
+        *,
+        confirmation_token: str | None,
+    ) -> ServerActionOutcome:
+        """Run the authorized deletion saga, including provider absence and final billing."""
+        server = await self._owned(customer_id, server_id)
+        if self._delete_command is None:
+            raise ServerUnavailableError("deletion workflow is unavailable")
+        consumed = await self._consume(
+            confirmation_token,
+            server,
+            customer_id,
+            ServerOperation.DELETE,
+            arguments=None,
+        )
+        if consumed is not None:
+            return consumed
+        await self._require(server, ServerOperation.DELETE)
+        try:
+            result = await self._delete_command.request(
+                customer_id,
+                server_id,
+                idempotency_key=sha256((confirmation_token or "").encode()).hexdigest()[:32],
+                execute_inline=False,
+            )
+        except DeleteNotOwnerError as exc:
+            raise ServerNotFoundError("server not found") from exc
+        except DeleteActionNotAllowedError as exc:
+            raise ServerOperationNotAllowedError(
+                "server cannot be deleted", operation=ServerOperation.DELETE, reason="state"
+            ) from exc
+        except DeleteOperationInProgressError as exc:
+            raise ServerUnavailableError("deletion is in progress") from exc
+        except DeleteOperationFailedError as exc:
+            raise ServerProviderError("deletion failed; contact support") from exc
+        return ServerActionOutcome(
+            operation=ServerOperation.DELETE,
+            accepted=True,
+            replayed=result.replayed,
+            detail="pending" if result.requeued else "deleted",
+        )
+
     async def reset_password(
         self,
         customer_id: UUID,
@@ -678,14 +833,11 @@ class ServerManagementService:
         *,
         confirmation_token: str | None,
     ) -> ServerActionOutcome:
-        """Reset the OS password (destructive, confirmed).
-
-        The provider response carries no password: the new value must be read
-        through the credential endpoints, so NOTHING is invented or displayed
-        here. The credential endpoints themselves stay operator-only.
-        """
+        """Reset the OS password and encrypt its provider-issued replacement."""
         server = await self._owned(customer_id, server_id)
         context = await self._require(server, ServerOperation.PASSWORD_RESET)
+        if self._credential_store is None:
+            raise ServerUnavailableError("encrypted credential storage is unavailable")
         consumed = await self._consume(
             confirmation_token,
             server,
@@ -696,12 +848,13 @@ class ServerManagementService:
         )
         if consumed is not None:
             return consumed
-        await self._call(
+        response = await self._call(
             context.provider.reset_vps_password(_provider_id(server)),
             operation=ServerOperation.PASSWORD_RESET,
             server=server,
             customer_id=customer_id,
         )
+        await self._save_provider_password(server, customer_id, response, required=True)
         await self._emit(
             BusinessEventType.SERVER_PASSWORD_RESET_REQUESTED,
             server,
@@ -906,7 +1059,7 @@ class ServerManagementService:
                 _provider_id(server), owned, value
             )
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         await self._audit.record_mutation(
             actor_type=ActorType.USER,
             action="server.ip_reverse_dns_set",
@@ -996,11 +1149,12 @@ class ServerManagementService:
         except ProviderError as exc:
             if _is_ambiguous(exc):
                 await self._record_ambiguous(server, customer_id, ServerOperation.RENAME)
-                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from exc
-            raise ServerProviderError(_safe_reason(exc)) from exc
-        server.os = server.os
+                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from None
+            raise ServerProviderError(_safe_reason(exc)) from None
         if info.image_name:
-            server.os = info.image_name or server.os
+            server.os = info.image_name
+        elif context.capabilities.authoritative_inventory:
+            server.os = None
         await self._servers.save(server)
         await self._audit.record_mutation(
             actor_type=ActorType.USER,
@@ -1310,7 +1464,7 @@ class ServerManagementService:
         try:
             rows = await context.provider.list_vps_ips(_provider_id(server))
         except ProviderError as exc:
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         for row in rows:
             if str(row.ip) == requested:
                 return requested
@@ -1390,7 +1544,7 @@ class ServerManagementService:
         except ProviderError as exc:
             if _is_ambiguous(exc):
                 await self._record_ambiguous(server, customer_id, operation)
-                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from exc
+                raise ServerAmbiguousOutcomeError(_safe_reason(exc)) from None
             await self._audit.record_mutation(
                 actor_type=ActorType.USER,
                 action=f"server.{operation.value}_failed",
@@ -1406,7 +1560,7 @@ class ServerManagementService:
                 category="provider_rejected",
                 reason=_safe_reason(exc),
             )
-            raise ServerProviderError(_safe_reason(exc)) from exc
+            raise ServerProviderError(_safe_reason(exc)) from None
         await self._audit.record_mutation(
             actor_type=ActorType.USER,
             action=f"server.{operation.value}",
@@ -1496,8 +1650,11 @@ class ServerManagementService:
     # Internals: provider snapshot -> local state
     # ------------------------------------------------------------------
 
-    async def _apply_provider_info(self, server: CloudServer, info: VpsInfo) -> None:
+    async def _apply_provider_info(
+        self, server: CloudServer, info: VpsInfo, *, authoritative_inventory: bool
+    ) -> None:
         """Fold a read-only provider snapshot into the local row (safe only)."""
+        original = (server.state, server.os, server.ipv4, server.ipv6)
         target = _PROVIDER_STATE_TO_LOCAL.get(info.state.strip().upper())
         if target is not None and target is not server.state:
             try:
@@ -1512,7 +1669,9 @@ class ServerManagementService:
                     server.id,
                     server.state,
                 )
-        if info.image_name and not server.os:
+        if authoritative_inventory:
+            server.os = info.image_name or None
+        elif info.image_name and info.image_name != server.os:
             server.os = info.image_name
         ipv4 = info.metadata.get("ipv4")
         ipv6 = info.metadata.get("ipv6")
@@ -1520,7 +1679,8 @@ class ServerManagementService:
             server.ipv4 = ipv4
         if isinstance(ipv6, str) and ipv6:
             server.ipv6 = ipv6
-        await self._servers.save(server)
+        if (server.state, server.os, server.ipv4, server.ipv6) != original:
+            await self._servers.save(server)
 
     async def _apply_provider_ips(self, server: CloudServer, context: _ProviderContext) -> None:
         """Refresh the cached public address from the provider's IP list."""
@@ -1782,9 +1942,8 @@ def _customer_failure_reason(error: str | None) -> str:
 
 
 def _safe_reason(exc: BaseException) -> str:
-    """A short, redacted reason safe for audit metadata and business events."""
-    text = str(exc).strip() or type(exc).__name__
-    return text[:200]
+    """Error categories are safe; provider messages may contain credentials."""
+    return type(exc).__name__
 
 
 def _is_ambiguous(exc: BaseException) -> bool:

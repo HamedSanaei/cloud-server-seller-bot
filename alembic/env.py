@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 
 from alembic import context
 
@@ -98,6 +98,11 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
+        # Transaction-scoped server lock survives a lost SSH/deploy client and
+        # serializes the actual DDL writer, not only a host shell process.
+        transaction = connection.begin()
+        if connection.dialect.name == "postgresql":
+            connection.execute(text("SELECT pg_advisory_xact_lock(739180054)"))
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
@@ -105,8 +110,13 @@ def run_migrations_online() -> None:
             compare_server_default=True,
         )
 
-        with context.begin_transaction():
-            context.run_migrations()
+        try:
+            with context.begin_transaction():
+                context.run_migrations()
+            transaction.commit()
+        except BaseException:
+            transaction.rollback()
+            raise
 
 
 if context.is_offline_mode():

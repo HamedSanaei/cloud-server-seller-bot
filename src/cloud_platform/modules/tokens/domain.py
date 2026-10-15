@@ -51,6 +51,8 @@ class TokenScope(StrEnum):
     SSH_KEYS_READ = "ssh_keys:read"
     SSH_KEYS_WRITE = "ssh_keys:write"
     TOKENS_MANAGE = "tokens:manage"
+    ADMIN_READ = "admin:read"
+    ADMIN_WRITE = "admin:write"
 
 
 ALL_SCOPES: frozenset[TokenScope] = frozenset(TokenScope)

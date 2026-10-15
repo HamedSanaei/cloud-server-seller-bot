@@ -42,7 +42,7 @@ from cloud_platform.bot.sessions import (
     PendingInput,
     ServerSessions,
 )
-from cloud_platform.bot.ui import BotScreen
+from cloud_platform.bot.ui import BotScreen, code_entities
 from cloud_platform.core.i18n import Translator
 from cloud_platform.core.session_store import SessionStoreUnavailable
 from cloud_platform.modules.navigation.domain import Callback
@@ -95,6 +95,7 @@ _OPERATION_LABELS: dict[ServerOperation, str] = {
     ServerOperation.REBOOT: "servers.op.reboot",
     ServerOperation.REINSTALL: "servers.op.reinstall",
     ServerOperation.PASSWORD_RESET: "servers.op.password_reset",  # pragma: allowlist secret
+    ServerOperation.DELETE: "servers.op.delete",
     ServerOperation.SNAPSHOT_CREATE: "servers.op.snapshot_create",
     ServerOperation.SNAPSHOT_RESTORE: "servers.op.snapshot_restore",
     ServerOperation.SNAPSHOT_DELETE: "servers.op.snapshot_delete",
@@ -122,6 +123,7 @@ _CONFIRM_COPY: dict[ServerOperation, tuple[str, str]] = {
         "servers.snapshot_delete_text",
     ),
     ServerOperation.REINSTALL: ("servers.reinstall_title", "servers.reinstall_text"),
+    ServerOperation.DELETE: ("servers.delete_title", "servers.delete_final"),
     ServerOperation.PASSWORD_RESET: ("servers.password_title", "servers.password_text"),
     ServerOperation.IP_NULL_ROUTE: ("servers.ip_null_title", "servers.ip_null_text"),
     ServerOperation.ISO_ATTACH: ("servers.iso_title", "servers.iso_text"),
@@ -174,6 +176,8 @@ SCREENS = frozenset(
         "rename",
         "renew",
         "autorenew",
+        "del1",
+        "del2",
         "ssh",
     }
 )
@@ -354,6 +358,10 @@ class ServerManagementUi:
             return await self._reinstall_confirm(user, args[0], args[1])
         if cb.screen == "pwreset" and len(args) == 1:
             return await self._password_confirm(user, args[0])
+        if cb.screen == "del1" and len(args) == 1:
+            return await self._delete_warning(user, args[0])
+        if cb.screen == "del2" and len(args) == 1:
+            return await self._delete_confirm(user, args[0])
         if cb.screen == "ips" and len(args) == 1:
             return await self._ip_list(user, args[0])
         if cb.screen in {"ipnull", "ipunnull", "iprdns"} and len(args) == 2:
@@ -395,7 +403,18 @@ class ServerManagementUi:
         rows.append(self._pager(page))
         rows.append([self._menu_button()])
         blocks.append(self._t.t("servers.list_header"))
-        return BotScreen("\n".join(blocks).strip(), InlineKeyboardMarkup(inline_keyboard=rows))
+        text = "\n".join(blocks).strip()
+        ips = tuple(view.ip for view in page.items if view.ip)
+        ports = (
+            ("22",)
+            if any(view.provider_key == "hetzner" and view.ip for view in page.items)
+            else ()
+        )
+        return BotScreen(
+            text,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            code_entities(text, ips, line_values=ports),
+        )
 
     async def _list_block(self, index: int, view: CustomerServerView) -> str:
         """One readable server card; omit facts unavailable from the purchase."""
@@ -407,6 +426,8 @@ class ServerManagementUi:
             lines.append(self._t.t("servers.list_provider", provider=view.provider_key.title()))
         if view.ip:
             lines.append(self._t.t("servers.list_ip", ip=view.ip))
+            if view.provider_key == "hetzner":
+                lines.append(self._t.t("servers.spec_ssh_port", value="22"))
         elif view.state is CustomerServerState.PROVISIONING:
             lines.append(self._t.t("servers.list_ip_pending"))
         cpu, ram = view.cpu, view.ram_gb
@@ -423,8 +444,10 @@ class ServerManagementUi:
             lines.append(self._t.t("servers.list_cpu", cpu=cpu))
         if ram:
             lines.append(self._t.t("servers.list_ram", ram=ram))
-        if view.operating_system and view.operating_system != title:
+        if view.operating_system:
             lines.append(self._t.t("servers.list_os", os=view.operating_system))
+        elif view.provider_key == "hetzner":
+            lines.append(self._t.t("servers.list_os_unknown"))
         lines.append(self._t.t("servers.list_state", state=self._state(view.state)))
         if view.failure_reason:
             lines.append(
@@ -495,7 +518,14 @@ class ServerManagementUi:
             ],
             [self._menu_button()],
         ]
-        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+        text = "\n".join(lines)
+        values = (view.ip,) if view.ip else ()
+        ports = ("22",) if view.ip and view.provider_key == "hetzner" else ()
+        return BotScreen(
+            text,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            code_entities(text, values, line_values=ports),
+        )
 
     def _spec_lines(self, view: CustomerServerView) -> list[str]:
         """Only the fields the provider genuinely returned (§6/§7)."""
@@ -504,8 +534,12 @@ class ServerManagementUi:
             lines.append(self._t.t("servers.spec_location", value=view.location_label))
         if view.ip:
             lines.append(self._t.t("servers.spec_ip", value=view.ip))
+            if view.provider_key == "hetzner":
+                lines.append(self._t.t("servers.spec_ssh_port", value="22"))
         if view.operating_system:
             lines.append(self._t.t("servers.spec_os", value=view.operating_system))
+        elif view.provider_key == "hetzner":
+            lines.append(self._t.t("servers.spec_os_unknown"))
         if view.plan:
             lines.append(self._t.t("servers.spec_plan", value=view.plan))
         if view.ram_gb:
@@ -613,6 +647,8 @@ class ServerManagementUi:
             add("rein", "servers.reinstall_button")
         if ServerOperation.PASSWORD_RESET in allowed:
             add("pwreset", "servers.password_button")
+        if ServerOperation.DELETE in allowed:
+            add("del1", "servers.delete_button")
         if ServerOperation.IP_LIST in allowed:
             add("ips", "servers.ips_button")
         if ServerOperation.ISO_LIST in allowed:
@@ -657,7 +693,16 @@ class ServerManagementUi:
             if view.refresh_error
             else self._t.t("servers.refresh_done")
         )
-        return BotScreen(f"{banner}\n\n{screen.text}", screen.keyboard)
+        text = f"{banner}\n\n{screen.text}"
+        offset = len(f"{banner}\n\n".encode("utf-16-le")) // 2
+        return BotScreen(
+            text,
+            screen.keyboard,
+            tuple(
+                entity.model_copy(update={"offset": entity.offset + offset})
+                for entity in screen.entities
+            ),
+        )
 
     # -- power ------------------------------------------------------------
 
@@ -823,6 +868,8 @@ class ServerManagementUi:
             )
         if operation is ServerOperation.PASSWORD_RESET:
             return await self._mgmt.reset_password(customer, server_id, confirmation_token=token)
+        if operation is ServerOperation.DELETE:
+            return await self._mgmt.delete_server(customer, server_id, confirmation_token=token)
         if operation is ServerOperation.IP_NULL_ROUTE:
             return await self._mgmt.null_route_ip(
                 customer, server_id, ip=args.get("ip", ""), confirmation_token=token
@@ -1149,6 +1196,42 @@ class ServerManagementUi:
             target=image.name,
         )
 
+    async def _delete_warning(self, user: User, ref: str) -> BotScreen:
+        customer = _customer_id(user)
+        server_id = await self._sessions.server_id(customer, ref)
+        if server_id is None:
+            return self._expired_screen()
+        allowed = await self._mgmt.available_operations(customer, server_id)
+        if ServerOperation.DELETE not in allowed:
+            return self._expired_screen()
+        view = await self._mgmt.get_server(customer, server_id)
+        return BotScreen(
+            "\n".join(
+                (
+                    self._t.t("servers.delete_title"),
+                    "",
+                    self._t.t("servers.confirm_target", target=self._target(view)),
+                    self._t.t("servers.delete_warning"),
+                )
+            ),
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [self._action_button("del2", "servers.delete_continue", ref)],
+                    [self._back_button("servers", "manage", ref), self._menu_button()],
+                ]
+            ),
+        )
+
+    async def _delete_confirm(self, user: User, ref: str) -> BotScreen:
+        customer = _customer_id(user)
+        server_id = await self._sessions.server_id(customer, ref)
+        if server_id is None:
+            return self._expired_screen()
+        view = await self._mgmt.get_server(customer, server_id)
+        return await self._stage_confirmation(
+            user, ref, ServerOperation.DELETE, arguments={}, target=self._target(view)
+        )
+
     async def _password_confirm(self, user: User, ref: str) -> BotScreen:
         return await self._stage_confirmation(
             user, ref, ServerOperation.PASSWORD_RESET, arguments={}
@@ -1190,7 +1273,12 @@ class ServerManagementUi:
                 ]
             )
         rows.append([self._back_button("servers", "manage", ref), self._menu_button()])
-        return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+        text = "\n".join(lines)
+        return BotScreen(
+            text,
+            InlineKeyboardMarkup(inline_keyboard=rows),
+            code_entities(text, tuple(ip.ip for ip in rows_data)),
+        )
 
     def _ip_line(self, ip: IpAddressView) -> str:
         kind = self._t.t("servers.ip_main" if ip.main_ip else "servers.ip_secondary")
@@ -1361,6 +1449,14 @@ class ServerManagementUi:
             text = self._t.t("servers.outcome_unknown")
         elif outcome.replayed:
             text = self._t.t("servers.action_in_progress")
+        elif outcome.operation is ServerOperation.REINSTALL:
+            text = self._t.t("servers.reinstall_accepted")
+        elif outcome.operation is ServerOperation.PASSWORD_RESET:
+            text = self._t.t("servers.password_reset_accepted")
+        elif outcome.operation is ServerOperation.DELETE:
+            text = self._t.t(
+                "servers.delete_pending" if outcome.detail == "pending" else "servers.delete_done"
+            )
         else:
             text = self._t.t(
                 "servers.action_done",
@@ -1368,9 +1464,10 @@ class ServerManagementUi:
             )
         rows = [
             [
+                self._action_button("refresh", "servers.refresh_button", ref),
                 self._back_button("servers", "view", ref),
-                self._menu_button(),
-            ]
+            ],
+            [self._menu_button()],
         ]
         return BotScreen(text, InlineKeyboardMarkup(inline_keyboard=rows))
 

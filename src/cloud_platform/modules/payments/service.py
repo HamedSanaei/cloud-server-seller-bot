@@ -14,18 +14,27 @@ deposit because:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from cloud_platform.modules.businesslog.domain import BusinessEventSink, emit_safe
+from cloud_platform.modules.businesslog.domain import (
+    BusinessEvent,
+    BusinessEventSink,
+    BusinessEventType,
+    NullBusinessEventSink,
+    emit_safe,
+    format_minor,
+)
 from cloud_platform.modules.businesslog.events import (
     recharge_failed_event,
     recharge_succeeded_event,
 )
 from cloud_platform.modules.payments.domain import (
+    DuplicateExternalIdError,
     InvalidPaymentSessionTransition,
     PaymentSession,
     PaymentSessionRepository,
@@ -35,6 +44,7 @@ from cloud_platform.modules.payments.domain import (
 )
 from cloud_platform.modules.wallet.domain import (
     LedgerRepository,
+    Wallet,
     WalletRepository,
 )
 from cloud_platform.providers.errors import ProviderError
@@ -121,8 +131,28 @@ class PaymentWebhookService:
                 idempotency_key=f"webhook-{gateway_key}-{external_id}",
                 gateway_payment_id=external_id,
             )
-            session = await self._payments.create(session)
+            try:
+                session = await self._payments.create(session)
+            except DuplicateExternalIdError:
+                winner = await self._payments.get_by_external_id(gateway_key, external_id)
+                if winner is None:
+                    raise
+                session = winner
             assert session.id is not None  # persisted sessions carry an id
+
+        # Authenticate facts even on terminal replays: a consumed identity
+        # must never silently stand in for a different owner or invoice.
+        if (
+            session.gateway_key != gateway_key
+            or session.gateway_payment_id != external_id
+            or (user_id is not None and user_id != session.user_id)
+            or (
+                amount_minor is not None
+                and (type(amount_minor) is not int or amount_minor != session.amount_minor)
+            )
+            or (currency is not None and currency != session.currency)
+        ):
+            raise ValueError("callback facts do not match the durable payment")
 
         if normalized == "failed":
             if session.status is PaymentSessionStatus.PENDING:
@@ -172,7 +202,9 @@ class PaymentWebhookService:
         :meth:`SqlAlchemyWalletRepository.credit_deposit` under a row-locked
         wallet: concurrent duplicates of this callback can never both
         increment the balance, and the append-only ledger keeps exactly one
-        entry per deterministic deposit key.
+        entry per deterministic deposit key. When operator events are enabled,
+        the success outbox row joins that same money transaction; channel
+        delivery and the later payment credit marker cannot lose the event.
 
         The credited amount is the FROZEN wallet credit side, never a fresh
         FX conversion: the settlement side was already verified EXACTLY
@@ -180,30 +212,58 @@ class PaymentWebhookService:
         """
         assert session.id is not None
         assert session.gateway_payment_id is not None
+        wallet_before = await self._wallet.get(session.user_id)
+        if wallet_before is None or wallet_before.currency != session_credit_currency(session):
+            raise ValueError("wallet currency does not match the frozen payment credit currency")
+        # Claim success under the payment repository's row lock before moving
+        # money. A concurrent failure cannot win after a deposit is posted.
+        # A crash here leaves a durable, uncredited success for reconciliation.
+        session = await self._payments.save(session)
+        assert session.id is not None
+        assert session.gateway_payment_id is not None
         deposit_key = f"deposit-{session.gateway_key}-{session.gateway_payment_id}"
 
-        wallet, _applied = await self._wallet.credit_deposit(
-            session.user_id,
-            session_credit_amount(session),
-            deposit_key,
-            reference=f"{session.gateway_key}/{session.gateway_payment_id}",
-        )
-        credited = await self._payments.save(session.mark_credited(at=datetime.now(UTC)))
-        # Operator channel: emitted only AFTER the wallet was actually
-        # credited (the session is persisted as credited above).
-        balance_after = getattr(wallet, "balance", None)
-        await emit_safe(
-            self._events,
-            recharge_succeeded_event(
+        event_factory: Callable[[Wallet], BusinessEvent | None] | None = None
+        policy = getattr(self._events, "policy", None)
+        if (
+            self._events is not None
+            and not isinstance(self._events, NullBusinessEventSink)
+            and (policy is None or policy.allows(BusinessEventType.RECHARGE_SUCCEEDED))
+        ):
+            # Freeze safe operator data before entering the money transaction;
+            # only its row-locked resulting balance is supplied by the wallet.
+            event = recharge_succeeded_event(
                 user=await self._load_user(session.user_id),
                 payment_session_id=session.id,
                 amount_minor=session_credit_amount(session),
                 currency=session_credit_currency(session),
                 gateway=session.gateway_key,
                 gateway_reference=session.gateway_payment_id,
-                balance_after_minor=(balance_after if isinstance(balance_after, int) else None),
-            ),
+                at=datetime.now(UTC),
+            )
+
+            def with_balance(wallet_after: Wallet) -> BusinessEvent:
+                return replace(
+                    event,
+                    payload={
+                        **event.payload,
+                        "balance_after": format_minor(
+                            wallet_after.balance, session_credit_currency(session)
+                        ),
+                    },
+                )
+
+            event_factory = with_balance
+
+        await self._wallet.credit_deposit(
+            session.user_id,
+            session_credit_amount(session),
+            deposit_key,
+            reference=f"{session.gateway_key}/{session.gateway_payment_id}",
+            expected_currency=session_credit_currency(session),
+            business_event_factory=event_factory,
         )
+        credited = await self._payments.save(session.mark_credited(at=datetime.now(UTC)))
         return credited
 
 

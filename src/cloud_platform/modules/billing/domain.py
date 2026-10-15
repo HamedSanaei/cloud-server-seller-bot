@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from decimal import ROUND_CEILING, Decimal
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
 from cloud_platform.core.money import Money
@@ -12,10 +11,10 @@ class BillingPolicy:
     minimum_quanta: int = 1
 
     def __post_init__(self) -> None:
-        if self.quantum_seconds <= 0:
-            raise ValueError("quantum_seconds must be positive")
-        if self.minimum_quanta < 0:
-            raise ValueError("minimum_quanta cannot be negative")
+        if type(self.quantum_seconds) is not int or self.quantum_seconds <= 0:
+            raise ValueError("quantum_seconds must be a positive integer")
+        if type(self.minimum_quanta) is not int or self.minimum_quanta < 0:
+            raise ValueError("minimum_quanta must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,11 +34,16 @@ class UsageCharge:
 def calculate_usage_charge(
     started_at: datetime, ended_at: datetime, price: PriceSnapshot
 ) -> UsageCharge:
+    if started_at.utcoffset() is not None and ended_at.utcoffset() is not None:
+        started_at = started_at.astimezone(UTC)
+        ended_at = ended_at.astimezone(UTC)
     if ended_at < started_at:
         raise ValueError("ended_at cannot be before started_at")
-    elapsed = Decimal(str((ended_at - started_at).total_seconds()))
-    raw_quanta = elapsed / Decimal(price.policy.quantum_seconds)
-    quanta = int(raw_quanta.to_integral_value(rounding=ROUND_CEILING))
+    duration = ended_at - started_at
+    elapsed_microseconds = (duration.days * 86_400 + duration.seconds) * 1_000_000
+    elapsed_microseconds += duration.microseconds
+    quantum_microseconds = price.policy.quantum_seconds * 1_000_000
+    quanta = -(-elapsed_microseconds // quantum_microseconds)
     quanta = max(price.policy.minimum_quanta, quanta)
     return UsageCharge(
         quanta=quanta,
@@ -91,15 +95,17 @@ def _grid_boundaries(
     started_at: datetime, ended_at: datetime, quantum_seconds: int
 ) -> list[datetime]:
     """Quantum-grid instants strictly inside the window (UTC-aligned)."""
-    q = quantum_seconds
-    start_ts = int(started_at.astimezone(UTC).timestamp())
-    end_ts = int(ended_at.astimezone(UTC).timestamp())
-    first = (start_ts // q + 1) * q  # first grid instant strictly after start
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    start = started_at.astimezone(UTC)
+    end = ended_at.astimezone(UTC)
+    duration = start - epoch
+    start_seconds = duration.days * 86_400 + duration.seconds
+    first_seconds = (start_seconds // quantum_seconds + 1) * quantum_seconds
+    boundary = epoch + timedelta(seconds=first_seconds)
     boundaries: list[datetime] = []
-    ts = first
-    while ts < end_ts:
-        boundaries.append(datetime.fromtimestamp(ts, tz=UTC))
-        ts += q
+    while boundary < end:
+        boundaries.append(boundary)
+        boundary += timedelta(seconds=quantum_seconds)
     return boundaries
 
 
@@ -134,12 +140,17 @@ def calculate_usage_segments(
     """
     _require_aware(started_at, "started_at")
     _require_aware(ended_at, "ended_at")
+    started_at = started_at.astimezone(UTC)
+    ended_at = ended_at.astimezone(UTC)
     if ended_at < started_at:
         raise ValueError("ended_at cannot be before started_at")
     if not schedule:
         raise ValueError("schedule must have at least one priced period")
     for period in schedule:
         _require_aware(period.effective_from, "PricedPeriod.effective_from")
+    schedule = tuple(
+        PricedPeriod(period.effective_from.astimezone(UTC), period.price) for period in schedule
+    )
     for earlier, later in pairwise(schedule):
         if later.effective_from < earlier.effective_from:
             raise ValueError("schedule must be ascending by effective_from")
@@ -152,7 +163,7 @@ def calculate_usage_segments(
     for a, b in pairwise(cut_points):
         if b <= a:
             continue
-        charge = calculate_usage_charge(a, b, _price_at(tuple(schedule), a))
+        charge = calculate_usage_charge(a, b, _price_at(schedule, a))
         segments.append(
             UsageSegment(
                 start=a,

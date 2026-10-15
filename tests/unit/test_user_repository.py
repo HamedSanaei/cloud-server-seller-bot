@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from hashlib import sha256
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from cloud_platform.modules.users.domain import User, UserNotFound, UserStatus
-from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+from cloud_platform.modules.users.repository import (
+    SqlAlchemyUserRepository,
+    UserStatusIdempotencyConflict,
+)
 
 
 def _row(
@@ -122,3 +126,160 @@ class TestUpdateStatus:
         session.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=lambda: None))
         with pytest.raises(UserNotFound):
             await repo.update_status(uuid.uuid4(), UserStatus.BANNED)
+
+
+class TestChangeStatusIdempotently:
+    @staticmethod
+    def _transaction(session: AsyncMock) -> AsyncMock:
+        transaction = AsyncMock()
+        session.begin = MagicMock(return_value=transaction)
+        return transaction
+
+    async def test_commits_bound_audit_receipt_with_status(
+        self, repo: SqlAlchemyUserRepository, session: AsyncMock
+    ) -> None:
+        transaction = self._transaction(session)
+        target = _row(status="banned")
+        actor_id = uuid.uuid4()
+        session.execute.side_effect = [
+            MagicMock(),
+            MagicMock(scalar_one_or_none=lambda: target),
+            MagicMock(scalar_one_or_none=lambda: None),
+        ]
+        result = await repo.change_status_idempotently(
+            target.id,
+            UserStatus.ACTIVE,
+            actor_id=actor_id,
+            idempotency_key="review-1",
+            reason="reviewed",
+        )
+        assert result is UserStatus.ACTIVE
+        assert target.status == "active"
+        receipt = session.add.call_args.args[0]
+        assert receipt.actor_type == "admin"
+        assert receipt.actor_id == actor_id
+        assert receipt.action == "admin.user.status_changed"
+        assert receipt.resource_type == "user"
+        assert receipt.resource_id == str(target.id)
+        assert receipt.reason == "reviewed"
+        assert receipt.event_metadata == {"status": "active", "idempotency_key": "review-1"}
+        lock_params = session.execute.call_args_list[0].args[1]
+        expected_lock = int.from_bytes(
+            sha256(f"admin.user.status_changed:{actor_id}:review-1".encode()).digest()[:8],
+            "big",
+            signed=True,
+        )
+        assert lock_params == {"lock_key": expected_lock}
+        session.flush.assert_awaited_once()
+        transaction.__aexit__.assert_awaited_once_with(None, None, None)
+
+    async def test_replay_returns_historical_status_without_reapplying(
+        self, repo: SqlAlchemyUserRepository, session: AsyncMock
+    ) -> None:
+        self._transaction(session)
+        target = _row(status="banned")
+        receipt = MagicMock(
+            actor_type="admin",
+            resource_type="user",
+            resource_id=str(target.id),
+            reason="reviewed",
+            event_metadata={"status": "active", "idempotency_key": "review-1"},
+        )
+        session.execute.side_effect = [
+            MagicMock(),
+            MagicMock(scalar_one_or_none=lambda: target),
+            MagicMock(scalar_one_or_none=lambda: receipt),
+        ]
+        result = await repo.change_status_idempotently(
+            target.id,
+            UserStatus.ACTIVE,
+            actor_id=uuid.uuid4(),
+            idempotency_key="review-1",
+            reason="reviewed",
+        )
+        assert result is UserStatus.ACTIVE
+        assert target.status == "banned"
+        session.add.assert_not_called()
+        session.flush.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("resource_id", str(uuid.uuid4())),
+            ("resource_type", "server"),
+            ("reason", "different reason"),
+            ("actor_type", "user"),
+            ("event_metadata", {"status": "frozen", "idempotency_key": "review-1"}),
+        ],
+    )
+    async def test_conflicting_receipt_fails_closed(
+        self,
+        repo: SqlAlchemyUserRepository,
+        session: AsyncMock,
+        field: str,
+        value: object,
+    ) -> None:
+        self._transaction(session)
+        target = _row(status="banned")
+        receipt = MagicMock(
+            actor_type="admin",
+            resource_type="user",
+            resource_id=str(target.id),
+            reason="reviewed",
+            event_metadata={"status": "active", "idempotency_key": "review-1"},
+        )
+        setattr(receipt, field, value)
+        session.execute.side_effect = [
+            MagicMock(),
+            MagicMock(scalar_one_or_none=lambda: target),
+            MagicMock(scalar_one_or_none=lambda: receipt),
+        ]
+        with pytest.raises(UserStatusIdempotencyConflict):
+            await repo.change_status_idempotently(
+                target.id,
+                UserStatus.ACTIVE,
+                actor_id=uuid.uuid4(),
+                idempotency_key="review-1",
+                reason="reviewed",
+            )
+        assert target.status == "banned"
+        session.add.assert_not_called()
+
+    async def test_missing_target_does_not_append_receipt(
+        self, repo: SqlAlchemyUserRepository, session: AsyncMock
+    ) -> None:
+        self._transaction(session)
+        session.execute.side_effect = [
+            MagicMock(),
+            MagicMock(scalar_one_or_none=lambda: None),
+            MagicMock(scalar_one_or_none=lambda: None),
+        ]
+        with pytest.raises(UserNotFound):
+            await repo.change_status_idempotently(
+                uuid.uuid4(),
+                UserStatus.ACTIVE,
+                actor_id=uuid.uuid4(),
+                idempotency_key="review-1",
+                reason="reviewed",
+            )
+        session.add.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("key", "reason"), [("", "reviewed"), ("  ", "reviewed"), ("key", ""), ("key", " ")]
+    )
+    async def test_requires_key_and_admin_reason(
+        self,
+        repo: SqlAlchemyUserRepository,
+        session: AsyncMock,
+        key: str,
+        reason: str,
+    ) -> None:
+        with pytest.raises(ValueError):
+            await repo.change_status_idempotently(
+                uuid.uuid4(),
+                UserStatus.ACTIVE,
+                actor_id=uuid.uuid4(),
+                idempotency_key=key,
+                reason=reason,
+            )
+        session.execute.assert_not_awaited()

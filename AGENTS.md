@@ -80,10 +80,12 @@ by convenience.
 **`staging` — the active development/integration lane.** Every push to
 `staging` runs `.github/workflows/deploy-staging.yml`: fast checks (`ruff
 check`, `ruff format --check`, `compileall` over `src`, api/worker/bot import
-smoke) -> cached Docker build -> immediate deploy of the exact pushed SHA to
-the CURRENT server and the SAME Telegram bot. It does not wait for `ci`, does
-not run the full suite, does not compute coverage and does not run
-`pre-commit run --all-files`.
+smoke), targeted financial/deployment regressions and real PostgreSQL migration
+contracts -> cached Docker build -> deploy of the exact pushed SHA to the
+CURRENT server and SAME Telegram bot. It does not wait for `ci`, run the full
+suite, compute coverage or run `pre-commit run --all-files`. The local staging
+contract below remains targeted; these shared-host CI guards are not a mandate
+to reproduce the release suite on the workstation.
 
 Normal feature development is therefore:
 
@@ -190,12 +192,14 @@ whole requirement, regardless of which subsystem the change touches.
   `DEPLOY_PROFILE=staging` skips only the one-shot provider catalog refresh
   (the worker's scheduled coordinator owns provider facts) and keeps every
   other gate, including migrations, schema parity, single-bot, health and
-  storefront readiness. A failed staging deploy rolls back exactly like a
-  release deploy.
-- Staging deploys are `staging-deploy` with `cancel-in-progress: true`: the
-  newest push wins and superseded runs are cancelled. The manual release
-  deploy joins `telegram-shared-host-deploy`, so the two lanes never mutate
-  the host at the same time.
+  storefront and read-only financial readiness. Automatic image rollback is
+  refused after an intended or observed schema advance; writers remain stopped
+  for a reviewed forward fix or explicitly approved operator recovery.
+- Active staging and release deployments use `cancel-in-progress: false` and
+  the shared `telegram-shared-host-deploy` job group. A server-side `flock`
+  additionally excludes direct operator invocations through failure recovery.
+  New pushes may supersede pending runs, never interrupt an active migration
+  or service replacement.
 - Never weaken the release lane to make staging faster, and never claim one
   lane's evidence for the other.
 

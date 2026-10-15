@@ -3,11 +3,11 @@
 Acceptance: provider/users/operations dashboards.
 
 Same session mechanism as the customer panel (an API-token cookie), but
-every request additionally re-checks platform RBAC: the session's user
-must exist, be ACTIVE and hold the admin settings permission. A frozen
-or banned admin loses the panel immediately - the check is per request,
-never cached. Anonymous and non-admin sessions are treated IDENTICALLY
-(a redirect to login), so the panel never leaks whether an id exists.
+every request requires the explicit ``admin:read`` token scope AND re-checks
+platform RBAC: the session's user must exist, be ACTIVE and hold the admin
+settings permission. A frozen or banned admin loses the panel immediately.
+Anonymous, unscoped and non-admin sessions all redirect to login, so the
+panel never leaks whether an id exists.
 
 Dashboards:
 - **users** - search + status (reuses the M14-003 search repository);
@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from cloud_platform.modules.audit.domain import AuditEvent
+from cloud_platform.modules.tokens.domain import TokenScope
 from cloud_platform.modules.users.domain import Permission, Role, User
 from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
 
@@ -59,6 +60,8 @@ async def _admin_identity(
     try:
         auth = await authenticator(raw)
     except Exception:
+        return None
+    if auth is None or not auth.has(TokenScope.ADMIN_READ):
         return None
     user = await repo.get(auth.user_id)
     if user is None or user.role is not Role.ADMIN or not user.is_active:

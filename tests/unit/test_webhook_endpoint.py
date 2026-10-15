@@ -28,6 +28,7 @@ def _service() -> tuple[PaymentWebhookService, AsyncMock, AsyncMock, AsyncMock]:
     payments.create = AsyncMock(side_effect=lambda s: dataclasses.replace(s, id=uuid4()))
     payments.save = AsyncMock(side_effect=lambda s: s)
     wallet = AsyncMock()
+    wallet.get = AsyncMock(return_value=types.SimpleNamespace(currency="EUR"))
     wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
     ledger = AsyncMock()
     ledger.get_entry_by_idempotency = AsyncMock(return_value=None)
@@ -77,6 +78,18 @@ class TestAuthentication:
         response = _post(client, body, sign_gateway_payload(SECRET, body))
         assert response.status_code == 404
 
+    def test_atlaspay_never_accepts_generic_signed_callback(self) -> None:
+        service, _payments, wallet, _ledger = _service()
+        client = TestClient(_build_app(service))
+        body = _body(currency="IRT")
+        response = client.post(
+            "/webhooks/payments/atlaspay",
+            content=body,
+            headers={"x-gateway-signature": sign_gateway_payload(SECRET, body)},
+        )
+        assert response.status_code == 404
+        wallet.credit_deposit.assert_not_awaited()
+
     def test_missing_signature_returns_401(self) -> None:
         service, _p, _w, _l = _service()
         client = TestClient(_build_app(service))
@@ -119,6 +132,7 @@ class TestCallbackProcessing:
         payments.create = AsyncMock(side_effect=lambda s: dataclasses.replace(s, id=uuid4()))
         payments.save = AsyncMock(side_effect=lambda s: state.update({"session": s}) or s)
         wallet = AsyncMock()
+        wallet.get = AsyncMock(return_value=types.SimpleNamespace(currency="EUR"))
         # Atomic deposit contract: (wallet_after, applied=True).
         wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
         ledger = AsyncMock()

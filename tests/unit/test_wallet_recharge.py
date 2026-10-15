@@ -13,6 +13,7 @@ enqueues ``recharge.created``. The tests pin:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -26,7 +27,6 @@ from cloud_platform.core.idempotency import IdempotencyKey
 from cloud_platform.modules.businesslog.domain import BusinessEvent, BusinessEventType
 from cloud_platform.modules.payments.domain import (
     DuplicateExternalIdError,
-    PaymentSessionStatus,
 )
 from cloud_platform.modules.payments.recharge import (
     RechargeAmountError,
@@ -76,7 +76,7 @@ class FakePayments:
         self.create_calls += 1
         if session.gateway_payment_id in self.by_authority:
             raise DuplicateExternalIdError("already exists")
-        stored = _bindable(_session(session, session_id=SESSION_ID))
+        stored = replace(session, id=SESSION_ID)
         self.by_authority[self._key(stored)] = stored
         return stored
 
@@ -87,7 +87,14 @@ class FakePayments:
         )
 
     async def get_by_external_id(self, gateway_key: str, authority: str) -> Any:
-        return self.by_authority.get(authority)
+        return next(
+            (
+                session
+                for session in self.by_authority.values()
+                if session.gateway_key == gateway_key and session.gateway_payment_id == authority
+            ),
+            None,
+        )
 
     async def get_by_idempotency_key(self, gateway_key: str, idempotency_key: str) -> Any:
         for session in self.by_authority.values():
@@ -101,35 +108,6 @@ class FakePayments:
                 self.by_authority[key] = session
                 break
         return session
-
-
-def _session(session: Any, *, session_id: UUID) -> Any:
-    return type(
-        "S",
-        (),
-        {
-            "id": session_id,
-            "user_id": session.user_id,
-            "gateway_key": session.gateway_key,
-            "gateway_payment_id": session.gateway_payment_id,
-            "amount_minor": session.amount_minor,
-            "currency": session.currency,
-            "idempotency_key": session.idempotency_key,
-            "status": PaymentSessionStatus.PENDING,
-            "credited_at": None,
-        },
-    )()
-
-
-def _bindable(session: Any) -> Any:
-    """Add the aggregate transition the intent flow relies on (in-place)."""
-
-    def _bind(pay_id: str) -> Any:
-        session.gateway_payment_id = pay_id
-        return session
-
-    session.with_gateway_payment_id = _bind
-    return session
 
 
 class FakeGateway:
@@ -338,6 +316,15 @@ class TestTelegramChannel:
 
         with pytest.raises(RuntimeError):
             await TelegramBusinessLogChannel(_Bot(), -100).send("x")
+
+    async def test_a_chat_id_is_required(self) -> None:
+        from cloud_platform.modules.businesslog.telegram import TelegramBusinessLogChannel
+
+        # The operator channel is optional at construction; only an actual
+        # operator send without a chat_id must fail (for the outbox retry).
+        channel = TelegramBusinessLogChannel(bot=object(), chat_id=0)
+        with pytest.raises(ValueError):
+            await channel.send("x")
 
 
 class FakeRecharge:
@@ -681,7 +668,7 @@ class TestPersistFirstTetraminatorFlow:
         await service.start(
             user=_user(), amount_minor=100_000, currency="IRT", idempotency_key="tetra-clash-1"
         )
-        with pytest.raises(RechargeError, match="another user"):
+        with pytest.raises(RechargeError, match="original owner/credit"):
             await service.start(
                 user=other, amount_minor=100_000, currency="IRT", idempotency_key="tetra-clash-1"
             )

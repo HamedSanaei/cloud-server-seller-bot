@@ -481,16 +481,8 @@ class HetznerCloudProvider:
         return self._map_server(payload["server"])
 
     async def list_servers(self) -> list[ProviderServer]:
-        servers: list[ProviderServer] = []
-        page = 1
-        while True:
-            payload = await self._request("GET", "/servers", params={"page": page})
-            servers.extend(self._map_server(item) for item in payload.get("servers", []))
-            pagination = (payload.get("meta") or {}).get("pagination") or {}
-            next_page = pagination.get("next_page")
-            if not isinstance(next_page, int) or next_page <= page:
-                return servers
-            page = next_page
+        """Return only a complete, validated Project inventory."""
+        return [self._map_server(item) for item in await self._pages("/servers", "servers")]
 
     async def create_server(
         self, request: CreateServerRequest, idempotency_key: IdempotencyKey
@@ -847,12 +839,12 @@ class HetznerCloudProvider:
         while True:
             try:
                 response = await self._client.request(method, path, **kwargs)
-            except httpx.RequestError as exc:
+            except httpx.RequestError:
                 if mutation:
                     raise ProviderOutcomeUnknown(
                         "Hetzner mutation transport outcome unknown"
-                    ) from exc
-                raise ProviderUnavailable(str(exc)) from exc
+                    ) from None
+                raise ProviderUnavailable("Hetzner request transport unavailable") from None
 
             self.last_rate_limit = RateLimitSnapshot(
                 _int_or_none(response.headers.get("RateLimit-Limit")),
@@ -1115,9 +1107,5 @@ def _error_code(response: httpx.Response) -> str | None:
 
 
 def _error_message(response: httpx.Response) -> str:
-    try:
-        payload = response.json()
-        error = payload.get("error", {})
-        return str(error.get("message") or error.get("code") or response.text)
-    except Exception:
-        return response.text or f"HTTP {response.status_code}"
+    """Provider bodies may echo credentials or issued passwords; never retain them."""
+    return f"Hetzner request failed (HTTP {response.status_code})"

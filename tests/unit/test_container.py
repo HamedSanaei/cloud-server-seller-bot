@@ -114,3 +114,41 @@ async def test_explicit_hetzner_accounts_manage_their_own_resources(monkeypatch)
         assert container.hourly_cloud_resolver().adapter_for("hetzner", "removed") is None
     finally:
         await container.close()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "credentialed"),
+    [(False, True), (True, False), (True, True)],
+    ids=["operator-disabled", "uncredentialed", "available"],
+)
+async def test_hourly_provider_availability_requires_enabled_credentials(
+    monkeypatch, enabled, credentialed
+):
+    from cloud_platform.core import container as container_module
+    from cloud_platform.core.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        providers_enabled={"hetzner": enabled, "leaseweb": False},
+        hetzner_api_token="",
+        hetzner_accounts=(
+            [{"id": "owner", "api_token": "test-credential"}] if credentialed else []
+        ),
+        leaseweb_api_key="",
+        leaseweb_accounts=[],
+    )
+    monkeypatch.setattr(container_module, "get_settings", lambda: settings)
+    container = create_container()
+    try:
+        providers = container.hourly_cloud_providers()
+        resolver = container.hourly_cloud_resolver()
+        if enabled and credentialed:
+            assert "hetzner" in providers
+            assert resolver.adapter_for("hetzner", "owner") is not None
+            assert resolver.adapter_for("hetzner", "removed") is None
+        else:
+            assert "hetzner" not in providers
+            if not credentialed:
+                assert resolver is None or resolver.adapter_for("hetzner", "owner") is None
+    finally:
+        await container.close()

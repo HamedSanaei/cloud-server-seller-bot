@@ -44,7 +44,7 @@
 # validation (public https payment callbacks, redis Telegram session backend).
 environment = "development"        # development | staging | production
 log_level = "INFO"
-default_currency = "USD"
+default_currency = "IRT"
 
 [database]
 # Local example has no password; production inserts it after "cloud"
@@ -454,6 +454,7 @@ console = true                     # temporary console link
 traffic = true                     # data-traffic usage
 snapshots = true                   # list / create / restore / delete
 reinstall = true                   # OS reinstall (destructive)
+deletion = true                    # idempotent confirmed server deletion
 password_reset = true              # OS password reset (destructive)  # pragma: allowlist secret
 iso = false                        # attach/detach ISO (advanced, off by default)
 ip_management = true               # list IPs, reverse DNS, null route

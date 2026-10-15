@@ -81,6 +81,28 @@ class TestCommandAndRedaction:
         assert "sup3r-s3cret" not in scrubbed
         assert "***" in scrubbed
 
+    def test_scrub_removes_decoded_uri_password(self) -> None:
+        from cloud_platform.backup.job import _scrub
+
+        dsn = "postgresql://cloud:secret%40value@localhost/cloud"  # pragma: allowlist secret
+        scrubbed = _scrub(f"connection {dsn}: password secret@value rejected", dsn)
+        assert dsn not in scrubbed
+        assert "secret%40value" not in scrubbed
+        assert "secret@value" not in scrubbed
+
+    async def test_runner_exception_does_not_expose_dsn_in_traceback(self, tmp_path: Path) -> None:
+        import traceback
+
+        async def runner(command) -> subprocess.CompletedProcess:
+            raise OSError(f"cannot execute {command!r}")
+
+        job = PostgresBackupJob(_config(tmp_path), runner=runner)
+        with pytest.raises(BackupError) as caught:
+            await job.run()
+        rendered = "".join(traceback.format_exception(caught.value))
+        assert DSN not in rendered
+        assert "sup3r-s3cret" not in rendered
+
 
 class TestBackupRun:
     async def test_dump_is_encrypted_at_rest(self, tmp_path: Path) -> None:

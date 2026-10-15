@@ -21,6 +21,7 @@ from cloud_platform.db.timestamps import (
 )
 from cloud_platform.modules.operations.create_attempts import CreateAttemptConflict
 from cloud_platform.modules.operations.domain import (
+    InvalidOperationTransition,
     Operation,
     OperationStatus,
     OperationType,
@@ -255,6 +256,8 @@ class SqlAlchemyOperationRepository:
                 raise LookupError(f"operation {operation.id} not found")
             if "create_routing" in (row.provider_response or {}):
                 raise CreateAttemptConflict("receipt-backed creates require fenced persistence")
+            if int(_attr(row, "attempts")) != operation.attempts:
+                raise InvalidOperationTransition("operation claim no longer owns this attempt")
             cast_any: Any = row
             cast_any.status = operation.status.value
             cast_any.provider_response = operation.provider_response

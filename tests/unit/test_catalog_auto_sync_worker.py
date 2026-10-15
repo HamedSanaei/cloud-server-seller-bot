@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import cloud_platform.worker.settings as ws
-from cloud_platform.core.config import Settings
+from cloud_platform.core.config import HetznerAccountSettings, Settings
 from cloud_platform.modules.offers.auto_sync import AutoSyncRunReport, ProviderAutoSyncReport
 from cloud_platform.modules.offers.domain import CatalogSyncState
 
@@ -49,6 +50,84 @@ def _coordinator(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     return coordinator
 
 
+@pytest.fixture
+def catalog_pass(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Real coordinator and price book; provider observations stay in memory."""
+    from tests.unit.test_offer_auto_sync import (
+        FakeLock,
+        FakeOffersRepo,
+        FakeSource,
+        FakeStateRepo,
+        _spec,
+    )
+
+    offers = FakeOffersRepo()
+    state = FakeStateRepo()
+    lock = FakeLock()
+    sources = {
+        key: FakeSource(key, offers, [("test-plan", "test-region", _spec(currency="USD"))])
+        for key in ("leaseweb", "hetzner", "hetzner.hourly")
+    }
+    leaseweb_router = MagicMock(
+        ordered_providers={"test-account": object()},
+        priorities={},
+        account_states={},
+        aclose=AsyncMock(),
+    )
+    hetzner_router = MagicMock(aclose=AsyncMock())
+    monkeypatch.setattr(
+        "cloud_platform.providers.leaseweb.accounts.build_leaseweb_account_router",
+        lambda settings: leaseweb_router if settings.leaseweb_api_key else None,
+    )
+    monkeypatch.setattr(
+        "cloud_platform.providers.leaseweb.cloud_accounts.build_cloud_account_router",
+        lambda settings: None,
+    )
+    monkeypatch.setattr(
+        "cloud_platform.providers.hetzner.accounts.build_hetzner_account_router",
+        lambda settings: hetzner_router if settings.hetzner_accounts else None,
+    )
+    monkeypatch.setattr(
+        "cloud_platform.providers.leaseweb.auto_sync.LeasewebCatalogSyncSource",
+        lambda syncer: sources["leaseweb"],
+    )
+    monkeypatch.setattr(
+        "cloud_platform.providers.hetzner.sync.HetznerCatalogSyncer",
+        lambda *args, **kwargs: SimpleNamespace(aclose=AsyncMock()),
+    )
+    monkeypatch.setattr(
+        "cloud_platform.providers.hetzner.auto_sync.HetznerCatalogSyncSource",
+        lambda syncer, billing_model=None: sources[
+            "hetzner.hourly" if billing_model == "hourly" else "hetzner"
+        ],
+    )
+    monkeypatch.setattr(
+        "cloud_platform.modules.offers.repository.SqlAlchemySellableOfferRepository",
+        lambda *args, **kwargs: offers,
+    )
+    monkeypatch.setattr(
+        "cloud_platform.modules.offers.repository.SqlAlchemyCatalogSyncStateRepository",
+        lambda *args: state,
+    )
+    monkeypatch.setattr(
+        "cloud_platform.modules.catalog.repository.PostgresAdvisoryCatalogSyncLock",
+        lambda *args: lock,
+    )
+    container = SimpleNamespace(
+        global_fx_resolver_or_none=lambda: None,
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
+    return SimpleNamespace(
+        offers=offers,
+        state=state,
+        lock=lock,
+        sources=sources,
+        container=container,
+        leaseweb_router=leaseweb_router,
+    )
+
+
 class TestCatalogAutoSyncJob:
     async def test_skipped_when_disabled(
         self, settings: Settings, monkeypatch: pytest.MonkeyPatch
@@ -68,6 +147,53 @@ class TestCatalogAutoSyncJob:
         coordinator = _coordinator(monkeypatch)
         await ws.catalog_auto_sync({})
         coordinator.run.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("credentialed", "enabled"),
+        [(False, True), (True, True), (True, False)],
+        ids=["leaseweb-without-hetzner", "both-providers", "operator-disabled-hetzner"],
+    )
+    async def test_only_eligible_providers_publish_and_record_success(
+        self, settings: Settings, catalog_pass: Any, credentialed: bool, enabled: bool
+    ) -> None:
+        settings.hetzner_accounts = (
+            [HetznerAccountSettings(id="test-account", api_token="test-credential")]
+            if credentialed
+            else []
+        )
+        settings.providers_enabled = {"hetzner": enabled}
+        settings.storefront_pricing = {
+            key: {"mode": "markup", "markup_percent": 25, "auto_publish": True}
+            for key in catalog_pass.sources
+        }
+        report = await ws.run_catalog_auto_sync_once()
+        expected = (
+            {"leaseweb", "hetzner", "hetzner.hourly"} if credentialed and enabled else {"leaseweb"}
+        )
+        assert report.ran
+        assert {item.provider_key for item in report.providers} == expected
+        assert all(item.ok and item.published == 1 for item in report.providers)
+        assert {run["provider_key"] for run in catalog_pass.state.runs} == expected
+        for key, source in catalog_pass.sources.items():
+            assert source.calls == int(key in expected)
+            row = await catalog_pass.offers.get_by_ref(key, "test-plan", "test-region")
+            if key in expected:
+                assert row is not None and row.enabled and row.selling_price_minor == 624
+            else:
+                assert row is None
+        catalog_pass.container.close.assert_awaited_once()
+        catalog_pass.leaseweb_router.aclose.assert_awaited_once()
+
+    async def test_overlapping_run_does_not_change_catalog_or_record_success(
+        self, settings: Settings, catalog_pass: Any
+    ) -> None:
+        catalog_pass.lock._held = True
+        assert await ws.run_catalog_auto_sync_once() is None
+        assert await catalog_pass.offers.list_all() == []
+        assert catalog_pass.state.runs == []
+        assert all(source.calls == 0 for source in catalog_pass.sources.values())
+        catalog_pass.container.close.assert_awaited_once()
+        catalog_pass.leaseweb_router.aclose.assert_awaited_once()
 
 
 class TestCatalogAutoSyncSchedule:

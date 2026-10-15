@@ -52,6 +52,23 @@ main IP (or «IP هنوز اختصاص نیافته» while provisioning), the O
 Each row has its own «⚙️ مدیریت» button; the list is paginated
 (`⬅️ قبلی  1 / 4  بعدی ➡️`) with a stable newest-first ordering.
 
+After an accepted reinstall, the selected provider image name replaces the
+cached OS shown on the list and details screens. A later provider refresh
+reconciles that name with the provider's reported image. IP addresses on the
+list, details and IP inventory screens, and the default Hetzner SSH port (22)
+where a public IP exists, use Telegram code entities for tap-to-copy. The
+one-time SSH username and password are likewise copyable in their protected
+private-chat message. The port is a default, not a claim about user-modified
+SSH configuration.
+
+Adapters opt into automatic authoritative inventory reads through
+`VpsCapabilities.authoritative_inventory`; generic management does not branch
+on provider names. Reads stay pinned to the server's credential account.
+For an authoritative adapter, unavailable/missing inventory proof hides cached
+OS/display names rather than presenting them as current provider facts.
+Commercial status remains independent of infrastructure state and readable
+without a configured provider adapter.
+
 ## Capability matrix
 
 | Operation            | Customer | Confirmation | Notes |

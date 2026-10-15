@@ -24,6 +24,8 @@ Wire aliases (Telegram's 64-byte button limit):
   The codec maps long screens to compact wire aliases on encode and back on
   decode, so navigation semantics never change while ``callback_data`` stays
   within :data:`TELEGRAM_CALLBACK_DATA_LIMIT_BYTES`.
+- Recharge start uses a compact flow/screen pair as well, leaving room for
+  the full amount, gateway and AtlasPay attempt nonce.
 - The HMAC always covers the CANONICAL key, so an aliased callback and its
   literal pre-alias form verify identically: callbacks signed before an
   alias existed keep working, and no signature strength is lost.

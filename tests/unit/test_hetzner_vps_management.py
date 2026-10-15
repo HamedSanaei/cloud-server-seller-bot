@@ -16,7 +16,11 @@ from cloud_platform.providers.errors import (
     ProviderOutcomeUnknown,
 )
 from cloud_platform.providers.hetzner.client import HetznerCloudProvider
-from cloud_platform.providers.vps_ports import vps_capabilities_of
+from cloud_platform.providers.vps_ports import (
+    VpsActionAccepted,
+    VpsPasswordIssued,
+    vps_capabilities_of,
+)
 
 BASE = "https://api.hetzner.cloud/v1"
 
@@ -39,15 +43,25 @@ def _server(**changes: Any) -> dict[str, Any]:
         "location": {"name": "fsn1"},
         "datacenter": None,
         "server_type": {"name": "cx22", "architecture": "x86", "disk": 40},
-        "image": {"id": 11, "name": "Ubuntu"},
+        "image": {
+            "id": 210163284,
+            "name": "centos-stream-10",
+            "description": "CentOS Stream 10",
+            "os_flavor": "centos",
+            "type": "system",
+        },
         "public_net": {"ipv4": {"ip": "192.0.2.3"}, "ipv6": {"ip": "2001:db8::1"}},
     }
     row.update(changes)
     return row
 
 
-def _page(key: str, values: list[dict[str, Any]], next_page: int | None = None) -> httpx.Response:
-    return httpx.Response(200, json={key: values, "meta": {"pagination": {"next_page": next_page}}})
+def _page(
+    key: str, values: list[dict[str, Any]], next_page: int | None = None, *, page: int = 1
+) -> httpx.Response:
+    return httpx.Response(
+        200, json={key: values, "meta": {"pagination": {"page": page, "next_page": next_page}}}
+    )
 
 
 def _action() -> httpx.Response:
@@ -63,6 +77,7 @@ def test_advertises_only_supported_groups() -> None:
     provider = _provider(lambda request: httpx.Response(500))
     caps = vps_capabilities_of(provider.vps_management)
     assert caps.inventory and caps.power and caps.reinstall
+    assert caps.credentials and caps.deletion
     assert not any(
         (
             caps.console,
@@ -71,13 +86,95 @@ def test_advertises_only_supported_groups() -> None:
             caps.snapshots,
             caps.metrics,
             caps.monitoring,
-            caps.credentials,
             caps.notifications,
         )
     )
     assert not hasattr(provider.vps_management, "create_vps_snapshot")
     assert not hasattr(provider.vps_management, "get_console_session")
     assert not hasattr(provider.vps_management, "null_route_vps_ip")
+    assert provider.vps_management.supports_customer_delete
+    assert not hasattr(provider.vps_management, "list_vps_credentials")
+
+
+async def test_reset_password_returns_redacted_one_time_provider_credential() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "action": {
+                    "id": 10,
+                    "status": "running",
+                    "resources": [{"type": "server", "id": 42}],
+                },
+                "root_password": "issued-after-reset",  # pragma: allowlist secret
+            },
+        )
+
+    provider = _provider(handler)
+    try:
+        result = await provider.vps_management.reset_vps_password("42")
+        assert isinstance(result, VpsActionAccepted)
+        assert result.provider_server_id == "42"
+        assert result.action == "reset_password"
+        assert "issued-after-reset" not in repr(result)
+        assert "issued-after-reset" not in str(result)
+        assert result.root_password is not None
+        assert result.root_password.reveal() == "issued-after-reset"
+        assert result.root_password.reveal() is None
+        assert len(calls) == 1
+        assert calls[0].method == "POST"
+        assert calls[0].url.path == "/v1/servers/42/actions/reset_password"
+        assert not calls[0].content
+    finally:
+        await provider.close()
+
+
+@pytest.mark.parametrize("password", [None, "", "  ", 123, ["not-a-password"]])
+async def test_reset_password_rejects_missing_or_invalid_provider_password(password: Any) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        payload = {
+            "action": {"id": 10, "resources": [{"type": "server", "id": 42}]},
+        }
+        if password is not None:
+            payload["root_password"] = password
+        return httpx.Response(201, json=payload)
+
+    provider = _provider(handler)
+    try:
+        with pytest.raises(ProviderOutcomeUnknown, match="root password"):
+            await provider.vps_management.reset_vps_password("42")
+        assert len(calls) == 1
+    finally:
+        await provider.close()
+
+
+async def test_reset_password_rejects_response_for_another_server() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "action": {"id": 10, "resources": [{"type": "server", "id": 77}]},
+                "root_password": "belongs-to-another-server",  # pragma: allowlist secret
+            },
+        )
+
+    provider = _provider(handler)
+    try:
+        with pytest.raises(ProviderOutcomeUnknown, match="server mismatch") as error:
+            await provider.vps_management.reset_vps_password("42")
+        assert "belongs-to-another-server" not in str(error.value)
+        assert len(calls) == 1
+    finally:
+        await provider.close()
 
 
 async def test_inventory_maps_location_state_and_ips_and_pages() -> None:
@@ -91,7 +188,7 @@ async def test_inventory_maps_location_state_and_ips_and_pages() -> None:
         assert request.url.path.endswith("/servers")
         if request.url.params["page"] == "1":
             return _page("servers", [_server()], 2)
-        return _page("servers", [_server(id=43, status="off", name="second")])
+        return _page("servers", [_server(id=43, status="off", name="second")], page=2)
 
     provider = _provider(handler)
     try:
@@ -105,9 +202,35 @@ async def test_inventory_maps_location_state_and_ips_and_pages() -> None:
         )
         assert one.metadata["ipv4"] == "192.0.2.3"
         assert one.metadata["ipv6"] == "2001:db8::1"
+        assert one.image_id == "210163284"
+        assert one.image_name == "CentOS Stream 10"
         rows = await provider.vps_management.list_vps_info()
         assert [(row.id, row.state) for row in rows] == [("42", "running"), ("43", "off")]
         assert len(calls) == 3
+    finally:
+        await provider.close()
+
+
+async def test_inventory_does_not_claim_os_from_unknown_or_custom_image() -> None:
+    provider = _provider(lambda request: httpx.Response(200, json={"server": _server(image=None)}))
+    try:
+        unknown = await provider.vps_management.get_vps_info("42")
+        assert unknown is not None
+        assert unknown.image_name is None
+    finally:
+        await provider.close()
+
+    provider = _provider(
+        lambda request: httpx.Response(
+            200,
+            json={"server": _server(image={"id": 999, "name": "old-ubuntu", "type": "snapshot"})},
+        )
+    )
+    try:
+        custom = await provider.vps_management.get_vps_info("42")
+        assert custom is not None
+        assert custom.image_id == "999"
+        assert custom.image_name is None
     finally:
         await provider.close()
 
@@ -217,8 +340,9 @@ async def test_reinstall_lists_compatible_system_images_then_rebuilds() -> None:
                 [
                     {
                         "id": 11,
-                        "name": "Ubuntu",
-                        "os_flavor": "ubuntu",
+                        "name": "centos-stream-10",
+                        "description": "CentOS Stream 10",
+                        "os_flavor": "centos",
                         "architecture": "x86",
                         "type": "system",
                         "status": "available",
@@ -237,19 +361,103 @@ async def test_reinstall_lists_compatible_system_images_then_rebuilds() -> None:
             )
         assert request.url.path == "/v1/servers/42/actions/rebuild"
         assert json.loads(request.content) == {"image": "11"}
-        return _action()
+        return httpx.Response(
+            201,
+            json={
+                "action": {
+                    "id": 10,
+                    "status": "running",
+                    "resources": [{"type": "server", "id": 42}],
+                },
+                "root_password": "issued-after-rebuild",  # pragma: allowlist secret
+            },
+        )
 
     provider = _provider(handler)
     try:
         images = await provider.vps_management.list_vps_reinstall_images("42")
         assert [row.id for row in images] == ["11"]
+        assert images[0].name == "CentOS Stream 10"
+        assert images[0].family == "centos"
         with pytest.raises(ProviderError, match="not installable"):
             await provider.vps_management.reinstall_vps("42", "12")
         with pytest.raises(ProviderError, match="market apps"):
             await provider.vps_management.reinstall_vps("42", "11", "unsupported")
         accepted = await provider.vps_management.reinstall_vps("42", "11")
+        assert isinstance(accepted, VpsActionAccepted)
+        assert isinstance(accepted, VpsPasswordIssued)
         assert accepted.action == "reinstall"
+        assert accepted.root_password is not None
+        assert "issued-after-rebuild" not in repr(accepted)
+        assert "issued-after-rebuild" not in str(accepted)
+        assert accepted.root_password.reveal() == "issued-after-rebuild"
+        assert accepted.root_password.reveal() is None
         assert [request.method for request in calls].count("POST") == 1
+    finally:
+        await provider.close()
+
+
+@pytest.mark.parametrize("password_field", [{}, {"root_password": None}])
+async def test_reinstall_accepts_ssh_key_response_without_password(
+    password_field: dict[str, Any],
+) -> None:
+    posts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+            return httpx.Response(
+                201,
+                json={
+                    "action": {"id": 10, "resources": [{"type": "server", "id": 42}]},
+                    **password_field,
+                },
+            )
+        if request.url.path.endswith("/images"):
+            return _page(
+                "images",
+                [{"id": 11, "architecture": "x86", "type": "system", "status": "available"}],
+            )
+        return httpx.Response(200, json={"server": _server()})
+
+    provider = _provider(handler)
+    try:
+        result = await provider.vps_management.reinstall_vps("42", "11")
+        assert isinstance(result, VpsPasswordIssued)
+        assert result.root_password is None
+        assert len(posts) == 1
+    finally:
+        await provider.close()
+
+
+@pytest.mark.parametrize("password", ["", "   ", 123, {"not": "a-password"}])
+async def test_reinstall_rejects_malformed_password_without_reissuing_rebuild(
+    password: Any,
+) -> None:
+    posts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+            return httpx.Response(
+                201,
+                json={
+                    "action": {"id": 10, "resources": [{"type": "server", "id": 42}]},
+                    "root_password": password,
+                },
+            )
+        if request.url.path.endswith("/images"):
+            return _page(
+                "images",
+                [{"id": 11, "architecture": "x86", "type": "system", "status": "available"}],
+            )
+        return httpx.Response(200, json={"server": _server()})
+
+    provider = _provider(handler)
+    try:
+        with pytest.raises(ProviderOutcomeUnknown, match="root password"):
+            await provider.vps_management.reinstall_vps("42", "11")
+        assert len(posts) == 1
     finally:
         await provider.close()
 

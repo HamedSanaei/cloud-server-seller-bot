@@ -786,8 +786,43 @@ class Container:
             create_attempts=self.create_account_attempt_repository(),
         )
 
+    def admin_wallet_service(self) -> Any:
+        from cloud_platform.modules.wallet.admin import AdminWalletService
+
+        return AdminWalletService(
+            user_repo=self.user_repository(), wallet_repo=self.wallet_repository()
+        )
+
+    def prepaid_hourly_billing_service(self) -> Any:
+        from cloud_platform.modules.billing.repository import (
+            PostgresAdvisoryAccrualLock,
+            SqlAlchemyPrepaidHourlyPeriodRepository,
+        )
+        from cloud_platform.modules.billing.service import PrepaidHourlyBillingService
+        from cloud_platform.modules.pricing.repository import (
+            SqlAlchemyServerPriceSnapshotRepository,
+        )
+
+        resolver = self.fx_resolver_or_none()
+        if resolver is None or not get_settings().fx_allow_usdt_proxy_for_settlement:
+            raise RuntimeError(
+                "IRT prepaid billing requires explicit domestic USD proxy settlement"
+            )
+        return PrepaidHourlyBillingService(
+            server_repo=self.server_repository(),
+            wallet_repo=self.wallet_repository(),
+            ledger_repo=self.ledger_repository(),
+            snapshot_repo=SqlAlchemyServerPriceSnapshotRepository(self.session_factory),
+            period_repo=SqlAlchemyPrepaidHourlyPeriodRepository(self.session_factory),
+            fx_resolver=resolver,
+            lock=PostgresAdvisoryAccrualLock(self.session_factory),
+        )
+
     def hourly_cloud_service(self) -> Any:
         """Reserve the frozen first hour and persist the provider-create intent."""
+        from cloud_platform.modules.billing.repository import (
+            SqlAlchemyPrepaidHourlyPeriodRepository,
+        )
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
         from cloud_platform.modules.hourly.service import HourlyCloudService
         from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
@@ -806,8 +841,18 @@ class Container:
             SqlAlchemyWalletRepository,
         )
 
+        settings = get_settings()
+        prepaid_billing = (
+            self.prepaid_hourly_billing_service()
+            if settings.fx_enabled
+            and settings.fx_domestic_enabled
+            and settings.fx_allow_usdt_proxy_for_settlement
+            else None
+        )
         return HourlyCloudService(
             server_repo=SqlAlchemyServerRepository(self.session_factory),
+            prepaid_billing=prepaid_billing,
+            period_repo=SqlAlchemyPrepaidHourlyPeriodRepository(self.session_factory),
             offers_repo=self.sellable_offer_repository(),
             account_repo=SqlAlchemyProviderAccountRepository(self.session_factory),
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
@@ -1473,6 +1518,61 @@ class Container:
 
         return ServerManagementPolicy.from_settings(get_settings())
 
+    def delete_command_service(self) -> Any:
+        """Owner-checked, idempotent deletion saga shared with the worker."""
+        from cloud_platform.modules.billing.repository import (
+            PostgresAdvisoryAccrualLock,
+            SqlAlchemyAccrualPeriodRepository,
+        )
+        from cloud_platform.modules.billing.service import FinalChargeService
+        from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.operations.service import DeleteCommandService
+        from cloud_platform.modules.pricing.repository import (
+            SqlAlchemyServerPriceSnapshotRepository,
+        )
+        from cloud_platform.modules.wallet.repository import (
+            SqlAlchemyHoldRepository,
+            SqlAlchemyLedgerRepository,
+        )
+
+        wallets = self.wallet_repository()
+        holds = SqlAlchemyHoldRepository(self.session_factory)
+        hold_service = self.hold_service()
+        final_charge = FinalChargeService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            wallet_repo=wallets,
+            hold_repo=holds,
+            hold_service=hold_service,
+            ledger_repo=SqlAlchemyLedgerRepository(self.session_factory),
+            accrual_repo=SqlAlchemyAccrualPeriodRepository(self.session_factory),
+            snapshot_repo=SqlAlchemyServerPriceSnapshotRepository(self.session_factory),
+            audit_repo=self.audit_repository(),
+            lock=PostgresAdvisoryAccrualLock(self.session_factory),
+        )
+        return DeleteCommandService(
+            server_repo=SqlAlchemyServerRepository(self.session_factory),
+            operation_repo=SqlAlchemyOperationRepository(self.session_factory),
+            provider_registry=self.provider_registry,
+            final_charge=final_charge,
+            hold_repo=holds,
+            hold_service=hold_service,
+            wallet_repo=wallets,
+            audit_repo=self.audit_repository(),
+        )
+
+    def prepaid_provider_lifecycle_service(self) -> Any:
+        """Provider-observed, owner-authorized stop and deferred delete."""
+        from cloud_platform.modules.operations.service import PrepaidProviderLifecycleService
+
+        return PrepaidProviderLifecycleService(
+            server_repo=self.server_repository(),
+            wallet_repo=self.wallet_repository(),
+            provider_registry=self.provider_registry,
+            power_commands=self.power_command_service(),
+            delete_commands=self.delete_command_service(),
+        )
+
     def server_management_service(self) -> Any:
         """Customer-facing, ownership-safe server management (Telegram).
 
@@ -1493,6 +1593,7 @@ class Container:
             power=self.power_command_service(),
             operations=SqlAlchemyOperationRepository(self.session_factory),
             credential_store=self.server_credential_store(),
+            delete_command=self.delete_command_service(),
             event_sink=self.business_event_sink(),
             # Commercial status + manual renewal come from the SAME checker the
             # worker runs, so the customer's "renew now" and the automatic pass

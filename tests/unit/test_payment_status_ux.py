@@ -75,6 +75,20 @@ class TestPaymentStatusUx:
         screen = render_payment_status(session, amount_text="50,000")
         assert "ناموفق" in screen.text
 
+    def test_underpaid_review_is_not_claimed_failed_or_credited(self) -> None:
+        session = PaymentSession(
+            user_id=uuid4(),
+            gateway_key="atlaspay",
+            amount_minor=200000,
+            currency="IRT",
+            idempotency_key="test-atlaspay-underpaid-1",
+            gateway_payment_id="58",
+            status=PaymentSessionStatus.MANUAL_REVIEW,
+        )
+        screen = render_payment_status(session, amount_text="200,000")
+        assert screen.text == Translator().t("payment.manual_review")
+        assert screen.keyboard is None
+
     def test_created_screen_has_pay_and_check_buttons(self) -> None:
         screen = render_payment_created("https://pay.example/A0001", amount_text="50,000")
         assert screen.keyboard is not None

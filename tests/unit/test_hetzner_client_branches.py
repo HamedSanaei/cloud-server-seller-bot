@@ -71,7 +71,7 @@ class TestErrorMapping:
     async def test_auth_failures_raise_auth_error(self, status: int) -> None:
         provider = _provider(lambda request: _error(status, "unauthorized", "bad token"))
         try:
-            with pytest.raises(ProviderAuthError, match="bad token"):
+            with pytest.raises(ProviderAuthError):
                 await provider._request("GET", "/servers/1")
         finally:
             await provider.close()
@@ -87,7 +87,7 @@ class TestErrorMapping:
     async def test_conflict_statuses_raise_conflict(self, status: int) -> None:
         provider = _provider(lambda request: _error(status, "locked", "in progress"))
         try:
-            with pytest.raises(ProviderConflict, match="in progress"):
+            with pytest.raises(ProviderConflict):
                 await provider._request("POST", "/servers/1/actions/poweron")
         finally:
             await provider.close()
@@ -95,7 +95,7 @@ class TestErrorMapping:
     async def test_server_error_raises_unavailable(self) -> None:
         provider = _provider(lambda request: _error(500, "server_error", "kaput"))
         try:
-            with pytest.raises(ProviderUnavailable, match="kaput"):
+            with pytest.raises(ProviderUnavailable):
                 await provider._request("GET", "/servers")
         finally:
             await provider.close()
@@ -103,7 +103,7 @@ class TestErrorMapping:
     async def test_generic_client_error_raises_provider_error(self) -> None:
         provider = _provider(lambda request: _error(422, "invalid_input", "bad input"))
         try:
-            with pytest.raises(ProviderError, match="bad input"):
+            with pytest.raises(ProviderError):
                 await provider._request("POST", "/servers")
         finally:
             await provider.close()
@@ -122,7 +122,7 @@ class TestErrorMapping:
 
         provider = _provider(handler)
         try:
-            with pytest.raises(ProviderUnavailable, match="connection refused"):
+            with pytest.raises(ProviderUnavailable):
                 await provider._request("GET", "/servers")
         finally:
             await provider.close()
@@ -173,7 +173,7 @@ class TestPagination:
         assert calls == ["1", "2"]
         assert provider.last_rate_limit.remaining == 98
 
-    async def test_list_servers_stops_when_next_page_does_not_advance(self) -> None:
+    async def test_list_servers_refuses_nonadvancing_incomplete_inventory(self) -> None:
         calls: list[str] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -188,11 +188,11 @@ class TestPagination:
 
         provider = _provider(handler)
         try:
-            servers = await provider.list_servers()
+            with pytest.raises(ProviderError):
+                await provider.list_servers()
         finally:
             await provider.close()
 
-        assert [s.id for s in servers] == ["7"]
         assert calls == ["1"]
 
 

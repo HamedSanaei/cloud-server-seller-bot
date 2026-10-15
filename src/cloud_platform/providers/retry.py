@@ -156,14 +156,14 @@ class RetryExecutor:
                 return await operation()
             except Exception as exc:
                 if classify_provider_error(exc) is ErrorClass.PERMANENT:
-                    logger.warning("permanent provider error; not retrying: %s", exc)
+                    logger.warning("permanent provider error; not retrying: %s", type(exc).__name__)
                     raise
                 last_error = exc
                 if attempt == self._policy.max_attempts:
                     logger.warning(
                         "provider operation exhausted %d attempts; last error: %s",
                         self._policy.max_attempts,
-                        exc,
+                        type(exc).__name__,
                     )
                     break
                 delay = self.compute_delay(attempt - 1, exc)
@@ -172,7 +172,7 @@ class RetryExecutor:
                     delay,
                     attempt,
                     self._policy.max_attempts,
-                    exc,
+                    type(exc).__name__,
                 )
                 await self._sleep_fn(delay)
         # Unreachable: the loop either returns or raises.

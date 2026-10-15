@@ -133,6 +133,7 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("features", "server_management", "traffic"): "server_management_traffic",
     ("features", "server_management", "snapshots"): "server_management_snapshots",
     ("features", "server_management", "reinstall"): "server_management_reinstall",
+    ("features", "server_management", "deletion"): "server_management_deletion",
     ("features", "server_management", "password_reset"): ("server_management_password_reset"),
     ("features", "server_management", "iso"): "server_management_iso",
     ("features", "server_management", "ip_management"): ("server_management_ip_management"),
@@ -346,7 +347,7 @@ class LeasewebAccountSettings(BaseModel):
     or diagnostics show only the stable account id and a length hint.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     id: str
     api_key: str = ""
@@ -394,7 +395,7 @@ class LeasewebAccountSettings(BaseModel):
 class HetznerAccountSettings(BaseModel):
     """Operator-configured credential/Project; the ceiling is not API-discovered."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     id: str
     api_token: str = Field(default="", repr=False, exclude=True)
@@ -703,7 +704,12 @@ class _TomlSettingsSource(PydanticBaseSettingsSource):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
     app_env: str = "development"
     log_level: str = "INFO"
@@ -904,7 +910,7 @@ class Settings(BaseSettings):
     fx_frankfurter_max_stale_seconds: int = Field(default=345600, ge=0)
     fx_frankfurter_catalog_max_stale_seconds: int = Field(default=86400, ge=0)
     fx_global_fiat_provider: str = "frankfurter"
-    default_currency: str = "USD"
+    default_currency: str = "IRT"
     # The OPERATOR-declared price book the selling price is derived from
     # (M08-005): confirmation, holds and immutable server price snapshots
     # all read the SAME book. There is no versioned book by default.
@@ -912,6 +918,7 @@ class Settings(BaseSettings):
     customer_billing_quantum_seconds: int = Field(default=3600, ge=60)
     low_balance_threshold_minor: int = Field(default=5000, ge=0)
     low_balance_grace_hours: int = Field(default=24, ge=0)
+
     backup_output_dir: str = "./backups"
     backup_retention_days: int = Field(default=14, ge=1)
     backup_encryption_key: str = ""
@@ -949,6 +956,7 @@ class Settings(BaseSettings):
     server_management_traffic: bool = True
     server_management_snapshots: bool = True
     server_management_reinstall: bool = True
+    server_management_deletion: bool = True
     server_management_password_reset: bool = True
     server_management_iso: bool = False
     server_management_ip_management: bool = True
@@ -1108,6 +1116,15 @@ class Settings(BaseSettings):
         return any(account.enabled and account.has_credential for account in self.leaseweb_accounts)
 
     @model_validator(mode="after")
+    def _restrict_header_identity(self) -> Settings:
+        if self.api_allow_header_identity and self.app_env.strip().lower() not in {
+            "development",
+            "test",
+        }:
+            raise ValueError("api.allow_header_identity is limited to development/test")
+        return self
+
+    @model_validator(mode="after")
     def _enforce_production_session_backend(self) -> Settings:
         """Production must use the shared Redis transient-state backend.
 
@@ -1128,6 +1145,15 @@ class Settings(BaseSettings):
                 "'production' (production compose sets "
                 "TELEGRAM_SESSIONS_BACKEND=redis)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _irt_low_balance_default(self) -> Settings:
+        if (
+            self.default_currency.upper() == "IRT"
+            and "low_balance_threshold_minor" not in self.model_fields_set
+        ):
+            self.low_balance_threshold_minor = 200_000
         return self
 
     @model_validator(mode="after")

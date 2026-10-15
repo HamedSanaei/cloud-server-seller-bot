@@ -97,7 +97,7 @@ async def create_token(
     service: Annotated[TokenService, Depends(_token_service)],
     _key: Annotated[str, Depends(require_idempotency_key)],
 ) -> dict[str, Any]:
-    """Returns the plaintext token EXACTLY ONCE; only a hash is stored."""
+    """Mint a token bounded by this authenticator's scopes; reveal it once."""
     name = body.get("name")
     scopes_raw = body.get("scopes")
     if not isinstance(name, str) or not isinstance(scopes_raw, list):
@@ -106,6 +106,8 @@ async def create_token(
         scopes = frozenset(TokenScope(s) for s in scopes_raw)
     except ValueError as exc:
         raise ApiError(ErrorCode.VALIDATION_ERROR, f"unknown scope: {exc}") from exc
+    if not scopes <= auth.scopes:
+        raise ApiError(ErrorCode.FORBIDDEN, "requested scopes exceed authenticated token scopes")
     token, plaintext = await service.create(
         actor_user_id=auth.user_id, owner_user_id=auth.user_id, name=name, scopes=scopes
     )

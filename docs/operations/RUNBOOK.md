@@ -76,15 +76,20 @@ encrypted with the 32-byte key in `BACKUP_ENCRYPTION_KEY`.
    ```
 
    The job selects the backup file, decrypts it with the configured key,
-   and streams the SQL through `psql --single-transaction` (all-or-nothing).
-   It prints `restore ok: <filename>` on success and
-   `restore failed: <reason>` (scrubbed: no DSN, no password) otherwise.
+   and streams SQL through `psql --single-transaction --set=ON_ERROR_STOP=on
+   --file=- --no-psqlrc --no-password`. The explicit stdin file makes psql
+   apply the single transaction to the stream; SQL errors stop and roll back
+   the entire restore, including preceding DDL.
+   It prints `restore ok: <filename>` on success and a scrubbed
+   `restore failed: <reason>` otherwise, without DSN/password exception chains.
 3. Verify the clean environment: table count and a spot-check query
    (e.g. `select count(*) from wallets;`) match the production snapshot;
    the restore's single transaction means a failed restore leaves the
    clean DB untouched.
 
-**Safety properties** (all covered by `tests/unit/test_restore_drill.py`):
+**Safety properties** (unit contracts in `tests/unit/test_restore_drill.py`;
+real PostgreSQL encrypted round-trip and SQL-error rollback in
+`tests/live/test_postgres_backup_restore.py`):
 - A wrong `BACKUP_ENCRYPTION_KEY` (or a corrupted file) fails the Fernet
   MAC and aborts BEFORE anything reaches the database.
 - Only files matching the platform's own name pattern are ever selected;
@@ -282,6 +287,16 @@ contract: `docs/leaseweb/PROVIDER_CONTRACT.md`.
    remain unavailable: both can incur separate charges, and customer price books,
    wallet settlement, and safe reconciliation for those resources are not yet wired.
    The management screen never allocates or replaces an IP implicitly.
+   For Hetzner VPS, management also offers a two-step permanent deletion.
+   The owner-authorized delete saga verifies provider absence before the final
+   usage charge; a pending/requeued deletion is not presented as complete.
+   LeaseWeb ordering VPS has no verified cancellation API, so this button is
+   not offered for that adapter. OS reinstall reports provider acceptance,
+   not completion: refresh the details to see the current provider image.
+   Hetzner password reset requires a running Linux guest with qemu guest agent.
+   Provider-issued reset/rebuild passwords replace any old cached credential
+   and are revealed only once in the private bot chat; a rebuild with no new
+   password invalidates the previously saved password.
    Once the provider confirms an hourly server is running, the worker persists
    its assigned IP and sends the owner a private Telegram success notification.
    New Hetzner system-image servers created without an SSH key can expose their

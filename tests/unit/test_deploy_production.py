@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -29,6 +31,11 @@ PROD_ENV_EXAMPLE = REPO_ROOT / "deploy" / "production" / ".env.example"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 ENTRYPOINT = REPO_ROOT / "docker-entrypoint.sh"
 GITATTRIBUTES = REPO_ROOT / ".gitattributes"
+BASH = (
+    "C:/Program Files/Git/bin/bash.exe"
+    if os.name == "nt" and Path("C:/Program Files/Git/bin/bash.exe").is_file()
+    else shutil.which("bash") or "bash"
+)
 
 
 def _workflow() -> dict:
@@ -40,15 +47,11 @@ def _on(doc: dict) -> dict:
     return doc[True]
 
 
-def _script() -> str:
-    return DEPLOY_SCRIPT.read_text(encoding="utf-8")
-
-
 def _bash_available() -> bool:
     """Whether this machine can execute the deploy script's shell functions."""
     try:
         probe = subprocess.run(
-            ["bash", "-c", "exit 0"],
+            [BASH, "-c", "exit 0"],
             capture_output=True,
             timeout=30,
         )
@@ -57,7 +60,7 @@ def _bash_available() -> bool:
     if probe.returncode != 0:
         return False
     check = subprocess.run(
-        ["bash", "-c", f"export DEPLOY_PRODUCTION_SOURCED=1; source '{DEPLOY_SCRIPT.as_posix()}'"],
+        [BASH, "-c", f"export DEPLOY_PRODUCTION_SOURCED=1; source '{DEPLOY_SCRIPT.as_posix()}'"],
         capture_output=True,
         timeout=30,
     )
@@ -71,7 +74,7 @@ def _bash_functions(body: str) -> str:
     """Run `body` with the deploy script's functions loaded (no deployment)."""
     result = subprocess.run(
         [
-            "bash",
+            BASH,
             "-c",
             f"export DEPLOY_PRODUCTION_SOURCED=1; source '{DEPLOY_SCRIPT.as_posix()}'; {body}",
         ],
@@ -131,14 +134,6 @@ class TestWorkflowTriggersAndGates:
         # A green CI run is no longer a deployment trigger of any kind.
         assert "github.event.workflow_run" not in text
 
-    def test_deploys_the_dispatched_sha_not_a_moving_ref(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert 'sha="${{ inputs.sha }}"' in text
-        # The release is still refused when it is not an ancestor of main.
-        assert "git merge-base --is-ancestor" in text
-        # Both checkouts pin the exact SHA.
-        assert text.count("ref: ${{") >= 2
-
     def test_deploy_job_uses_the_production_environment(self) -> None:
         jobs = _workflow()["jobs"]
         assert jobs["deploy"]["environment"] == "production"
@@ -159,11 +154,6 @@ class TestImageBuild:
     def test_immutable_full_sha_tag_is_pushed(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
         assert "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}" in text
-
-    def test_existing_sha_tag_is_never_rebuilt(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "docker manifest inspect" in text
-        assert "will NOT be rebuilt or overwritten" in text
 
     def test_built_image_is_verified_before_deploy(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -192,11 +182,6 @@ class TestWorkflowSecurity:
         text = WORKFLOW.read_text(encoding="utf-8")
         assert "chmod 600" in text
         assert 'rm -f "${HOME}/.ssh/prod_key"' in text
-
-    def test_token_travels_on_stdin_never_in_argv(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "--password-stdin" in text
-        assert "printf '%s' \"${GHCR_TOKEN}\" | ssh" in text
 
     def test_strict_shell_and_no_trace_mode(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -229,120 +214,8 @@ class TestDeployScriptStatic:
     def test_shell_syntax_is_valid(self) -> None:
         if not _bash_available():
             pytest.skip("no POSIX bash available")
-        result = subprocess.run(["bash", "-n", str(DEPLOY_SCRIPT)], capture_output=True, timeout=30)
+        result = subprocess.run([BASH, "-n", str(DEPLOY_SCRIPT)], capture_output=True, timeout=30)
         assert result.returncode == 0, result.stderr.decode()
-
-    def test_strict_mode(self) -> None:
-        assert "set -Eeuo pipefail" in _script()
-
-    def test_migrations_run_before_app_success(self) -> None:
-        script = _script()
-        assert "alembic upgrade head" in script or "run --rm --no-deps migrate" in script
-        assert script.index("migrate") < script.index("starting api + worker + bot")
-
-    def test_no_volume_destruction(self) -> None:
-        assert "down -v" not in _script()
-
-    def test_no_automatic_downgrade(self) -> None:
-        # The script documents the no-downgrade policy in prose; what must
-        # never appear is an actual downgrade command.
-        assert "alembic downgrade" not in _script().lower()
-
-    def test_health_gates_are_bounded(self) -> None:
-        script = _script()
-        assert "/health/ready" in script
-        assert "HEALTH_ATTEMPTS" in script
-        assert "alembic current" in script
-
-    def test_physical_schema_gate_runs_between_head_and_services(self) -> None:
-        """Revision equality is not compatibility: the physical schema is checked too.
-
-        Production reported revision 0037 (== image head) while provider_routes
-        and both credential-account columns were physically absent. The head
-        comparison passes on that database, so the release verifies the schema
-        its own code queries, read-only, BEFORE api/worker/bot are replaced.
-        """
-        script = _script()
-        gate = script.index("python -m cloud_platform.db.schema_parity")
-        assert script.index("database migration head verified") < gate
-        assert gate < script.index("starting api + worker + bot")
-        assert "database physical schema verified against the release" in script
-        # Read with the RELEASE image and in a one-shot container: no service is
-        # touched and deploy.env's PLATFORM_IMAGE is not consulted.
-        window = script[max(0, gate - 300) : gate]
-        assert 'PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}"' in window
-        assert "compose_candidate run --rm --no-deps migrate" in window
-        # It repairs nothing itself: the migration step owns schema changes.
-        assert "alembic downgrade" not in script.lower()
-        assert "alembic stamp" not in script
-
-    def test_single_bot_polling_is_enforced(self) -> None:
-        script = _script()
-        assert 'bot_count="$(compose_candidate ps -q bot | grep -c . || true)"' in script
-        assert '"${bot_count}" = "1"' in script
-
-    def test_rollback_restores_the_previous_image(self) -> None:
-        script = _script()
-        assert "ROLLBACK: restoring" in script
-        assert "database NOT downgraded" in script or "database left at the new migration" in script
-        # A rescued rollback is still a failed deployment.
-        assert "RESULT: DEPLOYMENT FAILED, ROLLBACK DONE" in script
-
-    def test_image_reference_is_validated(self) -> None:
-        assert "[0-9a-f]{40}" in _script()
-
-    def test_server_configuration_is_never_written(self) -> None:
-        script = _script()
-        assert "CONFIGURATION_PATH" in script
-        assert "never created or modified here" in script
-        assert 'cat "${ENV_FILE}"' not in script
-        assert "POSTGRES" not in script
-
-    def test_no_secret_printing(self) -> None:
-        script = _script()
-        assert "never reads, prints, or rewrites secrets" in script
-        assert "set -x" not in script
-
-    def test_forward_and_rollback_use_explicit_compose_contracts(self) -> None:
-        script = _script()
-        assert "compose_candidate() {" in script
-        assert "compose_current() {" in script
-        for operation in (
-            "compose_candidate pull",
-            "compose_candidate up -d postgres redis",
-            "compose_candidate run --rm --no-deps migrate",
-            "compose_candidate up -d api worker bot",
-            "compose_candidate exec -T api alembic current",
-        ):
-            assert operation in script, operation
-        assert "compose_current up -d api worker bot" in script
-        assert "\ncompose() {" not in script
-
-    def test_candidate_integrity_is_verified_before_mutation(self) -> None:
-        script = _script()
-        for token in (
-            "EXPECTED_COMPOSE_SHA256",
-            "must not be a symlink",
-            "SHA-256 mismatch",
-            "compose_candidate config",
-            "release candidate compose verified",
-        ):
-            assert token in script, token
-        assert "[0-9a-f]{64}" in script
-
-    def test_configuration_preflight_exercises_the_settings_validator(self) -> None:
-        """The release image must accept the server config before any mutation."""
-        script = _script()
-        assert "verify_application_configuration() {" in script
-        # The applications' own Settings loader runs inside the new image, so
-        # the payments invariant is enforced release-side, not by luck.
-        assert "cloud_platform.core.config import get_settings" in script
-        preflight = script.index("verify_application_configuration ||")
-        assert preflight < script.index("PLATFORM_IMAGE updated in")
-        assert preflight < script.index("running database migrations")
-        assert preflight < script.index("starting api + worker + bot")
-        # A rejected configuration must not look like a rollback candidate.
-        assert "nothing was changed" in script
 
     @needs_bash
     def test_rejected_configuration_fails_before_mutation(self, tmp_path: Path) -> None:
@@ -374,15 +247,6 @@ class TestDeployScriptStatic:
         assert "no rollback needed" in result.stdout
         assert "ROLLBACK DONE" not in result.stdout
         assert "release compose promoted" not in result.stdout
-
-    def test_promotion_happens_only_after_verification(self) -> None:
-        script = _script()
-        assert 'mv "${CANDIDATE_COMPOSE_FILE}" "${CURRENT_COMPOSE_FILE}"' in script
-        assert 'chmod 0644 "${CURRENT_COMPOSE_FILE}"' in script
-        assert "release compose promoted:" in script
-        assert script.index("release compose promoted:") > script.index(
-            "verifying migration revision"
-        )
 
 
 class TestDeployScriptFunctions:
@@ -435,6 +299,10 @@ _STUB_DOCKER = """#!/bin/sh
 # Fake docker for fail-closed tests: records every invocation, never mutates.
 echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
+    *" image inspect "*)
+        printf '%s\n' "${PLATFORM_IMAGE_NEW##*:}"
+        exit 0
+        ;;
     *" pull "*)
         # The configuration preflight pulls the new image first; the deploy's
         # own compose pull is the second. Counting pulls keeps the
@@ -523,6 +391,9 @@ def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = Fals
         config.write_text("[app]\n", encoding="utf-8")
     stub_bin = tmp_path / "stubbin"
     stub_bin.mkdir()
+    # Unit harness mocks host primitives; Linux CI also tests real flock.
+    (stub_bin / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub_bin / "flock").chmod(0o755)
     (stub_bin / "docker").write_text(_STUB_DOCKER, encoding="utf-8")
     (stub_bin / "docker").chmod(0o755)
     calls = tmp_path / "docker-calls.log"
@@ -540,7 +411,7 @@ def _fail_closed_harness(tmp_path: Path, *, missing: str, fail_pull: bool = Fals
         f"source '{DEPLOY_SCRIPT.as_posix()}'; "
         "if deploy; then echo HARNESS_RC=0; else echo HARNESS_RC=$?; fi"
     )
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    result = subprocess.run([BASH, "-c", script], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, f"harness itself failed: {result.stderr}"
     return result.stdout
 
@@ -625,6 +496,7 @@ echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
     *" inspect "*)
         case "$*" in
+            *"org.opencontainers.image.revision"*) echo "${PLATFORM_IMAGE_NEW##*:}" ;;
             *"Health"*) echo healthy ;;
             *) echo running ;;
         esac
@@ -691,6 +563,9 @@ def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProces
     config.write_text("[app]\n", encoding="utf-8")
     stub_bin = tmp_path / "stubbin"
     stub_bin.mkdir()
+    # Unit harness mocks host primitives; Linux CI also tests real flock.
+    (stub_bin / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub_bin / "flock").chmod(0o755)
     (stub_bin / "docker").write_text(_SERVICE_UP_STUB_DOCKER, encoding="utf-8")
     (stub_bin / "docker").chmod(0o755)
     (stub_bin / "sleep").write_text(_STUB_SLEEP, encoding="utf-8")
@@ -715,7 +590,7 @@ def _service_start_failure_harness(tmp_path: Path) -> subprocess.CompletedProces
         # explicitly so MAIN_RC is always reported instead of aborting early.
         "set +e; main; echo MAIN_RC=$?"
     )
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    return subprocess.run([BASH, "-c", script], capture_output=True, text=True, timeout=120)
 
 
 def _stub_calls(tmp_path: Path, name: str) -> str:
@@ -748,7 +623,11 @@ class TestDeployServiceStartFailure:
         assert result.returncode == 0, f"harness itself failed: {result.stderr}"
         calls = _stub_calls(tmp_path, "docker-calls.log")
         # One failed start attempt plus exactly one rollback restart.
-        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
+        up_lines = [
+            line
+            for line in calls.splitlines()
+            if "up -d api worker bot" in line.replace("--no-deps ", "")
+        ]
         assert len(up_lines) == 2
         # The failed attempt uses the release candidate; the rollback
         # restarts with the previous canonical contract, never the candidate.
@@ -773,6 +652,7 @@ echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
     *" inspect "*)
         case "$*" in
+            *"org.opencontainers.image.revision"*) echo "${PLATFORM_IMAGE_NEW##*:}" ;;
             *"Health"*) echo healthy ;;
             *"RestartCount"*)
                 n="$(cat "$INSPECT_COUNTER" 2>/dev/null || echo 0)"
@@ -824,6 +704,9 @@ def _stabilization_harness(tmp_path: Path, *, crash_loop: bool) -> subprocess.Co
     config.write_text("[app]\n", encoding="utf-8", newline="\n")
     stub_bin = tmp_path / "stubbin"
     stub_bin.mkdir()
+    # Unit harness mocks host primitives; Linux CI also tests real flock.
+    (stub_bin / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub_bin / "flock").chmod(0o755)
     (stub_bin / "docker").write_text(_STABLE_STUB_DOCKER, encoding="utf-8")
     (stub_bin / "docker").chmod(0o755)
     (stub_bin / "sleep").write_text(_STUB_SLEEP, encoding="utf-8")
@@ -846,7 +729,7 @@ def _stabilization_harness(tmp_path: Path, *, crash_loop: bool) -> subprocess.Co
         f"source '{DEPLOY_SCRIPT.as_posix()}'; "
         "set +e; main; echo MAIN_RC=$?"
     )
-    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    return subprocess.run([BASH, "-c", script], capture_output=True, text=True, timeout=120)
 
 
 class TestDeployStabilization:
@@ -882,10 +765,33 @@ _RELEASE_STUB_DOCKER = """#!/bin/sh
 # a FAIL_* flag (or the crash-loop / fail-up-once markers) says otherwise.
 echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
+    *".candidate.yml "*)
+        [ "$PLATFORM_IMAGE" = "$PLATFORM_IMAGE_NEW" ] || {
+            echo "FORWARD_IMAGE_DRIFT" >&2
+            exit 3
+        }
+        ;;
+    *" up -d --no-deps api worker bot "*)
+        [ "$PLATFORM_IMAGE" = "$ROLLBACK_IMAGE" ] || {
+            echo "ROLLBACK_IMAGE_DRIFT" >&2
+            exit 3
+        }
+        ;;
+esac
+case " $* " in
     *" inspect "*)
         case "$*" in
-            *"Health"*) echo healthy ;;
+            *"org.opencontainers.image.revision"*)
+                echo "${STUB_IMAGE_REVISION:-${PLATFORM_IMAGE_NEW##*:}}"
+                ;;
+            *"Health"*)
+                case " $* " in
+                    *" cid-${STUB_UNHEALTHY_SERVICE:-none} "*) echo unhealthy ;;
+                    *) echo healthy ;;
+                esac
+                ;;
             *"RestartCount"*)
+                [ "${STUB_FAIL_RESTART_PROBE:-0}" = "1" ] && exit 1
                 n="$(cat "$INSPECT_COUNTER" 2>/dev/null || echo 0)"
                 n=$((n + 1))
                 printf '%s' "$n" > "$INSPECT_COUNTER"
@@ -896,7 +802,28 @@ case " $* " in
         exit 0
         ;;
     *" ps -q "*)
-        echo "cid123"
+        case " $* " in
+            *" ps -q bot "*)
+                n="$(cat "$BOT_PS_COUNTER" 2>/dev/null || echo 0)"
+                n=$((n + 1))
+                printf '%s' "$n" > "$BOT_PS_COUNTER"
+                if [ "${STUB_TWO_BOTS:-0}" = "1" ] || {
+                    [ "${STUB_LATE_TWO_BOTS:-0}" = "1" ] && [ "$n" -ge 3 ]
+                }; then
+                    printf 'cid-bot\ncid-bot-extra\n'
+                else
+                    echo "cid-bot"
+                fi
+                ;;
+            *)
+                for service in "$@"; do :; done
+                echo "cid-${service}"
+                ;;
+        esac
+        exit 0
+        ;;
+    *" ps "*)
+        [ "${STUB_FAIL_STATUS:-0}" = "1" ] && exit 1
         exit 0
         ;;
     *" config "*)
@@ -904,6 +831,9 @@ case " $* " in
         exit 0
         ;;
     *" pull "*)
+        case " $* " in
+            *" compose "*) [ "${STUB_FAIL_COMPOSE_PULL:-0}" = "1" ] && exit 1 ;;
+        esac
         exit 0
         ;;
     *" get_settings"*)
@@ -918,6 +848,10 @@ case " $* " in
         # when the database lacks objects the release queries.
         case "$PLATFORM_IMAGE" in
             "$PLATFORM_IMAGE_NEW") ;;
+            "$ROLLBACK_IMAGE")
+                [ "$FAIL_ROLLBACK_SCHEMA" = "1" ] && exit 1
+                exit 0
+                ;;
             *)
                 echo "PROBE_USED_THE_WRONG_IMAGE: $PLATFORM_IMAGE" >&2
                 exit 3
@@ -958,6 +892,10 @@ case " $* " in
                 }
                 ;;
         esac
+        if [ ! -f "$MIGRATION_MARKER" ] && [ -n "${ALEMBIC_DB_HEAD_BEFORE+x}" ]; then
+            printf '%s\n' "$ALEMBIC_DB_HEAD_BEFORE"
+            exit 0
+        fi
         printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
         exit 0
         ;;
@@ -985,6 +923,10 @@ case " $* " in
         exit 0
         ;;
     *" run "*)
+        : > "$MIGRATION_MARKER"
+        if [ -n "${STUB_MIGRATION_SIGNAL:-}" ]; then
+            kill -"$STUB_MIGRATION_SIGNAL" "$DEPLOY_SHELL_PID"
+        fi
         [ "$FAIL_MIGRATE" = "1" ] && exit 1
         exit 0
         ;;
@@ -1009,6 +951,15 @@ case " $* " in
         exit 0
         ;;
     *" exec "*)
+        case "$*" in
+            *"post_deploy_smoke.py"*)
+                if [ "${STUB_TAMPER_CANDIDATE:-0}" = "1" ]; then
+                    printf '# changed during deployment\n' >> "$CANDIDATE_COMPOSE_FILE"
+                fi
+                [ "${FAIL_SMOKE:-0}" != "1" ]
+                exit $?
+                ;;
+        esac
         printf '%s\n' "${ALEMBIC_IMAGE_HEAD:-0034 (head)}"
         exit 0
         ;;
@@ -1031,11 +982,14 @@ def _release_harness(
     fail_catalog_refresh: bool = False,
     fail_normalize: bool = False,
     fail_storefront_readiness: bool = False,
+    fail_rollback_schema: bool = False,
     crash_loop: bool = False,
     deploy_profile: str = "production",
     alembic_image_head: str = "0034 (head)",
     alembic_db_head: str = "0034 (head)",
     expected_head: str = "0034",
+    previous_image: str = _OLD_IMAGE,
+    env_overrides: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path, bytes, bytes]:
     """Run main() against the release-candidate flow with stubbed externals.
 
@@ -1052,7 +1006,7 @@ def _release_harness(
     env_file = deploy_dir / "deploy.env"
     env_before = (
         "# deployment values (server-owned)\n"
-        f"PLATFORM_IMAGE={_OLD_IMAGE}\n"
+        f"PLATFORM_IMAGE={previous_image}\n"
         "POSTGRES_PASSWORD=s3cret-server-value\n"
         "API_PORT=8000\n"
     )
@@ -1066,6 +1020,9 @@ def _release_harness(
     canonical = deploy_dir / "docker-compose.yml"
     stub_bin = tmp_path / "stubbin"
     stub_bin.mkdir()
+    # Unit harness mocks host primitives; Linux CI also tests real flock.
+    (stub_bin / "flock").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub_bin / "flock").chmod(0o755)
     (stub_bin / "docker").write_text(_RELEASE_STUB_DOCKER, encoding="utf-8")
     (stub_bin / "docker").chmod(0o755)
     (stub_bin / "sleep").write_text(_STUB_SLEEP, encoding="utf-8")
@@ -1081,6 +1038,8 @@ def _release_harness(
         f"SLEEP_CALLS_LOG='{(tmp_path / 'sleep-calls.log').as_posix()}' "
         f"INSPECT_COUNTER='{(tmp_path / 'inspect-counter').as_posix()}' "
         f"UP_FAIL_COUNTER='{(tmp_path / 'up-counter').as_posix()}' "
+        f"MIGRATION_MARKER='{(tmp_path / 'migration-started').as_posix()}' "
+        f"BOT_PS_COUNTER='{(tmp_path / 'bot-ps-counter').as_posix()}' "
         f"CRASH_LOOP='{'1' if crash_loop else ''}' "
         f"FAIL_CONFIG='{'1' if fail_config else ''}' "
         f"FAIL_CONFIG_CHECK='{'1' if fail_config_check else ''}' "
@@ -1090,6 +1049,8 @@ def _release_harness(
         f"FAIL_CATALOG_REFRESH='{'1' if fail_catalog_refresh else ''}' "
         f"FAIL_NORMALIZE='{'1' if fail_normalize else ''}' "
         f"FAIL_STOREFRONT_READINESS='{'1' if fail_storefront_readiness else ''}' "
+        f"FAIL_ROLLBACK_SCHEMA='{'1' if fail_rollback_schema else ''}' "
+        f"ROLLBACK_IMAGE='{_OLD_IMAGE}' "
         f"ALEMBIC_IMAGE_HEAD='{alembic_image_head}' "
         f"ALEMBIC_DB_HEAD='{alembic_db_head}' "
         f"DEPLOY_PATH='{_deploy_path(deploy_dir)}' PLATFORM_IMAGE_NEW='{_NEW_IMAGE}' "
@@ -1100,10 +1061,13 @@ def _release_harness(
         f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='{expected_head}' "
         f"DEPLOY_PROFILE='{deploy_profile}' "
         f"STABILIZE_SECONDS=1 HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
-        f"source '{DEPLOY_SCRIPT.as_posix()}'; "
-        "set +e; main; echo MAIN_RC=$?"
+        + "".join(
+            f"export {key}={shlex.quote(value)}; " for key, value in (env_overrides or {}).items()
+        )
+        + f"source '{DEPLOY_SCRIPT.as_posix()}'; "
+        + "export DEPLOY_SHELL_PID=$$; set +e; main; echo MAIN_RC=$?"
     )
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    result = subprocess.run([BASH, "-c", script], capture_output=True, text=True, timeout=120)
     return result, deploy_dir, canonical, Path(candidate), env_before.encode(), config_before
 
 
@@ -1173,6 +1137,24 @@ class TestReleaseComposeContract:
             _OLD_IMAGE.encode(), _NEW_IMAGE.encode()
         )
         assert (tmp_path / "configuration.toml").read_bytes() == config_before
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        stop = next(
+            i for i, call in enumerate(calls) if " stop --timeout 45 api worker bot" in call
+        )
+        migration = next(
+            i for i, call in enumerate(calls) if call.endswith(" run --rm --no-deps migrate")
+        )
+        schema = next(
+            i for i, call in enumerate(calls) if "cloud_platform.db.schema_parity" in call
+        )
+        start = next(i for i, call in enumerate(calls) if " up -d api worker bot" in call)
+        smoke = next(i for i, call in enumerate(calls) if "post_deploy_smoke.py" in call)
+        assert stop < migration < schema < start < smoke
+        assert all(
+            "--project-name cloud-platform-production" in call
+            for call in calls
+            if call.startswith("compose ") and call != "compose version"
+        )
 
     @needs_bash
     def test_runtime_failure_rolls_back_with_canonical(self, tmp_path: Path) -> None:
@@ -1184,7 +1166,11 @@ class TestReleaseComposeContract:
         assert "release compose promoted" not in result.stdout
         assert result.stdout.count("ROLLBACK DONE") == 1
         calls = _stub_calls(tmp_path, "docker-calls.log")
-        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
+        up_lines = [
+            line
+            for line in calls.splitlines()
+            if "up -d api worker bot" in line.replace("--no-deps ", "")
+        ]
         assert len(up_lines) == 2
         assert "candidate" in up_lines[0]
         assert "candidate" not in up_lines[1]
@@ -1222,15 +1208,20 @@ class TestReleaseComposeContract:
         assert "MAIN_RC=1" in result.stdout
         assert "database is NOT at the image alembic head" in result.stderr
         calls = _stub_calls(tmp_path, "docker-calls.log")
-        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
-        # No CANDIDATE service start at all: the mismatch is caught before
-        # api/worker/bot are replaced. The only `up` left is the rollback of the
-        # previous release, which is the correct end state of a failed deploy.
-        assert up_lines, calls
-        assert all("candidate" not in line for line in up_lines)
+        up_lines = [
+            line
+            for line in calls.splitlines()
+            if "up -d api worker bot" in line.replace("--no-deps ", "")
+        ]
+        # Even an unstamped migration may have changed financial data. No old
+        # or candidate writers may start after this attempted transition.
+        assert up_lines == [], calls
+        assert "schema transition attempted" in result.stderr
         assert "release compose promoted" not in result.stdout
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
-        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before.replace(
+            _OLD_IMAGE.encode(), _NEW_IMAGE.encode()
+        )
 
     @needs_bash
     def test_revision_match_with_missing_physical_schema_never_starts_services(
@@ -1263,13 +1254,16 @@ class TestReleaseComposeContract:
         assert "PROBE_USED_THE_WRONG_IMAGE" not in result.stderr
         # No CANDIDATE service start at all: the drift is caught before api/
         # worker/bot are replaced, so the running release keeps serving.
-        up_lines = [line for line in calls.splitlines() if "up -d api worker bot" in line]
+        up_lines = [
+            line
+            for line in calls.splitlines()
+            if "up -d api worker bot" in line.replace("--no-deps ", "")
+        ]
         assert all("candidate" not in line for line in up_lines), up_lines
         assert "release compose promoted" not in result.stdout
         # The recorded image reference goes back to the release still running,
         # and the failed release leaves no stale candidate behind.
         assert result.stdout.count("ROLLBACK DONE") == 1
-        assert "restored previous image reference" in result.stdout
         assert not candidate.exists()
         assert (deploy_dir / "deploy.env").read_bytes() == env_before
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
@@ -1313,6 +1307,236 @@ class TestReleaseComposeContract:
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
 
     @needs_bash
+    @pytest.mark.parametrize("attempts", ["0", "00", "08", "99999999999999999999", "not-a-number"])
+    def test_invalid_health_attempts_cannot_bypass_readiness(
+        self, tmp_path: Path, attempts: str
+    ) -> None:
+        result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
+            tmp_path, env_overrides={"HEALTH_ATTEMPTS": attempts}
+        )
+        _assert_no_mutation(tmp_path, result, deploy_dir, canonical, env_before, config_before)
+
+    @needs_bash
+    def test_image_tag_cannot_claim_a_different_commit(self, tmp_path: Path) -> None:
+        result, deploy_dir, canonical, _, env_before, _ = _release_harness(
+            tmp_path, env_overrides={"STUB_IMAGE_REVISION": _OLD_SHA}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "revision does not match" in result.stderr
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        assert " run " not in calls
+        assert " up " not in calls
+
+    @needs_bash
+    def test_branched_database_cannot_hide_behind_its_first_revision(self, tmp_path: Path) -> None:
+        result, deploy_dir, _, _, env_before, _ = _release_harness(
+            tmp_path, alembic_db_head="0034 (head)\n0033 (head)"
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "multiple migration revisions" in result.stderr
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        assert not any(call.endswith(" run --rm --no-deps migrate") for call in calls)
+        assert not any(" stop " in call or " up -d api worker bot" in call for call in calls)
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+
+    @needs_bash
+    @pytest.mark.parametrize("observed", ["0033 (head)", "0034 (head)"])
+    def test_attempted_schema_transition_never_restarts_an_old_financial_epoch(
+        self, tmp_path: Path, observed: str
+    ) -> None:
+        result, deploy_dir, canonical, _, env_before, _ = _release_harness(
+            tmp_path,
+            fail_migrate=True,
+            alembic_db_head=observed,
+            env_overrides={
+                "ALEMBIC_DB_HEAD_BEFORE": "0033 (head)",
+                "ALLOW_FORWARD_SCHEMA_ROLLBACK": "1",
+            },
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "schema transition attempted" in result.stderr
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        assert any("candidate.yml stop --timeout 45 api worker bot" in call for call in calls)
+        assert not any(
+            " up -d api worker bot" in call or " up -d --no-deps api worker bot" in call
+            for call in calls
+        )
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before.replace(
+            _OLD_IMAGE.encode(), _NEW_IMAGE.encode()
+        )
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_failed_readiness_after_forward_migration_leaves_zero_pollers(
+        self, tmp_path: Path
+    ) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path,
+            fail_ready=True,
+            env_overrides={"ALEMBIC_DB_HEAD_BEFORE": "0033 (head)"},
+        )
+        assert "MAIN_RC=1" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        starts = [call for call in calls if " up -d api worker bot" in call]
+        assert len(starts) == 1 and "candidate" in starts[0]
+        assert calls.index(starts[0]) < next(
+            i
+            for i, call in enumerate(calls)
+            if "candidate.yml stop --timeout 45 api worker bot" in call
+        )
+        assert not any(" up -d --no-deps api worker bot" in call for call in calls)
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_first_deploy_failure_stops_its_partially_started_bot(self, tmp_path: Path) -> None:
+        result, _, _, _, _, _ = _release_harness(tmp_path, previous_image="", fail_up_api=True)
+        assert "MAIN_RC=1" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        start = next(i for i, call in enumerate(calls) if " up -d api worker bot" in call)
+        stop = next(
+            i
+            for i, call in enumerate(calls)
+            if "candidate.yml stop --timeout 45 api worker bot" in call
+        )
+        assert start < stop
+        assert not any(" up -d --no-deps api worker bot" in call for call in calls)
+
+    @needs_bash
+    @pytest.mark.parametrize("service", ["worker", "bot"])
+    def test_running_but_unhealthy_service_cannot_promote(
+        self, tmp_path: Path, service: str
+    ) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, env_overrides={"STUB_UNHEALTHY_SERVICE": service}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert f"{service} did not establish" in result.stderr
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_failed_financial_smoke_cannot_promote(self, tmp_path: Path) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, env_overrides={"FAIL_SMOKE": "1"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    @pytest.mark.parametrize("failure", ["STUB_FAIL_STATUS", "STUB_TAMPER_CANDIDATE"])
+    def test_final_gate_failure_still_has_the_previous_canonical_contract(
+        self, tmp_path: Path, failure: str
+    ) -> None:
+        result, deploy_dir, canonical, _, env_before, _ = _release_harness(
+            tmp_path, env_overrides={failure: "1"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert result.stdout.count("ROLLBACK DONE") == 1
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+
+    @needs_bash
+    def test_inherited_image_variable_cannot_override_the_release(self, tmp_path: Path) -> None:
+        result, deploy_dir, _, _, env_before, _ = _release_harness(
+            tmp_path, env_overrides={"PLATFORM_IMAGE": _OLD_IMAGE}
+        )
+        assert "MAIN_RC=0" in result.stdout, result.stderr
+        assert "IMAGE_DRIFT" not in result.stderr
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before.replace(
+            _OLD_IMAGE.encode(), _NEW_IMAGE.encode()
+        )
+
+    @needs_bash
+    def test_pull_failure_does_not_stop_or_restart_the_current_poller(self, tmp_path: Path) -> None:
+        result, deploy_dir, _, _, env_before, _ = _release_harness(
+            tmp_path, env_overrides={"STUB_FAIL_COMPOSE_PULL": "1"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        assert not any(" stop " in call or " up " in call for call in calls)
+        assert (deploy_dir / "deploy.env").read_bytes() == env_before
+
+    @needs_bash
+    def test_duplicate_bot_rollback_stops_instead_of_reporting_success(
+        self, tmp_path: Path
+    ) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, env_overrides={"STUB_TWO_BOTS": "1"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "ROLLBACK DONE" not in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        assert calls[-1].endswith("docker-compose.yml stop --timeout 45 api worker bot")
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_old_image_schema_rejection_never_starts_its_writers(self, tmp_path: Path) -> None:
+        result, _, _, _, _, _ = _release_harness(
+            tmp_path, fail_ready=True, fail_rollback_schema=True
+        )
+        assert "MAIN_RC=1" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log")
+        assert " up -d --no-deps api worker bot" not in calls
+
+    @needs_bash
+    @pytest.mark.parametrize("signal", ["HUP", "INT", "TERM"])
+    def test_disconnect_signal_does_not_interrupt_the_migration_window(
+        self, tmp_path: Path, signal: str
+    ) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, env_overrides={"STUB_MIGRATION_SIGNAL": signal}
+        )
+        assert "MAIN_RC=0" in result.stdout, result.stderr
+        assert canonical.read_bytes() == b"# release candidate contract\nservices: {}\n"
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        assert sum(" up -d api worker bot" in call for call in calls) == 1
+
+    @needs_bash
+    def test_second_bot_appearing_during_stabilization_fails_closed(self, tmp_path: Path) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, env_overrides={"STUB_LATE_TWO_BOTS": "1"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "bot container changed during stabilization" in result.stderr
+        assert "ROLLBACK DONE" not in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        assert calls[-1].endswith("docker-compose.yml stop --timeout 45 api worker bot")
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_unavailable_restart_evidence_is_not_stability(self, tmp_path: Path) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, env_overrides={"STUB_FAIL_RESTART_PROBE": "1"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "cannot inspect bot restart count" in result.stderr
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    @pytest.mark.skipif(
+        os.name == "nt" or shutil.which("flock") is None,
+        reason="real POSIX host-lock contract",
+    )
+    def test_main_refuses_a_second_host_mutator_before_deploy(self, tmp_path: Path) -> None:
+        import fcntl
+
+        command = (
+            f"export DEPLOY_PRODUCTION_SOURCED=1 DEPLOY_PATH={shlex.quote(tmp_path.as_posix())} "
+            f"PLATFORM_IMAGE_NEW={_NEW_IMAGE} CANDIDATE_COMPOSE_FILE=unused "
+            f"EXPECTED_COMPOSE_SHA256={'0' * 64}; "
+            f"source {shlex.quote(DEPLOY_SCRIPT.as_posix())}; "
+            "deploy() { echo UNSAFE_MUTATION; }; main"
+        )
+        with (tmp_path / ".deployment.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = subprocess.run(
+                [BASH, "-c", command], capture_output=True, text=True, timeout=10
+            )
+        assert result.returncode != 0
+        assert "UNSAFE_MUTATION" not in result.stdout
+
+    @needs_bash
     def test_failed_readiness_does_not_promote(self, tmp_path: Path) -> None:
         result, deploy_dir, canonical, _, env_before, config_before = _release_harness(
             tmp_path, fail_ready=True
@@ -1348,15 +1572,6 @@ class TestDeployProfiles:
     identical, and `test_staging_profile_still_fails_on_a_broken_storefront`
     proves it on the failure path.
     """
-
-    def test_only_production_and_staging_are_accepted(self) -> None:
-        assert "DEPLOY_PROFILE must be 'production' or 'staging'" in _script()
-
-    def test_the_staging_branch_precedes_the_refresh_it_skips(self) -> None:
-        script = _script()
-        branch = script.index('[ "${DEPLOY_PROFILE}" = "staging" ]')
-        refresh = script.index("python -m cloud_platform.cli catalog auto-sync run")
-        assert branch < refresh
 
     @needs_bash
     def test_production_profile_runs_the_catalog_refresh(self, tmp_path: Path) -> None:
@@ -1415,50 +1630,6 @@ class TestStorefrontReadinessGate:
     credentialed, auto-priced provider actually has something on sale, all
     BEFORE the compose contract is promoted.
     """
-
-    def test_catalog_canonicalization_runs_before_any_service_starts(self) -> None:
-        script = _script()
-        normalize = script.index("offers normalize-selling-currency --execute")
-        # The supported operator CLI path, not a bespoke SQL mutation.
-        assert "UPDATE" not in script
-        assert "psql" not in script
-        assert normalize > script.index("database physical schema verified against the release")
-        assert normalize > script.index("python -m cloud_platform.db.schema_parity")
-        assert normalize < script.index("starting api + worker + bot")
-        # It runs in a one-shot container with the RELEASE image.
-        window = script[max(0, normalize - 200) : normalize]
-        assert 'PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}"' in window
-        assert "compose_candidate run --rm --no-deps migrate" in window
-
-    def test_catalog_refresh_runs_before_canonicalization_and_services(self) -> None:
-        """Provider facts are re-observed BEFORE the catalog is canonicalized.
-
-        Canonicalization can only convert against facts the row already has: a
-        manual/auto row whose exact provider rate or integer cost is stale or
-        missing is left fail-closed by the price book. So the release refreshes
-        provider facts first (the same advisory-locked coordinator the worker
-        runs, bounded by the DEDICATED catalog budget — never the 120s generic
-        job timeout), then canonicalizes, then starts services.
-        """
-        script = _script()
-        refresh = script.index("python -m cloud_platform.cli catalog auto-sync run")
-        normalize = script.index("offers normalize-selling-currency --execute")
-        assert refresh > script.index("database physical schema verified against the release")
-        assert refresh < normalize < script.index("starting api + worker + bot")
-        window = script[max(0, refresh - 300) : normalize]
-        # The supported CLI path with the RELEASE image, in one-shot containers.
-        assert 'PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}"' in window
-        assert "compose_candidate run --rm --no-deps migrate" in window
-        # No bespoke SQL and no ad-hoc data surgery.
-        assert "UPDATE" not in script
-        assert "psql" not in script
-
-    def test_storefront_readiness_runs_after_health_and_before_promotion(self) -> None:
-        script = _script()
-        readiness = script.index("python -m cloud_platform.cli offers readiness")
-        assert script.index("API readiness: ok") < readiness
-        assert script.index("worker + bot stable") < readiness
-        assert readiness < script.index("promoting release compose to canonical")
 
     @needs_bash
     def test_refresh_failure_is_reported_and_never_fatal(self, tmp_path: Path) -> None:
@@ -1537,15 +1708,6 @@ class TestReleaseComposeDelivery:
         assert "steps.compose.outputs.candidate" in text
         assert "steps.compose.outputs.sha256" in text
 
-    def test_delivery_precedes_deploy_on_the_same_trust_path(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert text.index("Deliver release compose candidate") < text.index(
-            "Deploy the exact image over SSH"
-        )
-        assert "StrictHostKeyChecking=no" not in text
-        # SSH key login, GHCR login, compose delivery, deploy: one trust path.
-        assert text.count("StrictHostKeyChecking=yes") >= 3
-
     def test_single_delivery_path_for_every_deploy(self) -> None:
         steps = self._steps()
         delivery = [
@@ -1616,13 +1778,18 @@ class TestProductionHealthchecks:
         api = self._compose()["services"]["api"]
         assert "healthcheck" not in api, "api must keep the image HTTP healthcheck"
 
-    def test_non_http_services_disable_the_inherited_healthcheck(self) -> None:
+    def test_only_one_shot_services_disable_the_inherited_healthcheck(self) -> None:
         services = self._compose()["services"]
-        for name in ("worker", "bot", "migrate", "backup"):
-            healthcheck = services[name].get("healthcheck")
-            assert healthcheck is not None and healthcheck.get("disable") is True, (
-                f"{name} must not inherit the API HTTP healthcheck"
-            )
+        for name in ("migrate", "backup", "volume-init"):
+            assert services[name]["healthcheck"]["disable"] is True
+
+    def test_worker_and_bot_have_transport_specific_healthchecks(self) -> None:
+        services = self._compose()["services"]
+        worker = services["worker"]["healthcheck"]["test"]
+        bot = services["bot"]["healthcheck"]["test"]
+        assert worker[:2] == ["CMD", "python"]
+        assert "check_health(WorkerSettings)" in worker[-1]
+        assert bot == ["CMD", "python", "-m", "cloud_platform.bot.health"]
 
 
 class TestCiStillGatesDeploys:

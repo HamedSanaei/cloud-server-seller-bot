@@ -127,7 +127,7 @@ class Fakes:
         seeded_rows: list[AccrualPeriod] | None = None,
     ) -> None:
         self.servers = list(servers or [])
-        self.wallet = wallet or Wallet(USER_ID, id=WALLET_ID, balance=100_000)
+        self.wallet = wallet or Wallet(USER_ID, id=WALLET_ID, balance=100_000, currency="USD")
         self.holds = dict(holds or {})
         self.snapshot = snapshot
         self.rows: list[AccrualPeriod] = list(seeded_rows or [])

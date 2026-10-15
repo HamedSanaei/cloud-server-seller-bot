@@ -8,7 +8,7 @@ durable, never before.
 
 Money model (FX-aware): the customer picks a CREDIT amount in the wallet's
 own currency; each gateway settles in its own currency (Tetraminator: IRT,
-ZarinPal: IRR). The service converts credit -> settlement once (CHARGE
+ZarinPal: IRR, AtlasPay: IRT). The service converts credit -> settlement once (CHARGE
 purpose, frozen snapshot) and persists BOTH sides on the session: the
 settlement side is what the provider invoice charges and what inquiry
 verifies EXACTLY; the credit side is what the wallet receives. The callback
@@ -16,9 +16,8 @@ and reconciliation never fetch a new rate.
 
 Safety properties:
 
-- ordinary gateways are called first; gateways without a provider-side
-  idempotency guarantee persist a durable attempt first and never POST a
-  second order for an unbound/ambiguous attempt;
+- gateways without a provider-side idempotency guarantee persist a durable
+  attempt first and never POST a second order for an unbound/ambiguous attempt;
 - a replayed request (same Telegram button, same idempotency key) that the
   gateway resolves to the same authority collides on the session's unique
   ``(gateway_key, gateway_payment_id)`` pair and returns the EXISTING session
@@ -33,7 +32,7 @@ Safety properties:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from cloud_platform.core.idempotency import IdempotencyKey
@@ -43,7 +42,6 @@ from cloud_platform.modules.payments.domain import (
     DuplicateExternalIdError,
     PaymentSession,
     PaymentSessionRepository,
-    PaymentSessionStatus,
     session_credit_amount,
     session_credit_currency,
 )
@@ -100,6 +98,15 @@ class RechargeStart:
     redirect_url: str
     replayed: bool
     payment_details: RechargePaymentDetails | None = None
+
+    @property
+    def payable_amount_minor(self) -> int | None:
+        """Legacy UI projection of the unified authoritative invoice details."""
+        return self.payment_details.amount_minor if self.payment_details else None
+
+    @property
+    def tracking_code(self) -> str | None:
+        return self.payment_details.tracking_code if self.payment_details else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +238,8 @@ class WalletRechargeService:
         """Sync compatibility: same currency or exact IRT<->IRR (no FX call)."""
         settlement = self._settlement_currency(gateway)
         wallet = (currency or "").upper()
+        if getattr(gateway, "wallet_currency_only", False) and wallet != settlement:
+            return False
         if not settlement or not wallet:
             return False
         if settlement == wallet:
@@ -293,6 +302,11 @@ class WalletRechargeService:
             if not await self._enabled(key):
                 continue
             settlement_currency = self._settlement_currency(gateway)
+            if (
+                getattr(gateway, "wallet_currency_only", False)
+                and currency.upper() != settlement_currency
+            ):
+                continue
             if not settlement_currency:
                 continue
             if self._supports_or_exact(gateway, currency):
@@ -378,6 +392,8 @@ class WalletRechargeService:
                 raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             if self._supports_or_exact(gateway, currency):
                 return gateway
+            if getattr(gateway, "wallet_currency_only", False):
+                raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             if self._fx is None:
                 raise RechargeDisabledError(f"gateway {gateway_key!r} cannot charge in {currency}")
             try:
@@ -492,8 +508,8 @@ class WalletRechargeService:
             raise RechargeError("a persisted user id is required")
         if getattr(user, "role", None) == Role.ADMIN:
             raise RechargeAdminForbiddenError("administrator self-top-up is forbidden")
-        if type(amount_minor) is not int or amount_minor <= 0:
-            raise RechargeAmountError("amount must be a positive integer of minor units")
+        if type(amount_minor) is not int or not 0 < amount_minor <= 2**63 - 1:
+            raise RechargeAmountError("amount must be a positive signed int64 of minor units")
         key = (idempotency_key or "").strip()
         if not key:
             raise RechargeError("idempotency_key must not be empty")
@@ -506,7 +522,10 @@ class WalletRechargeService:
         for registered_key, candidate in self._gateways.items():
             if gateway_key is not None and registered_key != gateway_key:
                 continue
-            if not getattr(candidate, "requires_durable_creation", False):
+            if not (
+                getattr(candidate, "requires_durable_creation", False)
+                or _gateway_needs_callback_reference(candidate)
+            ):
                 continue
             existing = await self._payments.get_by_idempotency_key(registered_key, key)
             if existing is not None:
@@ -549,6 +568,7 @@ class WalletRechargeService:
                 currency=settlement_currency,
                 key=key,
                 snapshot=snapshot,
+                redirect_url=redirect_url,
             )
 
         if _gateway_needs_callback_reference(gateway):
@@ -593,6 +613,15 @@ class WalletRechargeService:
             if existing.user_id != user.id:
                 raise RechargeError("this payment authority belongs to another user") from None
             session = existing
+            if (
+                existing.amount_minor != settlement_amount
+                or existing.currency != settlement_currency
+                or session_credit_amount(existing) != amount_minor
+                or session_credit_currency(existing) != currency.upper()
+            ):
+                raise RechargeError(
+                    "payment authority belongs to another amount or currency"
+                ) from None
             replayed = True
 
         session_id = session.id
@@ -633,6 +662,12 @@ class WalletRechargeService:
         if gateway is None or not session.gateway_payment_id:
             raise RechargeError("payment invoice is unavailable")
         metadata = dict(session.payment_details or {})
+        # Production invoices created before unified metadata used dedicated
+        # columns. Preserve their genuine link/tracking information on replay.
+        if session.redirect_url:
+            metadata.setdefault("payment_url", session.redirect_url)
+        if session.tracking_code:
+            metadata.setdefault("tracking_code", session.tracking_code)
         getter = getattr(gateway, "get_payment_details", None)
         if callable(getter):
             fresh = await getter(session.gateway_payment_id)
@@ -664,6 +699,7 @@ class WalletRechargeService:
         currency: str,
         key: str,
         snapshot: dict[str, Any] | None,
+        redirect_url: str | None = None,
     ) -> RechargeStart:
         """Record attempt before the single non-idempotent provider mutation.
 
@@ -683,15 +719,30 @@ class WalletRechargeService:
             )
         except DuplicateExternalIdError as exc:
             # A concurrent click must not initiate another external mutation.
+            existing = await self._payments.get_by_idempotency_key(gateway.key, key)
+            credit_amount = (snapshot or {}).get("credit_amount_minor", amount_minor)
+            credit_currency = (snapshot or {}).get("credit_currency", currency)
+            if (
+                existing is not None
+                and existing.user_id == user.id
+                and session_credit_amount(existing) == credit_amount
+                and session_credit_currency(existing) == credit_currency
+                and existing.gateway_payment_id
+            ):
+                details = await self.payment_details(user=user, session_id=existing.id)
+                return RechargeStart(existing, details.payment_url, True, details)
             raise RechargeError(
                 "payment creation already started; inquire before retrying"
             ) from exc
+        create_options: dict[str, Any] = {"redirect_url": redirect_url}
+        if getattr(gateway, "accepts_customer_telegram_id", False):
+            create_options["customer_telegram_id"] = getattr(user, "telegram_user_id", None)
         intent = await gateway.create_payment(
             amount_minor=amount_minor,
             currency=currency,
             reference=str(user.id),
             idempotency_key=IdempotencyKey(key),
-            customer_telegram_id=getattr(user, "telegram_user_id", None),
+            **create_options,
         )
         authority = str(intent.gateway_payment_id or "")
         metadata = dict(intent.metadata)
@@ -699,7 +750,11 @@ class WalletRechargeService:
             raise RechargeError("gateway returned an invalid payment invoice")
         metadata["payment_url"] = intent.redirect_url
         session = await self._payments.save(
-            attempted.with_payment_intent(authority, intent.amount_minor, metadata)
+            replace(
+                attempted.with_payment_intent(authority, intent.amount_minor, metadata),
+                redirect_url=intent.redirect_url,
+                tracking_code=metadata.get("tracking_code"),
+            )
         )
         if session.id is None:
             raise RechargeError("a durable payment invoice must have a persisted identity")
@@ -740,9 +795,9 @@ class WalletRechargeService:
         The durable intent row is persisted FIRST (no external id yet), so
         the callback URL can reference the stable local session id. The
         gateway id is bound afterwards; a replay reuses an already-bound
-        pending session instead of POSTing a second invoice. A concurrent
-        double-tap that loses the initial insert race resumes the winner's
-        row instead of failing.
+        session instead of POSTing a second invoice. A concurrent insert loser
+        reuses an already-bound winner. An unbound intent is an ambiguous
+        provider mutation and must never initiate another invoice POST.
 
         ``amount_minor``/``currency`` are the SETTLEMENT side; the credit
         side rides ``snapshot`` and is frozen before the invoice call, so a
@@ -750,46 +805,46 @@ class WalletRechargeService:
         """
         resolved_key = gateway.key
         existing = await self._payments.get_by_idempotency_key(resolved_key, key)
-        if existing is not None and existing.user_id != user.id:
-            raise RechargeError("this recharge attempt belongs to another user") from None
-        if (
-            existing is not None
-            and existing.status is PaymentSessionStatus.PENDING
-            and existing.gateway_payment_id
-        ):
+        if existing is not None:
+            if (
+                existing.user_id != user.id
+                or session_credit_amount(existing) != credit_amount_minor
+                or session_credit_currency(existing) != credit_currency
+            ):
+                raise RechargeError("recharge replay does not match its original owner/credit")
+            if not existing.gateway_payment_id:
+                raise RechargeError("payment creation outcome is unknown; do not create again")
             return RechargeStart(
                 session=existing,
                 redirect_url=_gateway_payment_link(gateway, existing.gateway_payment_id),
                 replayed=True,
             )
-        if existing is not None and existing.status is PaymentSessionStatus.PENDING:
-            # Crashed between intent persist and gateway call: resume it.
-            intent = existing
-        else:
-            try:
-                intent = await self._payments.create(
-                    PaymentSession(
-                        user_id=user.id,
-                        gateway_key=resolved_key,
-                        amount_minor=amount_minor,
-                        currency=currency,
-                        idempotency_key=key,
-                        **(snapshot or {}),
-                    )
+        try:
+            intent = await self._payments.create(
+                PaymentSession(
+                    user_id=user.id,
+                    gateway_key=resolved_key,
+                    amount_minor=amount_minor,
+                    currency=currency,
+                    idempotency_key=key,
+                    **(snapshot or {}),
                 )
-            except DuplicateExternalIdError:
-                retry = await self._payments.get_by_idempotency_key(resolved_key, key)
-                if retry is None:
-                    raise
-                intent = retry
-                if intent.user_id != user.id:
-                    raise RechargeError("this recharge attempt belongs to another user") from None
-                if intent.status is PaymentSessionStatus.PENDING and intent.gateway_payment_id:
-                    return RechargeStart(
-                        session=intent,
-                        redirect_url=_gateway_payment_link(gateway, intent.gateway_payment_id),
-                        replayed=True,
-                    )
+            )
+        except DuplicateExternalIdError as exc:
+            retry = await self._payments.get_by_idempotency_key(resolved_key, key)
+            if (
+                retry is not None
+                and retry.user_id == user.id
+                and session_credit_amount(retry) == credit_amount_minor
+                and session_credit_currency(retry) == credit_currency
+                and retry.gateway_payment_id
+            ):
+                return RechargeStart(
+                    session=retry,
+                    redirect_url=_gateway_payment_link(gateway, retry.gateway_payment_id),
+                    replayed=True,
+                )
+            raise RechargeError("payment creation already started; do not create again") from exc
         if intent.id is None:  # pragma: no cover - a persisted session always has an id
             raise RechargeError("payment session has no id")
         base = _gateway_callback_base(gateway)

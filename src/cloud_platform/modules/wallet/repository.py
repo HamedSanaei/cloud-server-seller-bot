@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,13 +25,18 @@ from cloud_platform.db.base import AuditEvent as _AuditModel
 from cloud_platform.db.base import BusinessLogEvent as _BusinessLogModel
 from cloud_platform.db.base import Hold as _HoldModel
 from cloud_platform.db.base import LedgerEntry as _LEModel
+from cloud_platform.db.base import PaymentSession as _PaymentModel
+from cloud_platform.db.base import Server as _ServerModel
 from cloud_platform.db.base import Wallet as SQLAlchemyWallet
+from cloud_platform.db.base import WalletCurrencyMigration as _MigrationModel
 from cloud_platform.db.timestamps import (
+    from_db_utc,
     from_db_utc_or_none,
     to_db_utc,
     utc_now,
 )
 from cloud_platform.modules.businesslog.domain import STATUS_PENDING, BusinessEvent
+from cloud_platform.modules.fx.domain import ConversionSnapshot
 from cloud_platform.modules.wallet.domain import (
     DEFAULT_WALLET_CURRENCY,
     DuplicateIdempotencyError,
@@ -45,6 +51,9 @@ from cloud_platform.modules.wallet.domain import (
     LedgerEntryType,
     LedgerRepository,
     Wallet,
+    WalletCurrencyMigration,
+    WalletCurrencyMigrationError,
+    WalletCurrencyMigrationPlan,
     WalletRepository,
     WalletStatus,
 )
@@ -110,49 +119,6 @@ class SqlAlchemyWalletRepository:
             return wallet
         return await self._create(user_id, currency)
 
-    async def debit(self, user_id: UUID, amount: int, idempotency_key: str) -> Wallet:
-        del idempotency_key
-        async with self._session_factory() as session:
-            stmt = (
-                select(SQLAlchemyWallet)
-                .where(SQLAlchemyWallet.user_id == user_id)
-                .with_for_update()
-            )
-            result = await session.execute(stmt)
-            row = result.scalar_one_or_none()
-            if row is None:
-                raise ValueError(f"no wallet for user {user_id}")
-            bal = int(_attr(row, "balance"))
-            if bal < amount:
-                raise InsufficientBalanceError(f"balance {bal} < required {amount}")
-            cast(Any, row).balance = bal - amount
-            await session.commit()
-            # Server-generated columns (updated_at onupdate) expire on flush;
-            # refresh inside the greenlet before mapping to domain, otherwise
-            # attribute access raises MissingGreenlet on real PostgreSQL.
-            await session.refresh(row)
-            return _wallet_to_domain(row)
-
-    async def add_funds(self, user_id: UUID, amount: int, idempotency_key: str) -> Wallet:
-        del idempotency_key
-        if amount <= 0:
-            raise ValueError("add_funds requires a positive amount")
-        async with self._session_factory() as session:
-            stmt = (
-                select(SQLAlchemyWallet)
-                .where(SQLAlchemyWallet.user_id == user_id)
-                .with_for_update()
-            )
-            result = await session.execute(stmt)
-            row = result.scalar_one_or_none()
-            if row is None:
-                raise ValueError(f"no wallet for user {user_id}")
-            bal = int(_attr(row, "balance"))
-            cast(Any, row).balance = bal + amount
-            await session.commit()
-            await session.refresh(row)
-            return _wallet_to_domain(row)
-
     async def adjust(
         self,
         user_id: UUID,
@@ -165,8 +131,10 @@ class SqlAlchemyWalletRepository:
         description: str = "",
         audit_actor_id: UUID | None = None,
         business_event_factory: Callable[[Wallet], BusinessEvent | None] | None = None,
+        expected_currency: str | None = None,
+        expected_running_server_id: UUID | None = None,
     ) -> tuple[Wallet, bool]:
-        """Atomically mutate a wallet and append the matching ledger entry."""
+        """Atomically post a delta and ledger, fencing first prepaid charges under row locks."""
         if isinstance(delta, bool) or not isinstance(delta, int) or delta == 0:
             raise ValueError("wallet adjustment delta must be a non-zero integer")
         if not -(2**63) < delta <= 2**63 - 1:
@@ -189,6 +157,9 @@ class SqlAlchemyWalletRepository:
             row = result.scalar_one_or_none()
             if row is None:
                 raise ValueError(f"no wallet for user {user_id}")
+            if expected_currency is not None and str(_attr(row, "currency")) != expected_currency:
+                raise ValueError(f"wallet currency must be {expected_currency}")
+            wallet_currency = str(_attr(row, "currency"))
             wallet_id: UUID = _attr(row, "id")
 
             existing = await session.execute(
@@ -210,6 +181,7 @@ class SqlAlchemyWalletRepository:
                     key=new_key,
                     delta=delta,
                     entry_type=entry_type,
+                    currency=wallet_currency,
                     reference_type=reference_type,
                     reference_id=reference_id,
                     description=description,
@@ -223,6 +195,33 @@ class SqlAlchemyWalletRepository:
                 assert refreshed is not None
                 await session.refresh(refreshed)
                 return _wallet_to_domain(refreshed), False
+
+            if expected_running_server_id is not None:
+                if (
+                    delta >= 0
+                    or entry_type != LedgerEntryType.CHARGE
+                    or wallet_currency != "IRT"
+                    or reference_type != "server"
+                    or reference_id != str(expected_running_server_id)
+                ):
+                    raise ValueError("prepaid server fence requires a bound IRT server charge")
+                # Wallet first, then server: eligibility stays locked through
+                # the same commit as the money and ledger. Replays above are
+                # immutable accepted facts, not new purchases of future time.
+                server = (
+                    await session.execute(
+                        select(_ServerModel)
+                        .where(_ServerModel.id == expected_running_server_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    server is None
+                    or _attr(server, "user_id") != user_id
+                    or _attr(server, "state") != "running"
+                    or _attr(server, "billing_model") != "hourly_prepaid_irt"
+                ):
+                    raise ValueError("server is not eligible for a prepaid hourly charge")
 
             balance = int(_attr(row, "balance"))
             new_balance = balance + delta
@@ -298,6 +297,7 @@ class SqlAlchemyWalletRepository:
                             key=new_key,
                             delta=delta,
                             entry_type=entry_type,
+                            currency=wallet_currency,
                             reference_type=reference_type,
                             reference_id=reference_id,
                             description=description,
@@ -345,6 +345,7 @@ class SqlAlchemyWalletRepository:
         key: str,
         delta: int,
         entry_type: LedgerEntryType,
+        currency: str,
         reference_type: str,
         reference_id: str,
         description: str,
@@ -353,6 +354,7 @@ class SqlAlchemyWalletRepository:
         facts = (
             str(_attr(row, "entry_type")),
             int(_attr(row, "amount")),
+            str(_attr(row, "currency")),
             str(_attr(row, "reference_type") or ""),
             str(_attr(row, "reference_id") or ""),
             str(_attr(row, "description") or ""),
@@ -360,6 +362,7 @@ class SqlAlchemyWalletRepository:
         wanted = (
             str(entry_type.value if isinstance(entry_type, LedgerEntryType) else entry_type),
             abs(delta),
+            currency,
             str(reference_type or ""),
             str(reference_id or ""),
             str(description or ""),
@@ -377,6 +380,8 @@ class SqlAlchemyWalletRepository:
         idempotency_key: str,
         *,
         reference: str = "",
+        expected_currency: str | None = None,
+        business_event_factory: Callable[[Wallet], BusinessEvent | None] | None = None,
     ) -> tuple[Wallet, bool]:
         """Apply a gateway deposit EXACTLY once (atomically, row-locked).
 
@@ -391,9 +396,11 @@ class SqlAlchemyWalletRepository:
         ``deposit-{gateway}-{external_id}``) from the ledger's
         ``(wallet_id, idempotency_key)`` uniqueness.
         """
-        if amount <= 0:
+        if type(amount) is not int or not 0 < amount <= 2**63 - 1:
             raise ValueError("credit_deposit requires a positive amount")
-        new_key = str(idempotency_key)
+        new_key = str(idempotency_key).strip()
+        if not new_key:
+            raise ValueError("idempotency_key must not be empty")
         async with self._session_factory() as session:
             stmt = (
                 select(SQLAlchemyWallet)
@@ -404,18 +411,25 @@ class SqlAlchemyWalletRepository:
             row = result.scalar_one_or_none()
             if row is None:
                 raise ValueError(f"no wallet for user {user_id}")
+            actual_currency = str(_attr(row, "currency"))
+            if expected_currency is not None and actual_currency != expected_currency:
+                raise ValueError("wallet currency differs from verified payment credit")
             wallet_id: UUID = _attr(row, "id")
             existing = await session.execute(
-                select(_LEModel.idempotency_key).where(
+                select(_LEModel).where(
                     _LEModel.wallet_id == wallet_id,
                     _LEModel.idempotency_key == new_key,
                 )
             )
-            if existing.scalar_one_or_none() is not None:
+            previous = existing.scalar_one_or_none()
+            if previous is not None:
+                self._check_deposit_replay(previous, amount, actual_currency, reference, new_key)
                 await session.rollback()
                 await session.refresh(row)
                 return _wallet_to_domain(row), False
             bal = int(_attr(row, "balance"))
+            if bal + amount > 2**63 - 1:
+                raise ValueError("wallet balance exceeds signed int64 bounds")
             cast(Any, row).balance = bal + amount
             session.add(
                 _LEModel(
@@ -431,6 +445,20 @@ class SqlAlchemyWalletRepository:
                     description=f"gateway deposit {reference or new_key}",
                 )
             )
+            if business_event_factory is not None:
+                event = business_event_factory(_wallet_to_domain(row))
+                if event is not None:
+                    session.add(
+                        _BusinessLogModel(
+                            id=uuid4(),
+                            event_key=event.event_key,
+                            event_type=event.event_type.value,
+                            payload=event.sanitized_payload(),
+                            status=STATUS_PENDING,
+                            created_at=event.created_at,
+                            attempts=0,
+                        )
+                    )
             try:
                 await session.commit()
             except IntegrityError as exc:
@@ -439,6 +467,16 @@ class SqlAlchemyWalletRepository:
                 # roll back BOTH writes (balance + ledger) and report a replay.
                 await session.rollback()
                 if "uq_ledger_wallet_idempotency" in str(exc.orig):
+                    raced = await session.execute(
+                        select(_LEModel).where(
+                            _LEModel.wallet_id == wallet_id,
+                            _LEModel.idempotency_key == new_key,
+                        )
+                    )
+                    winner = raced.scalar_one_or_none()
+                    if winner is None:
+                        raise
+                    self._check_deposit_replay(winner, amount, actual_currency, reference, new_key)
                     refreshed = await session.get(SQLAlchemyWallet, wallet_id)
                     assert refreshed is not None
                     await session.refresh(refreshed)
@@ -446,6 +484,332 @@ class SqlAlchemyWalletRepository:
                 raise
             await session.refresh(row)
             return _wallet_to_domain(row), True
+
+    @staticmethod
+    def _check_deposit_replay(
+        entry: Any, amount: int, currency: str, reference: str, key: str
+    ) -> None:
+        if (
+            int(_attr(entry, "amount")) != amount
+            or str(_attr(entry, "currency")) != currency
+            or str(_attr(entry, "entry_type")) != LedgerEntryType.DEPOSIT.value
+            or str(_attr(entry, "description")) != f"gateway deposit {reference or key}"
+        ):
+            raise DuplicateIdempotencyError("deposit idempotency key carries different facts")
+
+    async def apply_currency_migration(
+        self, plan: WalletCurrencyMigrationPlan
+    ) -> tuple[Wallet, bool]:
+        """Apply an operator-approved USD-to-IRT cutover in one locked transaction.
+
+        All wallet-affecting activity must be quiesced by the operator:
+        standalone ledger posting, payment creation and server ordering do
+        not take this wallet lock and can insert rows after the safety reads.
+        """
+        if not isinstance(plan, WalletCurrencyMigrationPlan):
+            raise WalletCurrencyMigrationError("an approved currency migration plan is required")
+
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(SQLAlchemyWallet)
+                .where(SQLAlchemyWallet.id == plan.wallet_id)
+                .with_for_update()
+            )
+            wallet_row = result.scalar_one_or_none()
+            if wallet_row is None or _attr(wallet_row, "user_id") != plan.user_id:
+                raise WalletCurrencyMigrationError("migration wallet does not belong to the user")
+
+            prior = (
+                await session.execute(
+                    select(_MigrationModel).where(_MigrationModel.wallet_id == plan.wallet_id)
+                )
+            ).scalar_one_or_none()
+            if prior is not None:
+                await self._check_migration_replay(session, wallet_row, prior, plan)
+                replayed_wallet = _wallet_to_domain(wallet_row)
+                await session.rollback()
+                return replayed_wallet, False
+
+            if str(_attr(wallet_row, "currency")) != "USD":
+                raise WalletCurrencyMigrationError("only a USD wallet can migrate to IRT")
+            if str(_attr(wallet_row, "status") or "active") == WalletStatus.CLOSED:
+                raise WalletCurrencyMigrationError("a closed wallet cannot migrate")
+            if int(_attr(wallet_row, "balance")) != plan.source_balance_minor:
+                raise WalletCurrencyMigrationError(
+                    "USD wallet balance changed since migration approval"
+                )
+
+            quote_now = utc_now()
+            if (
+                plan.snapshot.observed_at > quote_now
+                or plan.snapshot.expires_at is None
+                or plan.snapshot.expires_at <= quote_now
+            ):
+                raise WalletCurrencyMigrationError(
+                    "migration FX quote is expired or not yet observed"
+                )
+
+            # clock_timestamp() (not transaction-start now()) shares the ledger
+            # DB clock. Two explicit microseconds separate close, audit and open;
+            # old ledger rows and settled holds must precede the first boundary.
+            boundary = from_db_utc_or_none(
+                (await session.execute(select(func.clock_timestamp()))).scalar_one()
+            )
+            assert boundary is not None
+            audit_at = boundary + timedelta(microseconds=1)
+            open_at = boundary + timedelta(microseconds=2)
+            if plan.snapshot.observed_at > boundary or plan.snapshot.expires_at <= open_at:
+                raise WalletCurrencyMigrationError("migration FX quote is not fresh at the cutover")
+            close_db_at = to_db_utc(boundary)
+            historic_entry = (
+                await session.execute(
+                    select(_LEModel.id)
+                    .where(
+                        _LEModel.wallet_id == plan.wallet_id,
+                        or_(
+                            _LEModel.created_at.is_(None),
+                            _LEModel.created_at >= close_db_at,
+                            _LEModel.currency != "USD",
+                            _LEModel.entry_type.in_(
+                                (LedgerEntryType.CURRENCY_CLOSE, LedgerEntryType.CURRENCY_OPEN)
+                            ),
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if historic_entry is not None:
+                raise WalletCurrencyMigrationError(
+                    "historical ledger cannot precede the USD boundary"
+                )
+
+            unsettled_hold = (
+                await session.execute(
+                    select(_HoldModel.id)
+                    .where(
+                        _HoldModel.wallet_id == plan.wallet_id,
+                        or_(
+                            _HoldModel.status == HoldStatus.CREATED,
+                            _HoldModel.currency != "USD",
+                            _HoldModel.created_at.is_(None),
+                            _HoldModel.created_at >= close_db_at,
+                            (
+                                (_HoldModel.status == HoldStatus.CAPTURED)
+                                & or_(
+                                    _HoldModel.captured_at.is_(None),
+                                    _HoldModel.captured_at >= close_db_at,
+                                )
+                            ),
+                            (
+                                (_HoldModel.status == HoldStatus.RELEASED)
+                                & or_(
+                                    _HoldModel.released_at.is_(None),
+                                    _HoldModel.released_at >= close_db_at,
+                                )
+                            ),
+                            ~_HoldModel.status.in_((HoldStatus.CAPTURED, HoldStatus.RELEASED)),
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if unsettled_hold is not None:
+                raise WalletCurrencyMigrationError(
+                    "an outstanding or unprovable USD hold blocks migration"
+                )
+
+            unsettled_payment = (
+                await session.execute(
+                    select(_PaymentModel.id)
+                    .where(
+                        _PaymentModel.user_id == plan.user_id,
+                        or_(
+                            _PaymentModel.status.in_(("pending", "manual_review")),
+                            (_PaymentModel.status == "succeeded")
+                            & _PaymentModel.credited_at.is_(None),
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if unsettled_payment is not None:
+                raise WalletCurrencyMigrationError("an unsettled payment blocks migration")
+
+            live_server = (
+                await session.execute(
+                    select(_ServerModel.id)
+                    .where(
+                        _ServerModel.user_id == plan.user_id,
+                        _ServerModel.state != "deleted",
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if live_server is not None:
+                raise WalletCurrencyMigrationError("a non-deleted server blocks migration")
+
+            amount_irt = plan.snapshot.target_amount_minor
+            close_id: UUID | None = None
+            open_id: UUID | None = None
+            if plan.source_balance_minor:
+                close_id, open_id = uuid4(), uuid4()
+                session.add(
+                    _LEModel(
+                        id=close_id,
+                        wallet_id=plan.wallet_id,
+                        amount=plan.source_balance_minor,
+                        currency="USD",
+                        entry_type=LedgerEntryType.CURRENCY_CLOSE,
+                        idempotency_key=f"currency-close-{plan.id}",
+                        reference_type="currency_migration",
+                        reference_id=plan.id,
+                        description="USD wallet currency migration close",
+                        created_at=close_db_at,
+                    )
+                )
+                session.add(
+                    _LEModel(
+                        id=open_id,
+                        wallet_id=plan.wallet_id,
+                        amount=amount_irt,
+                        currency="IRT",
+                        entry_type=LedgerEntryType.CURRENCY_OPEN,
+                        idempotency_key=f"currency-open-{plan.id}",
+                        reference_type="currency_migration",
+                        reference_id=plan.id,
+                        description="IRT wallet currency migration open",
+                        created_at=to_db_utc(open_at),
+                    )
+                )
+
+            session.add(
+                _MigrationModel(
+                    id=plan.id,
+                    user_id=plan.user_id,
+                    wallet_id=plan.wallet_id,
+                    source_balance_minor=plan.source_balance_minor,
+                    snapshot=plan.snapshot.to_dict(),
+                    operator_id=plan.operator_id,
+                    reason=plan.reason,
+                    close_entry_id=close_id,
+                    open_entry_id=open_id,
+                    created_at=audit_at,
+                )
+            )
+            cast(Any, wallet_row).balance = amount_irt
+            cast(Any, wallet_row).currency = "IRT"
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise WalletCurrencyMigrationError(
+                    "migration identity or ledger boundary conflicts"
+                ) from exc
+            await session.refresh(wallet_row)
+            return _wallet_to_domain(wallet_row), True
+
+    @staticmethod
+    async def _check_migration_replay(
+        session: AsyncSession,
+        wallet_row: SQLAlchemyWallet,
+        prior: _MigrationModel,
+        plan: WalletCurrencyMigrationPlan,
+    ) -> None:
+        """A consumed wallet migration cannot authorize different money or FX."""
+        if (
+            _attr(prior, "id") != plan.id
+            or _attr(prior, "user_id") != plan.user_id
+            or _attr(prior, "wallet_id") != plan.wallet_id
+            or int(_attr(prior, "source_balance_minor")) != plan.source_balance_minor
+            or _attr(prior, "snapshot") != plan.snapshot.to_dict()
+            or _attr(prior, "operator_id") != plan.operator_id
+            or _attr(prior, "reason") != plan.reason
+            or str(_attr(wallet_row, "currency")) != "IRT"
+        ):
+            raise WalletCurrencyMigrationError(
+                "migration ID or wallet has conflicting immutable facts"
+            )
+
+        created_at = from_db_utc_or_none(_attr(prior, "created_at"))
+        if created_at is None:
+            raise WalletCurrencyMigrationError("migration audit boundary lacks a timestamp")
+        if plan.source_balance_minor == 0:
+            if (
+                _attr(prior, "close_entry_id") is not None
+                or _attr(prior, "open_entry_id") is not None
+            ):
+                raise WalletCurrencyMigrationError(
+                    "zero-balance migration contains unexpected ledger facts"
+                )
+            return
+
+        close = await session.get(_LEModel, _attr(prior, "close_entry_id"))
+        opened = await session.get(_LEModel, _attr(prior, "open_entry_id"))
+        if close is None or opened is None:
+            raise WalletCurrencyMigrationError("migration ledger boundary is missing")
+        close_at = from_db_utc_or_none(_attr(close, "created_at"))
+        open_at = from_db_utc_or_none(_attr(opened, "created_at"))
+        if (
+            close_at is None
+            or open_at is None
+            or not close_at < created_at < open_at
+            or _attr(close, "id") == _attr(opened, "id")
+        ):
+            raise WalletCurrencyMigrationError("migration ledger chronology is invalid")
+        for entry, entry_type, amount, currency, key, description in (
+            (
+                close,
+                LedgerEntryType.CURRENCY_CLOSE,
+                plan.source_balance_minor,
+                "USD",
+                f"currency-close-{plan.id}",
+                "USD wallet currency migration close",
+            ),
+            (
+                opened,
+                LedgerEntryType.CURRENCY_OPEN,
+                plan.snapshot.target_amount_minor,
+                "IRT",
+                f"currency-open-{plan.id}",
+                "IRT wallet currency migration open",
+            ),
+        ):
+            if (
+                _attr(entry, "wallet_id") != plan.wallet_id
+                or str(_attr(entry, "entry_type")) != entry_type.value
+                or int(_attr(entry, "amount")) != amount
+                or str(_attr(entry, "currency")) != currency
+                or _attr(entry, "idempotency_key") != key
+                or _attr(entry, "reference_type") != "currency_migration"
+                or _attr(entry, "reference_id") != plan.id
+                or _attr(entry, "description") != description
+            ):
+                raise WalletCurrencyMigrationError(
+                    "migration ledger facts differ from the approved plan"
+                )
+
+    async def list_currency_migrations(self, wallet_id: UUID) -> list[WalletCurrencyMigration]:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(_MigrationModel)
+                .where(_MigrationModel.wallet_id == wallet_id)
+                .order_by(_MigrationModel.created_at, _MigrationModel.id)
+            )
+            return [
+                WalletCurrencyMigration(
+                    id=_attr(row, "id"),
+                    user_id=_attr(row, "user_id"),
+                    wallet_id=_attr(row, "wallet_id"),
+                    source_balance_minor=int(_attr(row, "source_balance_minor")),
+                    snapshot=ConversionSnapshot.from_dict(_attr(row, "snapshot")),
+                    operator_id=_attr(row, "operator_id"),
+                    reason=_attr(row, "reason"),
+                    close_entry_id=_attr(row, "close_entry_id"),
+                    open_entry_id=_attr(row, "open_entry_id"),
+                    created_at=from_db_utc(_attr(row, "created_at")),
+                )
+                for row in result.scalars().all()
+            ]
 
     async def _create(self, user_id: UUID, currency: str) -> Wallet:
         async with self._session_factory() as session:

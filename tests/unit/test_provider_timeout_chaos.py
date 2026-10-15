@@ -393,6 +393,18 @@ def _linux_images() -> list[ProviderImage]:
 # ---------------------------------------------------------------------------
 
 
+def _fake_request() -> CreateServerRequest:
+    return CreateServerRequest(
+        name="chaos-server",
+        plan_id="cx22",
+        image_id="img-linux",
+        location_id="fsn1",
+        ssh_key_ids=(),
+        labels={},
+        user_data=None,
+    )
+
+
 class TestCreateTimeoutChaos:
     async def test_crash_during_create_no_duplicate_server(self) -> None:
         """The ambiguous window: the worker DIES (op stays IN_FLIGHT) after
