@@ -556,10 +556,10 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "menu.wallet": "💰 Wallet",
         "menu.recharge": "⬆️ Top up",
         "menu.support": "🎧 Support",
-        "menu.admin": "Administration",
+        "menu.admin": "Management",
         "admin.title": "Superadmin management",
         "admin.gateways": "Manage gateways",
-        "admin.credit": "Credit a customer",
+        "admin.credit": "Manual Customer Wallet Credit",
         "admin.enabled": "Enabled",
         "admin.disabled": "Disabled",
         "admin.enable": "Enable {name}",
@@ -574,7 +574,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "admin.credit_failed": "Credit failed; check the wallet and amount.",
         "admin.denied": "Access denied.",
         "admin.credit_use_management": (
-            "Direct credit is disabled. Open Administration → Credit a customer, "
+            "Direct credit is disabled. Open Management → Manual Customer Wallet Credit, "
             "enter the amount and reason, then confirm."
         ),
         "recharge.admin_disabled": "Superadmin account top-up is not available.",
