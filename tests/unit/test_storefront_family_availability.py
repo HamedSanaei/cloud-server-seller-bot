@@ -3,9 +3,8 @@
 - ``families_screen`` lists ALL configured families with ``sellable_count``
   and ``available``; a family with no sellable offers is shown as unavailable,
   never hidden, and still resolves by existence.
-- The bot renders counts plus the unavailable marker, routes an unavailable
-  press to the honest unavailable screen, and auto-forwards only for a single
-  AVAILABLE family.
+- The bot renders available rows without counts, marks unavailable families,
+  and auto-forwards only for a single AVAILABLE family.
 - Generic storefront code never branches on provider/geo literals (second pin
   besides ``TestNoGeoBranching``).
 """
@@ -245,13 +244,14 @@ class TestFamilyAvailabilityCounts:
 
 
 class TestFamilyAvailabilityBot:
-    async def test_family_screen_shows_count_and_unavailable_marker(self) -> None:
+    async def test_family_screen_omits_counts_and_marks_unavailable(self) -> None:
         bot = _ui(_service([_monthly_offer(location_id="FRA-01") for _ in range(35)]))
         screen = await _press(bot, bot._callback("store", "families", PROVIDER))
         labels = [b.text for b in _buttons(screen)]
         monthly_label = next(label for label in labels if "VPS" in label)
         hourly_label = next(label for label in labels if "Cloud" in label)
-        assert "35" in monthly_label
+        assert "35" not in monthly_label
+        assert "پلن" not in monthly_label
         assert "موقتاً ناموجود" in hourly_label
         for button in _buttons(screen):
             assert button.callback_data is not None

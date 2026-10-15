@@ -120,7 +120,7 @@ class Harness:
         lock_acquired: bool = True,
     ) -> None:
         self.servers = list(servers or [])
-        self.wallet = wallet or Wallet(USER_ID, id=WALLET_ID, balance=100_000)
+        self.wallet = wallet or Wallet(USER_ID, id=WALLET_ID, balance=100_000, currency="USD")
         self.holds = dict(holds or {})
         self.snapshots = dict(snapshots if snapshots is not None else {SERVER_ID: _snapshot()})
         self.saved: list[CloudServer] = []
@@ -375,7 +375,7 @@ class TestFirstPeriodViaHoldCapture:
     async def test_first_period_captures_creation_hold(self) -> None:
         h = Harness(
             servers=[_server()],
-            wallet=Wallet(USER_ID, id=WALLET_ID, balance=10_000),
+            wallet=Wallet(USER_ID, id=WALLET_ID, balance=10_000, currency="USD"),
             holds={HOLD_KEY: _hold(HOLD_KEY)},
         )
         report = await h.make_job().run(now=T0)
@@ -431,7 +431,7 @@ class TestNoDuplicateChargesOnRetry:
         """Crash before the watermark save: the ledger must absorb the retry."""
         h = Harness(
             servers=[_server()],
-            wallet=Wallet(USER_ID, id=WALLET_ID, balance=10_000),
+            wallet=Wallet(USER_ID, id=WALLET_ID, balance=10_000, currency="USD"),
             holds={HOLD_KEY: _hold(HOLD_KEY)},
         )
         first = await h.make_job().run(now=T0)
@@ -513,7 +513,7 @@ class TestFailureModes:
     async def test_insufficient_balance_leaves_period_unsettled(self) -> None:
         h = Harness(
             servers=[_server()],
-            wallet=Wallet(USER_ID, id=WALLET_ID, balance=500),
+            wallet=Wallet(USER_ID, id=WALLET_ID, balance=500, currency="USD"),
         )
         report = await h.make_job().run(now=T0)
 

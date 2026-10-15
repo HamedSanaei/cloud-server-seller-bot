@@ -51,6 +51,17 @@ x-platform: &platform
     # documented server path.
     - ${CONFIGURATION_PATH:-/etc/cloud-server-seller/configuration.toml}:/etc/cloud-server-seller/configuration.toml:ro
   restart: unless-stopped
+  stop_grace_period: 45s
+  mem_limit: 1g
+  cpus: 1.0
+  pids_limit: 256
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   postgres:
@@ -67,6 +78,14 @@ services:
       timeout: 3s
       retries: 12
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # no published ports: only the platform services reach the database
 
   # Telegram transient state (callback references, pending confirmations,
@@ -86,6 +105,14 @@ services:
       timeout: 3s
       retries: 12
     restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   migrate:
     <<: *platform
@@ -116,11 +143,13 @@ services:
   worker:
     <<: *platform
     command: ["worker"]
-    # ARQ job runner: no HTTP server. The inherited image HTTP healthcheck
-    # would wrongly mark a working job processor unhealthy, so it is off;
-    # liveness is the running container plus the deploy-time stability gate.
+    # ARQ's expiring Redis sentinel proves the event loop actually ran.
     healthcheck:
-      disable: true
+      test: ["CMD", "python", "-c", "import sys; from arq.worker import check_health; from cloud_platform.worker.settings import WorkerSettings; sys.exit(check_health(WorkerSettings))"]
+      interval: 15s
+      timeout: 10s
+      start_period: 45s
+      retries: 3
     depends_on:
       postgres:
         condition: service_healthy
@@ -139,10 +168,14 @@ services:
   bot:
     <<: *platform
     command: ["bot"]
-    # No HTTP server here either: long-polling Telegram transport. Liveness
-    # is the running container plus the deploy-time restart-stability gate.
+    # Local heartbeat is refreshed only by successful Telegram long polls.
+    # This probe never calls getUpdates and never consumes a customer update.
     healthcheck:
-      disable: true
+      test: ["CMD", "python", "-m", "cloud_platform.bot.health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
     deploy:
       replicas: 1
     depends_on:
@@ -158,12 +191,19 @@ services:
   volume-init:
     image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in deploy.env (ghcr.io/<org>/<repo>:<full-sha>)}
     user: root
-    command: ["/bin/sh", "-c", "chown -R 999:999 /backups"]
+    command: ["/bin/sh", "-c", "chown -R $$(id -u app):$$(id -g app) /backups"]
     volumes:
       - backups:/backups
     restart: "no"
+    healthcheck:
+      disable: true
+    profiles: ["backup"]
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 32
 
   backup:
+    <<: *platform
     image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in deploy.env (ghcr.io/<org>/<repo>:<full-sha>)}
     command: ["backup"]
     # One-shot job: the image HTTP healthcheck (port 8000) does not apply.

@@ -33,15 +33,19 @@ async def verify_payment_session(gateway: Any, session: PaymentSession) -> Payme
         else:
             intent = await gateway.verify_payment(session.gateway_payment_id)
     if (
-        intent.gateway_payment_id != session.gateway_payment_id
+        type(intent.amount_minor) is not int
+        or intent.gateway_payment_id != session.gateway_payment_id
         or intent.amount_minor != session.amount_minor
         or intent.currency != session.currency
     ):
         raise ProviderError("verified payment does not match the durable invoice")
-    saved_tracking = (session.payment_details or {}).get("tracking_code")
+    saved_tracking = (session.payment_details or {}).get("tracking_code") or session.tracking_code
     verified_tracking = intent.metadata.get("tracking_code")
-    if saved_tracking and verified_tracking and saved_tracking != verified_tracking:
+    if saved_tracking and saved_tracking != verified_tracking:
         raise ProviderError("verified tracking code does not match the durable invoice")
+    merchant_reference = intent.metadata.get("merchant_order_ref")
+    if merchant_reference is not None and merchant_reference != session.idempotency_key:
+        raise ProviderError("verified merchant reference does not match the durable invoice")
     return intent
 
 
@@ -63,6 +67,13 @@ class PaymentInquiryService:
         session = await self._payments.get(session_id)
         if session is None or session.user_id != getattr(user, "id", None):
             raise PermissionDeniedError("payment session belongs to another user")
+        if session.status is PaymentSessionStatus.SUCCEEDED and session.credited_at is None:
+            outcome = await self._webhook.process_callback(
+                gateway_key=session.gateway_key,
+                external_id=session.gateway_payment_id or "",
+                status=PaymentSessionStatus.SUCCEEDED.value,
+            )
+            return outcome.session
         if session.status is not PaymentSessionStatus.PENDING:
             return session
         gateway = self._gateways.get(session.gateway_key)

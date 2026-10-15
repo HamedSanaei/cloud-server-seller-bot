@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,6 +21,7 @@ from cloud_platform.db.timestamps import (
 )
 from cloud_platform.modules.payments.domain import (
     DuplicateExternalIdError,
+    InvalidPaymentSessionTransition,
     PaymentSession,
     PaymentSessionStatus,
 )
@@ -51,6 +52,8 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
     fx_proxy_asset_raw = getattr(row, "fx_proxy_asset", None)
     fx_observed_raw = getattr(row, "fx_observed_at", None)
     details_raw = getattr(row, "payment_details", None)
+    redirect = getattr(row, "redirect_url", None)
+    tracking = getattr(row, "tracking_code", None)
     session = PaymentSession(
         user_id=_attr(row, "user_id"),
         gateway_key=str(_attr(row, "gateway_key")),
@@ -60,6 +63,8 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
         id=_attr(row, "id"),
         gateway_payment_id=_attr(row, "gateway_payment_id"),
         status=status,
+        redirect_url=redirect if isinstance(redirect, str) else None,
+        tracking_code=tracking if isinstance(tracking, str) else None,
         credit_amount_minor=int(credit_amount)
         if isinstance(credit_amount, int) and not isinstance(credit_amount, bool)
         else None,
@@ -84,6 +89,8 @@ def _to_row(aggregate: PaymentSession) -> _PaymentModel:
         user_id=aggregate.user_id,
         gateway_key=aggregate.gateway_key,
         gateway_payment_id=aggregate.gateway_payment_id,
+        redirect_url=aggregate.redirect_url,
+        tracking_code=aggregate.tracking_code,
         amount_minor=aggregate.amount_minor,
         currency=aggregate.currency,
         status=aggregate.status.value,
@@ -99,6 +106,42 @@ def _to_row(aggregate: PaymentSession) -> _PaymentModel:
         fx_proxy_asset=aggregate.fx_proxy_asset,
         payment_details=aggregate.payment_details,
     )
+
+
+def _validate_save(current: PaymentSession, proposed: PaymentSession) -> None:
+    """Compare durable financial facts while holding the payment row lock."""
+    for field_name in (
+        "user_id",
+        "gateway_key",
+        "currency",
+        "idempotency_key",
+        "credit_amount_minor",
+        "credit_currency",
+        "fx_source",
+        "fx_rate",
+        "fx_path",
+        "fx_observed_at",
+        "fx_proxy",
+        "fx_proxy_asset",
+    ):
+        if getattr(current, field_name) != getattr(proposed, field_name):
+            raise ValueError(f"payment {field_name} is immutable")
+    if current.gateway_payment_id is not None:
+        for field_name in (
+            "gateway_payment_id",
+            "amount_minor",
+            "payment_details",
+            "redirect_url",
+            "tracking_code",
+        ):
+            if getattr(current, field_name) != getattr(proposed, field_name):
+                raise ValueError(f"bound invoice {field_name} is immutable")
+    elif proposed.amount_minor != current.amount_minor and not proposed.gateway_payment_id:
+        raise ValueError("invoice total can change only when binding a provider invoice")
+    if current.status is not PaymentSessionStatus.PENDING and proposed.status is not current.status:
+        raise InvalidPaymentSessionTransition("persisted payment state is already terminal")
+    if proposed.credited_at is not None and proposed.status is not PaymentSessionStatus.SUCCEEDED:
+        raise InvalidPaymentSessionTransition("only succeeded payments can be credited")
 
 
 class SqlAlchemyPaymentSessionRepository:
@@ -162,7 +205,7 @@ class SqlAlchemyPaymentSessionRepository:
     async def list_pending_before(
         self, gateway_key: str, before: datetime, limit: int = 100
     ) -> list[PaymentSession]:
-        """PENDING sessions older than ``before`` (reconciliation cutoff).
+        """Pending or succeeded-but-uncredited sessions older than ``before``.
 
         ``created_at`` is a legacy naive-UTC column, so the aware cutoff is
         normalized at the boundary; binding it verbatim made asyncpg raise
@@ -175,7 +218,13 @@ class SqlAlchemyPaymentSessionRepository:
                 select(_PaymentModel)
                 .where(
                     _PaymentModel.gateway_key == gateway_key,
-                    _PaymentModel.status == PaymentSessionStatus.PENDING.value,
+                    or_(
+                        _PaymentModel.status == PaymentSessionStatus.PENDING.value,
+                        and_(
+                            _PaymentModel.status == PaymentSessionStatus.SUCCEEDED.value,
+                            _PaymentModel.credited_at.is_(None),
+                        ),
+                    ),
                     _PaymentModel.created_at <= cutoff,
                     _PaymentModel.gateway_payment_id.is_not(None),
                 )
@@ -189,32 +238,29 @@ class SqlAlchemyPaymentSessionRepository:
         assert session.id is not None  # only persisted sessions can be saved
         session_id: UUID = session.id
         async with self._session_factory() as db:
-            result = await db.execute(select(_PaymentModel).where(_PaymentModel.id == session_id))
+            result = await db.execute(
+                select(_PaymentModel).where(_PaymentModel.id == session_id).with_for_update()
+            )
             row = result.scalar_one_or_none()
             if row is None:
                 raise LookupError(f"payment session {session_id} not found")
+            current = _to_domain(row)
+            _validate_save(current, session)
+            if current.credited_at is not None:
+                # Preserve the first credit marker even when an older success
+                # races its final save after the winning callback.
+                return current
             cast_any: Any = row
             cast_any.status = session.status.value
             cast_any.gateway_payment_id = session.gateway_payment_id
+            cast_any.redirect_url = session.redirect_url
+            cast_any.tracking_code = session.tracking_code
             cast_any.credited_at = to_db_utc_or_none(session.credited_at)
             cast_any.updated_at = to_db_utc(utc_now())
             # The provider may add a unique suffix to its requested base amount.
             # Binding that invoice total never modifies the frozen wallet credit.
             cast_any.amount_minor = session.amount_minor
             cast_any.payment_details = session.payment_details
-            # Cross-currency snapshot columns (nullable; legacy rows keep NULL).
-            for field_name in (
-                "credit_amount_minor",
-                "credit_currency",
-                "fx_source",
-                "fx_rate",
-                "fx_path",
-                "fx_observed_at",
-                "fx_proxy",
-                "fx_proxy_asset",
-            ):
-                if hasattr(cast_any, field_name):
-                    setattr(cast_any, field_name, getattr(session, field_name))
             await db.commit()
             await db.refresh(row)
             return _to_domain(row)

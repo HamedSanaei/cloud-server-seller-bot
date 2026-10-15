@@ -32,9 +32,9 @@
 # the candidate path plus its expected SHA-256. Forward deployment runs
 # ENTIRELY against the candidate; the canonical file is replaced atomically
 # (same-filesystem rename) only after every health/stability/revision gate
-# passes. A failed release leaves the canonical contract untouched and rolls
-# back using the PREVIOUS canonical compose plus the previous image. The
-# database is NEVER downgraded.
+# passes. A failed release leaves the canonical contract untouched. Only a
+# release that attempted no schema transition may restart the previous image;
+# otherwise writers remain stopped for operator recovery. The database is NEVER downgraded.
 #
 # Required environment:
 #   DEPLOY_PATH              operator-owned directory (e.g. /opt/cloud-server-seller)
@@ -65,9 +65,9 @@
 # canonicalization (offers normalize-selling-currency) ->
 # api, worker, exactly one bot -> health/readiness -> STOREFRONT READINESS
 # (offers readiness: an enabled+credentialed+auto-priced provider with stored
-# offers but none sellable fails the release) -> report. On failure the
-# previous image is restored and restarted (the database is NEVER downgraded:
-# migrations stay forward-compatible so image rollback is always possible).
+# offers but none sellable fails the release) -> report. On failure rollback
+# never downgrades the database and never assumes an older application can
+# interpret a forward-migrated financial epoch.
 # A successful rollback is still a FAILED deployment (exit 1).
 #
 # Fail-closed design: every validation and every deployment step propagates
@@ -77,16 +77,20 @@
 # Preflight failures return before anything is mutated, so they never
 # trigger a rollback; only failures at/after the image switch roll back.
 #
-# This script never reads, prints, or rewrites secrets: deploy.env is only
-# touched on its PLATFORM_IMAGE line, configuration.toml is only checked for
-# existence, and GHCR authentication happens outside (GitHub Actions logs in
-# with the short-lived GITHUB_TOKEN before invoking this script).
+# This script never prints secrets or changes secret values: deploy.env is
+# touched only on its PLATFORM_IMAGE line. The mounted configuration is
+# validated inside the image without echoing validation inputs. GHCR login
+# happens outside this script with a short-lived, cleaned-up Docker config.
 set -Eeuo pipefail
 
 IMAGE_RE='^ghcr\.io/[a-z0-9._-]+/[a-z0-9._-]+:[0-9a-f]{40}$'
 PREV_IMAGE=""
 ROLLED_BACK="no"
 MUTATED="no"
+MIGRATION_STARTED="no"
+DB_HEAD_BEFORE=""
+WRITERS_STOPPED="no"
+APP_START_ATTEMPTED="no"
 
 load_config() {
     # Resolved here (not at file scope) so the functions below can be
@@ -116,12 +120,12 @@ fail() {
 
 compose_candidate() {
     # Forward deployment ALWAYS uses the release candidate contract.
-    docker compose --env-file "${ENV_FILE}" -f "${CANDIDATE_COMPOSE_FILE}" "$@"
+    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" docker compose --project-name cloud-platform-production --env-file "${ENV_FILE}" -f "${CANDIDATE_COMPOSE_FILE}" "$@"
 }
 
 compose_current() {
     # Rollback and canonical status ALWAYS use the previous canonical contract.
-    docker compose --env-file "${ENV_FILE}" -f "${CURRENT_COMPOSE_FILE}" "$@"
+    docker compose --project-name cloud-platform-production --env-file "${ENV_FILE}" -f "${CURRENT_COMPOSE_FILE}" "$@"
 }
 
 file_sha256() {
@@ -142,7 +146,12 @@ dotenv_value() {
 
 set_platform_image() {
     local file="$1" image="$2" tmp
-    tmp="$(mktemp)" || { fail "cannot create temp file"; return 1; }
+    tmp="$(mktemp "${file}.tmp.XXXXXX")" || { fail "cannot create temp file"; return 1; }
+    chmod --reference="${file}" "${tmp}" && chown --reference="${file}" "${tmp}" || {
+        rm -f "${tmp}"
+        fail "cannot preserve deployment env ownership/permissions"
+        return 1
+    }
     if grep -qE '^PLATFORM_IMAGE=' "${file}"; then
         awk -v img="${image}" '{ if ($0 ~ /^PLATFORM_IMAGE=/) print "PLATFORM_IMAGE=" img; else print }' \
             "${file}" > "${tmp}" || { fail "cannot rewrite ${file}"; rm -f "${tmp}"; return 1; }
@@ -151,8 +160,7 @@ set_platform_image() {
         printf 'PLATFORM_IMAGE=%s\n' "${image}" >> "${tmp}" \
             || { fail "cannot append to temp file"; rm -f "${tmp}"; return 1; }
     fi
-    cat "${tmp}" > "${file}" || { fail "cannot update ${file}"; rm -f "${tmp}"; return 1; }
-    rm -f "${tmp}"
+    mv -f "${tmp}" "${file}" || { fail "cannot atomically update ${file}"; rm -f "${tmp}"; return 1; }
 }
 
 container_healthy() {
@@ -169,7 +177,7 @@ container_running() {
 
 restart_count() {
     local id="$1"
-    docker inspect -f '{{.RestartCount}}' "${id}" 2>/dev/null || true
+    docker inspect -f '{{.RestartCount}}' "${id}" 2>/dev/null
 }
 
 wait_healthy() {
@@ -184,26 +192,69 @@ wait_healthy() {
 }
 
 api_ready() {
-    local port="$1" body
-    body="$(python3 -c 'import sys,urllib.request;print(urllib.request.urlopen(sys.argv[1],timeout=5).read().decode())' \
-        "http://127.0.0.1:${port}/health/ready" 2>/dev/null || true)"
-    case "${body}" in
-        *'"status": "ok"'*|*'"status":"ok"'*) return 0 ;;
-        *) return 1 ;;
-    esac
+    local port="$1"
+    python3 -c 'import json,sys,urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1],timeout=5) as response:
+        payload=json.load(response)
+        ok=response.status == 200 and isinstance(payload,dict) and payload.get("status") == "ok"
+except Exception:
+    ok=False
+sys.exit(0 if ok else 1)' "http://127.0.0.1:${port}/health/ready" >/dev/null 2>&1
 }
 
 rollback() {
+    # A first deployment can partially start too: stop candidate writers
+    # BEFORE checking whether a previous image exists.
+    if [ "${WRITERS_STOPPED}" = "yes" ] || [ "${APP_START_ATTEMPTED}" = "yes" ]; then
+        compose_candidate stop --timeout 45 api worker bot >/dev/null || {
+            fail "ROLLBACK: cannot stop candidate writers; refusing another poller"
+            return 1
+        }
+    fi
     if [ -z "${PREV_IMAGE}" ]; then
-        log "ROLLBACK: no previous image recorded (first deploy?) — nothing to restore"
+        log "ROLLBACK: no previous image recorded; candidate writers remain stopped"
         return 0
+    fi
+    if [ "${MIGRATION_STARTED}" = "yes" ]; then
+        local observed
+        observed="$(db_head)" || { fail "ROLLBACK: cannot establish database revision; writers remain stopped"; return 1; }
+        # A failed migration may have changed data before stamping its revision.
+        # Physical parity cannot prove that old code understands a new wallet
+        # denomination/financial epoch, even when all its columns still exist.
+        if [ "${IMAGE_HEAD:-}" != "${DB_HEAD_BEFORE}" ] || [ "${observed}" != "${DB_HEAD_BEFORE}" ]; then
+            fail "ROLLBACK: schema transition attempted (${DB_HEAD_BEFORE:-base} -> ${IMAGE_HEAD:-unknown}); observed ${observed:-base}. Writers remain stopped. Deploy a forward fix or perform separately verified operator recovery; no automatic old-image restart"
+            return 1
+        fi
+        PLATFORM_IMAGE="${PREV_IMAGE}" compose_current run --rm --no-deps migrate \
+            python -m cloud_platform.db.schema_parity >/dev/null 2>&1 || {
+                fail "ROLLBACK: previous image rejects current physical schema; writers remain stopped"
+                return 1
+            }
     fi
     log "ROLLBACK: restoring ${PREV_IMAGE}"
     set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
-    compose_current up -d api worker bot >/dev/null \
-        || { fail "ROLLBACK: cannot restart the previous application image"; return 1; }
+    if [ "${WRITERS_STOPPED}" = "yes" ] || [ "${APP_START_ATTEMPTED}" = "yes" ]; then
+        PLATFORM_IMAGE="${PREV_IMAGE}" compose_current up -d --no-deps api worker bot >/dev/null || {
+            compose_current stop --timeout 45 api worker bot >/dev/null || true
+            fail "ROLLBACK: cannot restart the previous application image; writers stopped"
+            return 1
+        }
+        local ids count
+        ids="$(compose_current ps -q bot)" || {
+            compose_current stop --timeout 45 api worker bot >/dev/null || true
+            fail "ROLLBACK: cannot establish bot cardinality; writers stopped"
+            return 1
+        }
+        count="$(printf '%s\n' "${ids}" | grep -c . || true)"
+        if [ "${count}" != "1" ] || ! container_running "${ids}"; then
+            compose_current stop --timeout 45 api worker bot >/dev/null || true
+            fail "ROLLBACK: single running bot not established; writers stopped"
+            return 1
+        fi
+    fi
     ROLLED_BACK="yes"
-    log "ROLLBACK: previous application image restarted (database left at the new migration revision)"
+    log "ROLLBACK: previous application image restored (database NOT downgraded)"
 }
 
 # The alembic head the RELEASE IMAGE ships with, read from the image itself.
@@ -216,19 +267,24 @@ rollback() {
 # (`run SERVICE COMMAND` REPLACES the service command, so `migrate alembic
 # heads` execs `alembic heads` directly and touches no database.)
 image_head() {
-    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
-        alembic heads 2>/dev/null \
-        | awk 'NF && $0 !~ /^(INFO|WARN|DEBUG|ERROR)/ { print $1 }' \
-        | grep -E '^[0-9a-zA-Z_]+$' | sort -u | tr '\n' ' ' | sed 's/ *$//'
+    local output
+    output="$(PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        alembic heads 2>/dev/null)" || return 1
+    printf '%s\n' "${output}" \
+        | awk 'NF && $0 !~ /^(INFO|WARN|DEBUG|ERROR)/ && $1 ~ /^[0-9a-zA-Z_]+$/ { print $1 }' \
+        | sort -u | tr '\n' ' ' | sed 's/ *$//'
 }
 
 # The revision the DATABASE currently reports, read with the release image
 # whose migrations the database is required to have reached.
 db_head() {
-    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
-        alembic current 2>/dev/null \
-        | awk 'NF && $0 !~ /^(INFO|WARN|DEBUG|ERROR)/ { print $1 }' \
-        | grep -E '^[0-9a-zA-Z_]+$' | head -n 1
+    # Keep every revision. Selecting the first row hides a branched database.
+    local output
+    output="$(PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
+        alembic current 2>/dev/null)" || return 1
+    printf '%s\n' "${output}" \
+        | awk 'NF && $0 !~ /^(INFO|WARN|DEBUG|ERROR)/ && $1 ~ /^[0-9a-zA-Z_]+$/ { print $1 }' \
+        | sort -u | tr '\n' ' ' | sed 's/ *$//'
 }
 
 verify_application_configuration() {
@@ -247,9 +303,16 @@ verify_application_configuration() {
         fail "cannot pull ${PLATFORM_IMAGE_NEW} for the configuration preflight"
         return 1
     fi
+    local revision
+    revision="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+        "${PLATFORM_IMAGE_NEW}" 2>/dev/null)" || { fail "cannot inspect release image revision"; return 1; }
+    [ "${revision}" = "${PLATFORM_IMAGE_NEW##*:}" ] || {
+        fail "release image revision does not match its immutable commit tag"
+        return 1
+    }
     if ! PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
-        python -c 'from cloud_platform.core.config import get_settings; get_settings()'; then
-        fail "server configuration rejected by the release image (see the error above; fix the configuration file and redeploy — nothing was changed)"
+        python -c 'from cloud_platform.core.config import get_settings; get_settings()' >/dev/null 2>&1; then
+        fail "server configuration rejected by the release image (validate the server-owned configuration locally; nothing was changed)"
         return 1
     fi
     log "server configuration accepted by the release image"
@@ -334,12 +397,14 @@ deploy() {
         fail "refusing suspicious DEPLOY_PATH: '${DEPLOY_PATH}'"
         return 1
     fi
-    case "${HEALTH_ATTEMPTS}" in
-        '' | *[!0-9]*) fail "HEALTH_ATTEMPTS must be a positive integer"; return 1 ;;
-    esac
-    case "${HEALTH_INTERVAL}" in
-        '' | *[!0-9]*) fail "HEALTH_INTERVAL must be a positive integer"; return 1 ;;
-    esac
+    if ! printf '%s' "${HEALTH_ATTEMPTS}" | grep -Eq '^[1-9][0-9]{0,8}$'; then
+        fail "HEALTH_ATTEMPTS must be a positive decimal integer without leading zeros"
+        return 1
+    fi
+    if ! printf '%s' "${HEALTH_INTERVAL}" | grep -Eq '^[1-9][0-9]{0,8}$'; then
+        fail "HEALTH_INTERVAL must be a positive decimal integer without leading zeros"
+        return 1
+    fi
     case "${STABILIZE_SECONDS}" in
         '' | *[!0-9]*) fail "STABILIZE_SECONDS must be a non-negative integer"; return 1 ;;
     esac
@@ -357,6 +422,16 @@ deploy() {
     verify_application_configuration || { fail "deployment aborted before anything was mutated"; return 1; }
 
     PREV_IMAGE="$(dotenv_value "${ENV_FILE}" PLATFORM_IMAGE)"
+    if [ -n "${PREV_IMAGE}" ]; then
+        printf '%s' "${PREV_IMAGE}" | grep -Eq "${IMAGE_RE}" || {
+            fail "recorded previous image is not an immutable commit image"
+            return 1
+        }
+        [ -f "${CURRENT_COMPOSE_FILE}" ] || {
+            fail "canonical compose missing for the recorded previous release"
+            return 1
+        }
+    fi
     log "target commit image : ${PLATFORM_IMAGE_NEW}"
     log "deploy path         : ${DEPLOY_PATH}"
     if [ -n "${PREV_IMAGE}" ]; then
@@ -396,12 +471,23 @@ deploy() {
             || { fail "${service} did not become healthy"; return 1; }
     done
 
+    DB_HEAD_BEFORE="$(db_head)" || { fail "cannot establish pre-migration revision"; return 1; }
+    case "${DB_HEAD_BEFORE}" in
+        *" "*) fail "database reports multiple migration revisions; refusing schema changes"; return 1 ;;
+    esac
+    log "stopping application writers before schema changes (including the single bot)"
+    MUTATED="yes"
+    WRITERS_STOPPED="yes"
+    if [ -f "${CURRENT_COMPOSE_FILE}" ]; then
+        compose_current stop --timeout 45 api worker bot >/dev/null || {
+            fail "cannot stop existing application writers; refusing migrations"
+            return 1
+        }
+    fi
     log "running database migrations (alembic upgrade head)"
+    MIGRATION_STARTED="yes"
     if ! compose_candidate run --rm --no-deps migrate; then
-        log "migration failed — restoring previous image reference (database left as-is)"
-        if [ -n "${PREV_IMAGE}" ]; then
-            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
-        fi
+        fail "migration failed; database left as-is and rollback compatibility must be established"
         return 1
     fi
     log "migrations applied"
@@ -414,12 +500,6 @@ deploy() {
     if [ "${DB_HEAD}" != "${IMAGE_HEAD}" ]; then
         log "alembic current: ${DB_HEAD:-<empty>} (image head: ${IMAGE_HEAD})"
         fail "database is NOT at the image alembic head ${IMAGE_HEAD}; refusing to start api/worker/bot on a mismatched schema"
-        # Nothing schema-dependent started, so the previous release is still
-        # the correct one: restore the recorded image reference.
-        if [ -n "${PREV_IMAGE}" ]; then
-            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
-            log "restored previous image reference (database left as-is)"
-        fi
         return 1
     fi
     log "database migration head verified: ${DB_HEAD} (== image head)"
@@ -439,12 +519,6 @@ deploy() {
     if ! PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
         python -m cloud_platform.db.schema_parity; then
         fail "database physical schema does not support the release (missing objects listed above); refusing to start api/worker/bot"
-        # Nothing schema-dependent started, so the previous release is still
-        # the correct one: restore the recorded image reference.
-        if [ -n "${PREV_IMAGE}" ]; then
-            set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
-            log "restored previous image reference (database left as-is)"
-        fi
         return 1
     fi
     log "database physical schema verified against the release"
@@ -505,6 +579,7 @@ deploy() {
     fi
 
     log "starting api + worker + bot (bot replicas = 1)"
+    APP_START_ATTEMPTED="yes"
     compose_candidate up -d api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
 
     local api_port
@@ -540,26 +615,37 @@ deploy() {
 
     # Telegram long polling is a single-consumer transport: exactly one bot.
     local bot_count bot_id
-    bot_count="$(compose_candidate ps -q bot | grep -c . || true)"
+    bot_id="$(compose_candidate ps -q bot)" || return 1
+    bot_count="$(printf '%s\n' "${bot_id}" | grep -c . || true)"
     [ "${bot_count}" = "1" ] || {
         fail "bot replica invariant violated: ${bot_count} bot containers (want exactly 1)"
         return 1
     }
-    bot_id="$(compose_candidate ps -q bot | head -n 1)"
     container_running "${bot_id}" || { fail "bot container is not running"; return 1; }
     log "bot replicas: exactly 1, running"
+    for service in api worker bot; do
+        id="$(compose_candidate ps -q "${service}")" || return 1
+        [ -n "${id}" ] && wait_healthy "${id}" "${HEALTH_ATTEMPTS}" "${HEALTH_INTERVAL}" || {
+            fail "${service} did not establish its service-specific health signal"
+            return 1
+        }
+    done
 
     # Startup-stability gate: a crash-looping container can look "running"
     # for a moment between restarts. Require the SAME worker/bot containers
     # to still be running with unchanged restart counts after a short
     # bounded wait. No HTTP probing: neither service serves HTTP.
     local bot_restarts_before worker_restarts_before
-    bot_restarts_before="$(restart_count "${bot_id}")"
-    worker_restarts_before="$(restart_count "${worker_id}")"
+    bot_restarts_before="$(restart_count "${bot_id}")" || { fail "cannot inspect bot restart count"; return 1; }
+    worker_restarts_before="$(restart_count "${worker_id}")" || { fail "cannot inspect worker restart count"; return 1; }
+    printf '%s:%s' "${bot_restarts_before}" "${worker_restarts_before}" | grep -Eq '^[0-9]+:[0-9]+$' || {
+        fail "invalid worker/bot restart counters"
+        return 1
+    }
     log "waiting ${STABILIZE_SECONDS}s for worker/bot startup stabilization"
     sleep "${STABILIZE_SECONDS}"
     local bot_id_after worker_id_after
-    bot_id_after="$(compose_candidate ps -q bot | head -n 1)"
+    bot_id_after="$(compose_candidate ps -q bot)" || return 1
     worker_id_after="$(compose_candidate ps -q worker | head -n 1)"
     [ "${bot_id_after}" = "${bot_id}" ] || { fail "bot container changed during stabilization"; return 1; }
     [ "${worker_id_after}" = "${worker_id}" ] || {
@@ -572,12 +658,10 @@ deploy() {
         return 1
     }
     if [ "$(restart_count "${bot_id}")" != "${bot_restarts_before}" ]; then
-        compose_candidate logs --tail=20 bot 2>/dev/null || true
         fail "bot restarted during stabilization (crash loop?)"
         return 1
     fi
     if [ "$(restart_count "${worker_id}")" != "${worker_restarts_before}" ]; then
-        compose_candidate logs --tail=20 worker 2>/dev/null || true
         fail "worker restarted during stabilization"
         return 1
     fi
@@ -585,23 +669,12 @@ deploy() {
 
     log "verifying migration revision"
     local current
-    current="$(compose_candidate exec -T api alembic current 2>/dev/null || true)"
-    # Defence in depth: the running API must report the SAME head that the
-    # image ships (the pre-start gate above already proved the database matches).
-    local expected="${IMAGE_HEAD:-${EXPECTED_HEAD}}"
-    if [ -n "${expected}" ]; then
-        case "${current}" in
-            *"${expected}"*) log "alembic current reports expected head ${expected}" ;;
-            *)
-                log "alembic current output: ${current:-<empty>}"
-                fail "database is not at expected head ${expected}"
-                return 1
-                ;;
-        esac
-    else
-        [ -n "${current}" ] || { fail "alembic current is empty"; return 1; }
-        log "alembic current: ${current}"
-    fi
+    current="$(db_head)" || { fail "cannot recheck database migration revision"; return 1; }
+    [ "${current}" = "${IMAGE_HEAD}" ] || {
+        fail "database is not at expected head ${IMAGE_HEAD}"
+        return 1
+    }
+    log "alembic current reports expected head ${IMAGE_HEAD}"
 
     # GATE: the customer-facing catalog must actually be open.
     #
@@ -620,31 +693,43 @@ deploy() {
     fi
     log "storefront readiness: ok"
 
-    # Atomic promotion: every gate above passed, so the release candidate
-    # becomes the canonical contract. Same-filesystem rename: either the
-    # canonical file is the new release, or it is untouched — never half
-    # written. The compose file holds no secrets (mode 0644 is safe).
+    log "verifying read-only database and worker smoke (not just API liveness)"
+    compose_candidate exec -T api python scripts/post_deploy_smoke.py \
+        --base-url http://127.0.0.1:8000 --expected-head "${IMAGE_HEAD}" || {
+            fail "database/worker post-deploy smoke failed"
+            return 1
+        }
+
+    # Make promotion the LAST fallible step: a failure must still leave the
+    # previous canonical compose available for compatible image rollback.
+    log "service status:"
+    compose_candidate ps || { fail "cannot list service status"; return 1; }
+    chmod 0644 "${CANDIDATE_COMPOSE_FILE}" \
+        || { fail "cannot set candidate compose permissions"; return 1; }
+    promoted_sha="$(file_sha256 "${CANDIDATE_COMPOSE_FILE}")" \
+        || { fail "cannot hash candidate compose before promotion"; return 1; }
+    [ "${promoted_sha}" = "${EXPECTED_COMPOSE_SHA256}" ] || {
+        fail "candidate compose changed during deployment; refusing promotion"
+        return 1
+    }
     log "promoting release compose to canonical"
     mv "${CANDIDATE_COMPOSE_FILE}" "${CURRENT_COMPOSE_FILE}" \
         || { fail "cannot promote release compose to canonical"; return 1; }
-    chmod 0644 "${CURRENT_COMPOSE_FILE}" \
-        || { fail "cannot set canonical compose permissions"; return 1; }
-    promoted_sha="$(file_sha256 "${CURRENT_COMPOSE_FILE}")" \
-        || { fail "cannot hash promoted compose"; return 1; }
-    [ "${promoted_sha}" = "${EXPECTED_COMPOSE_SHA256}" ] || {
-        fail "promoted compose hash mismatch (expected ${EXPECTED_COMPOSE_SHA256}, got ${promoted_sha})"
-        return 1
-    }
     log "release compose promoted: ${promoted_sha}"
-
-    log "service status:"
-    compose_current ps || { fail "cannot list service status"; return 1; }
     return 0
 }
 
 main() {
     load_config
     cd "${DEPLOY_PATH}" || { fail "cannot enter deploy path: ${DEPLOY_PATH}"; return 1; }
+    # The lock is shared by both lanes AND direct operator invocations.
+    # Keep it until this process exits; never unlink a flock inode.
+    command -v flock >/dev/null || { fail "flock is required for shared-host deployment safety"; return 1; }
+    exec 9> "${DEPLOY_PATH}/.deployment.lock" || return 1
+    flock -n 9 || { fail "another deployment owns the shared-host lock"; return 1; }
+    # SSH disconnect/cancellation must not interrupt schema changes or leave
+    # half-replaced services. Both workflows also disable auto-cancellation.
+    trap '' HUP INT TERM
     # `deploy` is intentionally NOT run as an `if` condition: errexit is
     # suppressed inside condition contexts, so its status is captured
     # explicitly instead of relying on `set -e`.
@@ -652,15 +737,6 @@ main() {
     deploy || rc=$?
     if [ "${rc}" = "0" ]; then
         log "DEPLOYMENT SUCCEEDED: ${PLATFORM_IMAGE_NEW}"
-        # Post-success cleanup only: keep the current and rollback images.
-        if [ -n "${PREV_IMAGE}" ] && [ "${PREV_IMAGE}" != "${PLATFORM_IMAGE_NEW}" ]; then
-            repo="${PLATFORM_IMAGE_NEW%:*}"
-            docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null \
-                | grep "^${repo}:" \
-                | grep -v -e ":${PLATFORM_IMAGE_NEW##*:}$" -e ":${PREV_IMAGE##*:}$" \
-                | awk '{print $2}' | sort -u | xargs -r docker rmi >/dev/null 2>&1 || true
-            log "old images pruned (current + rollback kept)"
-        fi
         return 0
     fi
     # Preflight failures return before anything is mutated: rolling back

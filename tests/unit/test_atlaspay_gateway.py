@@ -447,11 +447,16 @@ class MemoryPayments:
 
 
 class MemoryWallet:
-    def __init__(self) -> None:
+    def __init__(self, currency: str = "IRT") -> None:
+        self.currency = currency
         self.balance = 0
         self.deposits: dict[str, int] = {}
 
+    async def get(self, user_id: UUID) -> Any:
+        return SimpleNamespace(user_id=user_id, currency=self.currency, balance=self.balance)
+
     async def credit_deposit(self, user_id: UUID, amount: int, key: str, **kwargs: Any) -> Any:
+        assert kwargs.get("expected_currency", self.currency) == self.currency
         applied = key not in self.deposits
         if applied:
             self.deposits[key] = amount
@@ -485,7 +490,7 @@ class FrozenFx:
 
 async def test_bound_replay_recovers_real_api_link_and_preserves_fx_then_credits_once() -> None:
     requests: list[httpx.Request] = []
-    repo, wallet, fx = MemoryPayments(), MemoryWallet(), FrozenFx()
+    repo, wallet, fx = MemoryPayments(), MemoryWallet("EUR"), FrozenFx()
     user = User(
         username="fixture-customer",
         email="fixture@example.test",
@@ -877,7 +882,7 @@ async def test_untrusted_settlement_evidence_preserves_pending_money(
 
 @pytest.mark.parametrize("condition", ["foreign-owner", "missing-gateway", "still-pending"])
 async def test_inquiry_preserves_entire_pending_invoice(condition: str) -> None:
-    repo, wallet, fx = MemoryPayments(), MemoryWallet(), FrozenFx()
+    repo, wallet, fx = MemoryPayments(), MemoryWallet("EUR"), FrozenFx()
     user = User(username="fixture-customer", email="fixture@example.test", id=uuid4())
     requests: list[httpx.Request] = []
 
@@ -962,7 +967,7 @@ async def test_disabled_new_invoices_remain_recoverable_and_periodically_settle_
 ) -> None:
     from cloud_platform.worker import settings as worker
 
-    repo, wallet, fx = MemoryPayments(), MemoryWallet(), FrozenFx()
+    repo, wallet, fx = MemoryPayments(), MemoryWallet("EUR"), FrozenFx()
     user = User(username="fixture-customer", email="fixture@example.test", id=uuid4())
     requests: list[httpx.Request] = []
 

@@ -35,7 +35,7 @@ from cloud_platform.modules.catalog.repository import (
     PostgresAdvisoryCatalogSyncLock,
     SqlAlchemyLocationRepository,
 )
-from cloud_platform.modules.offers.domain import BILLING_MODEL_MONTHLY
+from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY, BILLING_MODEL_MONTHLY
 from cloud_platform.modules.offers.repository import (
     SqlAlchemyCatalogSyncStateRepository,
     SqlAlchemySellableOfferRepository,
@@ -499,7 +499,6 @@ class TestLiveHourlySyncAcceptance:
             CatalogAutoSyncCoordinator,
             PricingPolicy,
         )
-        from cloud_platform.modules.offers.domain import BILLING_MODEL_HOURLY
         from cloud_platform.providers.leaseweb.cloud import LeasewebHourlyCloudProvider
         from cloud_platform.providers.leaseweb.cloud_auto_sync import (
             LeasewebHourlyCloudSyncSource,

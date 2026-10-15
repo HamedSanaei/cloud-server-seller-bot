@@ -100,6 +100,12 @@ def test_ssh_password_reveal_requires_private_chat_and_acks_after_send(
     asyncio.run(_send_ssh_password(query, ui, user, "owned-ref"))
     assert "provider-issued-test-value" in _patch_outgoing["answer"].await_args.args[0]
     assert _patch_outgoing["answer"].await_args.kwargs["protect_content"] is True
+    text = _patch_outgoing["answer"].await_args.args[0]
+    raw = text.encode("utf-16-le")
+    assert [
+        raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
+        for entity in _patch_outgoing["answer"].await_args.kwargs["entities"]
+    ] == ["root", "provider-issued-test-value"]
     ui.finish_ssh_password.assert_awaited_once_with(user, server_id, claim_id, delivered=True)
 
     ui.claim_ssh_password.reset_mock()

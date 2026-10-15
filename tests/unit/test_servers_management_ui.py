@@ -288,6 +288,16 @@ class FakeManagement:
         self._owned(customer_id)
         return ServerActionOutcome(operation=ServerOperation.REINSTALL, accepted=True)
 
+    async def delete_server(
+        self, customer_id: UUID, server_id: UUID, *, confirmation_token: str | None
+    ) -> ServerActionOutcome:
+        self._consume(confirmation_token)
+        self._record("delete_server", server_id=server_id)
+        self._owned(customer_id)
+        return ServerActionOutcome(
+            operation=ServerOperation.DELETE, accepted=True, detail="pending"
+        )
+
     async def reset_password(
         self, customer_id: UUID, server_id: UUID, *, confirmation_token: str | None
     ) -> ServerActionOutcome:
@@ -471,6 +481,25 @@ class TestList:
         assert "8 گیگابایت" in screen.text
         offers.get.assert_awaited_once_with(offer_id)
 
+    async def test_hetzner_list_exposes_os_and_copyable_connection_values(self) -> None:
+        management = FakeManagement(
+            view=_view(
+                provider_key="hetzner",
+                display_name="Debian 13",
+                operating_system="Debian 13",
+                ip="192.0.2.22",
+            )
+        )
+        ui, _, _ = make_ui(management)
+        screen = await ui.list_screen(_user())
+        assert TRANSLATOR.t("servers.list_os", os="Debian 13") in screen.text
+        assert TRANSLATOR.t("servers.spec_ssh_port", value="22") in screen.text
+        raw = screen.text.encode("utf-16-le")
+        assert [
+            raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
+            for entity in screen.entities
+        ] == ["192.0.2.22", "22"]
+
     async def test_failed_create_shows_reason_without_raw_error(self) -> None:
         management = FakeManagement(
             view=_view(
@@ -534,6 +563,28 @@ class TestDetails:
         # The provider returned no RAM/window figure, so none is invented.
         assert "RAM" not in screen.text
         assert "🧠" not in screen.text
+
+    async def test_hetzner_details_and_refresh_keep_copyable_ip_and_port(self) -> None:
+        ui, _, _ = make_ui(FakeManagement(view=_view(provider_key="hetzner")))
+        ref = await _ref(ui)
+        for action in ("view", "refresh"):
+            screen = await ui.handle(Callback("servers", action, (ref,)), _user())
+            assert TRANSLATOR.t("servers.spec_ssh_port", value="22") in screen.text
+            raw = screen.text.encode("utf-16-le")
+            assert [
+                raw[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
+                for entity in screen.entities
+            ] == ["88.1.2.3", "22"]
+
+    async def test_hetzner_missing_image_never_claims_an_os(self) -> None:
+        ui, _, _ = make_ui(
+            FakeManagement(view=_view(provider_key="hetzner", operating_system=None))
+        )
+        detail = await ui.handle(Callback("servers", "view", (await _ref(ui),)), _user())
+        listing = await ui.list_screen(_user())
+        assert TRANSLATOR.t("servers.spec_os_unknown") in detail.text
+        assert TRANSLATOR.t("servers.list_os_unknown") in listing.text
+        assert "Ubuntu" not in detail.text
 
     async def test_manage_menu_hides_the_impossible_power_actions(self) -> None:
         ui, _m, _s = make_ui()
@@ -619,6 +670,24 @@ MANAGEMENT_SENT = "ارسال شد"
 # ---------------------------------------------------------------------------
 # Destructive operations
 # ---------------------------------------------------------------------------
+
+
+class TestDeleteFlow:
+    async def test_delete_requires_two_confirmations_and_only_executes_once(self) -> None:
+        ui, management, _s = make_ui()
+        ref = await _ref(ui)
+        warning = await ui.handle(Callback("servers", "del1", (ref,)), _user())
+        assert TRANSLATOR.t("servers.delete_warning") in warning.text
+        assert management.count("delete_server") == 0
+        confirm = await ui.handle(Callback("servers", "del2", (ref,)), _user())
+        assert TRANSLATOR.t("servers.delete_final") in confirm.text
+        assert management.count("delete_server") == 0
+        callback = _exec_callback(confirm)
+        result = await ui.handle(callback, _user())
+        repeat = await ui.handle(callback, _user())
+        assert TRANSLATOR.t("servers.delete_pending") in result.text
+        assert TRANSLATOR.t("servers.action_in_progress") in repeat.text
+        assert management.count("delete_server") == 1
 
 
 class TestDestructiveFlows:

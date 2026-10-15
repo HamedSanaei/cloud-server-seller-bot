@@ -104,8 +104,14 @@ class AdminBotUi:
         rows.append([self._button(self._t.t("nav.back"), "menu")])
         return BotScreen("\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
 
+    async def clear_prompt(self, admin: User) -> None:
+        self._authorize(admin)
+        await self._store.delete("admin-credit", str(admin.id))
+
     async def handle(self, cb: Callback, admin: User) -> BotScreen:
         self._authorize(admin)
+        if cb.screen in {"menu", "gateways"}:
+            await self.clear_prompt(admin)
         if cb.screen == "gateways":
             return await self.gateway_screen(admin)
         if cb.screen == "toggle" and len(cb.args) == 2 and cb.args[1] in {"on", "off"}:

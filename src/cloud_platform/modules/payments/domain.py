@@ -40,6 +40,7 @@ class PaymentSessionStatus(StrEnum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    MANUAL_REVIEW = "manual_review"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,8 @@ class PaymentSession:
     idempotency_key: str
     id: UUID | None = None
     gateway_payment_id: str | None = None
+    redirect_url: str | None = None
+    tracking_code: str | None = None
     status: PaymentSessionStatus = PaymentSessionStatus.PENDING
     credited_at: datetime | None = None
     credit_amount_minor: int | None = None
@@ -92,13 +95,16 @@ class PaymentSession:
     payment_details: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.amount_minor <= 0:
+        if type(self.amount_minor) is not int or not 0 < self.amount_minor <= 2**63 - 1:
             raise ValueError("payment amount must be a positive integer of minor units")
         if len(self.currency) != 3 or not self.currency.isalpha() or not self.currency.isupper():
             raise ValueError("currency must be a 3-letter uppercase ISO-4217 code")
         if not self.gateway_key or not self.gateway_key.strip():
             raise ValueError("gateway_key must not be empty")
-        if self.credit_amount_minor is not None and self.credit_amount_minor <= 0:
+        if self.credit_amount_minor is not None and (
+            type(self.credit_amount_minor) is not int
+            or not 0 < self.credit_amount_minor <= 2**63 - 1
+        ):
             raise ValueError("credit amount must be a positive integer of minor units")
         if self.credit_currency is not None and (
             len(self.credit_currency) != 3
@@ -126,7 +132,7 @@ class PaymentSession:
         self._require_pending()
         if self.gateway_payment_id is not None:
             raise InvalidPaymentSessionTransition("payment invoice is already bound")
-        if not gateway_payment_id:
+        if not gateway_payment_id or not gateway_payment_id.strip():
             raise ValueError("gateway payment id is required")
         return replace(
             self,
@@ -142,11 +148,12 @@ class PaymentSession:
                 "only pending sessions can transition"
             )
 
-    def _bind_external_id(self, gateway_payment_id: str) -> None:
+    def _validate_external_id(self, gateway_payment_id: str) -> None:
         self._require_pending()
         if not gateway_payment_id or not gateway_payment_id.strip():
             raise ValueError("gateway_payment_id must not be empty")
-        object.__setattr__(self, "gateway_payment_id", gateway_payment_id)
+        if self.gateway_payment_id is not None and self.gateway_payment_id != gateway_payment_id:
+            raise InvalidPaymentSessionTransition("payment invoice identity is already bound")
 
     def with_gateway_payment_id(self, gateway_payment_id: str) -> PaymentSession:
         """Return a copy bound to the external id, staying PENDING.
@@ -155,7 +162,7 @@ class PaymentSession:
         call (so the callback URL can reference it) and the gateway id
         arrives afterwards. Requires PENDING, like every other transition.
         """
-        self._bind_external_id(gateway_payment_id)
+        self._validate_external_id(gateway_payment_id)
         return PaymentSession(
             user_id=self.user_id,
             gateway_key=self.gateway_key,
@@ -164,6 +171,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=self.status,
             credited_at=self.credited_at,
             credit_amount_minor=self.credit_amount_minor,
@@ -181,7 +190,7 @@ class PaymentSession:
 
     def mark_succeeded(self, *, gateway_payment_id: str) -> PaymentSession:
         """Return a SUCCEEDED copy bound to the external id."""
-        self._bind_external_id(gateway_payment_id)
+        self._validate_external_id(gateway_payment_id)
         return PaymentSession(
             user_id=self.user_id,
             gateway_key=self.gateway_key,
@@ -190,6 +199,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=PaymentSessionStatus.SUCCEEDED,
             credited_at=self.credited_at,
             credit_amount_minor=self.credit_amount_minor,
@@ -207,7 +218,7 @@ class PaymentSession:
 
     def mark_failed(self, *, gateway_payment_id: str) -> PaymentSession:
         """Return a FAILED copy bound to the external id."""
-        self._bind_external_id(gateway_payment_id)
+        self._validate_external_id(gateway_payment_id)
         return PaymentSession(
             user_id=self.user_id,
             gateway_key=self.gateway_key,
@@ -216,6 +227,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=PaymentSessionStatus.FAILED,
             credited_at=self.credited_at,
             credit_amount_minor=self.credit_amount_minor,
@@ -230,6 +243,11 @@ class PaymentSession:
             updated_at=self.updated_at,
             payment_details=self.payment_details,
         )
+
+    def mark_manual_review(self) -> PaymentSession:
+        """Hold a provider-confirmed underpayment for operator resolution."""
+        self._require_pending()
+        return replace(self, status=PaymentSessionStatus.MANUAL_REVIEW)
 
     def mark_credited(self, *, at: datetime) -> PaymentSession:
         """Record that the ledger deposit was posted for this session."""
@@ -246,6 +264,8 @@ class PaymentSession:
             idempotency_key=self.idempotency_key,
             id=self.id,
             gateway_payment_id=self.gateway_payment_id,
+            redirect_url=self.redirect_url,
+            tracking_code=self.tracking_code,
             status=self.status,
             credited_at=at,
             credit_amount_minor=self.credit_amount_minor,

@@ -5,13 +5,14 @@ on:
   push:
     branches: [main]
 
-# One CI run per ref: newer pushes cancel superseded runs.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
-  # Avoid hardlink/permission flakiness of cached virtualenvs between runners.
   UV_LINK_MODE: copy
 
 jobs:
@@ -20,80 +21,116 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: "3.13"
           enable-cache: true
-      # --frozen: the lockfile is the single source of truth; the build fails
-      # if pyproject.toml and uv.lock drift, keeping every run deterministic.
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups
+        run: uv sync --locked --all-groups
       - name: Ruff (lint)
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
       - name: Ruff (format)
-        run: uv run ruff format --check .
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync ruff format --check .
       - name: Mypy
-        run: uv run mypy src
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync mypy src
       - name: Pre-commit (secret scanning, etc.)
-        run: uv run pre-commit run --all-files
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync pre-commit run --all-files
         env:
-          GIT_AUTHOR_NAME: "ci"
-          GIT_AUTHOR_EMAIL: "ci@ci.ci"
-          GIT_COMMITTER_NAME: "ci"
-          GIT_COMMITTER_EMAIL: "ci@ci.ci"
-      - name: Generated-artifact hygiene
-        run: uv run python scripts/check_generated_artifacts.py
+          GIT_AUTHOR_NAME: ci
+          GIT_AUTHOR_EMAIL: ci@ci.ci
+          GIT_COMMITTER_NAME: ci
+          GIT_COMMITTER_EMAIL: ci@ci.ci
+
+  repository-gates:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Migration compatibility
+            script: scripts/check_migrations.py
+          - name: Provider neutrality
+            script: scripts/check_domain_provider_branching.py
+          - name: Generated provider contracts
+            script: scripts/gen_leaseweb_coverage.py --check
+          - name: Task backlog
+            script: scripts/validate_tasks.py
+          - name: Generated-artifact hygiene
+            script: scripts/check_generated_artifacts.py
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+      - name: Run repository gate
+        env:
+          GATE_SCRIPT: ${{ matrix.script }}
+        run: |
+          read -r -a gate_args <<< "$GATE_SCRIPT"
+          uv run --no-sync python "${gate_args[@]}"
 
   test:
     name: Tests & coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    # Unit migration regressions need real PostgreSQL, not merely a URL.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: cloud
+          POSTGRES_PASSWORD: cloud
+          POSTGRES_DB: cloud
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U cloud -d cloud"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
+      CLOUD_PLATFORM_TEST_POSTGRES_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: "3.13"
           enable-cache: true
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups
-      # Deterministic suite: stable file order, JUnit results, and a coverage
-      # regression gate one point below the measured baseline (89%).
-      # Reports land in .ci-artifacts/ (git-ignored): generated test reports
-      # must never be committed.
+        run: uv sync --locked --all-groups
+      - name: Install PostgreSQL 17 backup and restore clients
+        run: |
+          sudo apt-get update
+          if ! apt-cache show postgresql-client-17 >/dev/null 2>&1; then
+            sudo apt-get install --yes postgresql-common
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+            sudo apt-get update
+          fi
+          sudo apt-get install --yes postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/psql --version
       - name: Run test suite
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: >-
           mkdir -p .ci-artifacts &&
-          uv run pytest
+          uv run --no-sync pytest
           --junitxml=.ci-artifacts/pytest-results.xml
           --cov=src
           --cov-report=xml:.ci-artifacts/coverage.xml
           --cov-report=term
           --cov-fail-under=88
-      # M12-003: the migration compatibility gate - rolling-deploy-unsafe
-      # schema changes (drops/renames/defaultless NOT NULL on the upgrade
-      # path) fail the build unless a reasoned '# compat-override:' is present.
-      - name: Migration compatibility gate
-        run: uv run python scripts/check_migrations.py
-      # M15-007: the provider-branching gate - no domain module may branch on
-      # a concrete provider key or import a provider adapter package; a new
-      # provider must be addable without touching src/cloud_platform/modules.
-      - name: Provider-branching gate
-        run: uv run python scripts/check_domain_provider_branching.py
-      # LEASEWEB-VPS-API honesty gate - the generated coverage matrix and the
-      # documentation snapshot must be current. On a clean clone (no raw
-      # capture) this verifies the inventory against the committed snapshot;
-      # with the capture present it also demands a byte-identical snapshot.
-      - name: Leaseweb generated-contract gate
-        run: uv run python scripts/gen_leaseweb_coverage.py --check
-      - name: Validate task backlog
-        if: always()
-        run: uv run python scripts/validate_tasks.py
       - name: Upload JUnit results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pytest-results
           path: .ci-artifacts/pytest-results.xml
@@ -101,7 +138,7 @@ jobs:
           retention-days: 14
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: .ci-artifacts/coverage.xml
@@ -109,58 +146,135 @@ jobs:
           retention-days: 14
 
   migration-smoke:
-    # LEASEWEB-MVP release gate: migrate a FRESH PostgreSQL database to head
-    # and assert the alembic head was reached. This makes the clean-DB
-    # migration smoke test reproducible in CI instead of local-only.
-    name: Fresh-PostgreSQL migration smoke
+    name: PostgreSQL migration bridge & contracts
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17-alpine
         env:
           POSTGRES_USER: cloud
           POSTGRES_PASSWORD: cloud
           POSTGRES_DB: cloud
-        ports:
-          - 5432:5432
+        ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U cloud"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+          --health-cmd "pg_isready -U cloud -d cloud"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
+      CLOUD_PLATFORM_TEST_POSTGRES_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: "3.13"
           enable-cache: true
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups
-      - name: Migrate a fresh database to head
-        env:
-          DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
-        run: uv run alembic upgrade head
-      - name: Assert head revision reached
-        env:
-          DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
+        run: uv sync --locked --all-groups
+      - name: Install PostgreSQL 17 backup and restore clients
         run: |
-          head_rev="$(uv run alembic heads | awk '{print $1}')"
-          current_rev="$(uv run alembic current | awk '{print $1}')"
-          echo "alembic head=$head_rev current=$current_rev"
+          sudo apt-get update
+          if ! apt-cache show postgresql-client-17 >/dev/null 2>&1; then
+            sudo apt-get install --yes postgresql-common
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+            sudo apt-get update
+          fi
+          sudo apt-get install --yes postgresql-client-17
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/psql --version
+      - name: Historical migration bridge (including fresh schema)
+        run: uv run --no-sync pytest tests/live/test_migration_bridge.py -q --no-cov
+      - name: Migrate a fresh database to head
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync alembic upgrade head
+      - name: Assert migration head and physical schema
+        run: |
+          uv run --no-sync python -m cloud_platform.db.schema_parity
+          head_rev="$(uv run --no-sync alembic heads | awk '{print $1}')"
+          current_rev="$(uv run --no-sync alembic current | awk '{print $1}')"
           test -n "$head_rev"
           test "$head_rev" = "$current_rev"
-      # Real-PostgreSQL contracts that mocks cannot express:
-      # - the catalog-sync lock key is a signed int64 and the coordinator runs
-      #   past lock acquisition;
-      # - the legacy TIMESTAMP WITHOUT TIME ZONE boundary: binding an aware
-      #   datetime into operations.updated_at / payment_sessions.created_at
-      #   raised asyncpg DataError, which aborted operation claiming BEFORE the
-      #   provider POST (a server stuck in "creating" with attempts=0);
-      # - wallet adjustment atomicity (balance mutation + ledger fact).
-      # Mock-only coverage silently let the datetime incident through, so
-      # every tests/live/test_postgres_*.py file runs on this gate.
       - name: Live PostgreSQL contracts
+        if: ${{ !cancelled() }}
+        run: >-
+          uv run --no-sync pytest tests/live/test_postgres_*.py
+          tests/live/test_financial_payment_outbox.py -q --no-cov
+
+  dependency-review:
+    name: Dependency security review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5.0.0
+        with:
+          fail-on-severity: moderate
+
+  security:
+    name: Locked dependency vulnerability audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Export and audit locked runtime and development dependencies
+        run: |
+          uv export --locked --all-groups --no-emit-project --format requirements-txt --output-file "$RUNNER_TEMP/audit-requirements.txt"
+          uv tool run --from pip-audit==2.10.1 pip-audit --strict --disable-pip --no-deps --requirement "$RUNNER_TEMP/audit-requirements.txt"
+
+  docker:
+    name: Workflow, Docker & deployment validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate GitHub workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - uses: docker/setup-buildx-action@v4
+      - name: Validate shell and production compose
         env:
-          CLOUD_PLATFORM_TEST_POSTGRES_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud
-        run: uv run pytest tests/live/test_postgres_*.py -q --no-cov
+          PLATFORM_IMAGE: ghcr.io/example/platform:0000000000000000000000000000000000000000
+          POSTGRES_PASSWORD: ci-validation-only # pragma: allowlist secret
+        run: |
+          bash -n scripts/deploy-production.sh docker-entrypoint.sh
+          docker compose -f deploy/production/docker-compose.yml config --quiet
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: platform:ci
+          build-args: RELEASE_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Exercise actual image entrypoint
+        run: |
+          docker run --rm platform:ci migrate --help
+          docker run --rm platform:ci python -c 'import cloud_platform.api.app'
+
+  required:
+    name: Required CI checks
+    if: always()
+    needs: [static, repository-gates, test, migration-smoke, dependency-review, security, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every applicable gate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          failed = [name for name, item in results.items()
+                    if item['result'] != 'success'
+                    and not (name == 'dependency-review' and os.environ['EVENT'] == 'push'
+                             and item['result'] == 'skipped')]
+          if failed:
+              raise SystemExit('Required gates failed or skipped: ' + ', '.join(failed))
+          PY

@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from cloud_platform.modules.wallet.domain import (
-    InsufficientBalanceError,
+    DuplicateIdempotencyError,
 )
 from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 
@@ -104,55 +104,6 @@ class TestGetOrCreate:
         assert wallet is not None
 
 
-class TestDebit:
-    async def test_debits_and_commits(
-        self, repo: SqlAlchemyWalletRepository, session: AsyncMock
-    ) -> None:
-        orm = _orm_wallet(balance=100)
-        session.execute = AsyncMock(return_value=_result(orm))
-        session.refresh = AsyncMock()
-        session.get = AsyncMock(return_value=orm)
-
-        updated = await repo.debit(uuid4(), 30, "test-key")
-        assert updated.balance == 70
-
-    async def test_insufficient_balance_raises(
-        self, repo: SqlAlchemyWalletRepository, session: AsyncMock
-    ) -> None:
-        orm = _orm_wallet(balance=10)
-        session.execute = AsyncMock(return_value=_result(orm))
-
-        with pytest.raises(InsufficientBalanceError):
-            await repo.debit(uuid4(), 20, "test-key")
-
-    async def test_no_wallet_raises(
-        self, repo: SqlAlchemyWalletRepository, session: AsyncMock
-    ) -> None:
-        session.execute = AsyncMock(return_value=_result(None))
-
-        with pytest.raises(ValueError):
-            await repo.debit(uuid4(), 10, "test-key")
-
-
-class TestAddFunds:
-    async def test_credits_and_commits(
-        self, repo: SqlAlchemyWalletRepository, session: AsyncMock
-    ) -> None:
-        orm = _orm_wallet(balance=100)
-        session.execute = AsyncMock(return_value=_result(orm))
-        session.refresh = AsyncMock()
-        session.get = AsyncMock(return_value=orm)
-
-        updated = await repo.add_funds(uuid4(), 50, "test-key")
-        assert updated.balance == 150
-
-    async def test_negative_amount_rejected(
-        self, repo: SqlAlchemyWalletRepository, session: AsyncMock
-    ) -> None:
-        with pytest.raises(ValueError, match="positive"):
-            await repo.add_funds(uuid4(), -10, "test-key")
-
-
 class TestCreditDeposit:
     """Gateway deposits apply exactly once, atomically with their ledger entry."""
 
@@ -180,7 +131,17 @@ class TestCreditDeposit:
     ) -> None:
         orm = _orm_wallet(balance=100)
         session.execute = AsyncMock(
-            side_effect=[_result(orm), _result("deposit-tetraminator-pay-1")]
+            side_effect=[
+                _result(orm),
+                _result(
+                    MagicMock(
+                        amount=500,
+                        currency="EUR",
+                        entry_type="deposit",
+                        description="gateway deposit deposit-tetraminator-pay-1",
+                    )
+                ),
+            ]
         )
 
         wallet, applied = await repo.credit_deposit(orm.user_id, 500, "deposit-tetraminator-pay-1")
@@ -196,7 +157,13 @@ class TestCreditDeposit:
         orm = _orm_wallet(balance=100)
         refreshed = _orm_wallet(balance=600, user_id=orm.user_id)
         refreshed.id = orm.id
-        session.execute = AsyncMock(side_effect=[_result(orm), _result(None)])
+        winner = MagicMock(
+            amount=500,
+            currency="EUR",
+            entry_type="deposit",
+            description="gateway deposit deposit-k",
+        )
+        session.execute = AsyncMock(side_effect=[_result(orm), _result(None), _result(winner)])
         integrity_error = IntegrityError(
             "stmt", {}, Exception('duplicate key ... "uq_ledger_wallet_idempotency"')
         )
@@ -208,6 +175,58 @@ class TestCreditDeposit:
         assert applied is False
         assert wallet.balance == 600  # winner's committed balance
         session.rollback.assert_awaited()
+
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            {"amount": 501},
+            {"currency": "IRT"},
+            {"entry_type": "refund"},
+            {"description": "gateway deposit another-payment"},
+        ],
+    )
+    async def test_unique_race_does_not_replay_different_immutable_facts(
+        self,
+        repo: SqlAlchemyWalletRepository,
+        session: AsyncMock,
+        changed: dict[str, Any],
+    ) -> None:
+        orm = _orm_wallet(balance=100)
+        facts = dict(
+            amount=500,
+            currency="EUR",
+            entry_type="deposit",
+            description="gateway deposit deposit-k",
+        )
+        facts.update(changed)
+        winner = MagicMock(**facts)
+        session.execute = AsyncMock(side_effect=[_result(orm), _result(None), _result(winner)])
+        session.commit = AsyncMock(
+            side_effect=IntegrityError(
+                "stmt",
+                {},
+                Exception('duplicate key "uq_ledger_wallet_idempotency"'),
+            )
+        )
+        session.rollback = AsyncMock(side_effect=lambda: setattr(orm, "balance", 100))
+        with pytest.raises(DuplicateIdempotencyError):
+            await repo.credit_deposit(orm.user_id, 500, "deposit-k")
+        assert orm.balance == 100
+        session.rollback.assert_awaited_once()
+        session.get.assert_not_awaited()
+
+    async def test_deposit_overflow_changes_no_balance_or_ledger(
+        self,
+        repo: SqlAlchemyWalletRepository,
+        session: AsyncMock,
+    ) -> None:
+        orm = _orm_wallet(balance=2**63 - 10)
+        session.execute = AsyncMock(side_effect=[_result(orm), _result(None)])
+        with pytest.raises(ValueError, match="signed int64"):
+            await repo.credit_deposit(orm.user_id, 10, "deposit-k")
+        assert orm.balance == 2**63 - 10
+        session.add.assert_not_called()
+        session.commit.assert_not_awaited()
 
     async def test_other_integrity_errors_propagate(
         self, repo: SqlAlchemyWalletRepository, session: AsyncMock

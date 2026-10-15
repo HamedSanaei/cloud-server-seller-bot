@@ -1,14 +1,7 @@
-"""Tests for the restore drill (M11-008).
+"""Unit coverage for encrypted restore selection, decryption and failures.
 
-Acceptance: restore into a clean environment verified.
-
-The drill is the full round trip: a backup produced by PostgresBackupJob is
-restored into a CLEAN environment (a fresh output dir + a fake psql sink)
-with the configured key, and the restored SQL is byte-identical to the
-original dump. The negative paths prove the drill is verifiably safe: a
-wrong key aborts BEFORE anything reaches the database, a missing/foreign
-file is rejected, a psql failure raises a scrubbed error (no DSN, no
-password), and the backup file is never modified by a failed restore.
+Real PostgreSQL transaction rollback and clean database round trips are
+exercised in tests/live/test_postgres_backup_restore.py.
 """
 
 from __future__ import annotations
@@ -26,7 +19,6 @@ from cloud_platform.backup.job import (
     PostgresBackupJob,
     PostgresRestoreJob,
     RestoreError,
-    build_pg_restore_command,
     list_backups,
     parse_backup_filename,
 )
@@ -66,14 +58,6 @@ def _psql_sink(sql_seen: list[bytes]) -> AsyncMock:
     return runner
 
 
-class TestRestoreCommand:
-    def test_psql_command_is_single_transaction(self) -> None:
-        cmd = build_pg_restore_command(DSN)
-        assert cmd[0] == "psql"
-        assert "--single-transaction" in cmd
-        assert cmd[-1] == DSN
-
-
 class TestFileSelection:
     def test_parses_the_embedded_timestamp(self) -> None:
         stamp = parse_backup_filename("cloud-backup-20260820-093000.dump.enc")
@@ -90,10 +74,10 @@ class TestFileSelection:
         assert list_backups(tmp) == []
 
 
-class TestCleanEnvironmentRestore:
-    """THE drill: backup -> clean dir -> restore -> identical SQL, once."""
+class TestEncryptedDumpTransfer:
+    """Verify encrypted backup bytes are decrypted and passed to the runner."""
 
-    async def test_round_trip_into_clean_environment(self, tmp_path: Path) -> None:
+    async def test_round_trip_passes_original_dump_to_runner(self, tmp_path: Path) -> None:
         # 1) a backup is produced (the M11-007 job, with a fake pg_dump)
         async def fake_pg_dump(command) -> subprocess.CompletedProcess:
             return subprocess.CompletedProcess(
@@ -123,8 +107,6 @@ class TestCleanEnvironmentRestore:
         assert restored == result.filename
         # the exact original SQL reached psql, exactly once
         assert sql_seen == [DUMP]
-        # and the psql argv pointed at the clean DSN in one transaction
-        # (the sink received the command; check it was the restore command)
 
     async def test_latest_picks_the_newest_backup(self, tmp_path: Path) -> None:
         old_name = f"{BACKUP_PREFIX}{OLD.strftime('%Y%m%d-%H%M%S')}.dump.enc"
@@ -222,6 +204,20 @@ class TestPsqlFailure:
         # the backup file is pristine for a retry
         assert backup.read_bytes() == before
         assert backup.exists()
+
+    async def test_runner_exception_does_not_expose_dsn_in_traceback(self, tmp_path: Path) -> None:
+        import traceback
+
+        _backup_file(tmp_path, "cloud-backup-20261015-120000.dump.enc")
+
+        async def runner(command, sql: bytes) -> subprocess.CompletedProcess:
+            raise OSError(f"cannot execute {command!r}")
+
+        with pytest.raises(RestoreError) as caught:
+            await _restore_job(tmp_path, runner=runner).run()
+        rendered = "".join(traceback.format_exception(caught.value))
+        assert DSN not in rendered
+        assert "sup3r-s3cret" not in rendered
 
 
 class TestConfigValidation:

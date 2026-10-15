@@ -42,7 +42,7 @@ def safe_fact(value: str | None) -> str | None:
 
 
 def create_routing(operation: Operation) -> CreateRoutingReceipt | None:
-    response = operation.provider_response or {}
+    response = getattr(operation, "provider_response", None) or {}
     if "create_routing" not in response:
         return None
     raw = response["create_routing"]
@@ -147,7 +147,7 @@ def current_account(operation: Operation, server_account_id: str | None) -> str:
 def safe_pre_post(operation: Operation) -> bool:
     receipt = create_routing(operation)
     if receipt is None or any(
-        (operation.provider_response or {}).get(key)
+        (getattr(operation, "provider_response", None) or {}).get(key)
         for key in ("provider_server_id", "provider_order_id")
     ):
         return False

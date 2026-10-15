@@ -10,8 +10,8 @@ performs first. Companion documents:
 
 ```text
 DEVELOPMENT LANE (active): push to `staging`
-  -> deploy-staging workflow: fast checks (ruff check, ruff format --check,
-     compileall, api/worker/bot import smoke)
+  -> deploy-staging workflow: fast static/import checks, targeted financial and
+     deployment regressions, historical/fresh PostgreSQL migration contracts
   -> cached Docker build of the EXACT pushed SHA -> GHCR
   -> SSH deploy with scripts/deploy-production.sh DEPLOY_PROFILE=staging
   -> migrations -> api/worker/single-bot -> health + storefront readiness
@@ -40,27 +40,29 @@ together with a server/bot of its own (a second token or a second environment);
 until then both lanes would fight over one single-consumer token. Pull-request
 CI runs never deploy.
 
-Concurrency: each lane is serialized on its own group — `staging-deploy` with
-`cancel-in-progress: true` (a superseded staging deploy is useless, the newest
-push wins) and `production-deploy` with `cancel-in-progress: false` (a release
-deploy is never cancelled halfway). Both deploy jobs additionally join
-`telegram-shared-host-deploy`, so a release deploy and a staging deploy can
-never mutate the same host at the same time.
+Both lanes disable cancellation of active runs and use the same deploy-job
+concurrency group, `telegram-shared-host-deploy`. Builds for one SHA are also
+serialized. The deploy engine additionally holds a server-side `flock` through
+failure recovery; direct operator invocations cannot bypass that exclusion.
+Once mutation begins, the engine ignores HUP/INT/TERM rather than interrupting
+a migration or service replacement. New pushes may replace pending runs, not
+interrupt an active deployment.
 
 ### The staging lane in one screen
 
 * **Trigger**: every push to `staging` (plus `workflow_dispatch`, which
   redeploys the current `staging` HEAD; a feature branch is never deployable
   through this lane).
-* **Checks**: `uv sync --frozen --all-groups`, then
-  `uv run python scripts/verify_ci.py --staging` (= `make staging-check`):
-  `ruff check`, `ruff format --check`, `compileall` over `src` and an
-  api/worker/bot import smoke. Deliberately NO pytest, NO coverage, NO mypy
-  (a cold run measures ~108s here) and NO `pre-commit --all-files`; those
-  belong to the release lane.
-* **Image**: `ghcr.io/<org>/<repo>:<pushed sha>` (immutable, never rebuilt or
-  overwritten when it already exists) plus a convenience `:staging` tag. The
-  deployment always references the SHA tag.
+* **Checks**: `uv sync --locked --all-groups`, the canonical staging
+  static/import gate, targeted financial/worker/deployment regressions, the
+  historical migration bridge, fresh physical-schema parity and live
+  PostgreSQL contracts. A PostgreSQL 17 service and matching backup/restore
+  clients are provided. Build/deploy depends on this job succeeding.
+  The full release suite, coverage, mypy and pre-commit remain release gates;
+  the staging pipeline does not substitute for them.
+* **Image**: only `ghcr.io/<org>/<repo>:<pushed full SHA>`, never rebuilt or
+  overwritten when it exists. Registry errors fail closed rather than being
+  interpreted as a missing tag. No mutable convenience tag is deployed.
 * **Target**: the SAME server, the SAME compose project
   (`cloud-platform-production`), the SAME server-owned
   `deploy.env`/`configuration.toml` and the SAME Telegram bot as production,
@@ -70,21 +72,22 @@ never mutate the same host at the same time.
   approval step; if required reviewers are ever enabled there, move those
   values to a shared environment (or dedicated staging credentials) BEFORE,
   otherwise staging deploys inherit the approval.
-* **Deploy engine**: the same `scripts/deploy-production.sh`. A comment in the
-  workflow would build a second, less-safe path; instead `DEPLOY_PROFILE=staging`
-  changes exactly one thing — it skips the one-shot provider catalog refresh,
-  because the worker's scheduled coordinator already owns provider facts. The
-  configuration preflight, migration + head + physical-schema gates, catalog
-  canonicalization, single-bot enforcement, API/health/stabilization and
-  storefront readiness gates are identical, and a failure rolls back the same
-  way.
-* **Database**: the current development database, forward only
-  (`alembic upgrade head`); never reset, recreated, or downgraded.
-* **Bot safety**: compose pins `bot` to `replicas: 1` and the deploy script
-  fails the release unless exactly one bot container is running, so the shared
-  Telegram token can never have two pollers. A cancelled staging deploy can
-  leave the stack mid-transition; the next push repairs it forward, and compose
-  REPLACES the `bot` service instead of adding one.
+* **Deploy engine**: the same `scripts/deploy-production.sh`.
+  `DEPLOY_PROFILE=staging` skips only the one-shot provider catalog refresh,
+  because the worker's scheduled coordinator owns provider facts.
+  Configuration, migration/head/physical-schema, catalog normalization,
+  single-poller, service health, financial reconciliation and storefront gates
+  remain enabled.
+* **Database**: the shared database, forward only (`alembic upgrade head`);
+  never reset, recreated, restamped to hide a conflict, or downgraded.
+* **Bot safety**: old application writers are stopped before migrations.
+  Compose uses the explicit project `cloud-platform-production` and
+  `bot.replicas: 1`. Promotion requires exactly one running, healthy bot and
+  a fresh heartbeat written by its existing successful `getUpdates` poll;
+  the health check never starts another poller.
+* **Failure safety**: image rollback is conditional, not universally safe.
+  An intended or observed schema advance leaves writers stopped for operator
+  recovery; see §6. Active deployments are not cancelled by newer pushes.
 * **Not** used by this lane: `deploy/staging/docker-compose.yml` (M12-004,
   `scripts/deploy.py`) describes a separate isolated stack with its own
   database, secrets and bot token; the staging lane replaces the running stack
@@ -113,11 +116,11 @@ Every deploy ships the exact `deploy/production/docker-compose.yml` from the
 exact tested commit as a per-SHA candidate
 (`.docker-compose.<FULL_SHA>.candidate.yml`), verifies its SHA-256, runs the
 whole release against it, and atomically promotes it to the canonical path
-only after all health/stability/revision gates pass. A failed release leaves
-the previous canonical compose untouched and rolls back with it. Manually
-copying compose to the server is NOT required for normal deploys (and a
-manual redeploy of an older SHA ships THAT SHA's compose, never current
-main's).
+only after all health/stability/revision/financial gates pass. Promotion is the
+last fallible step. A failure leaves the previous canonical compose untouched;
+it is used for automatic image rollback only when the database remains
+compatible under §6. A manual older-SHA dispatch is not approval to undo a
+financial/schema transition.
 
 * `deploy.env` holds ONLY `PLATFORM_IMAGE`, `POSTGRES_PASSWORD`, `API_PORT`
   and optionally `CONFIGURATION_PATH`. Automated deploys rewrite a single
@@ -241,82 +244,81 @@ reason, and its deploy job joins the shared-host concurrency group so the two
 lanes never overlap. Any change made here (rotation, renaming a variable)
 applies to both lanes at once — verify both workflows afterwards.
 
-Package visibility: the GHCR image may stay private — the workflow's
-`GITHUB_TOKEN` pulls it during build/verify, and the same token logs the
-server in per deploy. No personal access token is required. No other
-repository secrets are needed: application secrets live only in the server
-`configuration.toml`.
+Package visibility: the GHCR image may stay private. Each workflow supplies the
+short-lived `GITHUB_TOKEN` on stdin within one SSH session. That session creates
+a private temporary `DOCKER_CONFIG`, uses it for the pull/deploy, and removes it
+on exit; the new login is not written to the server user's default Docker
+credential file. Earlier pipelines may have left credentials there: inspect
+their presence without printing values and rotate/remove them only with
+operator authorization. Application secrets remain server-owned.
 
 ## 5. Deployment sequence (what the script does)
 
-1. Validate tools (`docker`, compose plugin, `python3`, `sha256sum`) and
-   required files; refuse to create or modify `configuration.toml` (fail
-   if missing).
-2. Verify the release candidate compose (`EXPECTED_COMPOSE_SHA256` over the
-   transferred file, regular file, no symlink, parses with the NEW image).
-   A mismatch fails before any mutation: no image switch, no migration, no
-   restarts, no rollback.
-3. Validate `PLATFORM_IMAGE_NEW` is `ghcr.io/<org>/<repo>:<40-hex-sha>`.
-4. Record the current `PLATFORM_IMAGE` as the rollback image.
-5. Rewrite ONLY the `PLATFORM_IMAGE` line in `deploy.env` (idempotent).
-6. Pull the image (candidate contract); on pull failure restore the
-   previous reference and stop (running containers untouched).
-7. Start/verify `postgres` + `redis` (bounded health waits, candidate contract).
-8. Run migrations (`alembic upgrade head` in the one-shot `migrate`
-   service); on failure restore the previous reference and stop.
-9. Refresh provider facts (`catalog auto-sync run`, one-shot container,
-   idempotent): exactly one complete catalog pass — the worker coordinator with
-   the DEDICATED catalog timeout, never the generic 120s job timeout whose
-   cancellation left a production catalog unpriced. It must come first because
-   a price can only be converted against provider facts the row already
-   carries. A non-zero exit is logged with its counters and NOT fatal.
-10. Canonicalize the catalog (`offers normalize-selling-currency --execute`,
-   one-shot container, idempotent). A schema migration refuses to invent
-   financial history, and the release that made canonical currency +
-   FX provenance a visibility requirement could not enforce it either — the
-   global-USD rollout deployed GREEN with 507 stored offers and ZERO on sale.
-   A non-zero exit here is logged with its counters and NOT fatal (an FX
-   outage must not block an unrelated release); step 12 is authoritative.
-11. Start/update `api`, `worker`, and exactly one `bot` (candidate contract).
-12. Health gates (all bounded, no infinite waits):
-    * `GET /health/ready` reports `{"status": "ok"}` (strongest readiness gate);
-    * `postgres` + `redis` containers healthy; `worker` running;
-    * exactly one `bot` container running (long-polling single consumer);
-    * `worker` + `bot` startup stability: same containers still running with
-      unchanged restart counts after a short bounded wait (a crash loop must
-      fail the deploy even if a container looks running for a moment);
-    * `alembic current` inside `api` reports the expected head
-      (`EXPECTED_HEAD`, resolved from the deployed commit in CI);
-    * `offers readiness` inside `api` (read-only, provider-neutral) proves the
-      customer catalog is actually OPEN: every provider that is configured
-      with a market, enabled, credentialed and auto-priced and has stored
-      offers must have at least one sellable row in the catalog currency, and
-      a provider whose last run discovered plans but persisted none fails.
-      Disabled/uncredentialed/policy-less providers are never required to have
-      offers, and an all-operator-disabled catalog is operator intent. A
-      failure here refuses to promote the release (rollback path runs).
-13. Atomically promote the candidate compose to the canonical path
-    (same-filesystem rename, mode 0644) and log its SHA-256.
-14. Print service status; on success prune older local images (current +
-    rollback images are always kept).
+1. Acquire the shared-host lock; validate tools, bounded health settings,
+   server-owned files and the candidate compose's SHA-256. Reject symlinks,
+   invalid profiles and non-SHA image references before service mutation.
+2. Pull the exact image; require its OCI revision to match its full SHA tag.
+   Validate the mounted server configuration without printing its values.
+3. Record the previous image, change only `PLATFORM_IMAGE` in `deploy.env`,
+   and establish PostgreSQL/Redis health. Read the database and image heads;
+   a database with multiple revisions is not deployable.
+4. Stop API, worker and the single bot before `alembic upgrade head`.
+   Alembic also holds a PostgreSQL transaction-scoped migration lock.
+5. Require the database head to equal the image head and verify the physical
+   schema, including the uniqueness/partial-index contracts used by upserts.
+   A version stamp alone is not schema evidence.
+6. Refresh provider facts (release profile only), then normalize catalog
+   selling currency. These bounded idempotent operations report failures;
+   the later read-only storefront gate remains authoritative during outages.
+7. Start API, worker and one bot. Require API readiness, PostgreSQL/Redis
+   health, ARQ worker health, a fresh existing-poller bot heartbeat, and stable
+   worker/bot container identities and restart counts.
+8. Recheck the migration head and read-only storefront readiness. Run
+   `scripts/post_deploy_smoke.py`: database/worker checks and wallet/payment
+   reconciliation share a read-only repeatable-read transaction. Smoke tests
+   do not create invoices, credit wallets or provision provider resources.
+9. Print service status, recheck candidate integrity and atomically promote
+   the compose file. Images and persistent volumes are not automatically
+   pruned; keep the previous image available for compatible recovery.
 
 ## 6. Migration and rollback behavior
 
-* Migrations run BEFORE the new code is declared healthy and are
-  forward-compatible (enforced by the migration compatibility gate in CI),
-  so rolling the application image back is always safe.
-* `alembic downgrade` is NEVER run automatically.
-* When health checks fail AFTER the switch, the script restores the previous
-  `PLATFORM_IMAGE`, restarts the previous api/worker/bot **with the previous
-  canonical compose (never the failed candidate)**, leaves the
-  database at the new (forward) revision, and exits 1: **a successful
-  rollback is still a failed deployment** (the workflow stays red).
-* With no previous image (first deploy), a failure reports NO ROLLBACK
-  TARGET loudly instead of pretending.
-* Manual rollback (same guarantees, same health gates): set `PLATFORM_IMAGE`
-  in `deploy.env` back to the previous SHA tag and re-run the script (or the
-  workflow) — or `docker compose --env-file deploy.env up -d api worker bot`
-  followed by the health checks in §5 step 9.
+### Ambiguous historical revision `0050`
+
+The released histories used `0050` for different changes. The canonical chain
+retains staging's `0050` through `0053`; additive bridge `0054` inspects the
+physical schema and preserves the main identity/payment/prepay changes too.
+Do not rename deployed revision stamps or use `alembic stamp` as a repair.
+Fresh databases, `0049`, both physical variants of `0050`, and staging `0053`
+are exercised by `tests/live/test_migration_bridge.py`, including rows,
+indexes, constraints and physical parity at one head.
+
+The bridge projects compatible payment evidence between legacy columns and
+JSON details. Conflicting evidence or duplicated gateway/idempotency facts
+abort the transaction rather than guessing, deduplicating or deleting money
+history. Resolve such conflicts with an approved, audited data decision, then
+retry the forward migration.
+
+### Recovery rules
+
+* Require a recent encrypted off-host backup and a successful clean-target
+  restore drill before approving a schema/financial-epoch advance. Backups are
+  not created or restored automatically by deployment.
+* `alembic downgrade` is never part of recovery. Physical parity does not prove
+  that an old image understands a new currency or financial epoch.
+* After a migration is attempted, if either the target image head or observed
+  database head differs from the pre-deploy revision, candidate writers are
+  stopped and **old-image restart is refused**, even when the migration fails
+  before stamping. Recover with a reviewed forward fix or a separately
+  verified operator recovery procedure.
+* When no schema transition was attempted, the prior image must pass physical
+  parity before automatic restoration with the previous canonical compose.
+  Failure recovery still leaves the workflow red.
+* A first deployment has no rollback image; failed candidate writers are
+  stopped. Never report an unavailable rollback target as success.
+* Do not manually run `compose up` on an old image after a forward migration.
+  Schema/data restoration is a separate destructive operation requiring
+  explicit approval, an isolated restore verification and writer exclusion.
 
 ## 7. Logs, inspection, backup
 
@@ -339,5 +341,6 @@ GitHub Actions logs show: commit SHA, image tag, target path, migration
 result, service status, health result, rollback status. They MUST never show:
 the SSH private key, `POSTGRES_PASSWORD`, `configuration.toml` content, the
 Leaseweb key, the Telegram token, the callback signing key, or payment
-secrets. The deploy script handles none of these values; the workflow passes
-the GHCR token on stdin only.
+secrets. Configuration validation suppresses input values. The workflow sends
+the GHCR token on stdin, unsets it and removes its private temporary Docker
+credential directory on exit. Never bypass SSH host-key verification to deploy.

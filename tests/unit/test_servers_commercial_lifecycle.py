@@ -48,6 +48,7 @@ from cloud_platform.modules.servers.service import (
     ServerOperationNotAllowedError,
 )
 from cloud_platform.modules.users.domain import User
+from cloud_platform.providers.registry import ProviderRegistry
 
 CUSTOMER = uuid4()
 OTHER_CUSTOMER = uuid4()
@@ -216,13 +217,6 @@ class FakeEventSink:
         return [event.event_type for event in self.events]
 
 
-class UnusedRegistry:
-    """Commercial operations are provider-agnostic: the registry is never used."""
-
-    def get(self, key: str) -> Any:
-        raise AssertionError("no provider lookup may happen on the commercial path")
-
-
 def _server(*, user_id: UUID = CUSTOMER) -> CloudServer:
     return CloudServer(
         id=SERVER_ID,
@@ -245,7 +239,7 @@ def make_service(
     sink = FakeEventSink()
     service = ServerManagementService(
         servers=FakeServerRepo([_server()]),  # type: ignore[arg-type]
-        registry=UnusedRegistry(),  # type: ignore[arg-type]
+        registry=ProviderRegistry(),
         policy=policy or ServerManagementPolicy(),
         confirmations=ConfirmationVerifier("test-signing-key", ttl_seconds=900),
         audit_repo=audit,  # type: ignore[arg-type]
@@ -307,7 +301,7 @@ class TestCommercialStatus:
     async def test_a_deployment_without_a_collector_still_reads(self) -> None:
         service = ServerManagementService(
             servers=FakeServerRepo([_server()]),  # type: ignore[arg-type]
-            registry=UnusedRegistry(),  # type: ignore[arg-type]
+            registry=ProviderRegistry(),
             policy=ServerManagementPolicy(),
             confirmations=ConfirmationVerifier("test-signing-key", ttl_seconds=900),
             audit_repo=FakeAuditRepo(),  # type: ignore[arg-type]

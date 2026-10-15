@@ -121,8 +121,14 @@ class TokenService:
             revoked_at=record.revoked_at,
             last_used_at=self._now(),
         )
-        await self._repo.save(used)
-        return TokenAuthentication(user_id=record.user_id, scopes=record.scopes, token_id=record.id)
+        try:
+            saved = await self._repo.save(used)
+        except TokenNotFoundError as exc:
+            raise InvalidTokenError("invalid or revoked token") from exc
+        if saved.revoked_at is not None:
+            raise InvalidTokenError("invalid or revoked token")
+        assert saved.id is not None
+        return TokenAuthentication(user_id=saved.user_id, scopes=saved.scopes, token_id=saved.id)
 
     async def list_tokens(self, *, actor_user_id: UUID, owner_user_id: UUID) -> list[ApiToken]:
         """Metadata only - never any material derived from the plaintext."""

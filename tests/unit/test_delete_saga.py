@@ -105,6 +105,17 @@ class _FakeWaiter:
         )
 
 
+class _ProbeWaiter:
+    async def wait_for(self, probe):
+        observed = await probe()
+        return WaitResult(
+            WaitOutcome.COMPLETED if observed.state.value == "completed" else WaitOutcome.TIMEOUT,
+            1,
+            0.1,
+            observed.detail,
+        )
+
+
 class _FakeFinalCharge:
     def __init__(
         self, charged: int = 1000, capped: bool = False, raise_missing: bool = False
@@ -300,6 +311,17 @@ def _hold(status: HoldStatus = HoldStatus.CREATED) -> Hold:
 
 
 class TestDeleteRequest:
+    async def test_deferred_request_waits_for_worker_before_provider_deletion(self) -> None:
+        fakes = Fakes(server=_server())
+        service = fakes.make_service()
+        queued = await service.request(USER_ID, SERVER_ID, IK, execute_inline=False)
+        assert queued.requeued and queued.server.state is ServerLifecycleState.DELETE_REQUESTED
+        assert fakes.provider.delete_calls == []
+        counts = await fakes.make_worker(service).process_pending_deletes()
+        assert counts["executed"] == 1
+        assert fakes.servers[SERVER_ID].state is ServerLifecycleState.DELETED
+        assert fakes.provider.delete_calls == ["prov-1"]
+
     async def test_happy_path(self) -> None:
         server = _server()
         fakes = Fakes(server=server)
@@ -510,6 +532,51 @@ class TestSagaSteps:
         op = fakes.ops[OP_KEY]
         assert op.status is OperationStatus.COMPLETED
         assert op.provider_response["charged_minor"] == 0
+
+    @pytest.mark.parametrize(
+        ("hold_status", "absent"),
+        [
+            (HoldStatus.CREATED, True),
+            (HoldStatus.CAPTURED, True),
+            (HoldStatus.RELEASED, True),
+            (HoldStatus.CREATED, False),
+        ],
+    )
+    async def test_prepaid_disappearance_releases_only_an_uncaptured_hold(
+        self, hold_status: HoldStatus, absent: bool
+    ) -> None:
+        server = _server(
+            state=ServerLifecycleState.MANUAL_REVIEW, billing_model="hourly_prepaid_irt"
+        )
+        reservation = _hold(hold_status)
+        reservation.currency = "IRT"
+        provider = _FakeProvider()
+        provider.absent = absent
+        fakes = Fakes(
+            server=server,
+            provider=provider,
+            waiter=_ProbeWaiter(),
+            holds={HOLD_KEY: reservation},
+        )
+        service = fakes.make_service()
+        result = await service.request(USER_ID, SERVER_ID, IK)
+
+        assert fakes.final.calls == []  # No retroactive charge on a prepaid contract.
+        assert provider.get_calls == 1
+        if not absent:
+            assert result.requeued
+            assert result.server.state is ServerLifecycleState.DELETING
+            assert reservation.status is HoldStatus.CREATED
+            assert fakes.released == []
+            return
+        assert result.server.state is ServerLifecycleState.DELETED
+        expected_releases = [HOLD_KEY] if hold_status is HoldStatus.CREATED else []
+        assert fakes.released == expected_releases
+        assert reservation.status is (
+            HoldStatus.RELEASED if hold_status is HoldStatus.CREATED else hold_status
+        )
+        assert (await service.request(USER_ID, SERVER_ID, IK)).replayed
+        assert fakes.released == expected_releases
 
     async def test_missing_snapshot_fails_op_but_server_stays_deleted(self) -> None:
         server = _server()

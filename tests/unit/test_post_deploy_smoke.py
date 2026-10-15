@@ -5,8 +5,12 @@ Acceptance: health + safe read-only provider checks.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from unittest.mock import patch
+from datetime import datetime
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -32,6 +36,14 @@ OK = {
     "http://x/health/ready": (200, json.dumps({"status": "ok", "mode": "starter"})),
     "http://x/metrics": (200, "cloud_platform_api_requests_total 1\n"),
 }
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    # HTTP mocks must not silently stand in for real DB/worker evidence.
+    monkeypatch.setattr(smoke, "database_revisions", smoke.repo_head_revision)
+    monkeypatch.setattr(smoke, "worker_health", lambda: 0)
+    monkeypatch.setattr(smoke, "financial_readiness", AsyncMock(return_value=(0, 0, 0, 0)))
 
 
 class TestHealthChecks:
@@ -61,9 +73,24 @@ class TestHealthChecks:
             results = smoke.check_health("http://x")
         assert all(r.ok is False for r in results)
 
-    def test_worker_check_uses_readiness(self) -> None:
-        with patch.object(smoke, "http_get", _fake_http(OK)):
+    @pytest.mark.parametrize("body", ["[]", "null", '"ok"', "42", "not-json"])
+    def test_non_object_health_body_fails_without_crashing(self, body: str) -> None:
+        with patch.object(smoke, "http_get", return_value=(200, body)):
+            assert all(not result.ok for result in smoke.check_health("http://x"))
+
+    def test_worker_check_uses_arq_not_api(self) -> None:
+        with patch.object(smoke, "http_get", side_effect=AssertionError("not worker evidence")):
             assert smoke.check_worker("http://x").ok is True
+
+    def test_api_green_does_not_hide_dead_worker(self) -> None:
+        with patch.object(smoke, "worker_health", return_value=1):
+            assert smoke.check_worker("http://x").ok is False
+
+    def test_worker_failure_is_redacted(self) -> None:
+        with patch.object(smoke, "worker_health", side_effect=RuntimeError("secret-value")):
+            result = smoke.check_worker("http://x")
+        assert result.ok is False
+        assert "secret-value" not in result.detail
 
 
 class TestMigrationHead:
@@ -87,6 +114,136 @@ class TestMigrationHead:
     def test_check_with_override(self) -> None:
         result = smoke.check_migration_head("http://x", "0099")
         assert "0099" in result.detail
+        assert result.ok is False
+
+    def test_multiple_observed_heads_fail(self) -> None:
+        with patch.object(smoke, "database_revisions", return_value="0050,0053"):
+            assert smoke.check_migration_head("http://x", "0053").ok is False
+
+    def test_database_probe_failure_is_not_a_green_expected_head(self) -> None:
+        with patch.object(smoke, "database_revisions", side_effect=RuntimeError("secret-dsn")):
+            result = smoke.check_migration_head("http://x", "0053")
+        assert not result.ok
+        assert "secret-dsn" not in result.detail
+
+
+class TestFinancialReadOnly:
+    @pytest.mark.parametrize("balance, expected_errors", [(500, 0), (499, 1)])
+    def test_real_repositories_reconcile_one_shared_snapshot_without_writes(
+        self, balance: int, expected_errors: int
+    ) -> None:
+        from sqlalchemy import JSON, MetaData, create_engine, event, insert, select
+        from sqlalchemy.dialects.postgresql import JSONB
+        from sqlalchemy.ext.asyncio import AsyncSession
+        from sqlalchemy.orm import Session
+
+        from cloud_platform.db.base import (
+            Hold,
+            LedgerEntry,
+            PaymentSession,
+            User,
+            Wallet,
+            WalletCurrencyMigration,
+        )
+
+        # Exercise real ORM reads and domain reconciliation against persisted
+        # facts. Only PostgreSQL DDL types/defaults are adapted for SQLite.
+        metadata = MetaData()
+        for model in (User, Wallet, Hold, LedgerEntry, WalletCurrencyMigration, PaymentSession):
+            table = model.__table__.to_metadata(metadata)
+            for column in table.c:
+                column.server_default = None
+                if isinstance(column.type, JSONB):
+                    column.type = JSON()
+        engine = create_engine("sqlite://")
+        metadata.create_all(engine)
+        wallet_id, user_id = uuid4(), uuid4()
+        with engine.begin() as connection:
+            connection.execute(
+                insert(metadata.tables["wallets"]),
+                {"id": wallet_id, "user_id": user_id, "currency": "IRT", "balance": balance},
+            )
+            connection.execute(
+                insert(metadata.tables["ledger"]),
+                {
+                    "id": uuid4(),
+                    "wallet_id": wallet_id,
+                    "entry_type": "deposit",
+                    "currency": "IRT",
+                    "amount": 500,
+                    "idempotency_key": "deposit-private-payment-reference",
+                    "created_at": datetime(2026, 1, 1),
+                },
+            )
+            connection.execute(
+                insert(metadata.tables["payment_sessions"]),
+                {
+                    "id": uuid4(),
+                    "user_id": user_id,
+                    "gateway_key": "test",
+                    "amount_minor": 500,
+                    "currency": "IRT",
+                    "status": "pending",
+                    "idempotency_key": "private-payment-reference",
+                },
+            )
+
+        statements: list[str] = []
+
+        def record(
+            connection: Any,
+            cursor: Any,
+            statement: str,
+            parameters: Any,
+            context: Any,
+            executemany: bool,
+        ) -> None:
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            with (
+                engine.connect() as connection,
+                connection.begin(),
+                Session(bind=connection) as session,
+            ):
+                connection.exec_driver_sql("PRAGMA query_only = ON")
+                statements.clear()
+
+                class AsyncReadSession:
+                    async def execute(self, statement: Any) -> Any:
+                        return session.execute(statement)
+
+                observed = asyncio.run(
+                    smoke._financial_snapshot(cast(AsyncSession, AsyncReadSession()))
+                )
+                assert observed == (1, expected_errors, 0, 1)
+                assert session.in_transaction()
+                assert connection.in_transaction()
+                assert statements and all(
+                    sql.lstrip().upper().startswith("SELECT ") for sql in statements
+                )
+                assert (
+                    connection.execute(select(metadata.tables["wallets"].c.balance)).scalar_one()
+                    == balance
+                )
+        finally:
+            engine.dispose()
+
+    def test_financial_error_count_fails_without_exposing_customer_data(self) -> None:
+        with patch.object(smoke, "financial_readiness", AsyncMock(return_value=(1, 1, 0, 1))):
+            result = smoke.check_financial_read_only()
+        assert not result.ok
+        assert result.detail == "wallets=1, ledger errors=1, warnings=0, payment sessions=1"
+
+    def test_financial_probe_exception_is_redacted(self) -> None:
+        with patch.object(
+            smoke, "financial_readiness", AsyncMock(side_effect=RuntimeError("secret-database-url"))
+        ):
+            result = smoke.check_financial_read_only()
+        assert not result.ok
+        assert "RuntimeError" in result.detail
+        assert "secret" not in result.detail
 
 
 class TestProviderCheck:

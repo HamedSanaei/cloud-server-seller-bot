@@ -20,3 +20,9 @@ build
 docs
 .github
 uv.lock.bak
+.ci-artifacts/
+.coverage*
+htmlcov/
+test-results/
+**/configuration.toml
+**/deploy.env

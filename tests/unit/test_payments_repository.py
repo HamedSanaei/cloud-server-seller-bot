@@ -29,6 +29,17 @@ def _row(session_id=None) -> MagicMock:
     row.credited_at = None
     row.created_at = None
     row.updated_at = None
+    row.redirect_url = None
+    row.tracking_code = None
+    row.payment_details = None
+    row.credit_amount_minor = None
+    row.credit_currency = None
+    row.fx_source = None
+    row.fx_rate = None
+    row.fx_path = None
+    row.fx_observed_at = None
+    row.fx_proxy = False
+    row.fx_proxy_asset = None
     return row
 
 
@@ -115,6 +126,7 @@ class TestSave:
         db.refresh = AsyncMock(side_effect=lambda r: setattr(r, "status", "succeeded"))
 
         aggregate = _aggregate()
+        row.user_id = aggregate.user_id
         object.__setattr__(aggregate, "id", target_id)
         updated = await repo.save(aggregate.mark_succeeded(gateway_payment_id="gw-123"))
 
@@ -141,6 +153,8 @@ class TestProviderInvoicePersistence:
         row.gateway_key = "atlaspay"
         row.currency = "IRT"
         row.idempotency_key = "atlas-invoice-persistence"
+        row.gateway_payment_id = None
+        row.amount_minor = 250000
         row.credit_amount_minor = 250
         row.credit_currency = "EUR"
         row.fx_source = "fixture"

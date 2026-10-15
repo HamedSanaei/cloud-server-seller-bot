@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 # Build stage: install locked dependencies into a virtualenv.
 # ---------------------------------------------------------------------------
-FROM python:3.13-slim AS builder
+FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f AS builder
 
 WORKDIR /app
 
@@ -26,16 +26,19 @@ WORKDIR /app
 # are copied, the second sync adds the project itself (editable, pointing
 # at /app/src).
 COPY pyproject.toml uv.lock ./
-RUN pip install --no-cache-dir "uv>=0.7,<1" \
-    && uv sync --frozen --no-dev --no-install-project --python /usr/local/bin/python
+RUN pip install --no-cache-dir "uv==0.11.28" \
+    && uv sync --locked --no-dev --no-install-project --python /usr/local/bin/python
 
 COPY src ./src
-RUN uv sync --frozen --no-dev --python /usr/local/bin/python
+RUN uv sync --locked --no-dev --python /usr/local/bin/python
 
 # ---------------------------------------------------------------------------
 # Runtime stage: the virtualenv + the sources + the entrypoint, nothing else.
 # ---------------------------------------------------------------------------
-FROM python:3.13-slim AS runtime
+FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f AS runtime
+
+ARG RELEASE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$RELEASE_REVISION
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -60,6 +63,7 @@ COPY --chown=app:app src ./src
 # and the revision scripts; env.py reads DATABASE_URL from the environment.
 COPY --chown=app:app alembic.ini ./alembic.ini
 COPY --chown=app:app alembic ./alembic
+COPY --chown=app:app scripts/post_deploy_smoke.py ./scripts/post_deploy_smoke.py
 COPY --chmod=755 --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh
 
 USER app

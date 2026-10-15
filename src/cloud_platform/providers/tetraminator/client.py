@@ -69,8 +69,8 @@ def toman_price_for(amount_minor: int, currency: str) -> int:
     """
     if currency != CURRENCY:
         raise ValueError(f"tetraminator only supports {CURRENCY} (got {currency})")
-    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int) or amount_minor <= 0:
-        raise ValueError("amount must be a positive integer of minor units")
+    if type(amount_minor) is not int or not 0 < amount_minor <= 2**63 - 1:
+        raise ValueError("amount must be a positive integer within signed int64 bounds")
     return amount_minor
 
 
@@ -240,8 +240,8 @@ class TetraminatorGateway(CapabilityGatedGateway):
                 response = await self._client.post(
                     f"{self._base_url}{path}", json=body, headers=self._headers()
                 )
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                raise ProviderUnavailable(str(exc)) from exc
+            except httpx.TransportError:
+                raise ProviderUnavailable("tetraminator transport failed") from None
         return self._checked_payload(response, f"POST {path}")
 
     async def _get(self, path: str) -> Any:
@@ -250,8 +250,8 @@ class TetraminatorGateway(CapabilityGatedGateway):
                 response = await self._client.get(
                     f"{self._base_url}{path}", headers=self._headers()
                 )
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                raise ProviderUnavailable(str(exc)) from exc
+            except httpx.TransportError:
+                raise ProviderUnavailable("tetraminator transport failed") from None
         return self._checked_payload(response, f"GET {path}")
 
     def _checked_payload(self, response: httpx.Response, operation: str) -> Any:
@@ -272,5 +272,5 @@ class TetraminatorGateway(CapabilityGatedGateway):
             raise ProviderError(f"tetraminator request failed (HTTP {status})")
         try:
             return response.json()
-        except Exception as exc:
-            raise ProviderError("tetraminator returned non-JSON payload") from exc
+        except ValueError:
+            raise ProviderError("tetraminator returned non-JSON payload") from None

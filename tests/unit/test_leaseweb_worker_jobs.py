@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -58,6 +59,42 @@ class TestSyncLeasewebOffers:
         await ws.sync_leaseweb_offers({})
         syncer_factory.assert_not_called()
 
+    @pytest.mark.parametrize("routed", [False, True], ids=["single-provider", "account-router"])
+    @pytest.mark.parametrize("fails", [False, True], ids=["successful-sync", "failed-sync"])
+    async def test_catalog_resources_close_after_success_or_failure(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, routed: bool, fails: bool
+    ) -> None:
+        resource = SimpleNamespace(
+            ordered_providers={}, priorities={}, account_states={}, aclose=AsyncMock()
+        )
+        monkeypatch.setattr(
+            "cloud_platform.providers.leaseweb.accounts.build_leaseweb_account_router",
+            lambda settings: resource if routed else None,
+        )
+        monkeypatch.setattr(
+            "cloud_platform.providers.leaseweb.ordering_sync.ordering_provider_from_settings",
+            lambda settings: resource,
+        )
+        step = SimpleNamespace(total_fetched=2, total_upserted=1, errors=[])
+        failure = RuntimeError("catalog unavailable")
+        syncer = SimpleNamespace(
+            sync_all=AsyncMock(
+                return_value={"products": step}, side_effect=failure if fails else None
+            )
+        )
+        monkeypatch.setattr(
+            "cloud_platform.providers.leaseweb.ordering_sync.LeaseWebOrderingCatalogSyncer",
+            lambda *args, **kwargs: syncer,
+        )
+        if fails:
+            with pytest.raises(RuntimeError, match="catalog unavailable") as raised:
+                await ws.sync_leaseweb_offers({})
+            assert raised.value is failure
+        else:
+            await ws.sync_leaseweb_offers({})
+        syncer.sync_all.assert_awaited_once()
+        resource.aclose.assert_awaited_once()
+
 
 class TestProcessLeasewebOrders:
     async def test_skipped_without_key(
@@ -90,6 +127,54 @@ class TestTelegramNotifiers:
     def test_telegram_notifiers_none_without_token(self, settings: Settings) -> None:
         settings.telegram_bot_token = ""
         assert ws._telegram_notifiers() is None
+
+
+class TestWorkerLifecycleAndNotifiers:
+    async def test_shutdown_clears_worker_context(self) -> None:
+        ctx = {"service": "cloud-platform-worker", "stale": object()}
+        await ws.shutdown(ctx)
+        assert ctx == {}
+
+    @pytest.mark.parametrize(
+        ("job", "method"),
+        [
+            (ws.process_leaseweb_orders, "order_worker"),
+            (ws.reconcile_leaseweb_orders, "order_reconciler"),
+            (ws.check_renewals, "renewal_checker"),
+        ],
+        ids=["submit", "reconcile", "renew"],
+    )
+    @pytest.mark.parametrize("phase", ["construction", "execution"])
+    async def test_notifier_close_failure_preserves_job_failure_and_container_cleanup(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        job: Any,
+        method: str,
+        phase: str,
+    ) -> None:
+        failure = RuntimeError("job unavailable")
+        container = MagicMock(initialize=AsyncMock(), close=AsyncMock())
+        container.provider_registry.keys.return_value = ("leaseweb",)
+        service = SimpleNamespace(
+            process_pending=AsyncMock(side_effect=failure),
+            reconcile=AsyncMock(side_effect=failure),
+            run=AsyncMock(side_effect=failure),
+        )
+        getattr(container, method).return_value = service
+        if phase == "construction":
+            getattr(container, method).side_effect = failure
+        session = SimpleNamespace(close=AsyncMock(side_effect=RuntimeError("telegram unavailable")))
+        notifier = SimpleNamespace(_bot=SimpleNamespace(session=session))
+        monkeypatch.setattr(ws, "_telegram_notifiers", lambda: (notifier, notifier))
+        monkeypatch.setattr("cloud_platform.core.container.create_container", lambda: container)
+
+        with pytest.raises(RuntimeError, match="job unavailable") as raised:
+            await job({})
+
+        assert raised.value is failure
+        assert session.close.await_count > 0
+        container.close.assert_awaited_once()
 
 
 class TestAccrueUsage:

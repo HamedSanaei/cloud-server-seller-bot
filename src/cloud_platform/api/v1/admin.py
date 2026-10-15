@@ -1,14 +1,13 @@
 """Admin REST surface (M14-003).
 
-Acceptance: search/actions are RBAC/audited.
+Acceptance: search/actions require both token capabilities and active admin RBAC.
 
-Every endpoint requires an authenticated actor whose platform User holds
-the admin permission for that operation (application-layer RBAC via
-:class:`PermissionChecker`); a non-admin gets the same stable ``403
-forbidden`` envelope as an unknown id - no existence leaks. Every
-mutation is audited through :class:`AuditTrail` as an ADMIN-actor event
-WITH a non-empty reason (the audit chokepoint itself rejects admin
-events without one) and requires the v1 idempotency key.
+Every GET requires ``admin:read`` and every mutation ``admin:write`` in
+addition to the platform User's application-layer permission. Non-admin,
+inactive, and unknown actors get the stable ``403 forbidden`` envelope.
+Status changes require a non-empty reason and an idempotency key; the user
+repository commits the status and immutable ADMIN audit receipt together.
+Exact replays return their historical result without reapplying the change.
 """
 
 from __future__ import annotations
@@ -20,18 +19,22 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 
 from cloud_platform.core.container import get_container
-from cloud_platform.modules.audit.domain import ActorType, AuditRepository
+from cloud_platform.modules.audit.domain import AuditRepository
 from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
-from cloud_platform.modules.audit.service import AuditTrail
+from cloud_platform.modules.tokens.domain import TokenScope
 from cloud_platform.modules.users.domain import (
     Permission,
     PermissionChecker,
     PermissionDeniedError,
     Role,
     User,
+    UserNotFound,
     UserStatus,
 )
-from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+from cloud_platform.modules.users.repository import (
+    SqlAlchemyUserRepository,
+    UserStatusIdempotencyConflict,
+)
 
 from .dependencies import get_token_authentication, require_idempotency_key
 from .errors import ApiError, ErrorCode
@@ -49,22 +52,18 @@ async def _audit_repo() -> AuditRepository:
     return SqlAlchemyAuditRepository(container.session_factory)
 
 
-async def _audit_trail(
-    repo: Annotated[AuditRepository, Depends(_audit_repo)],
-) -> AuditTrail:
-    """The audit chokepoint over the request-scoped repository."""
-    return AuditTrail(repo)
-
-
 def _admin_auth(
     permission: Permission,
+    scope: TokenScope,
 ) -> Callable[[Any, SqlAlchemyUserRepository], Awaitable[User]]:
-    """Dependency factory enforcing one admin permission (RBAC)."""
+    """Dependency factory enforcing token capability AND active admin RBAC."""
 
     async def _checker(
         auth: Annotated[Any, Depends(get_token_authentication)],
         repo: Annotated[SqlAlchemyUserRepository, Depends(_user_repo)],
     ) -> User:
+        if not auth.has(scope):
+            raise ApiError(ErrorCode.FORBIDDEN, f"token scope {scope.value} required")
         user = await repo.get(auth.user_id)
         if user is None or user.role is not Role.ADMIN:
             # identical envelope whether or not the id exists - no leak
@@ -87,7 +86,9 @@ def _admin_auth(
 
 @router.get("/users")
 async def search_users(
-    _actor: Annotated[User, Depends(_admin_auth(Permission.ADMIN_MANAGE_USERS))],
+    _actor: Annotated[
+        User, Depends(_admin_auth(Permission.ADMIN_MANAGE_USERS, TokenScope.ADMIN_READ))
+    ],
     repo: Annotated[SqlAlchemyUserRepository, Depends(_user_repo)],
     q: str = "",
     offset: int = 0,
@@ -115,7 +116,9 @@ async def search_users(
 @router.get("/users/{user_id}")
 async def get_user(
     user_id: UUID,
-    _actor: Annotated[User, Depends(_admin_auth(Permission.ADMIN_MANAGE_USERS))],
+    _actor: Annotated[
+        User, Depends(_admin_auth(Permission.ADMIN_MANAGE_USERS, TokenScope.ADMIN_READ))
+    ],
     repo: Annotated[SqlAlchemyUserRepository, Depends(_user_repo)],
 ) -> dict[str, Any]:
     user = await repo.get(user_id)
@@ -138,10 +141,11 @@ async def get_user(
 async def set_user_status(
     user_id: UUID,
     body: dict[str, Any],
-    actor: Annotated[User, Depends(_admin_auth(Permission.ADMIN_MANAGE_USERS))],
+    actor: Annotated[
+        User, Depends(_admin_auth(Permission.ADMIN_MANAGE_USERS, TokenScope.ADMIN_WRITE))
+    ],
     repo: Annotated[SqlAlchemyUserRepository, Depends(_user_repo)],
-    audit: Annotated[AuditTrail, Depends(_audit_trail)],
-    _key: Annotated[str, Depends(require_idempotency_key)],
+    key: Annotated[str, Depends(require_idempotency_key)],
 ) -> dict[str, Any]:
     status_raw = str(body.get("status") or "")
     reason = str(body.get("reason") or "").strip()
@@ -154,20 +158,16 @@ async def set_user_status(
         raise ApiError(
             ErrorCode.VALIDATION_ERROR, f"unknown status {status_raw!r}; valid: {valid}"
         ) from None
-    target = await repo.get(user_id)
-    if target is None:
-        raise ApiError(ErrorCode.NOT_FOUND, f"user {user_id} not found")
-    updated = await repo.update_status(user_id, status)
-    await audit.record_mutation(
-        actor_type=ActorType.ADMIN,
-        actor_id=actor.id,
-        action="admin.user.status_changed",
-        resource_type="user",
-        resource_id=str(user_id),
-        reason=reason,
-        metadata={"status": status.value},
-    )
-    return {"user": {"id": str(updated.id), "status": updated.status.value}}
+    assert actor.id is not None  # The authentication dependency fetched a persisted admin.
+    try:
+        outcome = await repo.change_status_idempotently(
+            user_id, status, actor_id=actor.id, idempotency_key=key, reason=reason
+        )
+    except UserNotFound:
+        raise ApiError(ErrorCode.NOT_FOUND, f"user {user_id} not found") from None
+    except UserStatusIdempotencyConflict as exc:
+        raise ApiError(ErrorCode.CONFLICT, str(exc)) from None
+    return {"user": {"id": str(user_id), "status": outcome.value}}
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +177,9 @@ async def set_user_status(
 
 @router.get("/audit")
 async def query_audit(
-    _actor: Annotated[User, Depends(_admin_auth(Permission.ADMIN_MANAGE_SETTINGS))],
+    _actor: Annotated[
+        User, Depends(_admin_auth(Permission.ADMIN_MANAGE_SETTINGS, TokenScope.ADMIN_READ))
+    ],
     events: Annotated[AuditRepository, Depends(_audit_repo)],
     resource_type: str | None = None,
     resource_id: str | None = None,

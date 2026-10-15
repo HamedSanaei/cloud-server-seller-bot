@@ -50,30 +50,13 @@ PRODUCTION_STARTPAY_URL = "https://www.zarinpal.com/pg/StartPay"
 SANDBOX_STARTPAY_URL = "https://sandbox.zarinpal.com/pg/StartPay"
 
 
-def _error_message(payload: Any, fallback: str) -> str:
-    if isinstance(payload, dict):
-        errors = payload.get("errors")
-        if isinstance(errors, dict) and errors:
-            parts: list[str] = []
-            for _key, value in errors.items():
-                if isinstance(value, list):
-                    parts.extend(str(v) for v in value)
-                else:
-                    parts.append(str(value))
-            if parts:
-                return "; ".join(parts)[:200]
-        data = payload.get("data")
-        if isinstance(data, dict):
-            message = data.get("message")
-            if isinstance(message, str) and message.strip():
-                return message.strip()[:200]
-    return fallback
-
-
 class ZarinPalGateway(CapabilityGatedGateway):
     """ZarinPal v4 adapter (create + verify; no refund endpoint in v4)."""
 
     key = GATEWAY_KEY
+    # Metadata is not a provider-side idempotency guarantee. Persist the
+    # attempt before requesting an authority and never re-POST an ambiguous one.
+    requires_durable_creation = True
     capabilities = frozenset({GatewayCapability.CREATE_PAYMENT, GatewayCapability.VERIFY_PAYMENT})
 
     def __init__(
@@ -103,11 +86,16 @@ class ZarinPalGateway(CapabilityGatedGateway):
     def startpay_url(self) -> str:
         return SANDBOX_STARTPAY_URL if self._sandbox else PRODUCTION_STARTPAY_URL
 
-    def redirect_url_for(self, authority: str) -> str:
+    def payment_link_for(self, authority: str) -> str:
         return f"{self.startpay_url}/{authority}"
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    def _validate_amount(self, amount_minor: int, currency: str) -> None:
+        if type(amount_minor) is not int or not 0 < amount_minor <= 2**63 - 1:
+            raise ValueError("payment amount must be a positive integer within signed int64 bounds")
+        super()._validate_amount(amount_minor, currency)
 
     async def create_payment(
         self,
@@ -136,16 +124,18 @@ class ZarinPalGateway(CapabilityGatedGateway):
         }
         payload = await self._post("/request.json", body)
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict) or type(data.get("code")) is not int:
+            raise ProviderError("zarinpal request returned an invalid response")
         code = data.get("code")
         authority = str(data.get("authority") or "").strip()
         if code != 100 or not authority:
-            raise ProviderError(_error_message(payload, f"zarinpal request failed (code={code})"))
+            raise ProviderError(f"zarinpal request failed (code={code})")
         return PaymentIntent(
             gateway_payment_id=authority,
             status=PaymentStatus.PENDING,
             amount_minor=amount_minor,
             currency=currency,
-            redirect_url=self.redirect_url_for(authority),
+            redirect_url=self.payment_link_for(authority),
             metadata={"reference": reference},
         )
 
@@ -168,8 +158,7 @@ class ZarinPalGateway(CapabilityGatedGateway):
         self._require_capability(GatewayCapability.VERIFY_PAYMENT)
         if not authority or not authority.strip():
             raise ValueError("authority must not be empty")
-        if amount_minor <= 0:
-            raise ValueError("amount must be a positive integer of minor units")
+        self._validate_amount(amount_minor, CURRENCY)
         payload = await self._post(
             "/verify.json",
             {
@@ -179,6 +168,8 @@ class ZarinPalGateway(CapabilityGatedGateway):
             },
         )
         data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict) or type(data.get("code")) is not int:
+            raise ProviderError("zarinpal verify returned an invalid response")
         code = data.get("code")
         if code in (100, 101):
             ref_id = str(data.get("ref_id") or authority)
@@ -199,7 +190,7 @@ class ZarinPalGateway(CapabilityGatedGateway):
                 redirect_url=None,
                 metadata={"code": str(code)},
             )
-        raise ProviderError(_error_message(payload, f"zarinpal verify failed (code={code})"))
+        raise ProviderError(f"zarinpal verify failed (code={code})")
 
     async def refund(
         self,
@@ -216,8 +207,8 @@ class ZarinPalGateway(CapabilityGatedGateway):
         async with metrics.provider_call(self.key, f"POST {path}"):
             try:
                 response = await self._client.post(f"{self._base_url}{path}", json=body)
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                raise ProviderUnavailable(str(exc)) from exc
+            except httpx.TransportError:
+                raise ProviderUnavailable("zarinpal transport failed") from None
         if response.status_code in (401, 403):
             raise ProviderAuthError("zarinpal rejected the merchant id")
         if response.status_code == 404:
@@ -230,5 +221,5 @@ class ZarinPalGateway(CapabilityGatedGateway):
             raise ProviderError(f"zarinpal request failed (HTTP {response.status_code})")
         try:
             return response.json()
-        except Exception as exc:
-            raise ProviderError("zarinpal returned non-JSON payload") from exc
+        except ValueError:
+            raise ProviderError("zarinpal returned non-JSON payload") from None

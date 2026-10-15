@@ -16,11 +16,11 @@ from cloud_platform.observability.tracing import (
 
 
 def _route_path(request: Request) -> str:
-    """The matched route template (bounded cardinality), else the raw path."""
+    """The matched route template, or one bounded label for unmatched paths."""
     route = request.scope.get("route")
     if route is not None and getattr(route, "path", None):
         return str(route.path)
-    return request.url.path
+    return "<unmatched>"
 
 
 def _setup_otel(app: FastAPI) -> None:
@@ -52,7 +52,6 @@ async def _observe_api(
     capture its traceparent at creation time).
     """
     started = time.perf_counter()
-    path = _route_path(request)
     tracer = get_tracer("api")
     parent_ctx = remote_parent_context(request.headers.get("traceparent"))
     with tracer.start_as_current_span(
@@ -65,9 +64,16 @@ async def _observe_api(
             set_span_status_error(span, exc)
             raise
         status = str(response.status_code)
-        api_span_attributes(span, request.method, path, int(status))
-        metrics.api_requests_total.labels(method=request.method, path=path, status=status).inc()
-        metrics.api_request_duration_seconds.labels(method=request.method, path=path).observe(
+        path = _route_path(request)
+        method = (
+            request.method
+            if request.method
+            in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"}
+            else "OTHER"
+        )
+        api_span_attributes(span, method, path, int(status))
+        metrics.api_requests_total.labels(method=method, path=path, status=status).inc()
+        metrics.api_request_duration_seconds.labels(method=method, path=path).observe(
             time.perf_counter() - started
         )
         return response

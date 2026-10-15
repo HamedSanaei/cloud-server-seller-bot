@@ -24,8 +24,9 @@ rely on. For every mapped table:
 * every unique constraint / unique index the models declare must be enforced
   on the same column set. Uniqueness is matched by COLUMNS, never by name, so a
   database that spells (or creates) the key differently is not called drift —
-  and a superset key counts, because uniqueness on ``(a, b, c)`` implies it on
-  ``(a, b)``.
+  and a subset key counts, because uniqueness on ``(a)`` implies it on
+  ``(a, b)``. Partial indexes count only for the same predicate (or when an
+  unconditional key enforces the stronger, whole-table requirement).
 
 Extra tables, extra columns and non-unique indexes are tolerated: they cannot
 break the release.
@@ -51,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -74,6 +76,59 @@ EXIT_OK = 0
 EXIT_DRIFT = 1
 EXIT_UNINSPECTABLE = 2
 
+UniquePredicates = dict[tuple[str, frozenset[str]], frozenset[str | None]]
+
+
+def _predicate(value: Any) -> str | None:
+    """Compare identical predicates despite PostgreSQL's harmless rendering.
+
+    This is deliberately not a SQL implication engine. Preserve quoted values
+    and identifiers exactly; normalize only whitespace, surrounding parentheses
+    and PostgreSQL's text casts outside quoted tokens.
+    """
+    if value is None:
+        return None
+    tokens = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")", str(value))
+    for index in range(0, len(tokens), 2):
+        tokens[index] = re.sub(
+            r"::(?:text|character varying|varchar)\b", "", tokens[index], flags=re.I
+        )
+        tokens[index] = tokens[index].lower()
+    parts = re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[\w$]+|[^\s]", "".join(tokens))
+    # PostgreSQL renders varchar casts as ((column)::text = value). Remove
+    # grouping around a single identifier, but never function-call parentheses
+    # or boolean-expression grouping.
+    index = 0
+    while index + 2 < len(parts):
+        if (
+            parts[index] == "("
+            and parts[index + 2] == ")"
+            and re.fullmatch(r'[\w$]+|"(?:[^"]|"")*"', parts[index + 1])
+            and (index == 0 or parts[index - 1] in {"(", "=", "<", ">", "!", "and", "or", "not"})
+        ):
+            parts[index : index + 3] = [parts[index + 1]]
+            index = max(0, index - 1)
+        else:
+            index += 1
+    result = " ".join(parts)
+    # Strip only parentheses enclosing the entire expression, not AND/OR grouping.
+    while result.startswith("(") and result.endswith(")"):
+        depth = 0
+        wraps = True
+        pieces = re.split(r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\")", result)
+        offset = 0
+        for index, piece in enumerate(pieces):
+            if index % 2 == 0:
+                for position, char in enumerate(piece):
+                    depth += (char == "(") - (char == ")")
+                    if depth == 0 and offset + position != len(result) - 1:
+                        wraps = False
+            offset += len(piece)
+        if not wraps:
+            break
+        result = result[1:-1].strip()
+    return result
+
 
 @dataclass(slots=True)
 class RequiredSchema:
@@ -81,6 +136,7 @@ class RequiredSchema:
 
     columns: dict[str, frozenset[str]]
     unique_keys: dict[str, frozenset[frozenset[str]]]
+    unique_predicates: UniquePredicates = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -91,6 +147,7 @@ class ObservedSchema:
     columns: dict[str, frozenset[str]]
     unique_keys: dict[str, frozenset[frozenset[str]]]
     unreadable: dict[str, str] = field(default_factory=dict)
+    unique_predicates: UniquePredicates = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -118,17 +175,27 @@ def required_schema(metadata: MetaData | None = None) -> RequiredSchema:
     resolved = Base.metadata if metadata is None else metadata
     columns: dict[str, frozenset[str]] = {}
     unique_keys: dict[str, frozenset[frozenset[str]]] = {}
+    predicates: dict[tuple[str, frozenset[str]], set[str | None]] = {}
     for name, table in resolved.tables.items():
         columns[name] = frozenset(column.name for column in table.columns)
         keys: set[frozenset[str]] = set()
         for constraint in table.constraints:
             if isinstance(constraint, sa.UniqueConstraint) and constraint.columns:
-                keys.add(frozenset(column.name for column in constraint.columns))
+                key = frozenset(column.name for column in constraint.columns)
+                keys.add(key)
+                predicates.setdefault((name, key), set()).add(None)
         for index in table.indexes:
             if index.unique:
-                keys.add(frozenset(column.name for column in index.columns))
+                key = frozenset(column.name for column in index.columns)
+                keys.add(key)
+                predicate = index.dialect_options["postgresql"].get("where")
+                predicates.setdefault((name, key), set()).add(_predicate(predicate))
         unique_keys[name] = frozenset(key for key in keys if key)
-    return RequiredSchema(columns=columns, unique_keys=unique_keys)
+    return RequiredSchema(
+        columns=columns,
+        unique_keys=unique_keys,
+        unique_predicates={key: frozenset(values) for key, values in predicates.items()},
+    )
 
 
 def observe_schema(inspector: Inspector) -> ObservedSchema:
@@ -137,6 +204,7 @@ def observe_schema(inspector: Inspector) -> ObservedSchema:
     columns: dict[str, frozenset[str]] = {}
     unique_keys: dict[str, frozenset[frozenset[str]]] = {}
     unreadable: dict[str, str] = {}
+    predicates: dict[tuple[str, frozenset[str]], set[str | None]] = {}
     for name in sorted(tables):
         try:
             columns[name] = frozenset(column["name"] for column in inspector.get_columns(name))
@@ -147,6 +215,7 @@ def observe_schema(inspector: Inspector) -> ObservedSchema:
                 )
                 if key:
                     keys.add(key)
+                    predicates.setdefault((name, key), set()).add(None)
             for index in inspector.get_indexes(name):
                 if index.get("unique"):
                     key = frozenset(
@@ -154,6 +223,9 @@ def observe_schema(inspector: Inspector) -> ObservedSchema:
                     )
                     if key:
                         keys.add(key)
+                        options = index.get("dialect_options") or {}
+                        predicate = options.get("postgresql_where")
+                        predicates.setdefault((name, key), set()).add(_predicate(predicate))
             unique_keys[name] = frozenset(keys)
         except Exception as exc:
             # Any reflection failure counts as unresolved evidence (see above).
@@ -163,7 +235,11 @@ def observe_schema(inspector: Inspector) -> ObservedSchema:
             columns.pop(name, None)
             unique_keys.pop(name, None)
     return ObservedSchema(
-        tables=tables, columns=columns, unique_keys=unique_keys, unreadable=unreadable
+        tables=tables,
+        columns=columns,
+        unique_keys=unique_keys,
+        unreadable=unreadable,
+        unique_predicates={key: frozenset(values) for key, values in predicates.items()},
     )
 
 
@@ -184,8 +260,23 @@ def evaluate(observed: ObservedSchema, required: RequiredSchema | None = None) -
             missing_columns.append((table, column))
         enforced = observed.unique_keys.get(table, frozenset())
         for key in sorted(resolved.unique_keys[table], key=lambda item: sorted(item)):
-            # A database key that is a SUPERSET of this one enforces it too.
-            if not any(key <= candidate for candidate in enforced):
+            needed = resolved.unique_predicates.get((table, key), frozenset({None}))
+            # Every required predicate must be covered. Whole-table uniqueness
+            # is stronger than any partial requirement; unrelated partial
+            # indexes never prove whole-table or differently filtered uniqueness.
+            if not all(
+                any(
+                    candidate <= key
+                    and any(
+                        actual is None or actual == predicate
+                        for actual in observed.unique_predicates.get(
+                            (table, candidate), frozenset({None})
+                        )
+                    )
+                    for candidate in enforced
+                )
+                for predicate in needed
+            ):
                 missing_unique_keys.append((table, key))
     return SchemaDrift(
         missing_tables=missing_tables,

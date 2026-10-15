@@ -64,6 +64,7 @@ def _repos() -> tuple[AsyncMock, AsyncMock, AsyncMock]:
     payments = AsyncMock()
     wallet = AsyncMock()
     ledger = AsyncMock()
+    wallet.get = AsyncMock(return_value=types.SimpleNamespace(currency="EUR"))
     wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=500), True))
     payments.save = AsyncMock(side_effect=lambda s: s)
     return payments, wallet, ledger
@@ -92,13 +93,18 @@ class TestFirstSuccess:
         assert outcome.session.status is PaymentSessionStatus.SUCCEEDED
         assert outcome.session.credited_at is not None
         wallet.credit_deposit.assert_awaited_once_with(
-            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}"
+            USER_ID,
+            500,
+            DEPOSIT_KEY,
+            reference=f"zarinpal/{EXT}",
+            expected_currency="EUR",
+            business_event_factory=None,
         )
 
         # The deposit key is deterministic from (gateway, external id).
         key = wallet.credit_deposit.await_args.args[2]
         assert key == DEPOSIT_KEY
-        payments.save.assert_awaited_once()
+        assert payments.save.await_count == 2  # success claim, then credit marker
 
     async def test_existing_pending_session_is_credited(self) -> None:
         payments, wallet, ledger = _repos()
@@ -113,7 +119,12 @@ class TestFirstSuccess:
         assert outcome.action is WebhookAction.CREDITED
         payments.create.assert_not_awaited()
         wallet.credit_deposit.assert_awaited_once_with(
-            USER_ID, 500, DEPOSIT_KEY, reference=f"zarinpal/{EXT}"
+            USER_ID,
+            500,
+            DEPOSIT_KEY,
+            reference=f"zarinpal/{EXT}",
+            expected_currency="EUR",
+            business_event_factory=None,
         )
 
 
@@ -161,7 +172,7 @@ class TestReplaySafety:
 
         assert outcome.action is WebhookAction.CREDITED
         assert outcome.session.credited_at is not None
-        payments.save.assert_awaited_once()
+        assert payments.save.await_count == 2
 
     async def test_concurrent_duplicate_deposit_is_tolerated(self) -> None:
         """Losing the atomic deposit race still settles the session, once."""
@@ -268,17 +279,20 @@ class _RecordingSink:
     def types(self) -> list[Any]:
         return [e.event_type for e in self.events]
 
-    def of(self, event_type: Any) -> Any:
-        return next(e for e in self.events if e.event_type is event_type)
+
+@pytest.fixture
+def outbox_store():
+    from tests.unit.test_financial_payment_invariants import SqlStore
+
+    store = SqlStore()
+    try:
+        yield store
+    finally:
+        store.engine.dispose()
 
 
 class TestBusinessLogEmission:
-    """Recharge outcomes reach the operator channel exactly once.
-
-    ``recharge.succeeded`` is emitted only AFTER the wallet was credited, and
-    a replayed callback (or a broken logger) must not duplicate the event or
-    change the financial outcome.
-    """
+    """Success notification, balance and ledger share one database commit."""
 
     def _service(self, sink: object) -> PaymentWebhookService:
         payments, wallet, ledger = _repos()
@@ -292,72 +306,49 @@ class TestBusinessLogEmission:
             user_repo=None,  # type: ignore[arg-type]
         )
 
-    async def test_success_callback_enqueues_recharge_succeeded(self) -> None:
-        from cloud_platform.modules.businesslog.domain import BusinessEventType
+    def _persistent_service(self, store, *, balance=0, sink=None):
+        store.seed(_pending(), balance=balance, wallet_currency="EUR")
+        return PaymentWebhookService(
+            store.payments,
+            store.wallets,
+            None,
+            event_sink=sink if sink is not None else _RecordingSink(),
+        )
 
-        sink = _RecordingSink()
-        service = self._service(sink)
+    async def test_success_callback_enqueues_recharge_succeeded(self, outbox_store) -> None:
+        service = self._persistent_service(outbox_store)
         outcome = await service.process_callback(
-            gateway_key="zarinpal",
-            external_id=EXT,
-            status="succeeded",
-            user_id=USER_ID,
-            amount_minor=500,
-            currency="EUR",
+            gateway_key="zarinpal", external_id=EXT, status="succeeded"
         )
         assert outcome.action is WebhookAction.CREDITED
-        assert sink.types() == [BusinessEventType.RECHARGE_SUCCEEDED]
-        payload = sink.of(BusinessEventType.RECHARGE_SUCCEEDED).payload
-        assert payload["amount"] == "€5.00"
-        assert payload["gateway"] == "zarinpal"
-        assert payload["gateway_reference"] == EXT
+        (event,) = outbox_store.business_events()
+        assert event.event_type == "recharge.succeeded" and event.status == "PENDING"
+        assert event.payload["amount"] == "€5.00"
+        assert event.payload["gateway"] == "zarinpal"
+        assert event.payload["gateway_reference"] == EXT
+        assert event.event_key == f"recharge.succeeded:{outcome.session.id}"
+        assert (await outbox_store.wallets.get(USER_ID)).balance == 500
+        assert len(outbox_store.ledger()) == 1
 
-    async def test_balance_after_is_reported_when_available(self) -> None:
-        from cloud_platform.modules.businesslog.domain import BusinessEventType
+    async def test_balance_after_is_reported_when_available(self, outbox_store) -> None:
+        service = self._persistent_service(outbox_store, balance=734)
+        await service.process_callback(gateway_key="zarinpal", external_id=EXT, status="succeeded")
+        (event,) = outbox_store.business_events()
+        assert event.payload["balance_after"] == "€12.34"
+        assert (await outbox_store.wallets.get(USER_ID)).balance == 1234
 
-        payments, wallet, ledger = _repos()
-        payments.get_by_external_id = AsyncMock(return_value=None)
-        payments.create = AsyncMock(side_effect=_with_id)
-        wallet.credit_deposit = AsyncMock(return_value=(types.SimpleNamespace(balance=1_234), True))
-        sink = _RecordingSink()
-        service = PaymentWebhookService(
-            payments,
-            wallet,
-            ledger,
-            event_sink=sink,
-            user_repo=None,  # type: ignore[arg-type]
-        )
-        await service.process_callback(
-            gateway_key="zarinpal",
-            external_id=EXT,
-            status="succeeded",
-            user_id=USER_ID,
-            amount_minor=500,
-            currency="EUR",
-        )
-        payload = sink.of(BusinessEventType.RECHARGE_SUCCEEDED).payload
-        assert payload["balance_after"] == "€12.34"
-
-    async def test_duplicate_success_callback_emits_once(self) -> None:
-        sink = _RecordingSink()
-        service = self._service(sink)
+    async def test_duplicate_success_callback_emits_once(self, outbox_store) -> None:
+        service = self._persistent_service(outbox_store)
         first = await service.process_callback(
-            gateway_key="zarinpal",
-            external_id=EXT,
-            status="succeeded",
-            user_id=USER_ID,
-            amount_minor=500,
-            currency="EUR",
+            gateway_key="zarinpal", external_id=EXT, status="succeeded"
         )
-        assert first.action is WebhookAction.CREDITED
-        # A replayed callback hits the same service with the same session.
-        payments = service._payments
-        payments.get_by_external_id = AsyncMock(return_value=first.session)
         second = await service.process_callback(
             gateway_key="zarinpal", external_id=EXT, status="succeeded"
         )
+        assert first.action is WebhookAction.CREDITED
         assert second.action is WebhookAction.DUPLICATE_IGNORED
-        assert len(sink.events) == 1
+        assert len(outbox_store.business_events()) == len(outbox_store.ledger()) == 1
+        assert (await outbox_store.wallets.get(USER_ID)).balance == 500
 
     async def test_failed_callback_enqueues_recharge_failed_once(self) -> None:
         from cloud_platform.modules.businesslog.domain import BusinessEventType
@@ -378,39 +369,13 @@ class TestBusinessLogEmission:
         await service.process_callback(gateway_key="zarinpal", external_id=EXT, status="failed")
         assert sink.types() == [BusinessEventType.RECHARGE_FAILED]
 
-    async def test_success_does_not_emit_a_recharge_created_event(self) -> None:
-        from cloud_platform.modules.businesslog.domain import BusinessEventType
-
-        sink = _RecordingSink()
-        service = self._service(sink)
-        await service.process_callback(
-            gateway_key="zarinpal",
-            external_id=EXT,
-            status="succeeded",
-            user_id=USER_ID,
-            amount_minor=500,
-            currency="EUR",
-        )
-        assert BusinessEventType.RECHARGE_CREATED not in sink.types()
-
-    async def test_broken_logger_never_blocks_the_deposit(self) -> None:
-        payments, wallet, ledger = _repos()
-        payments.get_by_external_id = AsyncMock(return_value=None)
-        payments.create = AsyncMock(side_effect=_with_id)
-        service = PaymentWebhookService(
-            payments,
-            wallet,
-            ledger,
-            event_sink=_RecordingSink(explode=True),  # type: ignore[arg-type]
-            user_repo=None,
-        )
+    async def test_delivery_sink_outage_does_not_block_transactional_deposit(
+        self, outbox_store
+    ) -> None:
+        service = self._persistent_service(outbox_store, sink=_RecordingSink(explode=True))
         outcome = await service.process_callback(
-            gateway_key="zarinpal",
-            external_id=EXT,
-            status="succeeded",
-            user_id=USER_ID,
-            amount_minor=500,
-            currency="EUR",
+            gateway_key="zarinpal", external_id=EXT, status="succeeded"
         )
         assert outcome.action is WebhookAction.CREDITED
-        wallet.credit_deposit.assert_awaited_once()
+        assert (await outbox_store.wallets.get(USER_ID)).balance == 500
+        assert len(outbox_store.business_events()) == len(outbox_store.ledger()) == 1

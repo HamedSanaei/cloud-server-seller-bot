@@ -145,17 +145,16 @@ def provider_for(
 ) -> Any:
     """Resolve the adapter serving a resource pinned to a credential account.
 
-    The one-liner exists so every call site resolves a PINNED resource the
-    same way, and so a registry that predates credential accounts (a test
-    double, or a single-credential implementation) still resolves logically.
-    The fail-closed guarantee is preserved: a registry that DOES understand
-    credential accounts raises
-    :class:`UnknownCredentialAccountError` for an unconfigured account rather
-    than falling back to another one.
+    Account-aware registries resolve the exact owner or raise. A legacy
+    single-account registry may serve only the default account; it must never
+    substitute its default credential for a resource pinned to another account.
     """
     resolver = getattr(registry, "get_for", None)
     if callable(resolver):
         return resolver(provider_key, credential_account_id)
+    account_id = normalize_account_id(credential_account_id)
+    if account_id != DEFAULT_CREDENTIAL_ACCOUNT:
+        raise UnknownCredentialAccountError(provider_key, account_id)
     return registry.get(provider_key)
 
 

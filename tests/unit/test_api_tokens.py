@@ -15,7 +15,12 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from cloud_platform.api.v1 import router as v1_router
+from cloud_platform.api.v1.errors import install_error_handlers
+from cloud_platform.api.v1.router import _catalog_repo, _token_service
 from cloud_platform.modules.audit.domain import ActorType
 from cloud_platform.modules.audit.service import AuditTrail
 from cloud_platform.modules.tokens.domain import (
@@ -226,3 +231,81 @@ class TestScopeSemantics:
         tokens = {generate_raw_token() for _ in range(50)}
         assert len(tokens) == 50
         assert all(t.startswith("cpt_") for t in tokens)
+
+
+class TestBearerTokenMinting:
+    @staticmethod
+    def client(service: TokenService) -> TestClient:
+        app = FastAPI()
+        app.include_router(v1_router)
+        install_error_handlers(app)
+        app.state.authenticate_token = service.authenticate
+        app.dependency_overrides[_token_service] = lambda: service
+
+        class Catalog:
+            async def list_offers(self) -> list[Any]:
+                return []
+
+        app.dependency_overrides[_catalog_repo] = Catalog
+        return TestClient(app)
+
+    @pytest.mark.parametrize(
+        "requested_scope", [scope for scope in TokenScope if scope is not TokenScope.TOKENS_MANAGE]
+    )
+    async def test_tokens_manage_cannot_mint_unheld_capabilities(
+        self, requested_scope: TokenScope
+    ) -> None:
+        service, repo, _audit = make_service()
+        _parent, raw = await service.create(
+            actor_user_id=USER_A,
+            owner_user_id=USER_A,
+            name="parent",
+            scopes=frozenset({TokenScope.TOKENS_MANAGE}),
+        )
+        with self.client(service) as client:
+            response = client.post(
+                "/v1/auth/tokens",
+                headers={"Authorization": f"Bearer {raw}", "Idempotency-Key": "mint-child"},
+                json={"name": "child", "scopes": [requested_scope.value]},
+            )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "forbidden"
+        assert len(repo.by_id) == 1
+        assert all(token.name == "parent" for token in repo.by_id.values())
+
+    @pytest.mark.parametrize(
+        "child_scopes",
+        [
+            frozenset(),
+            frozenset({TokenScope.CATALOG_READ}),
+            frozenset({TokenScope.TOKENS_MANAGE, TokenScope.CATALOG_READ}),
+            frozenset({TokenScope.ADMIN_READ}),
+            frozenset({TokenScope.ADMIN_WRITE}),
+        ],
+    )
+    async def test_child_keeps_only_requested_parent_scopes(
+        self, child_scopes: frozenset[TokenScope]
+    ) -> None:
+        service, repo, _audit = make_service()
+        _parent, raw = await service.create(
+            actor_user_id=USER_A,
+            owner_user_id=USER_A,
+            name="parent",
+            scopes=child_scopes | {TokenScope.TOKENS_MANAGE},
+        )
+        with self.client(service) as client:
+            response = client.post(
+                "/v1/auth/tokens",
+                headers={"Authorization": f"Bearer {raw}", "Idempotency-Key": "mint-child"},
+                json={"name": "child", "scopes": sorted(scope.value for scope in child_scopes)},
+            )
+            assert response.status_code == 201
+            child_raw = response.json()["plaintext"]
+            consumer = client.get(
+                "/v1/catalog/offers", headers={"Authorization": f"Bearer {child_raw}"}
+            )
+        child_auth = await service.authenticate(child_raw)
+        assert child_auth.user_id == USER_A
+        assert child_auth.scopes == child_scopes
+        assert len(repo.by_id) == 2
+        assert consumer.status_code == (200 if TokenScope.CATALOG_READ in child_scopes else 403)

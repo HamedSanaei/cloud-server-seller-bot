@@ -146,7 +146,8 @@ async def test_disabled_gateway_blocks_new_orders_but_pending_inquiry_still_cred
         create=AsyncMock(),
     )
     wallet = SimpleNamespace(
-        credit_deposit=AsyncMock(return_value=(SimpleNamespace(balance=50000), True))
+        get=AsyncMock(return_value=SimpleNamespace(currency="IRT")),
+        credit_deposit=AsyncMock(return_value=(SimpleNamespace(balance=50000), True)),
     )
     settings, gateway = Settings(), _gateway()
     management = GatewayManagementService(settings, [gateway.key])

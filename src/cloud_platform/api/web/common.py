@@ -53,10 +53,18 @@ async def session_token(request: Request) -> str | None:
     return request.cookies.get(SESSION_COOKIE)
 
 
+def _secure_session_cookie() -> bool:
+    """Only explicit development/test may use a local HTTP session."""
+    from cloud_platform.core.config import get_settings
+
+    return get_settings().app_env.strip().lower() not in {"development", "test"}
+
+
 def set_session_cookie(response: Response, raw_token: str) -> None:
     response.set_cookie(
         SESSION_COOKIE,
         raw_token,
+        secure=_secure_session_cookie(),
         httponly=True,
         samesite="lax",
         max_age=60 * 60 * 12,
@@ -64,4 +72,9 @@ def set_session_cookie(response: Response, raw_token: str) -> None:
 
 
 def clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(SESSION_COOKIE)
+    response.delete_cookie(
+        SESSION_COOKIE,
+        secure=_secure_session_cookie(),
+        httponly=True,
+        samesite="lax",
+    )

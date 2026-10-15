@@ -3,12 +3,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
+from hashlib import sha256
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cloud_platform.db.base import AuditEvent as SQLAlchemyAuditEvent
 from cloud_platform.db.base import TermsVersion as SQLAlchemyTermsVersion
 from cloud_platform.db.base import User as SQLAlchemyUser
 from cloud_platform.db.timestamps import (
@@ -18,6 +20,7 @@ from cloud_platform.db.timestamps import (
     to_db_utc_or_none,
     utc_now,
 )
+from cloud_platform.modules.audit.domain import ActorType
 from cloud_platform.modules.users.domain import (
     Role,
     TermsVersion,
@@ -83,6 +86,10 @@ def _to_row(domain: User) -> SQLAlchemyUser:
             updated_at=to_db_utc(utc_now()),
         )
     return row
+
+
+class UserStatusIdempotencyConflict(ValueError):
+    """An actor reused a status-change key with different command facts."""
 
 
 class SqlAlchemyUserRepository:
@@ -157,6 +164,83 @@ class SqlAlchemyUserRepository:
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)
+
+    async def change_status_idempotently(
+        self,
+        user_id: UUID,
+        status: UserStatus,
+        *,
+        actor_id: UUID,
+        idempotency_key: str,
+        reason: str,
+    ) -> UserStatus:
+        """Atomically persist status and its actor-scoped immutable audit receipt.
+
+        Exact replays return the receipt's historical status without touching the
+        current user. The transaction advisory lock serializes an actor/key even
+        when conflicting requests name different targets; only the target user
+        row is locked, never the actor (which may itself be another admin's target).
+        """
+        if not idempotency_key or not idempotency_key.strip():
+            raise ValueError("an idempotency key is required for status changes")
+        if not reason or not reason.strip():
+            raise ValueError("admin mutations must carry a non-empty reason")
+        action = "admin.user.status_changed"
+        lock_key = int.from_bytes(
+            sha256(f"{action}:{actor_id}:{idempotency_key}".encode()).digest()[:8],
+            byteorder="big",
+            signed=True,
+        )
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"), {"lock_key": lock_key}
+            )
+            target = (
+                await session.execute(
+                    select(SQLAlchemyUser).where(SQLAlchemyUser.id == user_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            receipt = (
+                await session.execute(
+                    select(SQLAlchemyAuditEvent).where(
+                        SQLAlchemyAuditEvent.actor_id == actor_id,
+                        SQLAlchemyAuditEvent.action == action,
+                        SQLAlchemyAuditEvent.event_metadata["idempotency_key"].astext
+                        == idempotency_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if receipt is not None:
+                metadata = _attr(receipt, "event_metadata")
+                if (
+                    _attr(receipt, "actor_type") != ActorType.ADMIN.value
+                    or _attr(receipt, "resource_type") != "user"
+                    or _attr(receipt, "resource_id") != str(user_id)
+                    or _attr(receipt, "reason") != reason
+                    or metadata.get("status") != status.value
+                ):
+                    raise UserStatusIdempotencyConflict(
+                        "status-change idempotency key carries different facts"
+                    )
+                return UserStatus(metadata["status"])
+            if target is None:
+                raise UserNotFound(f"User with id {user_id} not found")
+            cast(Any, target).status = status.value
+            session.add(
+                SQLAlchemyAuditEvent(
+                    actor_type=ActorType.ADMIN.value,
+                    actor_id=actor_id,
+                    action=action,
+                    resource_type="user",
+                    resource_id=str(user_id),
+                    reason=reason,
+                    event_metadata={"status": status.value, "idempotency_key": idempotency_key},
+                )
+            )
+            # Flush both writes before returning; __aexit__ commits or rolls them
+            # back together, including when an audit constraint/trigger rejects it.
+            await session.flush()
+            return status
 
     async def update_terms(self, user_id: UUID, terms_version: int) -> User:
         """Persist the user's accepted terms version. Raises UserNotFound if missing."""

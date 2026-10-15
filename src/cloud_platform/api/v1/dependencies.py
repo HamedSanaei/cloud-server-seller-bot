@@ -5,8 +5,8 @@ Two authentication paths, in priority order:
 1. **Bearer API token** (``Authorization: Bearer cpt_...``) - resolved
    through the app-state ``authenticate_token`` callable bound to the
    platform :class:`TokenService` at startup. Revocable, scoped.
-2. **Header identity** (``x-platform-user``) - a DEV/TEST fallback that is
-   DISABLED unless ``settings.api_allow_header_identity`` is true.
+2. **Header identity** (``x-platform-user``) - a DEV/TEST fallback, enabled
+   only in development/test with ``settings.api_allow_header_identity``.
 
 Scope enforcement is declarative per endpoint via :func:`require_scope`;
 a token without the scope gets the stable ``403 forbidden`` envelope.
@@ -57,10 +57,14 @@ async def get_token_authentication(
         auth = await authenticator(authorization.removeprefix("Bearer ").strip())
         return auth  # type: ignore[no-any-return]
 
-    # dev fallback - explicitly gated by settings; off in production
+    # The flag alone must never enable header identity outside local dev/test.
     from cloud_platform.core.config import get_settings
 
-    if get_settings().api_allow_header_identity:
+    settings = get_settings()
+    if settings.api_allow_header_identity and settings.app_env.strip().lower() in {
+        "development",
+        "test",
+    }:
         user_id = await get_current_user_id(request.headers.get(USER_HEADER))
         return TokenAuthentication(
             user_id=user_id,

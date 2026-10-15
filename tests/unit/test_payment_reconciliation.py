@@ -210,7 +210,11 @@ async def test_unbound_atlas_attempts_do_not_starve_bounded_pending_scan() -> No
         def __init__(self) -> None:
             self.deposits: dict[str, tuple[Any, int]] = {}
 
+        async def get(self, owner: Any) -> Any:
+            return SimpleNamespace(currency="EUR")
+
         async def credit_deposit(self, owner: Any, amount: int, key: str, **kwargs: Any) -> Any:
+            assert kwargs.get("expected_currency") == "EUR"
             applied = key not in self.deposits
             if applied:
                 self.deposits[key] = (owner, amount)

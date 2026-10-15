@@ -13,8 +13,9 @@ idempotency rules below are pinned by
   SHA-256 hashes only (the plaintext is shown exactly once at creation),
   and carry a set of scopes; each resource family requires one scope and
   a token without it gets `403` / `forbidden`. The `x-platform-user`
-  header is a dev/test fallback that stays disabled in production
-  (settings: `api_allow_header_identity`).
+  header requires `api_allow_header_identity` AND an `app_env` whose trimmed,
+  case-normalized value is `development` or `test`; staging, production and
+  other environment names cannot enable this fallback.
 - Ownership: application services enforce ownership. A foreign resource is
   indistinguishable from a missing one (`404` / `not_found`) — no
   existence leaks.
@@ -97,17 +98,18 @@ Exceeding the limit returns `429` + envelope code `rate_limited` with a
 | `POST /v1/ssh-keys`                        | live   | `ssh_keys:write`; `{name, public_key}` -> fingerprint |
 | `DELETE /v1/ssh-keys/{key_id}`             | live   | `ssh_keys:write`; 204 |
 | `GET  /v1/auth/tokens`                     | live   | `tokens:manage`; token metadata, never material |
-| `POST /v1/auth/tokens`                     | live   | `tokens:manage`; returns plaintext EXACTLY ONCE |
+| `POST /v1/auth/tokens`                     | live   | `tokens:manage`; requested scopes must be a subset of the authenticating token's scopes; plaintext shown once |
 | `DELETE /v1/auth/tokens/{token_id}`        | live   | `tokens:manage`; revokes immediately (idempotent) |
 
 ## Admin surface (`/v1/admin`, RBAC + audited)
 
-Admin endpoints require an authenticated actor whose platform User holds
-the corresponding admin permission (application-layer RBAC via
-`PermissionChecker`); non-admins get the same `403 forbidden` envelope as
-unknown ids - no existence leaks. Mutations require a reason and an
-idempotency key, and are audited as ADMIN-actor events (the audit
-chokepoint rejects admin events without a reason).
+Admin reads require `admin:read`; mutations require `admin:write`. These
+token capabilities are required IN ADDITION TO an active persisted platform
+User holding the corresponding admin permission (application-layer RBAC via
+`PermissionChecker`). A token scope never grants an admin role. Unscoped,
+inactive, non-admin and unknown actors get `403 forbidden` without exposing
+resources. Mutations require a reason and an idempotency key, and are audited
+as ADMIN-actor events (the audit chokepoint rejects events without a reason).
 
 | method & path                              | permission              | notes |
 |--------------------------------------------|-------------------------|-------|
@@ -115,6 +117,15 @@ chokepoint rejects admin events without a reason).
 | `GET  /v1/admin/users/{user_id}`           | `admin:manage_users`    | full profile |
 | `POST /v1/admin/users/{user_id}/status`    | `admin:manage_users`    | `{status, reason}`; audited |
 | `GET  /v1/admin/audit?actor_id=` or `?resource_type=&resource_id=` | `admin:manage_settings` | read-only trail query |
+
+Status-change keys are scoped to the acting admin and bind the target user,
+requested status, and reason. The status and its immutable
+`admin.user.status_changed` audit receipt commit in one transaction. An exact
+replay returns the original status snapshot, not the user's current status,
+and never reapplies the change or appends another audit event. For example,
+replaying an activation after a later ban returns `active` while leaving the
+user banned. Reusing the same actor/key with a different target, status, or
+reason returns `409 conflict`; a failed audit write rolls back the status.
 
 ## Scopes
 
@@ -129,6 +140,33 @@ Stable scope strings (`modules/tokens/domain.py::TokenScope`):
 | `ssh_keys:read`  | ssh-key list |
 | `ssh_keys:write` | ssh-key register/delete |
 | `tokens:manage`  | token create/list/revoke |
+| `admin:read`     | administrative reads, also requiring active admin RBAC |
+| `admin:write`    | administrative mutations, also requiring active admin RBAC |
+
+Token creation never expands authority: `tokens:manage` permits management
+but does not authorize minting any other scope the parent token lacks.
+Existing catalog/customer-only tokens receive no implicit admin scopes;
+an authorized issuer must issue replacement tokens with explicit scopes.
+
+Issued credentials, ownership and scope sets are immutable. Repository
+lifecycle saves only advance usage and revocation; a stale authentication
+save cannot clear a committed revocation. Authentication rejects a token
+revoked between its hash lookup and lifecycle save.
+
+## Web sessions
+
+The `/web` panels reuse the same revocable API tokens in the
+`platform_session` cookie and authenticate them on every request. Cookies
+are `HttpOnly` and `SameSite=Lax`; they are also `Secure` outside the explicit
+normalized `development`/`test` environments, which permit local HTTP.
+The customer panel loads and displays servers only with `servers:read` and
+wallets only with `wallet:read`; either scoped section works independently.
+A token with neither scope gets `403` without reading either resource.
+The admin panel additionally requires `admin:read` and active persisted
+admin RBAC; missing authority redirects to login before dashboard reads.
+Wallet amounts use the canonical integer-minor-unit formatter: IRT/IRR are
+zero-decimal units, and large USD balances preserve every cent without float
+conversion. The raw minor-unit balance remains visible for reconciliation.
 
 ## Stability policy
 

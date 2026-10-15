@@ -15,6 +15,7 @@ These tests PIN the contract:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -304,3 +305,41 @@ class TestTokenManagementSurface:
             resp = client.delete(f"/v1/auth/tokens/{target}", headers={"Idempotency-Key": "tk2"})
         assert resp.status_code == 204
         assert service.revoked == [target]
+
+
+class TestDevelopmentHeaderIdentity:
+    @pytest.mark.parametrize("app_env", ["development", " Development ", "test", " TEST "])
+    def test_explicit_local_environment_allows_enabled_header(
+        self, monkeypatch: pytest.MonkeyPatch, app_env: str
+    ) -> None:
+        monkeypatch.setattr(
+            "cloud_platform.core.config.get_settings",
+            lambda: SimpleNamespace(app_env=app_env, api_allow_header_identity=True),
+        )
+        with build_app(auth=None) as client:
+            response = client.get("/v1/catalog/offers", headers={"x-platform-user": str(USER_ID)})
+        assert response.status_code == 200
+
+    @pytest.mark.parametrize("app_env", ["production", " PRODUCTION ", "staging", "preview", ""])
+    def test_nonlocal_environment_rejects_header_even_with_flag(
+        self, monkeypatch: pytest.MonkeyPatch, app_env: str
+    ) -> None:
+        monkeypatch.setattr(
+            "cloud_platform.core.config.get_settings",
+            lambda: SimpleNamespace(app_env=app_env, api_allow_header_identity=True),
+        )
+        with build_app(auth=None) as client:
+            response = client.get("/v1/catalog/offers", headers={"x-platform-user": str(USER_ID)})
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == ErrorCode.UNAUTHORIZED.value
+
+    def test_local_header_still_requires_explicit_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "cloud_platform.core.config.get_settings",
+            lambda: SimpleNamespace(app_env="development", api_allow_header_identity=False),
+        )
+        with build_app(auth=None) as client:
+            response = client.get("/v1/catalog/offers", headers={"x-platform-user": str(USER_ID)})
+        assert response.status_code == 401

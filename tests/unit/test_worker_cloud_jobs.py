@@ -75,7 +75,11 @@ class TestProcessCloudCreates:
 
         service = _fake_service(requested=[bad, good], process=_process)
         container_patch(service)
-        await ws.process_cloud_creates({})
+        with pytest.raises(ExceptionGroup, match="cloud create dispatch phases failed") as raised:
+            await ws.process_cloud_creates({})
+        assert [str(error) for error in raised.value.exceptions] == [
+            f"hourly create {bad.id} failed (RuntimeError)"
+        ]
         assert service.process_server.await_count == 2
         # the failure is counted as "error", the healthy one as its outcome
         assert service.process_server.await_args_list[-1].args[0] == good.id
@@ -84,8 +88,11 @@ class TestProcessCloudCreates:
         service = _fake_service()
         service.servers_requested = AsyncMock(side_effect=RuntimeError("db down"))
         container = container_patch(service)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ExceptionGroup, match="cloud create dispatch phases failed") as raised:
             await ws.process_cloud_creates({})
+        assert [str(error) for error in raised.value.exceptions] == [
+            "hourly create dispatch failed (RuntimeError)"
+        ]
         container.close.assert_awaited_once()
 
     @pytest.mark.parametrize("failure_phase", ["construction", "listing"])
@@ -111,9 +118,11 @@ class TestProcessCloudCreates:
 
         # The scheduler sees a failed job, but the independent legacy intent
         # still advances through the real worker without a caller-side requeue.
-        with pytest.raises(type(failure)) as raised:
+        with pytest.raises(ExceptionGroup, match="cloud create dispatch phases failed") as raised:
             await ws.process_cloud_creates({})
-        assert raised.value is failure
+        assert [str(error) for error in raised.value.exceptions] == [
+            f"hourly create dispatch failed ({type(failure).__name__})"
+        ]
         operation = deps.ops.ops[f"server-create:{server.id}"]
         assert operation.status is OperationStatus.COMPLETED
         assert operation.attempts == 1
@@ -126,8 +135,11 @@ class TestProcessCloudCreates:
         deps.holds.release_hold.assert_not_awaited()
 
         # A later poll after the job failure must not submit that intent again.
-        with pytest.raises(type(failure)):
+        with pytest.raises(ExceptionGroup, match="cloud create dispatch phases failed") as retried:
             await ws.process_cloud_creates({})
+        assert [str(error) for error in retried.value.exceptions] == [
+            f"hourly create dispatch failed ({type(failure).__name__})"
+        ]
         assert deps.provider.create_calls == 1
         assert operation.attempts == 1
         assert container.initialize.await_count == 2
@@ -149,10 +161,12 @@ class TestProcessCloudCreates:
         failure = RuntimeError("legacy queue unavailable")
         container.provisioning_worker.return_value.run_once.side_effect = failure
 
-        with pytest.raises(RuntimeError) as raised:
+        with pytest.raises(ExceptionGroup, match="cloud create dispatch phases failed") as raised:
             await ws.process_cloud_creates({})
 
-        assert raised.value is failure
+        assert [str(error) for error in raised.value.exceptions] == [
+            "legacy catalog create dispatch failed (RuntimeError)"
+        ]
         service.process_server.assert_awaited_once_with(server.id)
         container.provisioning_worker.return_value.run_once.assert_awaited_once_with(limit=10)
         container.close.assert_awaited_once()
@@ -170,7 +184,10 @@ class TestProcessCloudCreates:
         with pytest.raises(ExceptionGroup) as raised:
             await ws.process_cloud_creates({})
 
-        assert raised.value.exceptions == (hourly_failure, legacy_failure)
+        assert [str(error) for error in raised.value.exceptions] == [
+            "hourly create dispatch failed (RuntimeError)",
+            "legacy catalog create dispatch failed (ValueError)",
+        ]
         container.provisioning_worker.assert_called_once_with()
         assert "hourly create dispatch failed" in caplog.text
         assert "legacy catalog create dispatch failed" in caplog.text
@@ -220,8 +237,15 @@ class TestReconcileCloudCreates:
 
         service = _fake_service(for_reconcile=[bad, good], reconcile=_reconcile)
         container_patch(service)
-        await ws.reconcile_cloud_creates({})
-        assert service.reconcile_server.await_count == 2
+        with pytest.raises(ExceptionGroup, match="hourly create reconciliation failed") as raised:
+            await ws.reconcile_cloud_creates({})
+        assert [str(error) for error in raised.value.exceptions] == [
+            f"hourly reconcile {bad.id} failed (RuntimeError)"
+        ]
+        assert [call.args[0] for call in service.reconcile_server.await_args_list] == [
+            bad.id,
+            good.id,
+        ]
 
     async def test_needs_review_outcome_is_reported_without_mutation(
         self, container_patch: Any

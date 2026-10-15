@@ -20,9 +20,8 @@ name: deploy-production
 # lane a server/bot of its own first, because until then `main` and `staging`
 # would fight over the same single-consumer Telegram bot token.
 #
-# Concurrency: deployments are serialized (`production-deploy`,
-# cancel-in-progress: false). A newer dispatch waits for the running deploy to
-# finish and then deploys afterwards — a deploy is never cancelled halfway.
+# Deployments never cancel an active mutating run. GitHub may replace pending
+# runs; both lanes additionally share one host-level deployment concurrency key.
 
 on:
   workflow_dispatch:
@@ -39,6 +38,7 @@ concurrency:
 permissions:
   contents: read
   packages: write
+  actions: read
 
 env:
   REGISTRY: ghcr.io
@@ -48,6 +48,10 @@ jobs:
     name: Build immutable image
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Both lanes can build the same commit; serialize the inspect/push pair.
+    concurrency:
+      group: immutable-image-${{ inputs.sha }}
+      cancel-in-progress: false
     # Manual dispatch only: while `staging` owns the development server and
     # the single Telegram bot, NO push - not even a green push to `main` -
     # deploys anything from this workflow.
@@ -59,11 +63,11 @@ jobs:
     steps:
       - name: Resolve deployment SHA
         id: resolve
+        env:
+          REQUESTED_SHA: ${{ inputs.sha }}
         run: |
           set -Eeuo pipefail
-          # Manual dispatch only: the operator hands over an immutable SHA,
-          # and the ancestor-of-main check below refuses anything unreleased.
-          sha="${{ inputs.sha }}"
+          sha="${REQUESTED_SHA}"
           if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "deployment SHA must be a full 40-char hex commit, got '${sha}'"
             exit 1
@@ -75,7 +79,7 @@ jobs:
           echo "deploying commit ${sha} as ${image}:${sha}"
 
       - name: Check out the exact tested commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.resolve.outputs.sha }}
           fetch-depth: 0
@@ -88,11 +92,25 @@ jobs:
             || { echo "SHA is not an ancestor of origin/main; refusing to deploy"; exit 1; }
           echo "SHA is on main; continuing"
 
+      - name: Require successful release CI for the exact SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          conclusion="$(gh run list --repo '${{ github.repository }}' --workflow ci.yml \
+            --commit "$RELEASE_SHA" --branch main --event push --limit 1 \
+            --json conclusion --jq '.[0].conclusion // "missing"')"
+          [ "$conclusion" = success ] || {
+            echo "Exact release SHA has no successful completed main CI ($conclusion)"
+            exit 1
+          }
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -102,26 +120,28 @@ jobs:
         id: exists
         run: |
           set -Eeuo pipefail
+          error_file="${RUNNER_TEMP}/manifest-inspect.err"
           if docker manifest inspect \
-            "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}" >/dev/null 2>&1; then
+            "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}" >/dev/null 2>"$error_file"; then
             echo "present=true" >> "${GITHUB_OUTPUT}"
-            echo "immutable tag already exists; it will NOT be rebuilt or overwritten"
-          else
+          elif grep -Eq 'manifest unknown|no such manifest' "$error_file"; then
             echo "present=false" >> "${GITHUB_OUTPUT}"
-            echo "immutable tag absent; building"
+          else
+            cat "$error_file" >&2
+            echo "Cannot prove the SHA tag is absent; refusing to overwrite it" >&2
+            exit 1
           fi
 
       - name: Build and push the immutable image
         if: steps.exists.outputs.present != 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
+          build-args: RELEASE_REVISION=${{ steps.resolve.outputs.sha }}
           push: true
-          tags: |
-            ${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}
-            ${{ steps.resolve.outputs.image }}:main
+          tags: ${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -167,7 +187,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Check out the exact tested commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.build.outputs.sha }}
           fetch-depth: 1
@@ -187,21 +207,6 @@ jobs:
           [ -n "${{ vars.PROD_DEPLOY_PATH }}" ] || { echo "PROD_DEPLOY_PATH variable is not set"; exit 1; }
           echo "ssh material ready (key never printed)"
 
-      - name: Authenticate the server to GHCR
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          # Short-lived token only; travels over the encrypted SSH session on
-          # stdin and is never printed, stored, or committed.
-          printf '%s' "${GHCR_TOKEN}" | ssh -i "${HOME}/.ssh/prod_key" \
-            -p "${{ vars.PROD_PORT || 22 }}" \
-            -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
-            -o ConnectTimeout=15 \
-            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
-            "docker login ${{ env.REGISTRY }} -u '${{ github.actor }}' --password-stdin"
-          echo "server GHCR authentication: ok"
 
       - name: Deliver release compose candidate
         id: compose
@@ -228,21 +233,34 @@ jobs:
             < deploy/production/docker-compose.yml
 
       - name: Deploy the exact image over SSH
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
-          # Values below are format-constrained (full hex SHA, lowercase
-          # image path, alembic revision, absolute deploy path, compose
-          # SHA-256) and are re-validated inside the deploy script before
-          # anything runs. The compose candidate travels from the same
-          # exact checkout as the image: image and contract share one SHA.
-          ssh -i "${HOME}/.ssh/prod_key" \
-            -p "${{ vars.PROD_PORT || 22 }}" \
-            -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
-            -o ConnectTimeout=15 \
-            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
-            "DEPLOY_PATH='${{ vars.PROD_DEPLOY_PATH }}' PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}' EXPECTED_HEAD='${{ needs.build.outputs.head }}' CANDIDATE_COMPOSE_FILE='${{ vars.PROD_DEPLOY_PATH }}/${{ steps.compose.outputs.candidate }}' EXPECTED_COMPOSE_SHA256='${{ steps.compose.outputs.sha256 }}' bash -s" \
-            < scripts/deploy-production.sh
+          # Login and deployment share one remote lifetime: authentication
+          # never touches ~/.docker and is removed on success or failure.
+          remote_command="$(cat <<'REMOTE'
+          set -Eeuo pipefail
+          DOCKER_CONFIG="$(mktemp -d)"
+          export DOCKER_CONFIG
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
+          IFS= read -r GHCR_TOKEN
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          unset GHCR_TOKEN
+          DEPLOY_PATH='${{ vars.PROD_DEPLOY_PATH }}' PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}' EXPECTED_HEAD='${{ needs.build.outputs.head }}' CANDIDATE_COMPOSE_FILE='${{ vars.PROD_DEPLOY_PATH }}/${{ steps.compose.outputs.candidate }}' EXPECTED_COMPOSE_SHA256='${{ steps.compose.outputs.sha256 }}' bash -s
+          REMOTE
+          )"
+          # Encode only the command, not credentials. This preserves quoting
+          # through any POSIX login shell without consuming the token/script.
+          remote_command="$(printf '%s' "$remote_command" | base64 -w0)"
+          { printf '%s\n' "$GHCR_TOKEN"; cat scripts/deploy-production.sh; } |
+            ssh -i "${HOME}/.ssh/prod_key" \
+              -p "${{ vars.PROD_PORT || 22 }}" \
+              -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+              -o ConnectTimeout=15 \
+              "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
+              "bash -c \"\$(printf '%s' '$remote_command' | base64 --decode)\""
 
       - name: Report deployment
         if: always()
@@ -252,6 +270,7 @@ jobs:
           echo "environment: production"
           echo "expected alembic head: ${{ needs.build.outputs.head }}"
           echo "target: ${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}:${{ vars.PROD_DEPLOY_PATH }}"
+
 
       - name: Remove ephemeral SSH key
         if: always()

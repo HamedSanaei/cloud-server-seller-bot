@@ -123,7 +123,9 @@ class Fakes:
         return server
 
     async def wallet_get(self, user_id) -> Wallet | None:
-        return Wallet(USER_ID, id=WALLET_ID, balance=self.balances.get(user_id, 0))
+        return Wallet(
+            USER_ID, id=WALLET_ID, balance=self.balances.get(user_id, 0), currency=CONFIG.currency
+        )
 
     async def notify(self, user_id, server_id, decision, balance_minor, episode=None) -> None:
         self.notified.append((user_id, server_id, decision, balance_minor))

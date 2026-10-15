@@ -1,7 +1,6 @@
-"""Own-contact identity, durable payment switches and prepaid activation anchor.
+"""Frozen main-branch 0050 artifact, distinct from deployed staging 0050.
 
-Revision ID: 0050
-Revises: 0049
+Historical fixture only: never include this directory in Alembic script paths.
 """
 
 from __future__ import annotations
@@ -26,8 +25,6 @@ def upgrade() -> None:
     op.add_column(
         "servers", sa.Column("billing_started_at", sa.DateTime(timezone=True), nullable=True)
     )
-    # Historical usage was anchored to created_at. Preserve that anchor and its
-    # deterministic ledger keys; new requests start billing only at activation.
     op.execute(
         sa.text("""
         UPDATE servers SET billing_started_at = created_at AT TIME ZONE 'UTC'

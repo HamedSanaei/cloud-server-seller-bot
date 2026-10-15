@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import ApiTokenRow
-from cloud_platform.modules.tokens.domain import ApiToken, TokenScope
+from cloud_platform.modules.tokens.domain import ApiToken, TokenNotFoundError, TokenScope
 
 
 def _attr(row: Any, name: str) -> Any:
@@ -94,9 +94,23 @@ class SqlAlchemyApiTokenRepository:
             return [_to_domain(row) for row in rows]
 
     async def save(self, token: ApiToken) -> ApiToken:
-        row = _to_row(token)
+        """Advance usage/revocation only; issued credentials and scopes are immutable.
+
+        Authentication saves a snapshot read in an earlier transaction. Lock
+        the persisted row before changing lifecycle fields so that a committed
+        revocation can never be cleared by that stale snapshot.
+        """
+        stmt = select(ApiTokenRow).where(ApiTokenRow.id == token.id).with_for_update()
         async with self._session_factory() as session:
-            merged = await session.merge(row)
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                raise TokenNotFoundError(f"token {token.id} not found")
+            if row.revoked_at is None:
+                row.revoked_at = token.revoked_at
+                if token.last_used_at is not None and (
+                    row.last_used_at is None or token.last_used_at > row.last_used_at
+                ):
+                    row.last_used_at = token.last_used_at
             await session.commit()
-            await session.refresh(merged)
-            return _to_domain(merged)
+            await session.refresh(row)
+            return _to_domain(row)

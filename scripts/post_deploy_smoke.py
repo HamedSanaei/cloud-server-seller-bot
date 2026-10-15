@@ -21,12 +21,19 @@ considered healthy (see the production runbook rollback section).
 from __future__ import annotations
 
 import argparse
+import ast
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from cloud_platform.core.config import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -47,7 +54,7 @@ def http_get(url: str, timeout: float = 5.0) -> tuple[int, str]:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return response.status, response.read().decode("utf-8", "replace")
     except Exception as exc:  # urllib wraps HTTPError + URLError + timeouts
-        return 0, f"{type(exc).__name__}: {exc}"
+        return 0, type(exc).__name__
 
 
 def check_health(base_url: str) -> list[CheckResult]:
@@ -59,12 +66,12 @@ def check_health(base_url: str) -> list[CheckResult]:
             payload = json.loads(body) if ok else {}
         except json.JSONDecodeError:
             payload = {}
-        ok = ok and payload.get("status") == "ok"
+        ok = ok and isinstance(payload, dict) and payload.get("status") == "ok"
         results.append(
             CheckResult(
                 f"GET {path}",
                 ok,
-                f"status={status} body={body[:120]}",
+                f"status={status}, expected status marker={ok}",
             )
         )
     return results
@@ -88,44 +95,142 @@ def repo_head_revision() -> str:
     revisions: set[str] = set()
     referenced: set[str] = set()
     for path in (REPO_ROOT / "alembic" / "versions").glob("*.py"):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("revision:"):
-                revisions.add(stripped.split("=", 1)[1].strip().strip('"').strip("'"))
-            elif stripped.startswith("down_revision:"):
-                rev = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                if rev not in ("None", ""):
-                    referenced.add(rev)
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                name, value = node.target.id, node.value
+            elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+                name, value = node.targets[0].id, node.value
+            else:
+                continue
+            if name not in {"revision", "down_revision"} or value is None:
+                continue
+            literal = ast.literal_eval(value)
+            if name == "revision":
+                if not isinstance(literal, str) or literal in revisions:
+                    raise ValueError(f"invalid or duplicate migration revision in {path.name}")
+                revisions.add(literal)
+            elif literal is not None:
+                referenced.update((literal,) if isinstance(literal, str) else literal)
     heads = sorted(revisions - referenced)
     return heads[0] if len(heads) == 1 else (",".join(heads) if heads else "")
+
+
+def database_revisions() -> str:
+    """Observe the configured database, never infer its state from the checkout."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from cloud_platform.core.config import get_settings
+
+    async def read() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as connection:
+                result = await connection.execute(text("SELECT version_num FROM alembic_version"))
+                return ",".join(sorted(result.scalars().all()))
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
 
 
 def check_migration_head(base_url: str, expected_head: str | None) -> CheckResult:
     """The DEPLOYED database's head vs the release's head.
 
-    The operator runs `alembic current` in the api container (the command is
-    printed); this check verifies the expected head resolves in this
-    checkout so the comparison is meaningful.
+    Run this script with the deployed application's configuration. An HTTP
+    liveness response or a locally expected revision is not database evidence.
     """
     if expected_head is None:
         expected_head = repo_head_revision()
+    try:
+        observed = database_revisions()
+    except Exception as exc:
+        return CheckResult(
+            "alembic current == head", False, f"database probe: {type(exc).__name__}"
+        )
+    ok = bool(expected_head) and "," not in expected_head and observed == expected_head
     return CheckResult(
-        "alembic current == head",
-        bool(expected_head),
-        f"expected head={expected_head or 'UNKNOWN'} "
-        "(verify: docker compose exec api alembic current)",
+        "alembic current == head", ok, f"expected={expected_head}, observed={observed}"
     )
 
 
+def worker_health() -> int:
+    """ARQ's expiring Redis health sentinel proves the worker actually ran."""
+    from arq.worker import check_health
+
+    from cloud_platform.worker.settings import WorkerSettings
+
+    return int(check_health(WorkerSettings))
+
+
 def check_worker(base_url: str) -> CheckResult:
-    """Readiness doubles as the worker check until /health/ready gains a
-    redis probe; keep the expectation explicit."""
-    status, _body = http_get(f"{base_url}/health/ready")
-    ok = status == 200
+    """An API returning HTTP 200 does not establish worker health."""
+    try:
+        ok = worker_health() == 0
+    except Exception as exc:
+        return CheckResult("worker/ARQ sentinel", False, f"worker probe: {type(exc).__name__}")
+    return CheckResult("worker/ARQ sentinel", ok, f"live Redis health sentinel={ok}")
+
+
+async def _financial_snapshot(session: AsyncSession) -> tuple[int, int, int, int]:
+    """Reuse the domain reconciler; never duplicate denomination/hold rules."""
+    from sqlalchemy import func, select
+
+    from cloud_platform.db.base import PaymentSession
+    from cloud_platform.modules.wallet.reconciliation import LedgerReconciliationService
+    from cloud_platform.modules.wallet.repository import (
+        SqlAlchemyHoldRepository,
+        SqlAlchemyLedgerRepository,
+        SqlAlchemyWalletRepository,
+    )
+
+    @asynccontextmanager
+    async def shared_session() -> AsyncIterator[AsyncSession]:
+        # Repositories enter/exit this context repeatedly. Only the caller
+        # owns the session/transaction: exiting a repository cannot close it.
+        yield session
+
+    report = await LedgerReconciliationService(
+        SqlAlchemyWalletRepository(shared_session),
+        SqlAlchemyHoldRepository(shared_session),
+        SqlAlchemyLedgerRepository(shared_session),
+    ).generate_report()
+    payments = await session.execute(select(func.count()).select_from(PaymentSession))
+    return report.wallets_checked, len(report.errors), len(report.warnings), payments.scalar_one()
+
+
+async def financial_readiness() -> tuple[int, int, int, int]:
+    """One consistent read-only snapshot, not racing separate wallet reads."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    from cloud_platform.core.config import get_settings
+
+    engine = create_async_engine(get_settings().database_url)
+    try:
+        async with engine.connect() as connection, connection.begin():
+            await connection.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            )
+            async with AsyncSession(bind=connection, expire_on_commit=False) as session:
+                return await _financial_snapshot(session)
+    finally:
+        await engine.dispose()
+
+
+def check_financial_read_only() -> CheckResult:
+    """No payment creation/inquiry, wallet write or customer data in output."""
+    try:
+        wallets, errors, warnings, payments = asyncio.run(financial_readiness())
+    except Exception as exc:
+        return CheckResult(
+            "payment/wallet read-only snapshot", False, f"financial probe: {type(exc).__name__}"
+        )
     return CheckResult(
-        "worker/readiness",
-        ok,
-        f"status={status} (verify arq job list in the worker log)",
+        "payment/wallet read-only snapshot",
+        errors == 0,
+        f"wallets={wallets}, ledger errors={errors}, warnings={warnings}, "
+        f"payment sessions={payments}",
     )
 
 
@@ -200,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     results.append(check_metrics(args.base_url))
     results.append(check_migration_head(args.base_url, args.expected_head))
     results.append(check_worker(args.base_url))
+    results.append(check_financial_read_only())
     if args.provider_key:
         from cloud_platform.core.config import get_settings
 

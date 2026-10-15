@@ -17,6 +17,9 @@ M14-005 acceptance: **provider/users/operations dashboards.**
 
 from __future__ import annotations
 
+from http.cookies import SimpleCookie
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -82,6 +85,13 @@ def web():
     servers = FakeServersPage()
     tokens: dict[str, TokenAuthentication] = {}
     audit_events: list[FakeAuditEvent] = [FakeAuditEvent()]
+    reads: dict[str, list[object]] = {
+        "servers": [],
+        "wallet": [],
+        "users": [],
+        "audit": [],
+        "providers": [],
+    }
 
     async def authenticate(raw_token: str) -> TokenAuthentication:
         entry = tokens.get(raw_token)
@@ -100,12 +110,14 @@ def web():
     async def _servers_view() -> object:
         class _Service:
             async def list_servers(self, _user_id: object) -> FakeServersPage:
+                reads["servers"].append(_user_id)
                 return servers
 
         return _Service()
 
     async def _wallet_view() -> object:
         async def _load(_user_id: object) -> FakeWallet:
+            reads["wallet"].append(_user_id)
             return FakeWallet()
 
         return _load
@@ -115,19 +127,22 @@ def web():
 
     async def _user_search() -> object:
         async def _search(q: str = "", *, offset: int = 0, limit: int = 20) -> list[FakeUser]:
-            del q, offset, limit
+            reads["users"].append(q)
+            del offset, limit
             return [users.admin]
 
         return _search
 
     async def _audit_feed() -> object:
         async def _load(limit: int) -> list[FakeAuditEvent]:
+            reads["audit"].append(limit)
             return audit_events[:limit]
 
         return _load
 
     async def _providers_view() -> object:
         async def _load() -> list[tuple[str, str]]:
+            reads["providers"].append(True)
             return [("hetzner", "list_locations, list_plans")]
 
         return _load
@@ -144,11 +159,17 @@ def web():
     client = TestClient(app)
     client.users = users  # type: ignore[attr-defined]
     client.tokens = tokens  # type: ignore[attr-defined]
+    client.reads = reads  # type: ignore[attr-defined]
 
-    def register(raw: str, user: FakeUser) -> None:
+    def register(
+        raw: str,
+        user: FakeUser,
+        *,
+        scopes: frozenset[TokenScope] = frozenset(TokenScope),
+    ) -> None:
         tokens[raw] = TokenAuthentication(
             user_id=user.id,
-            scopes=frozenset(TokenScope),
+            scopes=scopes,
             token_id=user.id,
         )
 
@@ -169,8 +190,10 @@ class FakeUserRepo:
     def __init__(self) -> None:
         self.admin = FakeUser(role=Role.ADMIN)
         self.plain = FakeUser()
+        self.lookups: list[object] = []
 
     async def get(self, user_id: object) -> FakeUser | None:
+        self.lookups.append(user_id)
         for u in (self.admin, self.plain):
             if u.id == user_id:
                 return u
@@ -218,7 +241,33 @@ class TestCustomerPanelM14004:
         assert "running" in response.text
         assert "Wallet" in response.text
         assert "12345" in response.text  # minor units verbatim
-        assert "123.45 EUR" in response.text  # major-unit hint
+
+    @pytest.mark.parametrize(
+        ("balance", "currency", "formatted"),
+        [
+            (1_000_000, "IRT", "1,000,000 تومان"),
+            (1_000_000, "IRR", "1,000,000 ریال"),
+            (9_223_372_036_854_775_807, "USD", "$92233720368547758.07"),
+        ],
+    )
+    def test_wallet_display_preserves_currency_units_and_int64_precision(
+        self, web, balance: int, currency: str, formatted: str
+    ) -> None:
+        from cloud_platform.api.web import customer as customer_web
+
+        async def wallet_loader():
+            async def load(user_id):
+                assert user_id == web.users.plain.id
+                return SimpleNamespace(balance=balance, currency=currency)
+
+            return load
+
+        web.app.dependency_overrides[customer_web._wallet_view] = wallet_loader
+        web.register_token(RAW_TOKEN, web.users.plain, scopes=frozenset({TokenScope.WALLET_READ}))
+        web.cookies.set("platform_session", RAW_TOKEN)
+        response = web.get("/web/panel")
+        assert response.status_code == 200
+        assert f"({formatted})" in response.text
 
     def test_revoked_token_kills_the_session_next_request(self, web):  # type: ignore[no-untyped-def]
         web.register_token("cpt_dying", web.users.plain)
@@ -231,6 +280,69 @@ class TestCustomerPanelM14004:
     def test_logout_clears_cookie(self, web):  # type: ignore[no-untyped-def]
         response = web.get("/web/logout", follow_redirects=False)
         assert response.status_code == 303
+
+    @pytest.mark.parametrize(
+        ("app_env", "secure"),
+        [
+            ("production", True),
+            (" PRODUCTION ", True),
+            ("staging", True),
+            ("development", False),
+            (" Development ", False),
+            (" TEST ", False),
+        ],
+    )
+    def test_session_cookie_transport_policy(self, web, monkeypatch, app_env: str, secure: bool):  # type: ignore[no-untyped-def]
+        monkeypatch.setattr(
+            "cloud_platform.core.config.get_settings",
+            lambda: SimpleNamespace(app_env=app_env),
+        )
+        web.register_token(RAW_TOKEN, web.users.plain)
+        login = web.post("/web/login", data={"token": RAW_TOKEN}, follow_redirects=False)
+        logout = web.get("/web/logout", follow_redirects=False)
+        for response in (login, logout):
+            cookie = SimpleCookie()
+            cookie.load(response.headers["set-cookie"])
+            session = cookie["platform_session"]
+            assert bool(session["secure"]) is secure
+            assert session["httponly"]
+            assert session["samesite"].lower() == "lax"
+
+    @pytest.mark.parametrize(
+        "scopes",
+        [
+            frozenset(),
+            frozenset({TokenScope.CATALOG_READ}),
+            frozenset({TokenScope.TOKENS_MANAGE}),
+            frozenset({TokenScope.ADMIN_READ, TokenScope.ADMIN_WRITE}),
+        ],
+    )
+    def test_unscoped_session_cannot_read_customer_data(self, web, scopes: frozenset[TokenScope]):  # type: ignore[no-untyped-def]
+        web.register_token(RAW_TOKEN, web.users.plain, scopes=scopes)
+        web.cookies.set("platform_session", RAW_TOKEN)
+        response = web.get("/web/panel")
+        assert response.status_code == 403
+        assert "hetzner" not in response.text
+        assert "12345" not in response.text
+        assert web.reads["servers"] == []
+        assert web.reads["wallet"] == []
+
+    @pytest.mark.parametrize("scope", [TokenScope.SERVERS_READ, TokenScope.WALLET_READ])
+    def test_panel_loads_only_the_authorized_resource(self, web, scope: TokenScope):  # type: ignore[no-untyped-def]
+        web.register_token(RAW_TOKEN, web.users.plain, scopes=frozenset({scope}))
+        web.cookies.set("platform_session", RAW_TOKEN)
+        response = web.get("/web/panel")
+        assert response.status_code == 200
+        if scope is TokenScope.SERVERS_READ:
+            assert "hetzner" in response.text
+            assert "12345" not in response.text
+            assert web.reads["servers"] == [web.users.plain.id]
+            assert web.reads["wallet"] == []
+        else:
+            assert "12345" in response.text
+            assert "hetzner" not in response.text
+            assert web.reads["wallet"] == [web.users.plain.id]
+            assert web.reads["servers"] == []
 
 
 class TestAdminPanelM14005:
@@ -264,3 +376,52 @@ class TestAdminPanelM14005:
         response = web.get("/web/admin?q=admin")
         assert response.status_code == 200
         assert web.users.admin.username in response.text
+
+    @pytest.mark.parametrize(
+        "scopes",
+        [
+            frozenset(),
+            frozenset({TokenScope.CATALOG_READ}),
+            frozenset({TokenScope.SERVERS_READ, TokenScope.WALLET_READ}),
+            frozenset({TokenScope.TOKENS_MANAGE}),
+            frozenset({TokenScope.ADMIN_WRITE}),
+        ],
+    )
+    def test_admin_role_without_admin_read_never_loads_data(
+        self, web, scopes: frozenset[TokenScope]
+    ):  # type: ignore[no-untyped-def]
+        web.register_token(RAW_TOKEN, web.users.admin, scopes=scopes)
+        web.cookies.set("platform_session", RAW_TOKEN)
+        response = web.get("/web/admin", follow_redirects=False)
+        assert response.status_code == 303
+        assert response.headers["location"] == "/web/login"
+        assert web.users.lookups == []
+        assert web.reads["users"] == []
+        assert web.reads["audit"] == []
+        assert web.reads["providers"] == []
+
+    def test_explicit_admin_read_retains_dashboard_access(self, web):  # type: ignore[no-untyped-def]
+        web.register_token(RAW_TOKEN, web.users.admin, scopes=frozenset({TokenScope.ADMIN_READ}))
+        web.cookies.set("platform_session", RAW_TOKEN)
+        response = web.get("/web/admin")
+        assert response.status_code == 200
+        assert "volume.reconciled" in response.text
+        assert web.users.lookups == [web.users.admin.id]
+        assert web.reads["users"] == [""]
+        assert web.reads["audit"] == [15]
+        assert web.reads["providers"] == [True]
+
+    @pytest.mark.parametrize("status", [UserStatus.FROZEN, UserStatus.BANNED])
+    def test_admin_rbac_is_rechecked_for_existing_session(self, web, status: UserStatus):  # type: ignore[no-untyped-def]
+        web.register_token(RAW_TOKEN, web.users.admin, scopes=frozenset({TokenScope.ADMIN_READ}))
+        web.cookies.set("platform_session", RAW_TOKEN)
+        assert web.get("/web/admin").status_code == 200
+        web.users.admin.status = status
+        for reads in web.reads.values():
+            reads.clear()
+        response = web.get("/web/admin", follow_redirects=False)
+        assert response.status_code == 303
+        assert response.headers["location"] == "/web/login"
+        assert web.reads["users"] == []
+        assert web.reads["audit"] == []
+        assert web.reads["providers"] == []

@@ -231,25 +231,40 @@ async def reconcile_provider_resources(ctx: dict[str, object]) -> None:
                 audit_repo=audit_repo,
                 create_attempts=container.create_account_attempt_repository(),
             )
-            create_report = await create_reconciler.reconcile()
-            state_report = await ServerStateReconciler(
-                server_repo=server_repo,
-                provider_registry=container.provider_registry,
-                audit_repo=audit_repo,
-                # The reconciler owns the final PROVISIONING -> RUNNING
-                # transition of an hourly cloud instance, so the operator's
-                # "vps provisioned" card is emitted from here, through the
-                # same durable outbox.
-                event_sink=container.business_event_sink(),
-                user_repo=container.user_repository(),
-                customer_sink=container.customer_provisioned_sink(),
-                prepay_server=container.accrual_job().prepay_server,
-            ).reconcile()
+            phase_errors: list[Exception] = []
+            create_report = state_report = None
+            try:
+                create_report = await create_reconciler.reconcile()
+            except Exception as exc:
+                logger.error("create reconciliation failed (%s)", type(exc).__name__)
+                phase_errors.append(
+                    RuntimeError(f"create reconciliation failed ({type(exc).__name__})")
+                )
+            try:
+                state_report = await ServerStateReconciler(
+                    server_repo=server_repo,
+                    provider_registry=container.provider_registry,
+                    prepaid_capture=container.hourly_cloud_service().capture_first_hour,
+                    audit_repo=audit_repo,
+                    event_sink=container.business_event_sink(),
+                    user_repo=container.user_repository(),
+                    customer_sink=container.customer_provisioned_sink(),
+                    prepay_server=container.accrual_job().prepay_server,
+                ).reconcile()
+            except Exception as exc:
+                logger.error("server state reconciliation failed (%s)", type(exc).__name__)
+                phase_errors.append(
+                    RuntimeError(f"server state reconciliation failed ({type(exc).__name__})")
+                )
             logger.info(
                 "provider resource reconciliation: create=%s state=%s",
                 create_report,
                 state_report,
             )
+            if phase_errors:
+                raise ExceptionGroup(
+                    "provider resource reconciliation phases failed", phase_errors
+                ) from None
         finally:
             await container.close()
 
@@ -362,6 +377,147 @@ async def renew_hourly_coverage(ctx: dict[str, object], server_id: str) -> None:
         await _schedule_hourly_renewal(cast(ArqRedis, ctx["redis"]), server)
     finally:
         await container.close()
+
+
+async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
+    """Renew paid coverage before expiry and enforce zero/expired-hour power state."""
+    del ctx
+    async with metrics.job("reconcile_prepaid_hourly"):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.core.container import create_container
+        from cloud_platform.db.session import SessionFactory
+        from cloud_platform.modules.billing.service import (
+            PrepaidBalanceDecision,
+            PrepaidBalancePolicyService,
+        )
+        from cloud_platform.modules.notifications.domain import (
+            LowBalanceNotifier,
+            TelegramLowBalanceNotifier,
+        )
+        from cloud_platform.modules.notifications.repository import (
+            SqlAlchemyLowBalanceNotificationLogRepository,
+        )
+        from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+
+        container = create_container()
+        try:
+            await container.initialize()
+            settings = get_settings()
+            billing_enabled = (
+                settings.fx_enabled
+                and settings.fx_domestic_enabled
+                and settings.fx_allow_usdt_proxy_for_settlement
+            )
+            renewal = (
+                await container.prepaid_hourly_billing_service().run() if billing_enabled else None
+            )
+            policy = PrepaidBalancePolicyService(
+                container.server_repository(), container.wallet_repository()
+            )
+            decisions = await policy.evaluate()
+            errors: list[Exception] = []
+            token = _telegram_bot_token()
+            bot = None
+            if token is not None:
+                from aiogram import Bot
+
+                bot = Bot(token=token)
+            notices = (
+                LowBalanceNotifier(
+                    TelegramLowBalanceNotifier(bot, SqlAlchemyUserRepository(SessionFactory)),
+                    SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
+                )
+                if bot is not None
+                else None
+            )
+            try:
+                for server_id, decision in decisions.decisions.items():
+                    server = await container.server_repository().get(server_id)
+                    if server is None:
+                        continue
+                    wallet = await container.wallet_repository().get(server.user_id)
+                    if wallet is None or wallet.currency != "IRT":
+                        continue
+                    episode = server.prepaid_zero_since
+                    if wallet.balance > 0 and wallet.balance < 200_000:
+                        decision = PrepaidBalanceDecision.WARN
+                        episode = server.low_balance_since
+                    if (
+                        decision
+                        not in (
+                            PrepaidBalanceDecision.WARN,
+                            PrepaidBalanceDecision.STOP,
+                            PrepaidBalanceDecision.DELETE,
+                        )
+                        or episode is None
+                    ):
+                        continue
+                    if notices is None:
+                        logger.error(
+                            "prepaid balance notice unavailable: Telegram bot is unconfigured"
+                        )
+                        continue
+                    try:
+                        await notices.notify(
+                            server.user_id, server_id, decision, wallet.balance, "IRT", episode
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "prepaid Telegram balance notice failed for %s (%s)",
+                            server_id,
+                            type(exc).__name__,
+                        )
+                        errors.append(RuntimeError(f"prepaid notice failed ({type(exc).__name__})"))
+            finally:
+                if bot is not None:
+                    await bot.session.close()
+            lifecycle = container.prepaid_provider_lifecycle_service()
+            expired = (
+                renewal.stop_requested_server_ids
+                if renewal is not None
+                else [
+                    server.id
+                    for server in await container.server_repository().list_running()
+                    if server.is_prepaid_hourly_irt
+                    and (
+                        server.prepaid_paid_until is None
+                        or server.prepaid_paid_until <= datetime.now(UTC)
+                    )
+                ]
+            )
+            for server_id in expired:
+                try:
+                    await lifecycle.enforce_unpaid(server_id)
+                except Exception as exc:
+                    logger.error(
+                        "unpaid prepaid server stop failed for %s (%s)",
+                        server_id,
+                        type(exc).__name__,
+                    )
+                    errors.append(RuntimeError(f"unpaid server stop failed ({type(exc).__name__})"))
+            for server_id in (
+                *decisions.stop_requested_server_ids,
+                *decisions.delete_requested_server_ids,
+            ):
+                try:
+                    await lifecycle.enforce(server_id)
+                except Exception as exc:
+                    logger.error(
+                        "prepaid server lifecycle failed for %s (%s)", server_id, type(exc).__name__
+                    )
+                    errors.append(RuntimeError(f"prepaid lifecycle failed ({type(exc).__name__})"))
+            if renewal is not None and renewal.errors:
+                errors.append(
+                    RuntimeError(f"prepaid renewal failed for {len(renewal.errors)} items")
+                )
+            if decisions.errors:
+                errors.append(
+                    RuntimeError(f"prepaid balance pass failed for {len(decisions.errors)} items")
+                )
+            if errors:
+                raise ExceptionGroup("prepaid hourly reconciliation failed", errors) from None
+        finally:
+            await container.close()
 
 
 async def evaluate_low_balance(ctx: dict[str, object]) -> None:
@@ -1071,25 +1227,32 @@ async def process_cloud_creates(ctx: dict[str, object]) -> None:
                     try:
                         outcome = await service.process_server(server.id)
                     except Exception as exc:
-                        logger.warning("hourly create %s failed: %s", server.id, exc)
+                        logger.warning(
+                            "hourly create %s failed (%s)", server.id, type(exc).__name__
+                        )
+                        phase_errors.append(
+                            RuntimeError(f"hourly create {server.id} failed ({type(exc).__name__})")
+                        )
                         outcome = "error"
                     outcomes[outcome] = outcomes.get(outcome, 0) + 1
                 if outcomes:
                     logger.info("hourly creates processed: %s", outcomes)
             except Exception as exc:
-                logger.exception("hourly create dispatch failed")
-                phase_errors.append(exc)
+                logger.error("hourly create dispatch failed (%s)", type(exc).__name__)
+                phase_errors.append(
+                    RuntimeError(f"hourly create dispatch failed ({type(exc).__name__})")
+                )
             try:
                 legacy_report = await container.provisioning_worker().run_once(limit=10)
                 if legacy_report:
                     logger.info("legacy catalog creates processed: %s", legacy_report)
             except Exception as exc:
-                logger.exception("legacy catalog create dispatch failed")
-                phase_errors.append(exc)
-            if len(phase_errors) == 1:
-                raise phase_errors[0]
+                logger.error("legacy catalog create dispatch failed (%s)", type(exc).__name__)
+                phase_errors.append(
+                    RuntimeError(f"legacy catalog create dispatch failed ({type(exc).__name__})")
+                )
             if phase_errors:
-                raise ExceptionGroup("cloud create dispatch phases failed", phase_errors)
+                raise ExceptionGroup("cloud create dispatch phases failed", phase_errors) from None
         finally:
             await container.close()
 
@@ -1111,15 +1274,21 @@ async def reconcile_cloud_creates(ctx: dict[str, object]) -> None:
             await container.initialize()
             service = container.hourly_cloud_service()
             outcomes: dict[str, int] = {}
+            errors: list[Exception] = []
             for server in await service.servers_for_reconcile():
                 try:
                     outcome = await service.reconcile_server(server.id)
                 except Exception as exc:
-                    logger.warning("hourly reconcile %s failed: %s", server.id, exc)
+                    logger.warning("hourly reconcile %s failed (%s)", server.id, type(exc).__name__)
+                    errors.append(
+                        RuntimeError(f"hourly reconcile {server.id} failed ({type(exc).__name__})")
+                    )
                     outcome = "error"
                 outcomes[outcome] = outcomes.get(outcome, 0) + 1
             if outcomes:
                 logger.info("hourly creates reconciled: %s", outcomes)
+            if errors:
+                raise ExceptionGroup("hourly create reconciliation failed", errors) from None
         finally:
             await container.close()
 
@@ -1284,7 +1453,7 @@ async def reconcile_tetraminator_payments(ctx: dict[str, object]) -> None:
         from cloud_platform.providers.tetraminator.client import TetraminatorGateway
 
         settings = get_settings()
-        if not settings.tetraminator_enabled or not settings.tetraminator_api_key:
+        if not settings.tetraminator_api_key:
             return
         gateway = TetraminatorGateway(
             api_key=settings.tetraminator_api_key,
@@ -1322,15 +1491,16 @@ async def reconcile_atlaspay_payments(ctx: dict[str, object]) -> None:
         from cloud_platform.providers.atlaspay.client import AtlasPayGateway
 
         settings = get_settings()
-        if not settings.atlaspay_enabled or not settings.atlaspay_api_key:
+        if not settings.atlaspay_api_key:
             return
         container = create_container()
-        gateway = AtlasPayGateway(
-            api_key=settings.atlaspay_api_key,
-            base_url=settings.atlaspay_base_url,
-            timeout_seconds=settings.atlaspay_timeout_seconds,
-        )
+        gateway = None
         try:
+            gateway = AtlasPayGateway(
+                api_key=settings.atlaspay_api_key,
+                base_url=settings.atlaspay_base_url,
+                timeout_seconds=settings.atlaspay_timeout_seconds,
+            )
             repo = SqlAlchemyPaymentSessionRepository(container.session_factory)
             service = PaymentReconciliationService(
                 payments_repo=repo,
@@ -1348,8 +1518,11 @@ async def reconcile_atlaspay_payments(ctx: dict[str, object]) -> None:
             report = await service.run()
             logger.info("atlaspay reconcile: %s", report.render())
         finally:
-            await gateway.close()
-            await container.close()
+            try:
+                if gateway is not None:
+                    await gateway.close()
+            finally:
+                await container.close()
 
 
 async def deliver_business_log_events(ctx: dict[str, object]) -> None:
@@ -1423,6 +1596,7 @@ def _cron_jobs() -> list[Any]:
         cron(process_deletes, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_deletes, minute=every_three_minutes, run_at_startup=True),
         cron(accrue_usage, minute=every_minute, run_at_startup=True),
+        cron(reconcile_prepaid_hourly, minute=every_minute, run_at_startup=True),
         cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
@@ -1440,6 +1614,7 @@ class WorkerSettings:
     functions: ClassVar[list[Any]] = [
         reconcile_provider_resources,
         accrue_usage,
+        reconcile_prepaid_hourly,
         func(renew_hourly_coverage, max_tries=240, keep_result=0),
         evaluate_low_balance,
         process_deletes,
@@ -1466,6 +1641,7 @@ class WorkerSettings:
     # cron entry sets an explicit, larger timeout (a full provider walk would
     # otherwise be cancelled mid-run).
     job_timeout = 120
+    health_check_interval = 30
 
 
 # M16-004: queue partitioning by responsibility. Each role runs as its own
@@ -1485,6 +1661,7 @@ PROVISIONING_FUNCTIONS: list[Any] = [
 ]
 BILLING_FUNCTIONS: list[Any] = [
     accrue_usage,
+    reconcile_prepaid_hourly,
     func(renew_hourly_coverage, max_tries=240, keep_result=0),
     evaluate_low_balance,
     reconcile_payments,
@@ -1527,6 +1704,7 @@ def _role_cron_jobs(role: str) -> list[Any]:
     if role == "billing":
         return [
             cron(accrue_usage, minute=every_minute, run_at_startup=True),
+            cron(reconcile_prepaid_hourly, minute=every_minute, run_at_startup=True),
             cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
             cron(reconcile_payments, minute=every_fifteen_minutes, run_at_startup=True),
             cron(

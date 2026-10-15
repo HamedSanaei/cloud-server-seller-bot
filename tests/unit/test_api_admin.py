@@ -1,21 +1,18 @@
 """Tests for the admin API (M14-003).
 
-Acceptance: search/actions are RBAC/audited.
+Acceptance: capabilities AND active admin RBAC gate every request.
 
-- RBAC in the application layer: only role=admin users pass
-  (PermissionChecker.require); non-admins get 403 forbidden envelope,
-  identical for unknown ids - no existence leak;
-- user search/detail under admin:manage_users; audit query under
-  admin:manage_settings;
-- status changes REQUIRE a reason and are audited as ADMIN-actor events;
-- mutations require the idempotency key.
+GETs require admin:read; mutations require admin:write and delegate a
+reason-bound, actor-scoped idempotent status command to the repository.
+The PostgreSQL suite proves atomic audit persistence and replay semantics.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -27,7 +24,9 @@ from cloud_platform.api.v1.admin import (
 from cloud_platform.api.v1.dependencies import get_token_authentication
 from cloud_platform.modules.audit.domain import ActorType, AuditEvent
 from cloud_platform.modules.audit.service import AuditTrail
-from cloud_platform.modules.users.domain import Role, User, UserStatus
+from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
+from cloud_platform.modules.users.domain import Role, User, UserNotFound, UserStatus
+from cloud_platform.modules.users.repository import UserStatusIdempotencyConflict
 
 ADMIN_ID = uuid4()
 USER_ID = uuid4()
@@ -37,7 +36,7 @@ TARGET_ID = uuid4()
 class FakeUserRepo:
     def __init__(self) -> None:
         self.users: dict[UUID, User] = {}
-        self.updated_status: list[tuple[UUID, UserStatus]] = []
+        self.change_status_idempotently = AsyncMock(return_value=UserStatus.FROZEN)
 
     async def get(self, user_id: UUID) -> User | None:
         return self.users.get(user_id)
@@ -50,19 +49,6 @@ class FakeUserRepo:
             if needle in u.username.lower() or needle in u.email.lower()
         ]
         return matches[offset : offset + limit]
-
-    async def update_status(self, user_id: UUID, status: UserStatus) -> User:
-        target = self.users[user_id]
-        changed = User(
-            id=target.id,
-            username=target.username,
-            email=target.email,
-            status=status,
-            role=target.role,
-        )
-        self.users[user_id] = changed
-        self.updated_status.append((user_id, status))
-        return changed
 
 
 class FakeAuditRepo:
@@ -98,7 +84,9 @@ def make_plain() -> User:
     return User(id=USER_ID, username="joe", email="joe@example.com", role=Role.USER)
 
 
-def build_app() -> tuple[TestClient, FakeUserRepo, FakeAuditRepo]:
+def build_app(
+    scopes: frozenset[TokenScope] = frozenset({TokenScope.ADMIN_READ, TokenScope.ADMIN_WRITE}),
+) -> tuple[TestClient, FakeUserRepo, FakeAuditRepo]:
     app = FastAPI()
     app.include_router(v1_router)
     from cloud_platform.api.v1.admin import router as admin_router
@@ -110,7 +98,7 @@ def build_app() -> tuple[TestClient, FakeUserRepo, FakeAuditRepo]:
 
     users = FakeUserRepo()
     audits = FakeAuditRepo()
-    auth = TokenAuthStub(user_id=ADMIN_ID)
+    auth = token_auth(ADMIN_ID, scopes)
     users.users[ADMIN_ID] = make_admin()  # the acting admin exists
     app.dependency_overrides[get_token_authentication] = lambda: auth
     app.dependency_overrides[_user_repo] = lambda: users
@@ -118,16 +106,11 @@ def build_app() -> tuple[TestClient, FakeUserRepo, FakeAuditRepo]:
     return TestClient(app), users, audits  # type: ignore[return-value]
 
 
-class TokenAuthStub:
-    """Stands in for the token-auth dependency."""
-
-    def __init__(self, user_id: UUID) -> None:
-        self.user_id = user_id
-        self.scopes: frozenset[Any] = frozenset()
-        self.token_id = uuid4()
-
-    def has(self, *_scopes: Any) -> bool:
-        return True
+def token_auth(
+    user_id: UUID,
+    scopes: frozenset[TokenScope] = frozenset({TokenScope.ADMIN_READ, TokenScope.ADMIN_WRITE}),
+) -> TokenAuthentication:
+    return TokenAuthentication(user_id=user_id, scopes=scopes, token_id=uuid4())
 
 
 class TestRbacGate:
@@ -139,7 +122,7 @@ class TestRbacGate:
         # override identity to a NON-admin user that exists
         plain = make_plain()
         users.users[USER_ID] = plain
-        client.app.dependency_overrides[get_token_authentication] = lambda: TokenAuthStub(USER_ID)  # type: ignore[attr-defined]
+        client.app.dependency_overrides[get_token_authentication] = lambda: token_auth(USER_ID)  # type: ignore[attr-defined]
         resp = client.get(f"/v1/admin/users/{TARGET_ID}")
         assert resp.status_code == 403
         error = resp.json()["error"]
@@ -147,10 +130,85 @@ class TestRbacGate:
 
     def test_unknown_actor_is_forbidden_too(self) -> None:
         client, _users, _audits = build_app()
-        client.app.dependency_overrides[get_token_authentication] = lambda: TokenAuthStub(uuid4())  # type: ignore[attr-defined]
+        client.app.dependency_overrides[get_token_authentication] = lambda: token_auth(uuid4())  # type: ignore[attr-defined]
         resp = client.get("/v1/admin/users")
         assert resp.status_code == 403
         assert resp.json()["error"]["code"] == "forbidden"
+
+    @pytest.mark.parametrize("status", [UserStatus.FROZEN, UserStatus.BANNED])
+    def test_inactive_admin_cannot_read_or_mutate(self, status: UserStatus) -> None:
+        client, users, _audits = build_app()
+        users.users[ADMIN_ID].status = status
+        assert client.get("/v1/admin/users").status_code == 403
+        response = client.post(
+            f"/v1/admin/users/{TARGET_ID}/status",
+            headers={"Idempotency-Key": "inactive"},
+            json={"status": "active", "reason": "reviewed"},
+        )
+        assert response.status_code == 403
+        users.change_status_idempotently.assert_not_awaited()
+
+
+class TestTokenCapabilities:
+    @pytest.mark.parametrize(
+        "scopes",
+        [
+            frozenset(),
+            frozenset({TokenScope.CATALOG_READ}),
+            frozenset({TokenScope.ADMIN_WRITE}),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/admin/users",
+            f"/v1/admin/users/{TARGET_ID}",
+            f"/v1/admin/audit?actor_id={ADMIN_ID}",
+        ],
+    )
+    def test_gets_reject_tokens_without_admin_read(
+        self, scopes: frozenset[TokenScope], path: str
+    ) -> None:
+        client, _users, _audits = build_app(scopes)
+        response = client.get(path)
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "forbidden"
+
+    @pytest.mark.parametrize(
+        "scopes",
+        [
+            frozenset(),
+            frozenset({TokenScope.SERVERS_WRITE}),
+            frozenset({TokenScope.ADMIN_READ}),
+        ],
+    )
+    def test_mutation_rejects_tokens_without_admin_write(
+        self, scopes: frozenset[TokenScope]
+    ) -> None:
+        client, users, audits = build_app(scopes)
+        response = client.post(
+            f"/v1/admin/users/{TARGET_ID}/status",
+            headers={"Idempotency-Key": "restricted"},
+            json={"status": "active", "reason": "reviewed"},
+        )
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "forbidden"
+        users.change_status_idempotently.assert_not_awaited()
+        assert audits.events == []
+
+    def test_read_only_admin_can_read(self) -> None:
+        client, _users, _audits = build_app(frozenset({TokenScope.ADMIN_READ}))
+        assert client.get("/v1/admin/users").status_code == 200
+
+    def test_write_only_admin_can_mutate(self) -> None:
+        client, users, _audits = build_app(frozenset({TokenScope.ADMIN_WRITE}))
+        response = client.post(
+            f"/v1/admin/users/{TARGET_ID}/status",
+            headers={"Idempotency-Key": "write-only"},
+            json={"status": "frozen", "reason": "reviewed"},
+        )
+        assert response.status_code == 200
+        users.change_status_idempotently.assert_awaited_once()
 
 
 class TestSearchAndDetail:
@@ -173,7 +231,7 @@ class TestSearchAndDetail:
 
 
 class TestStatusActionAudited:
-    def test_status_change_requires_reason_and_audits(self) -> None:
+    def test_status_change_requires_reason_and_delegates_atomic_audit(self) -> None:
         client, users, audits = build_app()
         users.users[TARGET_ID] = User(
             id=TARGET_ID, username="bad", email="bad@example.com", role=Role.USER
@@ -185,7 +243,7 @@ class TestStatusActionAudited:
         )
         assert no_reason.status_code == 400
         assert no_reason.json()["error"]["code"] == "validation_error"
-        assert users.updated_status == []  # nothing happened
+        users.change_status_idempotently.assert_not_awaited()
 
         ok = client.post(
             f"/v1/admin/users/{TARGET_ID}/status",
@@ -194,12 +252,39 @@ class TestStatusActionAudited:
         )
         assert ok.status_code == 200
         assert ok.json()["user"]["status"] == "frozen"
-        event = audits.events[-1]
-        assert event.action == "admin.user.status_changed"
-        assert event.actor_type is ActorType.ADMIN
-        assert event.actor_id == ADMIN_ID
-        assert event.reason == "fraud report"
-        assert event.metadata == {"status": "frozen"}
+        users.change_status_idempotently.assert_awaited_once_with(
+            TARGET_ID,
+            UserStatus.FROZEN,
+            actor_id=ADMIN_ID,
+            idempotency_key="a2",
+            reason="fraud report",
+        )
+        # The endpoint must not append an independently committed second audit.
+        assert audits.events == []
+
+    def test_conflicting_key_returns_conflict_envelope(self) -> None:
+        client, users, _audits = build_app()
+        users.change_status_idempotently.side_effect = UserStatusIdempotencyConflict(
+            "status-change idempotency key carries different facts"
+        )
+        response = client.post(
+            f"/v1/admin/users/{TARGET_ID}/status",
+            headers={"Idempotency-Key": "reused"},
+            json={"status": "banned", "reason": "reviewed"},
+        )
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "conflict"
+
+    def test_missing_target_returns_not_found_envelope(self) -> None:
+        client, users, _audits = build_app()
+        users.change_status_idempotently.side_effect = UserNotFound("missing target")
+        response = client.post(
+            f"/v1/admin/users/{TARGET_ID}/status",
+            headers={"Idempotency-Key": "missing"},
+            json={"status": "active", "reason": "reviewed"},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "not_found"
 
     def test_mutations_require_idempotency_key(self) -> None:
         client, _users, _audits = build_app()

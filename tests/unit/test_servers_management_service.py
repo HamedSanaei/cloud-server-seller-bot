@@ -15,6 +15,7 @@ They assert the guarantees the spec calls out explicitly:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -41,6 +42,7 @@ from cloud_platform.modules.servers.service import (
     ServerProviderError,
 )
 from cloud_platform.providers.errors import ProviderError, ProviderOutcomeUnknown
+from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.vps_ports import (
     ConsoleSession,
     DataTrafficUsage,
@@ -49,6 +51,8 @@ from cloud_platform.providers.vps_ports import (
     VpsIpRecord,
     VpsIsoRecord,
     VpsMonitoringRecord,
+    VpsOneTimePassword,
+    VpsPasswordIssued,
     VpsReinstallImage,
     VpsSnapshotRecord,
 )
@@ -196,6 +200,8 @@ class FakeProvider:
         self.calls: list[str] = []
         self.failures: dict[str, Exception] = {}
         self.state = "RUNNING"
+        self.image_name: str | None = "Ubuntu 24.04"
+        self.inventory_ids: list[str] = [PROVIDER_ID]
         self.snapshots: list[VpsSnapshotRecord] = [
             VpsSnapshotRecord(id="snap-1", name="before-upgrade", state="AVAILABLE")
         ]
@@ -225,13 +231,21 @@ class FakeProvider:
             id=provider_server_id,
             state=self.state,
             reference="customer-ref",
-            image_name="Ubuntu 24.04",
+            image_name=self.image_name,
             datacenter="FRA-01",
         )
 
     async def list_vps_info(self) -> list[VpsInfo]:
         self._call("list_vps_info")
-        return []
+        return [
+            VpsInfo(
+                id=provider_server_id,
+                state=self.state,
+                reference="customer-ref",
+                image_name=self.image_name,
+            )
+            for provider_server_id in self.inventory_ids
+        ]
 
     async def rename_vps(self, provider_server_id: str, reference: str) -> VpsInfo:
         self._call("rename_vps")
@@ -368,7 +382,7 @@ class FakeRegistry:
         self.provider = provider
 
     def get(self, key: str) -> Any:
-        if key != "leaseweb":
+        if key not in ("leaseweb", "hetzner"):
             raise KeyError(f"unknown provider: {key}")
         return self.provider
 
@@ -409,6 +423,10 @@ def make_service(
         audit_repo=audit,  # type: ignore[arg-type]
         power=power,  # type: ignore[arg-type]
         event_sink=sink,
+        credential_store=SimpleNamespace(
+            invalidate_for_owner=AsyncMock(),
+            replace_issued=AsyncMock(),
+        ),
     )
     return service, provider, power, audit, sink
 
@@ -697,6 +715,10 @@ class TestConfirmations:
             audit_repo=FakeAuditRepo(),  # type: ignore[arg-type]
             power=FakePower(),  # type: ignore[arg-type]
             event_sink=FakeEventSink(),
+            credential_store=SimpleNamespace(
+                invalidate_for_owner=AsyncMock(),
+                replace_issued=AsyncMock(),
+            ),
         )
         token = await service.issue_confirmation(
             CUSTOMER, SERVER_ID, ServerOperation.PASSWORD_RESET
@@ -752,6 +774,96 @@ class TestConfirmations:
         assert second.replayed is True
         assert provider.count("reinstall_vps") == 1
 
+    async def test_reinstall_does_not_claim_desired_os_before_provider_reports_it(self) -> None:
+        service, provider, *_ = make_service()
+        server = service._servers.rows[SERVER_ID]
+        server.os = "Ubuntu 24.04"
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.REINSTALL, arguments={"image": "img-debian"}
+        )
+        await service.reinstall(
+            CUSTOMER, SERVER_ID, image_ref="img-debian", confirmation_token=token
+        )
+        assert server.os is None
+        provider.image_name = "Debian 13"
+        view = await service.refresh_server(CUSTOMER, SERVER_ID)
+        assert view.operating_system == "Debian 13"
+        assert provider.count("reinstall_vps") == 1
+
+    async def test_password_reset_stores_issued_password_and_never_replays_provider(self) -> None:
+        service, provider, *_ = make_service()
+        provider.reset_vps_password = AsyncMock(
+            return_value=VpsPasswordIssued(
+                PROVIDER_ID, "reset_password", VpsOneTimePassword("issued-test-password")
+            )
+        )
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.PASSWORD_RESET
+        )
+        first = await service.reset_password(CUSTOMER, SERVER_ID, confirmation_token=token)
+        second = await service.reset_password(CUSTOMER, SERVER_ID, confirmation_token=token)
+        assert first.accepted and second.replayed
+        provider.reset_vps_password.assert_awaited_once_with(PROVIDER_ID)
+        service._credential_store.replace_issued.assert_awaited_once_with(
+            server_id=SERVER_ID,
+            provider_server_id=PROVIDER_ID,
+            password="issued-test-password",  # pragma: allowlist secret
+            username="root",
+        )
+
+    async def test_password_storage_failure_does_not_report_reset_success(self) -> None:
+        service, provider, *_ = make_service()
+        provider.reset_vps_password = AsyncMock(
+            return_value=VpsPasswordIssued(
+                PROVIDER_ID, "reset_password", VpsOneTimePassword("issued-test-password")
+            )
+        )
+        service._credential_store.replace_issued.side_effect = RuntimeError(
+            "storage error containing issued-test-password"
+        )
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.PASSWORD_RESET
+        )
+        with pytest.raises(ServerAmbiguousOutcomeError) as excinfo:
+            await service.reset_password(CUSTOMER, SERVER_ID, confirmation_token=token)
+        assert "issued-test-password" not in str(excinfo.value)
+        assert excinfo.value.__cause__ is None
+        provider.reset_vps_password.assert_awaited_once()
+
+    async def test_reinstall_invalidates_old_password_when_provider_returns_none(self) -> None:
+        service, _provider, *_ = make_service()
+        token = await service.issue_confirmation(
+            CUSTOMER, SERVER_ID, ServerOperation.REINSTALL, arguments={"image": "img-ubuntu"}
+        )
+        await service.reinstall(
+            CUSTOMER, SERVER_ID, image_ref="img-ubuntu", confirmation_token=token
+        )
+        service._credential_store.invalidate_for_owner.assert_awaited_once_with(
+            server_id=SERVER_ID, user_id=CUSTOMER, provider_server_id=PROVIDER_ID
+        )
+
+    async def test_delete_requires_supported_adapter_and_owned_confirmation(self) -> None:
+        service, provider, *_ = make_service()
+        command = SimpleNamespace(
+            request=AsyncMock(return_value=SimpleNamespace(replayed=False, requeued=True))
+        )
+        service._delete_command = command
+        with pytest.raises(ServerOperationNotAllowedError):
+            await service.issue_confirmation(CUSTOMER, SERVER_ID, ServerOperation.DELETE)
+        provider.supports_customer_delete = True
+        with pytest.raises(ServerNotFoundError):
+            await service.issue_confirmation(OTHER_CUSTOMER, SERVER_ID, ServerOperation.DELETE)
+        token = await service.issue_confirmation(CUSTOMER, SERVER_ID, ServerOperation.DELETE)
+        outcome = await service.delete_server(CUSTOMER, SERVER_ID, confirmation_token=token)
+        replayed = await service.delete_server(CUSTOMER, SERVER_ID, confirmation_token=token)
+        assert outcome.detail == "pending" and replayed.replayed
+        command.request.assert_awaited_once_with(
+            CUSTOMER,
+            SERVER_ID,
+            idempotency_key=sha256(token.encode()).hexdigest()[:32],
+            execute_inline=False,
+        )
+
     async def test_snapshot_restore_and_delete_mutate_once(self) -> None:
         service, provider, *_ = make_service()
         restore = await service.issue_confirmation(
@@ -785,6 +897,7 @@ class TestProviderFailures:
         provider = FakeProvider()
         provider.failures["reinstall_vps"] = ProviderOutcomeUnknown("5xx after transmission")
         service, _p, _power, audit, sink = make_service(provider=provider)
+        service._servers.rows[SERVER_ID].os = "Ubuntu 24.04"
         token = await service.issue_confirmation(
             CUSTOMER, SERVER_ID, ServerOperation.REINSTALL, arguments={"image": "img-ubuntu"}
         )
@@ -796,6 +909,7 @@ class TestProviderFailures:
 
         assert provider.count("reinstall_vps") == 1
         assert "server.reinstall_outcome_unknown" in audit.names
+        assert service._servers.rows[SERVER_ID].os is None
         assert BusinessEventType.SERVER_OPERATION_FAILED in sink.types
 
     async def test_definitive_rejection_maps_to_provider_error(self) -> None:
@@ -905,6 +1019,83 @@ class TestReads:
         assert all(name in {"get_vps_info", "list_vps_ips"} for name in provider.calls), (
             provider.calls
         )
+
+    async def test_refresh_replaces_stale_os_after_reinstall(self) -> None:
+        server = make_server()
+        server.os = "Debian 12"
+        service, *_ = make_service(server=server)
+        view = await service.refresh_server(CUSTOMER, SERVER_ID)
+        assert view.operating_system == "Ubuntu 24.04"
+        assert server.os == "Ubuntu 24.04"
+
+    async def test_authoritative_inventory_corrects_stale_os_for_an_unrecognized_provider(
+        self,
+    ) -> None:
+        server = make_server()
+        server.provider_key = "reference-cloud"
+        server.os = "ubuntu-26.04"
+        server.image_id = "387894171"  # immutable checkout image, not observed OS
+        provider = FakeProvider()
+        provider.authoritative_vps_inventory = True
+        provider.image_name = "CentOS Stream 10"
+        service, *_ = make_service(server=server, provider=provider)
+        provider.key = server.provider_key
+        registry = ProviderRegistry()
+        registry.register(provider)
+        service._registry = registry
+
+        page = await service.list_servers(CUSTOMER)
+        assert page.items[0].operating_system == "CentOS Stream 10"
+        assert server.os == "CentOS Stream 10"
+        assert server.image_id == "387894171"
+        server.os = "ubuntu-26.04"
+        detail = await service.get_server(CUSTOMER, SERVER_ID)
+        assert detail.operating_system == "CentOS Stream 10"
+        assert provider.count("list_vps_info") == 1
+        assert provider.count("get_vps_info") == 1
+
+    async def test_hetzner_list_batches_servers_on_same_credential_account(self) -> None:
+        server = make_server()
+        server.provider_key = "hetzner"
+        second = make_server(provider_server_id="lsw-vps-2")
+        second.id = uuid4()
+        second.provider_key = "hetzner"
+        second.provider_account_id = server.provider_account_id
+        provider = FakeProvider()
+        provider.authoritative_vps_inventory = True
+        provider.image_name = "CentOS Stream 10"
+        provider.inventory_ids.append("lsw-vps-2")
+        service, *_ = make_service(server=server, provider=provider)
+        service._servers.rows[second.id] = second
+
+        page = await service.list_servers(CUSTOMER)
+        assert {item.operating_system for item in page.items} == {"CentOS Stream 10"}
+        assert provider.count("list_vps_info") == 1
+        assert provider.count("get_vps_info") == 0
+
+    async def test_hetzner_does_not_display_stale_os_without_image_proof(self) -> None:
+        server = make_server()
+        server.provider_key = "hetzner"
+        server.os = "ubuntu-26.04"
+        provider = FakeProvider()
+        provider.authoritative_vps_inventory = True
+        provider.failures["get_vps_info"] = ProviderError("unavailable")
+        service, *_ = make_service(server=server, provider=provider)
+
+        detail = await service.get_server(CUSTOMER, SERVER_ID)
+        assert detail.operating_system is None
+        assert detail.display_name is None
+        assert detail.refresh_error
+        assert server.os == "ubuntu-26.04"
+        provider.failures["list_vps_info"] = ProviderError("unavailable")
+        page = await service.list_servers(CUSTOMER)
+        assert page.items[0].operating_system is None
+        assert server.os == "ubuntu-26.04"
+
+        provider.image_name = None
+        page = await service.list_servers(CUSTOMER)
+        assert page.items[0].operating_system is None
+        assert server.os is None
 
     async def test_snapshots_and_images_are_listed(self) -> None:
         service, *_ = make_service()

@@ -61,6 +61,7 @@ class AtlasPayGateway(CapabilityGatedGateway):
     minimum_charge_minor = 50_000
     maximum_charge_minor = 2_000_000
     requires_durable_creation = True
+    accepts_customer_telegram_id = True
     capabilities = frozenset({GatewayCapability.CREATE_PAYMENT, GatewayCapability.VERIFY_PAYMENT})
 
     def __init__(
@@ -204,6 +205,7 @@ class AtlasPayGateway(CapabilityGatedGateway):
             currency=self.supported_currency,
             metadata={
                 **self._details(payload, require_complete=False),
+                "merchant_order_ref": str(payload.get("merchantOrderRef") or ""),
                 "provider_status": state,
                 "requires_manual_delivery": str(payload["requiresManualDelivery"]).lower(),
             },
@@ -258,8 +260,8 @@ class AtlasPayGateway(CapabilityGatedGateway):
             if source == "paymentDeadlineAt":
                 try:
                     deadline = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                except ValueError as exc:
-                    raise ProviderError("AtlasPay payment deadline is invalid") from exc
+                except ValueError:
+                    raise ProviderError("AtlasPay payment deadline is invalid") from None
                 if deadline.tzinfo is None:
                     raise ProviderError("AtlasPay payment deadline must include timezone")
             details[target] = value
@@ -272,8 +274,8 @@ class AtlasPayGateway(CapabilityGatedGateway):
     ) -> dict[str, Any]:
         try:
             response = await self._client.request(method, f"{self._base_url}{path}", json=body)
-        except httpx.TransportError as exc:
-            raise ProviderUnavailable("AtlasPay transport failed") from exc
+        except httpx.TransportError:
+            raise ProviderUnavailable("AtlasPay transport failed") from None
         if response.status_code in {401, 403}:
             raise ProviderAuthError("AtlasPay rejected credentials")
         if response.status_code == 404:
@@ -286,8 +288,8 @@ class AtlasPayGateway(CapabilityGatedGateway):
             raise ProviderError(f"AtlasPay request failed (HTTP {response.status_code})")
         try:
             payload = response.json()
-        except ValueError as exc:
-            raise ProviderError("AtlasPay returned invalid JSON") from exc
+        except ValueError:
+            raise ProviderError("AtlasPay returned invalid JSON") from None
         if not isinstance(payload, dict) or payload.get("success") is False:
             raise ProviderError("AtlasPay returned an unsuccessful response")
         return payload

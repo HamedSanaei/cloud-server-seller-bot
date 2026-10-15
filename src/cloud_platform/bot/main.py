@@ -34,9 +34,10 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Mess
 
 from cloud_platform.backup.job import BackupError, PostgresBackupJob, build_backup_config
 from cloud_platform.bot.admin_ui import AdminBotUi
+from cloud_platform.bot.health import PollingHeartbeat
 from cloud_platform.bot.identity_flow import IdentityFlow
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
-from cloud_platform.bot.ui import BotScreen, BotUi
+from cloud_platform.bot.ui import BotScreen, BotUi, code_entities
 from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import Container, close_container, get_container
 from cloud_platform.core.i18n import Locale, Translator, get_catalog
@@ -145,9 +146,11 @@ async def _send_ssh_password(
         await query.answer(_t.t("servers.ssh_unavailable"), show_alert=True)
         return
     try:
+        text = _t.t("servers.ssh_secret", username=secret.username, password=password)
         await message.answer(
-            _t.t("servers.ssh_secret", username=secret.username, password=password),
+            text,
             protect_content=True,
+            entities=list(code_entities(text, (secret.username, password))),
         )
     except Exception:
         # Do not log exception text: a Telegram error may echo the message body.
@@ -258,8 +261,13 @@ def register_handlers(
     fallback that lands every unmatched update on the main menu.
     """
 
+    async def clear_admin_prompt(message: Message) -> None:
+        if admin_ui is not None and (admin := await _super_admin(message, container)) is not None:
+            await admin_ui.clear_prompt(admin)
+
     @dp.message(CommandStart())
     async def _start(message: Message) -> None:
+        await clear_admin_prompt(message)
         user = await _resolve_user(container, message.from_user)
         await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard(user))
         screen = monthly_ui.menu_screen(user)
@@ -279,15 +287,18 @@ def register_handlers(
         if admin is None or admin_ui is None:
             await message.answer(_t.t("admin.denied"))
             return
+        await admin_ui.clear_prompt(admin)
         screen = admin_ui.menu(admin)
         await message.answer(screen.text, reply_markup=screen.keyboard)
 
     @dp.message(Command("menu"))
     async def _menu(message: Message) -> None:
+        await clear_admin_prompt(message)
         await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
+        await clear_admin_prompt(message)
         user = await _resolve_user(container, message.from_user)
         await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard(user))
 
@@ -313,7 +324,22 @@ def register_handlers(
                     return
             admin = await _super_admin(message, container)
             if admin_ui is not None and admin is not None and message.text:
-                if _button_matches(message.text, "menu.admin"):
+                navigation = any(
+                    _button_matches(message.text, key)
+                    for key in (
+                        "menu.buy",
+                        "menu.servers",
+                        "menu.wallet",
+                        "menu.recharge",
+                        "menu.support",
+                        "nav.menu",
+                    )
+                )
+                if navigation:
+                    await admin_ui.clear_prompt(admin)
+                    screen = None
+                elif _button_matches(message.text, "menu.admin"):
+                    await admin_ui.clear_prompt(admin)
                     screen = admin_ui.menu(admin)
                 else:
                     screen = await admin_ui.handle_text(message.text, admin)
@@ -395,6 +421,13 @@ def register_handlers(
                     )
                     await query.answer()
                     return
+                if (
+                    admin_ui is not None
+                    and user is not None
+                    and user.role == Role.ADMIN
+                    and user.status == UserStatus.ACTIVE
+                ):
+                    await admin_ui.clear_prompt(user)
                 purchase = (
                     (
                         cb.flow == "store"
@@ -454,6 +487,8 @@ async def main() -> None:
     # adapter a second time and fail at the registry boundary.
     container = await get_container()
     bot = Bot(token=settings.telegram_bot_token)
+    heartbeat = PollingHeartbeat()
+    bot.session.middleware(heartbeat)
     ui = BotUi(
         settings.callback_signing_key,
         container.buy_flow_service(),
@@ -516,6 +551,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        heartbeat.clear()
         await Container.aclose_gateways(gateways)
         await Container.aclose_fx(fx_resolver)
         await close_container()
