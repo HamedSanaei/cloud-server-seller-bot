@@ -14,6 +14,35 @@ private `/start`. Existing users, identity records, wallets and history remain.
 Removing an identity revokes its configured authorization, including stale
 callbacks. The public API cannot supply or promote a Telegram identity.
 
+## Customer wallet denomination
+
+Customer wallets are denominated in whole Toman (`IRT`), not USD or Iranian
+rial (`IRR`). Domain defaults, trusted Telegram onboarding, repository defaults
+and the database insertion default agree on `IRT`. AtlasPay Toman payments and
+manual Toman adjustments therefore need no wallet FX conversion.
+
+Provider-native costs, foreign catalog quotes and the USD invoice required by
+NOWPayments are separate accounting facts, not additional customer wallets.
+Any cross-currency payment must freeze a permitted, fresh conversion and credit
+the Toman wallet only. Changing a wallet default must not enable USDT-proxy
+settlement or invent an exchange rate.
+
+Historical non-IRT wallets require an explicitly reviewed migration. Do not
+rename an existing currency, reset a balance, rewrite old ledger entries, or
+change a pending invoice's frozen credit amount/currency. Even a zero balance
+does not authorize migration while an older payment remains unresolved; hold
+it for an explicit operator decision and preserve the original financial facts.
+Migration `0060` changes only the insertion default, never existing rows.
+
+For an explicitly approved **zero-balance, no-ledger/no-hold** wallet only,
+the operator-only `SqlAlchemyEmptyTomanCutover` command can cancel one reviewed
+unpaid invoice and change the denomination atomically. It keeps the invoice's
+original identity and monetary fields, records an immutable cancellation receipt,
+and blocks late callbacks from crediting it. This is local cancellation, not a
+claim that a provider's bank/payment link was deleted. Other obligations, paid
+invoices or monetary history require financial review and block this command.
+It never fabricates an FX rate or zero-value ledger entries.
+
 Authorized accounts get the corporate server/renewal/my-servers/management/support
 keyboard, without a personal wallet or recharge action. Management controls are
 application-authorized, not merely hidden buttons. Customer wallet adjustment

@@ -1487,6 +1487,7 @@ class Container:
             gateway_settings=self.gateway_settings_repository(),
             gateway_defaults=self.payment_gateway_defaults(),
             configured_ids=get_settings().telegram_superadmin_user_ids,
+            wallet_repo=self.wallet_repository(),
         )
 
     def fx_config(self) -> Any:

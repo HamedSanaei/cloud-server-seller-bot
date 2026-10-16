@@ -63,3 +63,4 @@ def test_complete_management_composition_has_real_sections_and_shared_funding(mo
     assert screen.text
     assert container.prepaid_hourly_billing_service()._funding is not None
     assert container.order_settlement_service()._funding is not None
+    assert container.wallet_recharge_service(gateways={})._wallets is not None

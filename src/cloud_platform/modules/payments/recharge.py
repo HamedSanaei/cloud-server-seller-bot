@@ -186,6 +186,7 @@ class WalletRechargeService:
         gateway_settings: Any | None = None,
         gateway_defaults: Mapping[str, bool] | None = None,
         configured_ids: tuple[int, ...] = (),
+        wallet_repo: Any | None = None,
     ) -> None:
         merged: dict[str, RechargeGateway] = dict(gateways or {})
         if gateway is not None:
@@ -195,6 +196,7 @@ class WalletRechargeService:
         self._events = event_sink
         self._users = user_repo
         self._configured_ids = validate_telegram_user_ids(configured_ids)
+        self._wallets = wallet_repo
         # Optional platform FX resolver (credit -> settlement conversion).
         # Owned by the process (like the gateway collection): this service
         # never closes it.
@@ -527,6 +529,12 @@ class WalletRechargeService:
             or getattr(user, "telegram_user_id", None) in self._configured_ids
         ):
             raise RechargeAdminForbiddenError("administrator self-top-up is forbidden")
+        if self._wallets is not None:
+            wallet = await self._wallets.get(user.id)
+            if wallet is None or wallet.user_id != user.id or wallet.currency != "IRT":
+                raise RechargeDisabledError("customer wallet must be migrated to Toman first")
+            if currency != wallet.currency:
+                raise RechargeAmountError("recharge currency must match the Toman wallet")
         if type(amount_minor) is not int or not 0 < amount_minor <= 2**63 - 1:
             raise RechargeAmountError("amount must be a positive signed int64 of minor units")
         key = (idempotency_key or "").strip()

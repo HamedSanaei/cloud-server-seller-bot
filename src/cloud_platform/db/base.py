@@ -103,7 +103,7 @@ class Wallet(Base):
         PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True
     )
     balance = Column(BigInteger, default=0, nullable=False)
-    currency = Column(String(3), nullable=False, server_default="USD")
+    currency = Column(String(3), nullable=False, server_default="IRT")
     created_at = Column(DateTime, server_default="CURRENT_TIMESTAMP")
     updated_at = Column(
         DateTime, server_default="CURRENT_TIMESTAMP", onupdate=sa.text("CURRENT_TIMESTAMP")
