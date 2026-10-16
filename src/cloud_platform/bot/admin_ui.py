@@ -262,7 +262,11 @@ class AdminBotUi:
         if cb.screen == "cancel":
             if len(cb.args) == 1:
                 await self._store.delete("admin-credit-confirm", f"{admin.id}:{cb.args[0]}")
-            await self.clear_prompt(admin)
+                active = await self._store.get("admin-credit-active", str(admin.id))
+                if active is not None and active.get("nonce") == cb.args[0]:
+                    await self.clear_prompt(admin)
+            else:
+                await self.clear_prompt(admin)
             return self.menu(admin)
         if cb.screen == "apply" and len(cb.args) == 1:
             active = await self._store.get("admin-credit-active", str(admin.id))
