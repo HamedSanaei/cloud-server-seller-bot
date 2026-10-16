@@ -38,7 +38,7 @@ def _run_probe(start: str) -> None:
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     scripts = ScriptDirectory.from_config(config)
-    assert scripts.get_heads() == ["0055"]
+    assert scripts.get_heads() == ["0059"]
     engine = sa.create_engine(
         os.environ["CLOUD_PLATFORM_TEST_POSTGRES_URL"].replace(
             "postgresql+asyncpg://", "postgresql://"
@@ -227,9 +227,12 @@ def _run_probe(start: str) -> None:
                 immutable_tables = ["wallets", "ledger"]
                 if start != "staging0050":
                     immutable_tables += ["prepaid_hourly_periods", "wallet_currency_migrations"]
+                # Compare every historical column, not new nullable receipt
+                # columns added by subsequent additive migrations.
+                historical_columns = {name: list(table(name).c) for name in immutable_tables}
                 before = {
-                    name: connection.execute(sa.select(table(name))).all()
-                    for name in immutable_tables
+                    name: connection.execute(sa.select(*columns)).all()
+                    for name, columns in historical_columns.items()
                 }
                 server_columns = list(table("servers").c)
                 server_facts = connection.execute(
@@ -302,7 +305,9 @@ def _run_probe(start: str) -> None:
                 assert evaluate(observe_schema(sa.inspect(connection))).ok
                 _assert_physical_shape(connection)
                 for name, rows in before.items():
-                    assert connection.execute(sa.select(table(name))).all() == rows, name
+                    assert connection.execute(sa.select(*historical_columns[name])).all() == rows, (
+                        name
+                    )
                 assert (
                     connection.execute(sa.select(*server_columns).order_by(server_columns[0])).all()
                     == server_facts
@@ -349,7 +354,9 @@ def _run_probe(start: str) -> None:
                 artifact.op = Operations(MigrationContext.configure(connection))
                 artifact.upgrade()
                 for name, rows in before.items():
-                    assert connection.execute(sa.select(table(name))).all() == rows, name
+                    assert connection.execute(sa.select(*historical_columns[name])).all() == rows, (
+                        name
+                    )
             finally:
                 transaction.rollback()
     finally:
@@ -407,8 +414,18 @@ def _assert_physical_shape(connection) -> None:
     assert frozenset({"server_id", "period_start"}) in periods_unique
     assert frozenset({"idempotency_key"}) in periods_unique
     period_fks = inspector.get_foreign_keys("prepaid_hourly_periods")
-    assert {item["referred_table"] for item in period_fks} == {"servers", "wallets"}
-    assert all(item["options"].get("ondelete") == "CASCADE" for item in period_fks)
+    historical_fks = [
+        item for item in period_fks if item["referred_table"] in {"servers", "wallets"}
+    ]
+    assert {item["referred_table"] for item in historical_fks} == {"servers", "wallets"}
+    assert all(item["options"].get("ondelete") == "CASCADE" for item in historical_fks)
+    corporate_fks = [item for item in period_fks if item not in historical_fks]
+    assert {item["referred_table"] for item in corporate_fks} == {
+        "users",
+        "operator_funding_grants",
+        "operator_expenses",
+    }
+    assert all(item["options"].get("ondelete") == "RESTRICT" for item in corporate_fks)
     migration_fks = inspector.get_foreign_keys("wallet_currency_migrations")
     assert len(migration_fks) == 5
     assert all(item["options"].get("ondelete") == "RESTRICT" for item in migration_fks)
