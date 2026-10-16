@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import EditMessageText
 from aiogram.types import CallbackQuery, Chat, Message, ReplyKeyboardMarkup, Update
 from aiogram.types import User as TelegramUser
 
@@ -127,6 +129,47 @@ def assert_root(flow):
         labels = [button.text for row in keyboard.keyboard for button in row]
         assert Translator().t("admin.create_server") in labels
         assert Translator().t("menu.wallet") not in labels
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        "users",
+        "gateways",
+        "wallet_adjust",
+        "payments",
+        "reports",
+        "services",
+        "sales",
+        "health",
+        "messages",
+        "menu",
+    ],
+)
+async def test_inline_management_navigation_edits_without_pushing_panel_up(flow, screen):
+    await text(flow, "/admin")
+    assert_root(flow)
+    installed = flow.answer.await_args_list[0].kwargs["reply_markup"]
+    assert installed.is_persistent is True
+    flow.answer.reset_mock()
+    flow.edit.reset_mock()
+    flow.ack.reset_mock()
+
+    await click(flow, screen)
+    flow.answer.assert_not_awaited()
+    flow.edit.assert_awaited_once()
+    flow.ack.assert_awaited_once_with()
+    assert installed.is_persistent is True
+
+
+async def test_repeated_unchanged_panel_click_is_acknowledged_without_a_new_message(flow):
+    flow.edit.side_effect = TelegramBadRequest(
+        method=EditMessageText(chat_id=101, message_id=1, text="unchanged panel"),
+        message="Bad Request: message is not modified",
+    )
+    await click(flow, "menu")
+    flow.answer.assert_not_awaited()
+    flow.ack.assert_awaited_once_with()
 
 
 async def test_users_search_profile_and_services_are_bounded_and_keep_root(flow):

@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Message
 
@@ -596,12 +597,15 @@ def register_handlers(
                     if identity_flow is not None:
                         await identity_flow.clear_prompt(current)
                     admin_screen = await admin_ui.handle(cb, current)
-                    await query.message.answer(
-                        _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(current)
-                    )
-                    await query.message.edit_text(
-                        admin_screen.text, reply_markup=admin_screen.keyboard
-                    )
+                    # The persistent reply keyboard was installed on entry.
+                    # Re-sending it creates chat noise below the inline panel.
+                    try:
+                        await query.message.edit_text(
+                            admin_screen.text, reply_markup=admin_screen.keyboard
+                        )
+                    except TelegramBadRequest as exc:
+                        if "message is not modified" not in exc.message.casefold():
+                            raise
                     await query.answer()
                     return
                 if is_superadmin(user, _configured_superadmins()):
