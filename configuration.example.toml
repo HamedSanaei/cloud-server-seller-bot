@@ -418,7 +418,9 @@ max_stale_seconds = 300
 charge_max_stale_seconds = 30
 request_timeout_seconds = 5
 allow_usdt_proxy_for_display = true
-allow_usdt_proxy_for_settlement = false
+# Internal USD = 1 USDT. Settle using live USDT/IRT, never a USD wallet.
+# Customer ledger is IRT: 1 toman = 10 IRR. Explicit false still blocks settlement.
+allow_usdt_proxy_for_settlement = true
 
 [fx.abantether]
 base_url = "https://api.abantether.com"

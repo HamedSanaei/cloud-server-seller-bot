@@ -640,7 +640,15 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
             if current is not None and current != period.period_start:
                 if current == period.period_end and row.status == PrepaidHourlyPeriodStatus.PAID:
                     return
-                raise ValueError("prepaid paid coverage must be contiguous")
+                # A stopped customer may buy a new hour without paying for the
+                # powered-off gap. Never allow this for periodic running usage.
+                if not (
+                    period.funding_source is FundingSource.CUSTOMER_WALLET
+                    and _attr(server, "state") == "stopped"
+                    and row.status == PrepaidHourlyPeriodStatus.PENDING
+                    and period.period_start > current
+                ):
+                    raise ValueError("prepaid paid coverage must be contiguous")
             if current is None and (
                 period.period_start != _aware_or_none(_attr(server, "created_at"))
                 or row.status == PrepaidHourlyPeriodStatus.PAID

@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
@@ -179,6 +180,7 @@ class LowBalanceNotificationKind(StrEnum):
     DELETE = "delete"
     AUTO_DELETE = "auto_delete"  # Existing monthly policy decision.
     RECOVERED = "recovered"
+    RUNWAY = "runway"
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +194,9 @@ class LowBalanceNotificationEvent:
     currency: str
     episode: datetime
     at: datetime | None = None
+
+    runway_hours: Decimal | None = None
+    active_servers: int = 0
 
     def render(self) -> str:
         """ASCII rendering (integer-formatted money, no floats)."""
@@ -238,19 +243,32 @@ class TelegramLowBalanceNotifier:
             )
         balance = format_minor(event.balance_minor, event.currency)
         server = str(event.server_id)[:8]
-        if event.kind is LowBalanceNotificationKind.WARN:
+        if event.kind is LowBalanceNotificationKind.RUNWAY:
+            minutes = max(0, int((event.runway_hours or Decimal(0)) * 60))
+            hours, remainder = divmod(minutes, 60)
+            text = (
+                f"⚠️ هشدار اعتبار {event.active_servers} سرور ساعتی فعال\n"
+                f"موجودی قابل استفاده: {balance}\n"
+                f"با نرخ فعلی، نخستین خاموشی ناشی از کمبود موجودی تقریباً تا "
+                f"{hours} ساعت و {remainder} دقیقه دیگر رخ می‌دهد (کمتر از ۳ روز).\n"
+                "برای جلوگیری از خاموشی و حذف بعدی سرورها، کیف پول تومانی را شارژ کنید. "
+                "پس از پایان اعتبار پرداخت‌شده و ۲۴ ساعت ناکافی ماندن موجودی، "
+                "سرور خاموش‌شده در معرض حذف است. این برآورد با تغییر نرخ تتر تغییر می‌کند."
+            )
+        elif event.kind is LowBalanceNotificationKind.WARN:
             text = (
                 f"هشدار موجودی سرور {server}: موجودی کیف پول شما {balance} است "
                 "و به کمتر از 200,000 تومان رسیده است. لطفاً کیف پول را شارژ کنید."
             )
         elif event.kind is LowBalanceNotificationKind.STOP:
             text = (
-                f"موجودی کیف پول شما صفر شده است. سرور {server} در حال خاموش شدن است. "
+                f"اعتبار ساعت پرداخت‌شده پایان یافته و موجودی برای ساعت بعد کافی نیست. "
+                f"سرور {server} در حال خاموش شدن است. "
                 "برای جلوگیری از حذف، کیف پول را شارژ کنید."
             )
         elif event.kind is LowBalanceNotificationKind.DELETE:
             text = (
-                f"یک روز از صفر شدن موجودی کیف پول شما گذشته است. "
+                "یک روز (۲۴ ساعت) از ناکافی شدن اعتبار پرداخت‌نشده گذشته است. "
                 f"حذف سرور {server} در حال انجام است."
             )
         elif event.kind is LowBalanceNotificationKind.RECOVERED:
@@ -275,6 +293,10 @@ class LowBalanceNotificationLogRepository(Protocol):
     but before the log commit may send twice. Strict exactly-once delivery
     requires a durable outbox with a delivery state and reconciliation.
     """
+
+    async def last_runway_sent(self, user_id: UUID) -> datetime | None:
+        """Most recent successful aggregate reminder, independent of server changes."""
+        ...
 
     async def was_sent(
         self, server_id: UUID, kind: LowBalanceNotificationKind, episode: datetime

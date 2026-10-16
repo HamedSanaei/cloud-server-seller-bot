@@ -134,6 +134,7 @@ class SqlAlchemyWalletRepository:
         expected_currency: str | None = None,
         expected_running_server_id: UUID | None = None,
         expected_customer_server_id: UUID | None = None,
+        expected_stopped_server_id: UUID | None = None,
         admin_configured_ids: tuple[int, ...] | None = None,
     ) -> tuple[Wallet, bool]:
         """Atomically post a delta and ledger, fencing first prepaid charges under row locks."""
@@ -143,6 +144,10 @@ class SqlAlchemyWalletRepository:
             raise ValueError("wallet and ledger amounts must fit signed int64 bounds")
         if entry_type == LedgerEntryType.ADJUSTMENT and audit_actor_id is None:
             raise ValueError("administrator adjustments require an audited actor")
+        if expected_stopped_server_id is not None and (
+            expected_customer_server_id != expected_stopped_server_id
+        ):
+            raise ValueError("resume fence requires the same customer server fence")
         new_key = str(idempotency_key).strip()
         if not new_key:
             raise ValueError("idempotency_key must not be empty")
@@ -276,10 +281,31 @@ class SqlAlchemyWalletRepository:
                     or _attr(server, "funding_source") != "customer_wallet"
                     or _attr(server, "billing_model") not in {"hourly", "hourly_prepaid_irt"}
                     or _attr(server, "state") not in {"running", "stopped", "provisioning"}
+                    or (
+                        expected_stopped_server_id is not None
+                        and _attr(server, "state") != "stopped"
+                    )
                 ):
                     raise ValueError("server is not eligible for customer-funded hourly coverage")
 
             balance = int(_attr(row, "balance"))
+            if delta < 0 and (
+                expected_running_server_id is not None or expected_customer_server_id is not None
+            ):
+                # A server renewal must not consume funds already reserved by
+                # another checkout. Wallet locking serializes this with holds.
+                held = int(
+                    (
+                        await session.execute(
+                            select(func.coalesce(func.sum(_HoldModel.amount), 0)).where(
+                                _HoldModel.wallet_id == wallet_id, _HoldModel.status == "created"
+                            )
+                        )
+                    ).scalar()
+                    or 0
+                )
+                if balance - held < -delta:
+                    raise InsufficientBalanceError("available balance cannot fund the next hour")
             new_balance = balance + delta
             if new_balance < 0:
                 raise InsufficientBalanceError(f"balance {balance} < required {-delta}")

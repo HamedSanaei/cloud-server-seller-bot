@@ -21,6 +21,7 @@ from cloud_platform.modules.fx.domain import ConversionSnapshot, FxPurpose
 from cloud_platform.modules.wallet.domain import (
     Hold,
     HoldStatus,
+    InsufficientBalanceError,
     LedgerEntry,
     LedgerEntryType,
     Wallet,
@@ -76,7 +77,10 @@ class PeriodStore:
             self.fail_mark_once = False
             raise RuntimeError("database write interrupted after committed ledger")
         assert self.rows[(period.server_id, period.period_start)].fx_snapshot == period.fx_snapshot
-        assert self.server.prepaid_paid_until in (None, period.period_start)
+        assert self.server.prepaid_paid_until in (None, period.period_start) or (
+            self.server.state is ServerLifecycleState.STOPPED
+            and self.server.prepaid_paid_until < period.period_start
+        )
         self.rows[(period.server_id, period.period_start)] = replace(
             period, status=PrepaidHourlyPeriodStatus.PAID
         )
@@ -109,12 +113,14 @@ class Wallets:
         description,
         expected_currency,
         expected_running_server_id=None,
+        expected_customer_server_id=None,
+        expected_stopped_server_id=None,
     ):
         assert user_id == self.wallet.user_id and expected_currency == "IRT"
         if key in self.entries:
             return self.wallet, False
         if self.wallet.balance + delta < 0:
-            raise ValueError("insufficient IRT for upcoming hour")
+            raise InsufficientBalanceError("insufficient IRT for upcoming hour")
         self.wallet.balance += delta
         self.debits += 1
         self.entries[key] = LedgerEntry(

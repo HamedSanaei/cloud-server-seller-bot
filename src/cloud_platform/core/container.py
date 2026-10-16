@@ -1019,6 +1019,7 @@ class Container:
             period_repo=SqlAlchemyPrepaidHourlyPeriodRepository(self.session_factory),
             fx_resolver=resolver,
             lock=PostgresAdvisoryAccrualLock(self.session_factory),
+            available_balance=self.hold_service().available_balance,
         )
 
     def hourly_cloud_service(self) -> Any:
@@ -1804,6 +1805,7 @@ class Container:
             provider_registry=self.provider_registry,
             power_commands=self.power_command_service(),
             delete_commands=self.delete_command_service(),
+            can_fund_hour=self.prepaid_hourly_billing_service().can_fund_hour,
         )
 
     def server_management_service(self) -> Any:
@@ -1832,6 +1834,7 @@ class Container:
             # worker runs, so the customer's "renew now" and the automatic pass
             # can never disagree about the price or the idempotency key.
             renewal_collector=self.renewal_checker(),
+            hourly_can_start=self.prepaid_hourly_billing_service().can_start,
         )
 
     @asynccontextmanager

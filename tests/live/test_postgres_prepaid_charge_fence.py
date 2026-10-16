@@ -21,6 +21,7 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import DefaultClause
 
 from cloud_platform.db.base import Catalog as CatalogRow
+from cloud_platform.db.base import Hold as HoldRow
 from cloud_platform.db.base import LedgerEntry as LedgerRow
 from cloud_platform.db.base import Provider as ProviderRow
 from cloud_platform.db.base import ProviderAccount as AccountRow
@@ -31,7 +32,11 @@ from cloud_platform.modules.compute.domain import (
     BILLING_MODEL_PREPAID_HOURLY_IRT,
     ServerLifecycleState,
 )
-from cloud_platform.modules.wallet.domain import DuplicateIdempotencyError, LedgerEntryType
+from cloud_platform.modules.wallet.domain import (
+    DuplicateIdempotencyError,
+    InsufficientBalanceError,
+    LedgerEntryType,
+)
 from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 
 DB_URL = os.environ.get("CLOUD_PLATFORM_TEST_POSTGRES_URL", "").strip()
@@ -59,7 +64,16 @@ async def database() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
         },
     )
     subset = MetaData()
-    for model in (UserRow, ProviderRow, AccountRow, CatalogRow, WalletRow, LedgerRow, ServerRow):
+    for model in (
+        UserRow,
+        ProviderRow,
+        AccountRow,
+        CatalogRow,
+        WalletRow,
+        LedgerRow,
+        ServerRow,
+        HoldRow,
+    ):
         table = model.__table__.to_metadata(subset)
         for column in table.columns:
             default = column.server_default
@@ -134,6 +148,44 @@ async def money_facts(database: async_sessionmaker[AsyncSession]) -> tuple[int, 
             (await session.execute(select(func.count()).select_from(LedgerRow))).scalar_one()
         )
         return balance, count
+
+
+async def test_hourly_debit_cannot_spend_another_checkouts_active_hold(database):
+    user_id, server_id = await seed(database)
+    async with database.begin() as session:
+        wallet_id = await session.scalar(select(WalletRow.id).where(WalletRow.user_id == user_id))
+        session.add(
+            HoldRow(
+                wallet_id=wallet_id,
+                amount=950,
+                currency="IRT",
+                status="created",
+                idempotency_key="other-checkout",
+            )
+        )
+    with pytest.raises(InsufficientBalanceError, match="available balance"):
+        await charge(SqlAlchemyWalletRepository(database), user_id, server_id)
+    assert await money_facts(database) == (1_000, 0)
+
+
+async def test_resume_charge_cannot_pass_a_running_or_deleted_server_fence(database):
+    user_id, server_id = await seed(database)
+    repo = SqlAlchemyWalletRepository(database)
+    for state in ("running", "deleted"):
+        async with database.begin() as session:
+            await session.execute(
+                update(ServerRow).where(ServerRow.id == server_id).values(state=state)
+            )
+        with pytest.raises(ValueError, match="not eligible"):
+            await charge(
+                repo,
+                user_id,
+                server_id,
+                expected_running_server_id=None,
+                expected_customer_server_id=server_id,
+                expected_stopped_server_id=server_id,
+            )
+    assert await money_facts(database) == (1_000, 0)
 
 
 async def server_state(database: async_sessionmaker[AsyncSession], server_id: UUID) -> str:

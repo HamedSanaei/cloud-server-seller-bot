@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -254,6 +254,7 @@ class ServerManagementService:
         operations: OperationRepository | None = None,
         credential_store: ServerCredentialStore | None = None,
         delete_command: DeleteCommandService | None = None,
+        hourly_can_start: Callable[[CloudServer], Awaitable[bool]] | None = None,
     ) -> None:
         self._servers = servers
         self._registry = registry
@@ -264,6 +265,7 @@ class ServerManagementService:
         self._operations = operations
         self._credential_store = credential_store
         self._delete_command = delete_command
+        self._hourly_can_start = hourly_can_start
         self._events = event_sink
         # The commercial collector (RenewalChecker) is optional: a deployment
         # that exposes no billing capability simply renders no commercial lines.
@@ -392,7 +394,7 @@ class ServerManagementService:
         server = await self._owned(customer_id, server_id)
         context = await self._context(server)
         capabilities = context.capabilities if context is not None else _NO_PROVIDER_CAPABILITIES
-        return frozenset(
+        operations = frozenset(
             operation
             for operation in ServerOperation
             if policies.operation_allowed(
@@ -403,6 +405,14 @@ class ServerManagementService:
             )
             is None
         )
+        if ServerOperation.START in operations and not await self._can_start_hourly(server):
+            return operations - {ServerOperation.START}
+        return operations
+
+    async def _can_start_hourly(self, server: CloudServer) -> bool:
+        if not server.is_prepaid_hourly_irt:
+            return True
+        return self._hourly_can_start is not None and await self._hourly_can_start(server)
 
     async def refresh_server(self, customer_id: UUID, server_id: UUID) -> CustomerServerView:
         """Read-only refresh: provider state, IPs and image land on the row.
@@ -1444,6 +1454,12 @@ class ServerManagementService:
                 "server has no provider resource yet",
                 operation=operation,
                 reason="not_provisioned",
+            )
+        if operation is ServerOperation.START and not await self._can_start_hourly(server):
+            raise ServerOperationNotAllowedError(
+                "insufficient funds for an hourly restart",
+                operation=operation,
+                reason="insufficient_balance",
             )
         return context
 

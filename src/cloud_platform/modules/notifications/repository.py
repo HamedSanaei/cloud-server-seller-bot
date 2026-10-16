@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -71,6 +71,20 @@ class SqlAlchemyLowBalanceNotificationLogRepository:
         session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
     ) -> None:
         self._session_factory = session_factory
+
+    async def last_runway_sent(self, user_id: object) -> datetime | None:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(_LowBalanceModel.sent_at)
+                .where(_LowBalanceModel.user_id == user_id)
+                .where(_LowBalanceModel.kind == LowBalanceNotificationKind.RUNWAY.value)
+                .order_by(_LowBalanceModel.sent_at.desc())
+                .limit(1)
+            )
+            value = result.scalar_one_or_none()
+            return (
+                value.replace(tzinfo=UTC) if value is not None and value.tzinfo is None else value
+            )
 
     async def was_sent(
         self, server_id: object, kind: LowBalanceNotificationKind, episode: datetime

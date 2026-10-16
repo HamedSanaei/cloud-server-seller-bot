@@ -37,7 +37,10 @@ from cloud_platform.db.base import ServerPriceSnapshot as SnapshotRow
 from cloud_platform.db.base import User as UserRow
 from cloud_platform.db.base import Wallet as WalletRow
 from cloud_platform.db.timestamps import to_db_utc
-from cloud_platform.modules.billing.repository import SqlAlchemyPrepaidHourlyPeriodRepository
+from cloud_platform.modules.billing.repository import (
+    PostgresAdvisoryAccrualLock,
+    SqlAlchemyPrepaidHourlyPeriodRepository,
+)
 from cloud_platform.modules.billing.service import (
     PrepaidHourlyBillingService,
     PrepaidHourlyPeriod,
@@ -47,6 +50,10 @@ from cloud_platform.modules.billing.service import (
 from cloud_platform.modules.compute.domain import CloudServer, ServerLifecycleState
 from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
 from cloud_platform.modules.fx.domain import ConversionSnapshot, FxPurpose
+from cloud_platform.modules.notifications.hourly import HourlyRunwayWarningService
+from cloud_platform.modules.notifications.repository import (
+    SqlAlchemyLowBalanceNotificationLogRepository,
+)
 from cloud_platform.modules.pricing.domain import MarginRule, OfferCost, ServerPriceSnapshot
 from cloud_platform.modules.pricing.repository import SqlAlchemyServerPriceSnapshotRepository
 from cloud_platform.modules.wallet.repository import (
@@ -1065,3 +1072,64 @@ async def test_deleted_while_fx_is_pending_cannot_debit_or_extend_coverage(
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_customer_resume_concurrently_buys_one_hour_without_charging_stopped_gap(database):
+    contract = await seed_contract(database)
+    first = await capture_first_hour(database, contract)
+    servers = SqlAlchemyServerRepository(database.factory)
+    row = await servers.get(contract.server.id)
+    row.state = ServerLifecycleState.STOPPED
+    await servers.save(row)
+    before = await persisted(database, contract)
+    services = [billing_service(database, OfflineFx()) for _ in range(2)]
+    for service in services:
+        service._lock = PostgresAdvisoryAccrualLock(database.factory)
+    results = await asyncio.gather(
+        *(service.ensure_customer_coverage(row) for service in services), return_exceptions=True
+    )
+    for service in services:
+        await service.ensure_customer_coverage(row)
+    after = await persisted(database, contract)
+    assert any(not isinstance(result, Exception) for result in results)
+    assert after[1] == before[1] - 250_000 and after[2] == before[2] + 1
+    assert after[0] > to_db_utc(datetime.now(UTC))
+    assert first.period_end < datetime.now(UTC)
+
+
+async def test_real_runway_lock_and_log_deduplicate_competing_workers(database):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    contract = await seed_contract(database)
+    now = datetime.now(UTC)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def send(_event):
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=5)
+
+    notifier = SimpleNamespace(send=AsyncMock(side_effect=send))
+    log = SqlAlchemyLowBalanceNotificationLogRepository(database.factory)
+
+    def worker():
+        return HourlyRunwayWarningService(
+            servers=SqlAlchemyServerRepository(database.factory),
+            billing=billing_service(database, OfflineFx()),
+            notifier=notifier,
+            log=log,
+            lock=PostgresAdvisoryAccrualLock(database.factory, key=777_072),
+        )
+
+    first = asyncio.create_task(worker().run(now))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert await worker().run(now) == 0
+        release.set()
+        assert await first == 1
+    finally:
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+    assert await log.last_runway_sent(contract.server.user_id) is not None
+    assert await worker().run(now + timedelta(hours=5, minutes=59)) == 0
+    assert notifier.send.await_count == 1

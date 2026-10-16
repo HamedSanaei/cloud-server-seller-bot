@@ -924,9 +924,9 @@ class Settings(BaseSettings):
     fx_request_timeout_seconds: float = Field(default=5.0, gt=0)
     # USD has no verified fiat market: display may use the configured USDT
     # proxy explicitly (metadata proxy=true), settlement via the proxy stays
-    # off unless the operator opts in.
+    # enabled by the owner's USD=USDT policy; customer wallets remain IRT.
     fx_allow_usdt_proxy_for_display: bool = True
-    fx_allow_usdt_proxy_for_settlement: bool = False
+    fx_allow_usdt_proxy_for_settlement: bool = True
     fx_abantether_base_url: str = "https://api.abantether.com"
     fx_abantether_eur_symbol: str = "EUR"
     fx_abantether_usd_proxy_symbol: str = "USDT"

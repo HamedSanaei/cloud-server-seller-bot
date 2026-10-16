@@ -257,6 +257,7 @@ class WalletRepository(Protocol):
         expected_currency: str | None = None,
         expected_running_server_id: UUID | None = None,
         expected_customer_server_id: UUID | None = None,
+        expected_stopped_server_id: UUID | None = None,
         admin_configured_ids: tuple[int, ...] | None = None,
     ) -> tuple[Wallet, bool]:
         """Atomically apply a signed balance delta and append its ledger fact.

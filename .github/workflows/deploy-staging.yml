@@ -92,6 +92,9 @@ jobs:
         run: >-
           uv run --no-sync pytest tests/unit/test_payment*.py tests/unit/test_wallet*.py
           tests/unit/test_prepaid_hourly*.py
+          tests/unit/test_hourly_credit_policy.py tests/unit/test_hourly_runway_warnings.py
+          tests/unit/test_prepaid_provider_lifecycle.py tests/unit/test_prepaid_balance_notices.py
+          tests/unit/test_servers_management_service.py tests/unit/test_servers_management_ui.py
           tests/unit/test_deploy_production.py::TestReleaseComposeContract
           tests/unit/test_post_deploy_smoke.py tests/unit/test_audit_cicd.py
           tests/unit/test_financial*.py tests/unit/test_audit_worker_operations.py

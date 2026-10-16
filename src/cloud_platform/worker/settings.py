@@ -415,11 +415,10 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
                 and settings.fx_domestic_enabled
                 and settings.fx_allow_usdt_proxy_for_settlement
             )
-            renewal = await container.prepaid_hourly_billing_service().run(
-                customer_enabled=billing_enabled
-            )
+            billing = container.prepaid_hourly_billing_service()
+            renewal = await billing.run(customer_enabled=billing_enabled)
             policy = PrepaidBalancePolicyService(
-                container.server_repository(), container.wallet_repository()
+                container.server_repository(), container.wallet_repository(), billing
             )
             decisions = await policy.evaluate()
             errors: list[Exception] = []
@@ -446,13 +445,9 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
                     if wallet is None or wallet.currency != "IRT":
                         continue
                     episode = server.prepaid_zero_since
-                    if wallet.balance > 0 and wallet.balance < 200_000:
-                        decision = PrepaidBalanceDecision.WARN
-                        episode = server.low_balance_since
                     if (
                         decision
                         not in (
-                            PrepaidBalanceDecision.WARN,
                             PrepaidBalanceDecision.STOP,
                             PrepaidBalanceDecision.DELETE,
                         )
@@ -536,6 +531,44 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
                 raise ExceptionGroup("prepaid hourly reconciliation failed", errors) from None
         finally:
             await container.close()
+
+
+async def warn_hourly_runway(ctx: dict[str, object]) -> None:
+    """Independent notification job: Telegram delays must not delay power-off."""
+    del ctx
+    from aiogram import Bot
+
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.core.container import create_container
+    from cloud_platform.db.session import SessionFactory
+    from cloud_platform.modules.billing.repository import PostgresAdvisoryAccrualLock
+    from cloud_platform.modules.notifications.domain import TelegramLowBalanceNotifier
+    from cloud_platform.modules.notifications.hourly import HourlyRunwayWarningService
+    from cloud_platform.modules.notifications.repository import (
+        SqlAlchemyLowBalanceNotificationLogRepository,
+    )
+    from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
+
+    settings, token = get_settings(), _telegram_bot_token()
+    if token is None or not (
+        settings.fx_enabled
+        and settings.fx_domestic_enabled
+        and settings.fx_allow_usdt_proxy_for_settlement
+    ):
+        return
+    container, bot = create_container(), Bot(token=token)
+    try:
+        # Only repositories and the FX resolver are needed, not provider access.
+        await HourlyRunwayWarningService(
+            servers=container.server_repository(),
+            billing=container.prepaid_hourly_billing_service(),
+            notifier=TelegramLowBalanceNotifier(bot, SqlAlchemyUserRepository(SessionFactory)),
+            log=SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
+            lock=PostgresAdvisoryAccrualLock(SessionFactory, key=777_072),
+        ).run()
+    finally:
+        await bot.session.close()
+        await container.close()
 
 
 async def evaluate_low_balance(ctx: dict[str, object]) -> None:
@@ -1695,6 +1728,7 @@ def _cron_jobs() -> list[Any]:
         cron(reconcile_deletes, minute=every_three_minutes, run_at_startup=True),
         cron(accrue_usage, minute=every_minute, run_at_startup=True),
         cron(reconcile_prepaid_hourly, minute=every_minute, run_at_startup=True),
+        cron(warn_hourly_runway, minute=every_minute, run_at_startup=True),
         cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
         cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
@@ -1715,6 +1749,7 @@ class WorkerSettings:
         reconcile_provider_resources,
         accrue_usage,
         reconcile_prepaid_hourly,
+        warn_hourly_runway,
         func(renew_hourly_coverage, max_tries=240, keep_result=0),
         evaluate_low_balance,
         process_deletes,
@@ -1819,6 +1854,7 @@ def _role_cron_jobs(role: str) -> list[Any]:
         ]
     return [
         cron(deliver_business_log_events, minute=every_minute, run_at_startup=True),
+        cron(warn_hourly_runway, minute=every_minute, run_at_startup=True),
         cron(deliver_admin_messages, minute=every_minute, run_at_startup=True),
         cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
@@ -1848,6 +1884,7 @@ class NotifyWorkerSettings(WorkerSettings):
 
     queue_name = "notify"
     functions: ClassVar[list[Any]] = [
+        warn_hourly_runway,
         deliver_business_log_events,
         deliver_admin_messages,
         evaluate_low_balance,

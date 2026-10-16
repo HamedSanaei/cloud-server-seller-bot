@@ -435,7 +435,11 @@ def prepaid_worker(monkeypatch):
     lifecycle = Lifecycle()
     from cloud_platform.modules.billing.service import PrepaidHourlyRunReport
 
-    billing = SimpleNamespace(run=AsyncMock(return_value=PrepaidHourlyRunReport()))
+    billing = SimpleNamespace(
+        run=AsyncMock(return_value=PrepaidHourlyRunReport()),
+        spendable_balance=AsyncMock(side_effect=lambda server: balances[server.user_id]),
+        next_hour_cost=AsyncMock(return_value=1),
+    )
     servers, wallets = Servers(), Wallets()
     container = SimpleNamespace(
         initialize=AsyncMock(),

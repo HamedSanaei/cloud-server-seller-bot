@@ -1530,6 +1530,8 @@ async def _require_hourly_prepayment(
     if server.is_prepaid_monthly:
         return
     if server.is_prepaid_hourly_irt:
+        if prepay is not None and server.state is ServerLifecycleState.STOPPED:
+            server = await prepay(server)
         paid_until = server.prepaid_paid_until
         if paid_until is None or (
             paid_until.replace(tzinfo=UTC) if paid_until.tzinfo is None else paid_until
@@ -2610,12 +2612,15 @@ class PowerControlsService:
         server_repo: ServerRepository,
         provider_registry: ProviderRegistry,
         signing_key: str,
+        *,
+        hourly_can_start: Callable[[CloudServer], Awaitable[bool]] | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
         self._servers = server_repo
         self._registry = provider_registry
         self._signing_key = signing_key
+        self._hourly_can_start = hourly_can_start
 
     async def detail(self, user_id: UUID, server_id: UUID) -> ServerPowerView | None:
         """The detail screen of one server the user owns, or None."""
@@ -2633,6 +2638,10 @@ class PowerControlsService:
             capabilities = set(provider.capabilities)
 
         controls = available_server_controls(server.state, capabilities)
+        if server.is_prepaid_hourly_irt and not operator_funded(server):
+            allowed = self._hourly_can_start is not None and await self._hourly_can_start(server)
+            if not allowed:
+                controls = tuple(control for control in controls if control.action != "power_on")
         actions = tuple(
             PowerActionOption(
                 action=PowerAction(control.action),
@@ -3615,7 +3624,7 @@ class PrepaidProviderLifecycleOutcome(StrEnum):
 
 
 class PrepaidProviderLifecycleService:
-    """Enforce zero-IRT policy using observed provider status and owner-checked commands."""
+    """Enforce unpaid-IRT policy without truncating already purchased time."""
 
     def __init__(
         self,
@@ -3625,12 +3634,14 @@ class PrepaidProviderLifecycleService:
         provider_registry: ProviderRegistry,
         power_commands: PowerCommandService,
         delete_commands: DeleteCommandService,
+        can_fund_hour: Callable[[CloudServer], Awaitable[bool]] | None = None,
     ) -> None:
         self._servers = server_repo
         self._wallets = wallet_repo
         self._registry = provider_registry
         self._power = power_commands
         self._delete = delete_commands
+        self._can_fund_hour = can_fund_hour
 
     async def suspend_operator(
         self, server_id: UUID, *, now: datetime | None = None
@@ -3714,8 +3725,24 @@ class PrepaidProviderLifecycleService:
                 raise ValueError("zero watermark cannot be in the future")
         if not unpaid:
             wallet = await self._wallets.get(server.user_id)
-            if wallet is None or wallet.currency != "IRT" or wallet.balance != 0:
+            if wallet is None or wallet.currency != "IRT":
                 return PrepaidProviderLifecycleOutcome.SKIPPED
+            if (
+                await self._can_fund_hour(server)
+                if self._can_fund_hour is not None
+                else wallet.balance > 0
+            ):
+                return PrepaidProviderLifecycleOutcome.SKIPPED
+        if (
+            server.prepaid_paid_until is not None
+            and (
+                server.prepaid_paid_until.replace(tzinfo=UTC)
+                if server.prepaid_paid_until.tzinfo is None
+                else server.prepaid_paid_until
+            )
+            > moment
+        ):
+            return PrepaidProviderLifecycleOutcome.SKIPPED
         if not server.provider_server_id or server.state not in (
             ServerLifecycleState.RUNNING,
             ServerLifecycleState.STOPPED,
@@ -3766,7 +3793,13 @@ class PrepaidProviderLifecycleService:
             or current.state is not ServerLifecycleState.STOPPED
             or current_wallet is None
             or current_wallet.currency != "IRT"
-            or current_wallet.balance != 0
+            or current.prepaid_paid_until != server.prepaid_paid_until
+        ):
+            return PrepaidProviderLifecycleOutcome.SKIPPED
+        if (
+            await self._can_fund_hour(current)
+            if self._can_fund_hour is not None
+            else current_wallet.balance > 0
         ):
             return PrepaidProviderLifecycleOutcome.SKIPPED
         await self._delete.request(
