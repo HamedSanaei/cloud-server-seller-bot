@@ -8,12 +8,13 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import RenewalNotification as _RenewalNotificationModel
 from cloud_platform.db.base import RenewalRecord as _RenewalRecordModel
+from cloud_platform.modules.funding.domain import FundingSource
 from cloud_platform.modules.renewals.domain import (
     RenewalKind,
     RenewalRecord,
@@ -48,6 +49,9 @@ def _to_domain(row: _RenewalRecordModel) -> RenewalRecord:
         auto_charge_enabled=bool(_attr(row, "auto_charge_enabled")),
         grace_until=_aware_or_none(_attr(row, "grace_until")),
         last_checked_at=_aware_or_none(_attr(row, "last_checked_at")),
+        funding_source=FundingSource(row.funding_source),
+        funding_operator_id=row.funding_operator_id,
+        provider_cost_snapshot=row.provider_cost_snapshot,
     )
 
 
@@ -89,6 +93,9 @@ class SqlAlchemyRenewalRepository:
                     currency=record.currency,
                     status=record.status.value,
                     auto_charge_enabled=record.auto_charge_enabled,
+                    funding_source=record.funding_source.value,
+                    funding_operator_id=record.funding_operator_id,
+                    provider_cost_snapshot=record.provider_cost_snapshot,
                 )
                 session.add(row)
             else:
@@ -108,6 +115,27 @@ class SqlAlchemyRenewalRepository:
             await session.refresh(row)
             return _to_domain(row)
 
+    async def advance_period(self, record: RenewalRecord, expected_period_end: datetime) -> bool:
+        """Advance precisely the charged period, never overwrite a concurrent advance."""
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(_RenewalRecordModel)
+                .where(
+                    _RenewalRecordModel.server_id == record.server_id,
+                    _RenewalRecordModel.provider_renewal_at == expected_period_end,
+                )
+                .values(
+                    provider_renewal_at=record.provider_renewal_at,
+                    status=record.status.value,
+                    grace_until=record.grace_until,
+                    last_checked_at=record.last_checked_at,
+                )
+                .returning(_RenewalRecordModel.server_id)
+            )
+            advanced = result.scalar_one_or_none() is not None
+            await session.commit()
+            return advanced
+
     async def set_auto_renew(self, server_id: UUID, enabled: bool) -> RenewalRecord:
         """Persist the customer's automatic-renewal preference durably."""
         async with self._session_factory() as session:
@@ -121,21 +149,9 @@ class SqlAlchemyRenewalRepository:
             return _to_domain(row)
 
     async def lock_for_update(self, server_id: UUID) -> RenewalRecord | None:
-        """Read one record under ``SELECT ... FOR UPDATE``.
-
-        Financial concurrency lives in PostgreSQL: two workers renewing the
-        same service contend on this row (and then on the wallet hold's unique
-        idempotency key) rather than racing on shared Redis state.
-        """
-        async with self._session_factory() as session:
-            row = (
-                await session.execute(
-                    select(_RenewalRecordModel)
-                    .where(_RenewalRecordModel.server_id == server_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            return _to_domain(row) if row is not None else None
+        """Compatibility read: the financial receipt and advance_period CAS
+        own concurrency. A row lock here would end before the caller charges."""
+        return await self.get(server_id)
 
     async def list_active(self) -> list[RenewalRecord]:
         async with self._session_factory() as session:

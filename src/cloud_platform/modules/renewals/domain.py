@@ -38,6 +38,8 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from cloud_platform.modules.funding.domain import FundingSource
+
 
 class RenewalStatus(StrEnum):
     """The COMMERCIAL state of a service (never the provider's state).
@@ -145,6 +147,9 @@ class RenewalRecord:
     #: End of the payable window once the period expired unpaid (grace only).
     grace_until: datetime | None = None
     last_checked_at: datetime | None = None
+    funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
+    funding_operator_id: UUID | None = None
+    provider_cost_snapshot: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.customer_price_minor <= 0:
@@ -175,6 +180,10 @@ class RenewalRepository(Protocol):
 
     async def upsert(self, record: RenewalRecord) -> RenewalRecord: ...
 
+    async def advance_period(self, record: RenewalRecord, expected_period_end: datetime) -> bool:
+        """CAS advance after a deterministic period receipt; stale workers cannot rewind."""
+        ...
+
     async def list_active(self) -> list[RenewalRecord]:
         """Every non-cancelled record (daily checker candidates)."""
         ...
@@ -188,11 +197,10 @@ class RenewalRepository(Protocol):
         ...
 
     async def lock_for_update(self, server_id: UUID) -> RenewalRecord | None:
-        """Read one record with a row lock (serialises concurrent renewal runs).
+        """Compatibility snapshot read; no lock survives the repository call.
 
-        Concurrency protection for money lives in the DATABASE, never in Redis:
-        two workers renewing the same service must contend on one row so only
-        one of them attempts the ledger write.
+        Deterministic funding receipts and advance_period's CAS fence provide
+        concurrency safety across the separate financial transaction.
         """
         ...
 

@@ -24,7 +24,10 @@ from uuid import UUID
 
 from cloud_platform.db.timestamps import from_db_utc
 from cloud_platform.modules.audit.domain import ActorType, AuditEvent
-from cloud_platform.modules.payments.inquiry import verify_payment_session
+from cloud_platform.modules.payments.inquiry import (
+    AuthoritativePaymentService,
+    verify_payment_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +85,24 @@ class PaymentReconciliationService:
         for session in sessions:
             external_id: str | None = session.gateway_payment_id
             session_id: Any = session.id
+            if self.gateway.key == "nowpayments":
+                checked += 1
+                try:
+                    saved = await AuthoritativePaymentService(
+                        payments_repo=self.payments_repo,
+                        webhook_service=self.webhook_service,
+                        gateways={self.gateway.key: self.gateway},
+                    ).reconcile_session(session)
+                    if saved.credited_at is not None and session.credited_at is None:
+                        credited += 1
+                    elif saved.status is PaymentSessionStatus.FAILED:
+                        marked_failed += 1
+                    else:
+                        still_pending += 1
+                except Exception:
+                    logger.warning("NOWPayments reconciliation failed for %s", session_id)
+                    errors += 1
+                continue
             if not external_id:
                 skipped += 1
                 continue

@@ -247,6 +247,28 @@ async def test_navigation_leaves_admin_prompt_instead_of_treating_menu_text_as_c
     assert route.accounts.entries == {}
 
 
+@pytest.mark.parametrize(
+    "navigation",
+    [
+        "/menu",
+        "/start",
+        "/admin",
+        "nav.menu",
+        "admin.create_server",
+        "admin.renew_server",
+        "menu.support",
+    ],
+)
+async def test_leaving_confirmation_makes_old_apply_inert(route, navigation):
+    keyboard = await _confirmation(route)
+    confirm = keyboard.inline_keyboard[0][0].callback_data
+    text = navigation if navigation.startswith("/") else Translator().t(navigation)
+    await _text(route, text)
+    await _click(route, confirm)
+    assert route.accounts.wallet.balance == 0
+    assert route.accounts.entries == {}
+
+
 async def test_failed_credit_reuses_confirmation_without_minting_another_ledger_fact(route):
     keyboard = await _confirmation(route)
     confirm = keyboard.inline_keyboard[0][0].callback_data

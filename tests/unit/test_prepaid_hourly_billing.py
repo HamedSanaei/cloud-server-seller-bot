@@ -162,6 +162,9 @@ class FakeServers:
     def __init__(self, *rows):
         self.rows = {row.id: row for row in rows}
 
+    async def get(self, server_id):
+        return self.rows.get(server_id)
+
     async def list_running(self):
         return [
             replace(row) for row in self.rows.values() if row.state is ServerLifecycleState.RUNNING

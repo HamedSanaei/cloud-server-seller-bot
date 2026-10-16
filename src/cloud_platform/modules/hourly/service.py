@@ -49,11 +49,13 @@ from cloud_platform.modules.compute.domain import (
     ServerCreateIntent,
     ServerLifecycleState,
 )
+from cloud_platform.modules.funding import FundingAuthorizationError, FundingService, FundingSource
 from cloud_platform.modules.fx.domain import (
     SUPPORTED_CURRENCIES,
     FxPurpose,
     major_to_minor,
 )
+from cloud_platform.modules.hourly.domain import operator_funded
 from cloud_platform.modules.offers.domain import (
     SellableOfferRepository,
     is_sellable_in_currency,
@@ -640,6 +642,7 @@ class HourlyCloudService:
         prepay_server: Callable[[CloudServer], Awaitable[CloudServer]] | None = None,
         prepaid_billing: PrepaidHourlyBillingService | None = None,
         period_repo: PrepaidHourlyPeriodRepository | None = None,
+        funding_service: FundingService | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -678,6 +681,7 @@ class HourlyCloudService:
         self._periods = period_repo
         self._create_attempts = create_attempts
         self._routes = fulfillment_routes
+        self._funding = funding_service
 
     def _uses_account_pool(self, provider_key: str) -> bool:
         return (
@@ -997,6 +1001,15 @@ class HourlyCloudService:
         self, server: CloudServer, snapshot: Any, *, allow_paid: bool = False
     ) -> Any:
         """Read-only POST gate: neither a missing quote nor a missing hold is repaired here."""
+        if operator_funded(server):
+            if self._prepaid_billing is None or server.created_at is None:
+                raise HourlyError("operator first-hour receipt service is not configured")
+            try:
+                return await self._prepaid_billing.verify_operator_period(
+                    server, snapshot, server.created_at, authorize_new_dispatch=not allow_paid
+                )
+            except ValueError as exc:
+                raise HourlyError(str(exc)) from exc
         self._require_prepaid_ports()
         assert self._periods is not None
         if server.created_at is None or not server.idempotency_key:
@@ -1040,6 +1053,11 @@ class HourlyCloudService:
 
     async def _reserve_first_hour(self, server: CloudServer, snapshot: Any) -> None:
         """Repair/complete checkout from the frozen USD snapshot, never today's offer."""
+        if operator_funded(server):
+            if self._prepaid_billing is None:
+                raise HourlyError("operator hourly funding is not configured")
+            await self._prepaid_billing.prepare_operator_first_hour(server, snapshot)
+            return
         if not server.is_prepaid_hourly_irt:
             await self._reserve_same_currency_first_hour(server, snapshot)
             return
@@ -1069,13 +1087,18 @@ class HourlyCloudService:
     async def capture_first_hour(self, server_id: UUID) -> None:
         """Provisioning bridge: capture the bound hold before entering RUNNING."""
         server = await self._servers.get(server_id)
-        if server is None or not server.is_prepaid_hourly_irt:
+        if server is None or (not server.is_prepaid_hourly_irt and not operator_funded(server)):
             return
         if not server.provider_server_id or server.state not in (
             ServerLifecycleState.PROVISIONING,
             ServerLifecycleState.RUNNING,
         ):
             raise HourlyError("first-hour capture requires an attached provider server")
+        if operator_funded(server):
+            if self._prepaid_billing is None:
+                raise HourlyError("operator hourly receipt service is not configured")
+            await self._prepaid_billing.capture_operator_first_hour(server)
+            return
         self._require_prepaid_ports()
         assert self._prepaid_billing is not None
         await self._prepaid_billing.capture_first_hour(server, self._hold_repo, self._holds)
@@ -1323,7 +1346,7 @@ class HourlyCloudService:
                         raise HourlyRequestFailedError(
                             "the previous hourly request already failed; a new order is required"
                         )
-                    if existing.is_prepaid_hourly_irt:
+                    if existing.is_prepaid_hourly_irt or operator_funded(existing):
                         if (
                             existing.state is ServerLifecycleState.REQUESTED
                             and operation.status is OperationStatus.PENDING
@@ -1347,7 +1370,7 @@ class HourlyCloudService:
                                 "the previous hourly request already failed; "
                                 "a new order is required"
                             ) from None
-                        if existing.is_prepaid_hourly_irt:
+                        if existing.is_prepaid_hourly_irt or operator_funded(existing):
                             await self._first_hour_hold(existing, snapshot)
                         return HourlyCreateResult(server=existing, replayed=True)
             except (HourlyError, InsufficientHoldBalanceError):
@@ -1370,7 +1393,7 @@ class HourlyCloudService:
                                 "the previous hourly request already failed; "
                                 "a new order is required"
                             ) from None
-                        if existing.is_prepaid_hourly_irt:
+                        if existing.is_prepaid_hourly_irt or operator_funded(existing):
                             await self._first_hour_hold(existing, snapshot)
                         return HourlyCreateResult(server=existing, replayed=True)
             if asyncio.get_running_loop().time() >= deadline:
@@ -1678,22 +1701,32 @@ class HourlyCloudService:
         if not image_id or not image_id.strip():
             raise HourlyNotAvailableError("an image id is required")
 
-        wallet = await self._wallets.get(user.id)
-        if wallet is None:
-            raise HourlyError(f"user {user.id} has no wallet")
-        if getattr(wallet, "status", None) is not WalletStatus.ACTIVE:
-            raise HourlyError("wallet is not active for a new purchase")
-        # The wallet port must declare its unit; never infer it from an offer.
-        wallet_currency = str(getattr(wallet, "currency", None) or "").strip().upper()
-        offer_currency = offer.selling_currency.strip().upper()
-        prepaid = wallet_currency == "IRT" and offer_currency == "USD"
-        if wallet_currency != offer_currency and not prepaid:
-            raise HourlyError(
-                f"wallet currency {wallet_currency} does not match offer selling currency "
-                f"{offer.selling_currency}"
-            )
-        if prepaid:
-            self._require_prepaid_ports()
+        funding_source = (
+            await self._funding.resolve_source(user.id)
+            if self._funding is not None
+            else FundingSource.CUSTOMER_WALLET
+        )
+        corporate = funding_source is FundingSource.OPERATOR
+        prepaid = False
+        if corporate:
+            if self._prepaid_billing is None:
+                raise HourlyError("operator hourly funding is not configured")
+        else:
+            wallet = await self._wallets.get(user.id)
+            if wallet is None:
+                raise HourlyError(f"user {user.id} has no wallet")
+            if getattr(wallet, "status", None) is not WalletStatus.ACTIVE:
+                raise HourlyError("wallet is not active for a new purchase")
+            wallet_currency = str(getattr(wallet, "currency", None) or "").strip().upper()
+            offer_currency = offer.selling_currency.strip().upper()
+            prepaid = wallet_currency == "IRT" and offer_currency == "USD"
+            if wallet_currency != offer_currency and not prepaid:
+                raise HourlyError(
+                    f"wallet currency {wallet_currency} does not match offer selling currency "
+                    f"{offer.selling_currency}"
+                )
+            if prepaid:
+                self._require_prepaid_ports()
 
         account = await self._accounts.get_or_create_active(user.id, offer.provider_key)
         catalog_account = str(offer.provider_account_id or "").strip() or None
@@ -1843,6 +1876,8 @@ class HourlyCloudService:
             billing_model=BILLING_MODEL_PREPAID_HOURLY_IRT if prepaid else BILLING_MODEL_HOURLY,
             idempotency_key=idempotency_key,
             quantum_seconds=3600,
+            funding_source=funding_source,
+            funding_operator_id=user.id if corporate else None,
             os=image_label,
             image_id=image_id,
             credential_account_id=pinned_account,
@@ -1911,7 +1946,7 @@ class HourlyCloudService:
                 provider_key=offer.provider_key,
             )
         except Exception:
-            if not prepaid:
+            if not prepaid and not corporate:
                 await quarantine_partial()
             # REQUESTED prepaid rows stay repairable: no POST can cross the
             # worker gate until the bound FX period and hold both exist.
@@ -1941,7 +1976,7 @@ class HourlyCloudService:
                 },
             )
         except Exception:
-            if not prepaid:
+            if not prepaid and not corporate:
                 await quarantine_partial()
             raise
         logger.info(
@@ -1981,6 +2016,15 @@ class HourlyCloudService:
             raise HourlyRequestFailedError("first-hour reservation is no longer active")
 
     async def _release_creation_hold(self, server: CloudServer) -> None:
+        if operator_funded(server):
+            if self._funding is None or server.created_at is None:
+                raise HourlyError("operator grant cancellation service is not configured")
+            grant = await self._funding.get_grant(prepaid_hourly_key(server.id, server.created_at))
+            if grant is not None and grant.state.value == "authorized":
+                await self._funding.cancel(
+                    grant, reason="Hourly provider create definitively failed"
+                )
+            return
         if not server.idempotency_key:
             return
         wallet = await self._wallets.get(server.user_id)
@@ -1996,6 +2040,11 @@ class HourlyCloudService:
         raw = getattr(response, "status", None) or getattr(response, "state", "")
         status = str(getattr(raw, "value", raw) or "").strip().lower()
         if status not in {"running", "active", "ready"}:
+            return
+        if operator_funded(server):
+            if self._prepaid_billing is None:
+                raise HourlyError("operator hourly receipt service is not configured")
+            await self._prepaid_billing.capture_operator_first_hour(server)
             return
         if server.is_prepaid_hourly_irt:
             # The reconciler captures the bound IRT hold before RUNNING;
@@ -2200,6 +2249,15 @@ class HourlyCloudService:
                 return "claimed-elsewhere"
             server.credential_account_id = account_id
             reference = hourly_reference_name(server.id)
+            if operator_funded(server):
+                try:
+                    await self._first_hour_hold(server, snapshot)
+                except FundingAuthorizationError as exc:
+                    return await self._fail_operation(
+                        claimed, server, str(exc), stage="funding_authorization"
+                    )
+                except HourlyError as exc:
+                    return await self._requeue_operation(claimed, str(exc))
             try:
                 created = await adapter.create_instance(
                     instance_type=snapshot.offer.plan_id,
@@ -2421,7 +2479,7 @@ class HourlyCloudService:
         try:
             preflight_snapshot = await self._snapshots.require_snapshot(server.id)
         except Exception as exc:
-            if server.is_prepaid_hourly_irt:
+            if server.is_prepaid_hourly_irt or operator_funded(server):
                 # Creator may have crashed before writing the snapshot. Keep
                 # REQUESTED for same-key repair; it cannot reach the POST.
                 logger.warning("prepaid first-hour intent %s awaits snapshot: %s", server.id, exc)
@@ -2441,10 +2499,25 @@ class HourlyCloudService:
         _validate_hourly_operation(operation, server)
         if operation.is_terminal:
             return "skipped"
+        if operator_funded(server) and operation.status is OperationStatus.PENDING:
+            try:
+                if self._funding is None:
+                    raise FundingAuthorizationError("operator funding service is unavailable")
+                await self._funding.authorize_new_period(
+                    owner_id=server.user_id, operator_id=server.user_id
+                )
+            except FundingAuthorizationError as exc:
+                return await self._fail_operation(
+                    operation, server, str(exc), stage="funding_authorization"
+                )
         if operation.status is OperationStatus.PENDING:
-            if server.is_prepaid_hourly_irt:
+            if server.is_prepaid_hourly_irt or operator_funded(server):
                 try:
                     await self._first_hour_hold(server, preflight_snapshot)
+                except FundingAuthorizationError as exc:
+                    return await self._fail_operation(
+                        operation, server, str(exc), stage="funding_authorization"
+                    )
                 except HourlyError:
                     return "awaiting-first-hour"
             else:
@@ -2650,9 +2723,13 @@ class HourlyCloudService:
                 category=FAILURE_PROVIDER_CAPACITY,
                 stage="capacity_canary",
             )
-        if server.is_prepaid_hourly_irt:
+        if server.is_prepaid_hourly_irt or operator_funded(server):
             try:
                 await self._first_hour_hold(server, snapshot)
+            except FundingAuthorizationError as exc:
+                return await self._fail_operation(
+                    claimed, server, str(exc), stage="funding_authorization"
+                )
             except HourlyError as exc:
                 await self._release_canary_lease(
                     provider_key=server.provider_key,
@@ -3093,6 +3170,11 @@ class HourlyCloudService:
         have. The category-scoped deterministic key means a re-processed
         failure never posts twice.
         """
+        if claimed.status is OperationStatus.PENDING:
+            denied = await self._ops.claim(claimed.id)
+            if denied is None:
+                return "claimed-elsewhere"
+            claimed = denied
         if create_routing(claimed) is not None:
             if self._create_attempts is None:
                 raise HourlyError("create attempt persistence is not configured")

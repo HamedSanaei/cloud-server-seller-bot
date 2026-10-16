@@ -65,7 +65,7 @@ class User(Base):
     # Relationships
     account_providers = relationship("ProviderAccount", back_populates="user")
     wallet = relationship("Wallet", uselist=False, back_populates="user")
-    servers = relationship("Server", back_populates="user")
+    servers = relationship("Server", back_populates="user", foreign_keys="Server.user_id")
 
 
 class TelegramSuperadminAssignment(Base):
@@ -397,6 +397,18 @@ class Server(Base):
     """
 
     __tablename__ = "servers"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "funding_source IN ('customer_wallet', 'operator')",
+            name="ck_servers_funding_source",
+        ),
+        sa.CheckConstraint(
+            "(funding_source = 'customer_wallet' AND funding_operator_id IS NULL) OR "
+            "(funding_source = 'operator' AND funding_operator_id IS NOT NULL "
+            "AND funding_operator_id = user_id)",
+            name="ck_servers_funding_owner",
+        ),
+    )
 
     id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
     user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -449,9 +461,20 @@ class Server(Base):
     # separate from legacy arrears accrual and warning episode watermarks.
     prepaid_paid_until = Column(DateTime, nullable=True)
     prepaid_zero_since = Column(DateTime, nullable=True)
+    #: Who funds this server's provider cost: ``customer_wallet`` (the
+    #: historical path, the compatible default for every existing row) or
+    #: ``operator`` (organisation-funded). Appended last so the default is a
+    #: compatible additive field; never accepted from a public payload.
+    funding_source = Column(String(32), nullable=False, server_default="customer_wallet")
+    #: The funding operator's user id when ``funding_source`` is operator; NULL
+    #: for customer-wallet servers. RESTRICT: financial provenance must not be
+    #: cascaded away with the user.
+    funding_operator_id = Column(
+        PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
 
     # Relationships
-    user = relationship("User", back_populates="servers")
+    user = relationship("User", back_populates="servers", foreign_keys=[user_id])
     provider = relationship("Provider", back_populates="servers")
     provider_account = relationship("ProviderAccount", back_populates="servers")
     catalog_entry = relationship("Catalog", back_populates="servers")
@@ -614,6 +637,27 @@ class ProviderOrder(Base):
     """
 
     __tablename__ = "provider_orders"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "funding_source IN ('customer_wallet', 'operator')",
+            name="ck_provider_orders_funding_source",
+        ),
+        sa.CheckConstraint(
+            "(funding_source = 'customer_wallet' AND funding_operator_id IS NULL "
+            "AND funding_grant_operation_key IS NULL) OR "
+            "(funding_source = 'operator' AND funding_operator_id IS NOT NULL "
+            "AND funding_grant_operation_key IS NOT NULL AND provider_cost_snapshot IS NOT NULL "
+            "AND jsonb_typeof(provider_cost_snapshot) = 'object')",
+            name="ck_provider_orders_funding_evidence",
+        ),
+    )
+
+    funding_source = Column(String(32), nullable=False, server_default="customer_wallet")
+    funding_operator_id = Column(
+        PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    funding_grant_operation_key = Column(String(200), nullable=True)
+    provider_cost_snapshot = Column(JSONB, nullable=True)
 
     id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
     server_id = Column(
@@ -883,6 +927,25 @@ class RenewalRecord(Base):
     """
 
     __tablename__ = "renewals"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "funding_source IN ('customer_wallet', 'operator')",
+            name="ck_renewals_funding_source",
+        ),
+        sa.CheckConstraint(
+            "(funding_source = 'customer_wallet' AND funding_operator_id IS NULL) OR "
+            "(funding_source = 'operator' AND funding_operator_id IS NOT NULL "
+            "AND provider_cost_snapshot IS NOT NULL "
+            "AND jsonb_typeof(provider_cost_snapshot) = 'object')",
+            name="ck_renewals_funding_evidence",
+        ),
+    )
+
+    funding_source = Column(String(32), nullable=False, server_default="customer_wallet")
+    funding_operator_id = Column(
+        PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    provider_cost_snapshot = Column(JSONB, nullable=True)
 
     server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), primary_key=True)
     provider_contract_id = Column(String, nullable=True)
@@ -1112,6 +1175,9 @@ class PaymentSession(Base):
 
     __tablename__ = "payment_sessions"
     __table_args__ = (
+        UniqueConstraint(
+            "gateway_key", "provider_payment_id", name="uq_payment_sessions_provider_payment"
+        ),
         Index(
             "uq_atlaspay_merchant_ref",
             "gateway_key",
@@ -1132,6 +1198,8 @@ class PaymentSession(Base):
     user_id = Column(PG_UUID, nullable=False)
     gateway_key = Column(String, nullable=False)
     gateway_payment_id = Column(String, nullable=True)
+    # Hosted invoice identity and concrete provider payment identity are distinct.
+    provider_payment_id = Column(String, nullable=True)
     amount_minor = Column(BigInteger, nullable=False)
     currency = Column(String(3), nullable=False)
     status = Column(String, nullable=False, server_default="pending")
@@ -1423,19 +1491,43 @@ class PrepaidHourlyPeriod(Base):
         UniqueConstraint("server_id", "period_start", name="uq_prepaid_hourly_server_start"),
         Index("ix_prepaid_hourly_pending", "server_id", "status", "period_start"),
         sa.CheckConstraint(
-            "usd_minor > 0 AND irt_minor > 0 AND period_end > period_start",
+            "usd_minor > 0 AND period_end > period_start",
             name="ck_prepaid_hourly_positive",
+        ),
+        sa.CheckConstraint(
+            "(funding_source = 'customer_wallet' AND nominal_currency = 'USD' "
+            "AND wallet_id IS NOT NULL "
+            "AND irt_minor IS NOT NULL AND irt_minor > 0 AND fx_snapshot IS NOT NULL "
+            "AND jsonb_typeof(fx_snapshot) = 'object' "
+            "AND funding_operator_id IS NULL AND operator_grant_id IS NULL "
+            "AND operator_expense_id IS NULL) OR "
+            "(funding_source = 'operator' AND wallet_id IS NULL AND irt_minor IS NULL "
+            "AND fx_snapshot IS NULL AND funding_operator_id IS NOT NULL "
+            "AND operator_grant_id IS NOT NULL "
+            "AND (status != 'paid' OR operator_expense_id IS NOT NULL))",
+            name="ck_prepaid_hourly_funding_evidence",
         ),
     )
 
     id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
     server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
-    wallet_id = Column(PG_UUID, ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False)
+    wallet_id = Column(PG_UUID, ForeignKey("wallets.id", ondelete="CASCADE"), nullable=True)
     period_start = Column(DateTime, nullable=False)
     period_end = Column(DateTime, nullable=False)
     usd_minor = Column(BigInteger, nullable=False)
-    irt_minor = Column(BigInteger, nullable=False)
-    fx_snapshot = Column(JSONB, nullable=False)
+    nominal_currency = Column(String(3), nullable=False, server_default="USD")
+    irt_minor = Column(BigInteger, nullable=True)
+    fx_snapshot = Column(JSONB(none_as_null=True), nullable=True)
+    funding_source = Column(String(32), nullable=False, server_default="customer_wallet")
+    funding_operator_id = Column(
+        PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    operator_grant_id = Column(
+        PG_UUID, ForeignKey("operator_funding_grants.id", ondelete="RESTRICT"), nullable=True
+    )
+    operator_expense_id = Column(
+        PG_UUID, ForeignKey("operator_expenses.id", ondelete="RESTRICT"), nullable=True
+    )
     idempotency_key = Column(String(255), unique=True, nullable=False)
     status = Column(String(16), nullable=False)
 
@@ -1633,3 +1725,228 @@ class BusinessLogEvent(Base):
     attempts = Column(Integer, nullable=False, server_default="0")
     next_attempt_at = Column(DateTime(timezone=True), nullable=True)
     last_error = Column(String(500), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Operator funding — grants, immutable expenses and cutover receipts
+# ---------------------------------------------------------------------------
+#
+# Organisation-funded servers are paid for by the operator, NOT the customer's
+# wallet. A grant is authorization evidence for an upcoming provider cost; a
+# settled grant produces exactly one immutable expense. None of these tables
+# touches wallets, holds or the ledger, and there is no synthetic cash payment.
+
+
+class OperatorFundingGrant(Base):
+    """Authorization evidence for operator-funded provider work.
+
+    The globally unique ``operation_key`` makes reservation idempotent:
+    an exact repeat returns the same immutable facts, while the same key with
+    different owner/purpose/resource/amount/currency/cost facts fails closed.
+    Grants are self-only (``owner_user_id`` equals ``operator_user_id``) and
+    are NEVER customer-wallet credit.
+
+    Attributes:
+        id: Primary key (generated UUID)
+        operation_key: Globally unique deterministic reservation key
+        operator_user_id: The funding operator (RESTRICT)
+        owner_user_id: The resource owner; must equal ``operator_user_id``
+        resource_key: Stable local intent/server/period identity
+        purpose: monthly_create | monthly_renew | hourly_usage | final_usage
+        nominal_amount_minor: Authorized nominal amount (positive int64)
+        nominal_currency: Uppercase three-letter currency
+        provider_cost_snapshot: Exact native cost evidence (JSONB)
+        state: authorized | settled | cancelled
+        created_at: UTC creation instant (timestamptz)
+    """
+
+    __tablename__ = "operator_funding_grants"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "nominal_amount_minor > 0",
+            name="ck_operator_funding_grants_amount_positive",
+        ),
+        sa.CheckConstraint(
+            "owner_user_id = operator_user_id",
+            name="ck_operator_funding_grants_self_owner",
+        ),
+        sa.CheckConstraint(
+            "state IN ('authorized', 'settled', 'cancelled')",
+            name="ck_operator_funding_grants_state",
+        ),
+        sa.CheckConstraint(
+            "purpose IN ('monthly_create', 'monthly_renew', 'hourly_usage', 'final_usage')",
+            name="ck_operator_funding_grants_purpose",
+        ),
+        sa.CheckConstraint(
+            "char_length(nominal_currency) = 3 AND nominal_currency = upper(nominal_currency)",
+            name="ck_operator_funding_grants_currency",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    operation_key = Column(String(200), unique=True, nullable=False)
+    operator_user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    owner_user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    resource_key = Column(String(200), nullable=False)
+    purpose = Column(String(32), nullable=False)
+    nominal_amount_minor = Column(BigInteger, nullable=False)
+    nominal_currency = Column(String(3), nullable=False)
+    provider_cost_snapshot = Column(JSONB, nullable=False)
+    state = Column(String(16), nullable=False, server_default="authorized")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class OperatorExpense(Base):
+    """Immutable organisation-cost evidence: one grant settled exactly once.
+
+    ``grant_id`` is unique, so a settled grant can never produce a second
+    expense (no duplicate fake charge on retry). The nominal amount and the
+    provider snapshot are frozen copies of the grant's immutable facts. The
+    table is append-only: a database trigger rejects UPDATE and DELETE.
+
+    Attributes:
+        id: Primary key
+        grant_id: The settled grant (unique, RESTRICT)
+        operation_key: Deterministic expense key (unique)
+        owner_user_id / operator_user_id: Frozen self-only ownership
+        resource_key / purpose: Frozen identity of the funded work
+        nominal_amount_minor / nominal_currency: Frozen nominal cost
+        provider_cost_snapshot: Frozen exact native cost (JSONB)
+        occurred_at: UTC settlement instant (timestamptz)
+    """
+
+    __tablename__ = "operator_expenses"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "nominal_amount_minor > 0",
+            name="ck_operator_expenses_amount_positive",
+        ),
+        sa.CheckConstraint(
+            "owner_user_id = operator_user_id",
+            name="ck_operator_expenses_self_owner",
+        ),
+        sa.CheckConstraint(
+            "purpose IN ('monthly_create', 'monthly_renew', 'hourly_usage', 'final_usage')",
+            name="ck_operator_expenses_purpose",
+        ),
+        sa.CheckConstraint(
+            "char_length(nominal_currency) = 3 AND nominal_currency = upper(nominal_currency)",
+            name="ck_operator_expenses_currency",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    grant_id = Column(
+        PG_UUID,
+        ForeignKey("operator_funding_grants.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    operation_key = Column(String(220), unique=True, nullable=False)
+    owner_user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    operator_user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    resource_key = Column(String(200), nullable=False)
+    purpose = Column(String(32), nullable=False)
+    nominal_amount_minor = Column(BigInteger, nullable=False)
+    nominal_currency = Column(String(3), nullable=False)
+    provider_cost_snapshot = Column(JSONB, nullable=False)
+    occurred_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class OperatorFundingCutover(Base):
+    """Immutable receipt for converting one server to operator funding.
+
+    No cutover is executed by migration or startup in this unit: this schema
+    exists so a later, explicitly reviewed rollout can record exactly when and
+    why one server changed funding source, with a frozen metadata snapshot.
+    The table is append-only: a database trigger rejects UPDATE and DELETE.
+
+    Attributes:
+        id: Primary key
+        operation_key: Globally unique cutover receipt key
+        server_id: The converted server (RESTRICT)
+        operator_user_id: The operator who performed the cutover (RESTRICT)
+        prior_funding_source: customer_wallet | operator (the source before)
+        effective_at: UTC instant the cutover took effect (timestamptz)
+        reason: Bounded human reason (required)
+        metadata: Immutable JSONB snapshot (DB column ``metadata``)
+    """
+
+    __tablename__ = "operator_funding_cutovers"
+    __table_args__ = (
+        sa.CheckConstraint(
+            "prior_funding_source IN ('customer_wallet', 'operator')",
+            name="ck_operator_funding_cutovers_prior_source",
+        ),
+    )
+
+    id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
+    operation_key = Column(String(200), unique=True, nullable=False)
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="RESTRICT"), nullable=False)
+    operator_user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    prior_funding_source = Column(String(32), nullable=False)
+    effective_at = Column(DateTime(timezone=True), nullable=False)
+    reason = Column(Text, nullable=False)
+    #: ``metadata`` is reserved by SQLAlchemy's declarative base, so the ORM
+    #: attribute is ``cutover_metadata`` while the DB column stays ``metadata``.
+    cutover_metadata = Column("metadata", JSONB, nullable=False, server_default="'{}'::jsonb")
+
+
+class AdminMessageCampaign(Base):
+    """Immutable approved content and frozen recipients for administrator messages."""
+
+    __tablename__ = "admin_message_campaigns"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "idempotency_key", name="uq_admin_message_campaign_actor_key"),
+        sa.CheckConstraint("char_length(body) BETWEEN 1 AND 3000", name="ck_admin_campaign_body"),
+        sa.CheckConstraint(
+            "char_length(reason) BETWEEN 1 AND 500", name="ck_admin_campaign_reason"
+        ),
+        sa.CheckConstraint(
+            "jsonb_typeof(recipient_ids) = 'array' AND "
+            "jsonb_array_length(recipient_ids) BETWEEN 1 AND 100",
+            name="ck_admin_campaign_recipient_count",
+        ),
+    )
+    id = Column(PG_UUID, primary_key=True, server_default=sa.text("uuid_generate_v4()"))
+    actor_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    body = Column(Text, nullable=False)
+    reason = Column(Text, nullable=False)
+    idempotency_key = Column(String(128), nullable=False)
+    recipient_ids = Column(JSONB, nullable=False)
+    facts_hash = Column(String(64), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")
+    )
+
+
+class AdminMessageDelivery(Base):
+    """Bounded, leased delivery; ambiguous Telegram sends are never auto-retried."""
+
+    __tablename__ = "admin_message_deliveries"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "user_id", name="uq_admin_message_delivery_recipient"),
+        Index("ix_admin_message_delivery_pending", "status", "next_attempt_at"),
+        sa.CheckConstraint("telegram_user_id > 0", name="ck_admin_delivery_telegram_identity"),
+        sa.CheckConstraint("attempts >= 0", name="ck_admin_delivery_attempts"),
+        sa.CheckConstraint(
+            "status IN ('pending', 'leased', 'sent', 'failed', 'ambiguous')",
+            name="ck_admin_delivery_status",
+        ),
+    )
+    id = Column(PG_UUID, primary_key=True, server_default=sa.text("uuid_generate_v4()"))
+    campaign_id = Column(
+        PG_UUID, ForeignKey("admin_message_campaigns.id", ondelete="RESTRICT"), nullable=False
+    )
+    user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    telegram_user_id = Column(BigInteger, nullable=False)
+    status = Column(String(16), nullable=False, server_default="pending")
+    attempts = Column(Integer, nullable=False, server_default="0")
+    next_attempt_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP")
+    )
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    claim_token = Column(PG_UUID, nullable=True)
+    error_code = Column(String(64), nullable=True)
+    sent_at = Column(DateTime(timezone=True), nullable=True)

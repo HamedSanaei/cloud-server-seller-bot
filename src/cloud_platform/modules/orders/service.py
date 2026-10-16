@@ -69,7 +69,7 @@ on one implementation.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -90,6 +90,16 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.funding.domain import (
+    FundingAuthorizationError,
+    FundingError,
+    FundingGrantState,
+    FundingPurpose,
+    FundingSource,
+    ProviderCostSnapshot,
+    expense_operation_key,
+)
+from cloud_platform.modules.funding.service import FundingService
 from cloud_platform.modules.offers.domain import SellableOffer, SellableOfferRepository
 from cloud_platform.modules.operations.create_attempts import (
     CreateAccountAttemptRepository,
@@ -298,6 +308,7 @@ class OrderActivator:
         delivery_notifier: OrderDeliveryNotifier,
         event_sink: BusinessEventSink | None = None,
         user_repo: Any | None = None,
+        settlement: OrderSettlementService | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -308,6 +319,7 @@ class OrderActivator:
         self._delivery = delivery_notifier
         self._events = event_sink
         self._users = user_repo
+        self._settlement = settlement
 
     async def activate(
         self,
@@ -324,6 +336,16 @@ class OrderActivator:
         provider (order-based) or the plain provider port (direct-create).
         Activation therefore needs no knowledge of how the server was made.
         """
+        if server.funding_source is FundingSource.OPERATOR:
+            if self._settlement is None:
+                raise ValueError("operator activation requires the expense receipt barrier")
+            if (
+                await self._settlement.ensure_order_payment_settled(order, server)
+                is not SettlementVerdict.SETTLED
+            ):
+                raise ValueError("operator activation requires a durable expense receipt")
+        if order.settlement_status is not SettlementStatus.COMPLETE:
+            raise ValueError("activation requires a durable funding receipt")
         remote: ProviderServer | None = None
         try:
             remote = await ordering.get_server(vps_id)
@@ -418,8 +440,8 @@ class OrderActivator:
             purchased_at=server.created_at or datetime.now(UTC),
             provider_renewal_at=provider_renewal_at,
             renewal_date_estimated=estimated,
-            customer_price_minor=offer.selling_price_minor,
-            currency=offer.selling_currency,
+            customer_price_minor=order.selling_price_minor or offer.selling_price_minor,
+            currency=order.selling_currency or offer.selling_currency,
         )
         existing = await self._renewals.get(server.id)
         record = RenewalRecord(
@@ -433,8 +455,12 @@ class OrderActivator:
             currency=info.currency,
             status=existing.status if existing is not None else RenewalStatus.ACTIVE,
             auto_charge_enabled=(existing.auto_charge_enabled if existing is not None else True),
+            funding_source=server.funding_source,
+            funding_operator_id=server.funding_operator_id,
+            provider_cost_snapshot=order.provider_cost_snapshot,
         )
-        await self._renewals.upsert(record)
+        if existing is None:
+            await self._renewals.upsert(record)
         return info
 
 
@@ -481,6 +507,8 @@ class OrderSettlementService:
         audit_repo: AuditRepository,
         clock: Callable[[], datetime] | None = None,
         create_attempts: CreateAccountAttemptRepository | None = None,
+        funding_service: FundingService | None = None,
+        renewal_repo: RenewalRepository | None = None,
     ) -> None:
         self._wallets = wallet_repo
         self._holds = hold_repo
@@ -491,6 +519,8 @@ class OrderSettlementService:
         self._create_attempts = create_attempts
         self._audit = AuditTrail(audit_repo)
         self._now = clock or (lambda: datetime.now(UTC))
+        self._funding = funding_service
+        self._renewals = renewal_repo
 
     async def ensure_order_payment_settled(
         self, order: ProviderOrder, server: CloudServer
@@ -503,6 +533,10 @@ class OrderSettlementService:
         the provider.
         """
         now = self._now()
+        if server.funding_source is FundingSource.OPERATOR:
+            return await self._settle_operator(order, server, now)
+        if order.funding_source is not FundingSource.CUSTOMER_WALLET:
+            return await self._needs_review(order, now, "server/order funding source mismatch")
         if server.idempotency_key is None:
             return await self._needs_review(
                 order, now, "server has no idempotency key; cannot locate the checkout hold"
@@ -577,6 +611,154 @@ class OrderSettlementService:
             order.id,
             hold.id,
         )
+        return SettlementVerdict.SETTLED
+
+    async def _settle_operator(
+        self, order: ProviderOrder, server: CloudServer, now: datetime
+    ) -> SettlementVerdict:
+        """The immutable expense is the only operator delivery receipt."""
+        if order.funding_grant_operation_key != order.operation_key:
+            return await self._settle_operator_cutover(order, server, now)
+        if (
+            self._funding is None
+            or order.funding_source is not FundingSource.OPERATOR
+            or order.funding_operator_id != server.user_id
+            or server.funding_operator_id != server.user_id
+            or order.funding_grant_operation_key != order.operation_key
+            or order.provider_cost_snapshot is None
+            or not (order.provider_order_id or server.provider_server_id)
+        ):
+            return await self._needs_review(
+                order, now, "accepted operator order lacks funding identity"
+            )
+        try:
+            grant = await self._funding.get_grant(order.operation_key)
+            if (
+                grant is None
+                or grant.owner_user_id != server.user_id
+                or grant.operator_user_id != server.user_id
+                or grant.resource_key != f"server:{server.id}"
+                or grant.purpose is not FundingPurpose.MONTHLY_CREATE
+                or grant.nominal_amount_minor != order.selling_price_minor
+                or grant.nominal_currency != order.selling_currency
+                or grant.provider_cost_snapshot
+                != ProviderCostSnapshot.from_dict(order.provider_cost_snapshot)
+            ):
+                return await self._needs_review(
+                    order, now, "operator grant differs from accepted order"
+                )
+            expense = await self._funding.settle(grant)
+            receipt = await self._funding.get_expense(expense_operation_key(order.operation_key))
+            if receipt != expense or expense.grant_id != grant.id:
+                return await self._needs_review(
+                    order, now, "operator expense receipt missing or mismatched"
+                )
+        except FundingError as exc:
+            return await self._needs_review(order, now, f"operator funding receipt rejected: {exc}")
+        except Exception as exc:
+            return await self._retry_later(
+                order, now, f"operator expense pending ({type(exc).__name__})"
+            )
+        order.settlement_status = SettlementStatus.COMPLETE
+        order.settlement_attempted_at = now
+        order.settlement_attempts = 0
+        order.settlement_error = None
+        await self._orders.save(order)
+        await self._repair_operation(order)
+        return SettlementVerdict.SETTLED
+
+    async def _settle_operator_cutover(
+        self, order: ProviderOrder, server: CloudServer, now: datetime
+    ) -> SettlementVerdict:
+        """Re-prove an audited current-term assumption without inventing create cost."""
+        reason = "operator cutover has no coherent current-period expense receipt"
+        if (
+            self._funding is None
+            or self._renewals is None
+            or order.funding_source is not FundingSource.OPERATOR
+            or order.funding_operator_id != server.user_id
+            or server.funding_operator_id != server.user_id
+            or not server.provider_server_id
+            or not order.provider_order_id
+            or not order.funding_grant_operation_key
+            or order.provider_cost_snapshot is None
+        ):
+            return await self._needs_review(order, now, reason)
+        try:
+            cutover = await self._funding.get_cutover(server.id)
+            renewal = await self._renewals.get(server.id)
+            if (
+                cutover is None
+                or cutover.operator_user_id != server.user_id
+                or cutover.server_id != server.id
+                or cutover.prior_funding_source is not FundingSource.CUSTOMER_WALLET
+                or cutover.metadata.get("classification_only") is not False
+                or cutover.metadata.get("provider_key") != server.provider_key
+                or cutover.metadata.get("provider_server_id") != server.provider_server_id
+                or cutover.metadata.get("credential_account_id") != server.credential_account_id
+                or not cutover.metadata.get("provider_proof")
+                or renewal is None
+                or renewal.provider_renewal_at is None
+                or renewal.funding_source is not FundingSource.OPERATOR
+                or renewal.funding_operator_id != server.user_id
+            ):
+                return await self._needs_review(order, now, reason)
+            coverage = cutover.metadata.get("coverage")
+            if not isinstance(coverage, Mapping):
+                return await self._needs_review(order, now, reason)
+            start = datetime.fromisoformat(str(coverage["period_start"]))
+            end = datetime.fromisoformat(str(coverage["period_end"]))
+            if (
+                start.tzinfo is None
+                or end.tzinfo is None
+                or not start <= cutover.effective_at <= now < end
+                or renewal.provider_renewal_at != end
+            ):
+                return await self._needs_review(order, now, reason)
+            period = start.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            grant_key = f"renewal-charge:{server.id}:{period.date().isoformat()}"
+            if (
+                coverage.get("grant_operation_key") != grant_key
+                or order.funding_grant_operation_key != grant_key
+                or coverage.get("expense_operation_key") != expense_operation_key(grant_key)
+            ):
+                return await self._needs_review(order, now, reason)
+            grant = await self._funding.get_grant(grant_key)
+            expense = await self._funding.get_expense(expense_operation_key(grant_key))
+            snapshot = ProviderCostSnapshot.from_dict(order.provider_cost_snapshot)
+            if (
+                grant is None
+                or expense is None
+                or str(grant.id) != coverage.get("grant_id")
+                or str(expense.id) != coverage.get("expense_id")
+                or expense.grant_id != grant.id
+                or grant.state is not FundingGrantState.SETTLED
+                or grant.owner_user_id != server.user_id
+                or grant.operator_user_id != server.user_id
+                or grant.purpose is not FundingPurpose.MONTHLY_RENEW
+                or grant.resource_key != f"server:{server.id}:period:{period.isoformat()}"
+                or grant.nominal_amount_minor != renewal.customer_price_minor
+                or grant.nominal_currency != renewal.currency
+                or grant.provider_cost_snapshot != snapshot
+                or renewal.provider_cost_snapshot != order.provider_cost_snapshot
+                or order.selling_price_minor != grant.nominal_amount_minor
+                or order.selling_currency != grant.nominal_currency
+            ):
+                return await self._needs_review(order, now, reason)
+            if await self._funding.settle(grant) != expense:
+                return await self._needs_review(order, now, reason)
+        except (FundingError, KeyError, ValueError, TypeError):
+            return await self._needs_review(order, now, reason)
+        except Exception as exc:
+            return await self._retry_later(
+                order, now, f"cutover expense lookup pending ({type(exc).__name__})"
+            )
+        order.settlement_status = SettlementStatus.COMPLETE
+        order.settlement_attempted_at = now
+        order.settlement_attempts = 0
+        order.settlement_error = None
+        await self._orders.save(order)
+        await self._repair_operation(order)
         return SettlementVerdict.SETTLED
 
     async def _retry_later(
@@ -688,6 +870,7 @@ class OrderWorker:
         user_repo: Any | None = None,
         create_attempts: CreateAccountAttemptRepository | None = None,
         fulfillment_routes: Any | None = None,
+        funding_service: FundingService | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -704,6 +887,7 @@ class OrderWorker:
         self._users = user_repo
         self._create_attempts = create_attempts
         self._routes = fulfillment_routes
+        self._funding = funding_service
         self._settlement = settlement or OrderSettlementService(
             wallet_repo=wallet_repo,
             hold_repo=hold_repo,
@@ -714,6 +898,8 @@ class OrderWorker:
             audit_repo=audit_repo,
             clock=clock,
             create_attempts=create_attempts,
+            funding_service=funding_service,
+            renewal_repo=renewal_repo,
         )
         self._now = clock or (lambda: datetime.now(UTC))
 
@@ -735,6 +921,7 @@ class OrderWorker:
             delivery_notifier=self._delivery,
             event_sink=self._events,
             user_repo=self._users,
+            settlement=self._settlement,
         )
 
     async def process_pending(self, limit: int = 10) -> dict[OrderWorkerOutcome, int]:
@@ -951,6 +1138,12 @@ class OrderWorker:
         )
         # Persist the POST-attempt instant BEFORE the chargeable call: the
         # read-only recovery scan window starts here (durable across crashes).
+        try:
+            await self._authorize_dispatch(order, server)
+        except FundingError as exc:
+            return await self._fail_permanent(
+                server, order, f"operator funding denied before dispatch: {exc}", claimed=claimed
+            )
         order.post_attempted_at = claimed.updated_at or self._now()
         await self._orders.save(order)
         try:
@@ -1174,6 +1367,12 @@ class OrderWorker:
         )
         # Persist the POST-attempt instant BEFORE the chargeable call: the
         # read-only recovery scan window starts here (durable across crashes).
+        try:
+            await self._authorize_dispatch(order, server)
+        except FundingError as exc:
+            return await self._fail_permanent(
+                server, order, f"operator funding denied before dispatch: {exc}", claimed=claimed
+            )
         order.post_attempted_at = claimed.updated_at or self._now()
         await self._orders.save(order)
         try:
@@ -1321,6 +1520,15 @@ class OrderWorker:
                     error=f"mandatory-input revalidation unreadable ({type(exc).__name__})",
                 )
                 return OrderWorkerOutcome.REQUEUED
+            try:
+                await self._authorize_dispatch(order, server)
+            except FundingError as exc:
+                return await self._fail_permanent(
+                    server,
+                    order,
+                    f"operator funding denied before dispatch: {exc}",
+                    claimed=claimed,
+                )
             claimed = await self._create_attempts.start_attempt(
                 claimed.id,
                 claimed.attempts,
@@ -1763,7 +1971,44 @@ class OrderWorker:
         )
         return OrderWorkerOutcome.FAILED
 
+    async def _authorize_dispatch(self, order: ProviderOrder, server: CloudServer) -> None:
+        """Fresh authoritative policy check before every new provider dispatch."""
+        if server.funding_source is FundingSource.CUSTOMER_WALLET:
+            if order.funding_source is not FundingSource.CUSTOMER_WALLET:
+                raise FundingAuthorizationError("server/order funding source mismatch")
+            return
+        if (
+            self._funding is None
+            or order.funding_source is not FundingSource.OPERATOR
+            or order.funding_operator_id != server.user_id
+            or server.funding_operator_id != server.user_id
+            or order.funding_grant_operation_key != order.operation_key
+            or order.provider_cost_snapshot is None
+            or order.selling_price_minor is None
+            or order.selling_currency is None
+        ):
+            raise FundingAuthorizationError("operator order funding evidence missing")
+        grant = await self._funding.reserve(
+            owner_id=server.user_id,
+            operator_id=server.user_id,
+            operation_key=order.operation_key,
+            resource_key=f"server:{server.id}",
+            purpose=FundingPurpose.MONTHLY_CREATE,
+            nominal_amount_minor=order.selling_price_minor,
+            nominal_currency=order.selling_currency,
+            provider_cost_snapshot=ProviderCostSnapshot.from_dict(order.provider_cost_snapshot),
+            reason=f"Dispatch own monthly order {order.id} for server {server.id}",
+        )
+        if grant.state is not FundingGrantState.AUTHORIZED:
+            raise FundingAuthorizationError(
+                "a settled cost cannot authorize another provider dispatch"
+            )
+
     async def _release_hold(self, server: CloudServer) -> None:
+        if server.funding_source is FundingSource.OPERATOR:
+            # No wallet exists on this path. A grant with no accepted provider
+            # identity remains reserved for audited/manual recovery.
+            return
         if server.idempotency_key is None:
             return
         wallet = await self._wallets.get(server.user_id)
@@ -1942,7 +2187,10 @@ class OrderReconciler:
         financially unsafe states escalate to a human. Shared by every
         provisioning mode so the barrier cannot drift between them.
         """
-        if order.settlement_status is SettlementStatus.COMPLETE:
+        if (
+            order.settlement_status is SettlementStatus.COMPLETE
+            and server.funding_source is FundingSource.CUSTOMER_WALLET
+        ):
             return None
         verdict = await self._settlement.ensure_order_payment_settled(order, server)
         if verdict is SettlementVerdict.NEEDS_REVIEW:
@@ -1981,6 +2229,7 @@ class OrderReconciler:
             delivery_notifier=self._delivery,
             event_sink=self._events,
             user_repo=self._users,
+            settlement=self._settlement,
         )
 
     async def _reconcile_direct(
@@ -2148,7 +2397,11 @@ class OrderReconciler:
             except Exception:
                 logger.exception("failed to mark server %s ERROR", server.id)
         if server.idempotency_key is not None:
-            wallet = await self._wallets.get(server.user_id)
+            wallet = (
+                await self._wallets.get(server.user_id)
+                if server.funding_source is FundingSource.CUSTOMER_WALLET
+                else None
+            )
             if wallet is not None and wallet.id is not None:
                 from cloud_platform.modules.checkout.service import hold_key
 
@@ -2553,6 +2806,9 @@ class OrderRecoveryService:
         """Capture the checkout hold exactly once (idempotent by key)."""
         server = await self._servers.get(order.server_id)
         if server is None or server.idempotency_key is None:
+            return
+        if server.funding_source is FundingSource.OPERATOR:
+            await self._settle_recovered_direct(order, server)
             return
         wallet = await self._wallets.get(server.user_id)
         if wallet is None or wallet.id is None:
@@ -2984,6 +3240,7 @@ class OrderManualResolutionService:
             delivery_notifier=self._delivery,
             event_sink=self._events,
             user_repo=self._users,
+            settlement=self._settlement,
         )
         await activator.activate(
             server=server, order=order, offer=offer, vps_id=vps_id, ordering=ordering

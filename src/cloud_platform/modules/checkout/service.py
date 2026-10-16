@@ -28,7 +28,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, ClassVar
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cloud_platform.core.config import get_settings
 from cloud_platform.modules.audit.domain import ActorType, AuditRepository
@@ -48,6 +48,13 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.funding.domain import (
+    FundingPurpose,
+    FundingSource,
+    ProviderCostSnapshot,
+)
+from cloud_platform.modules.funding.service import FundingService
+from cloud_platform.modules.fx.domain import minor_to_major
 from cloud_platform.modules.markets.domain import (
     FAMILY_BILLINGS,
     FAMILY_ORDER,
@@ -74,7 +81,6 @@ from cloud_platform.modules.users.domain import User, UserStatus
 from cloud_platform.modules.wallet.domain import (
     Hold,
     HoldRepository,
-    InsufficientHoldBalanceError,
     WalletRepository,
 )
 from cloud_platform.providers.base import (
@@ -184,6 +190,20 @@ def hold_key(idempotency_key: str) -> str:
     return f"leaseweb-order:{idempotency_key}"
 
 
+def monthly_provider_cost(offer: SellableOffer) -> ProviderCostSnapshot:
+    """Freeze a provider quote in its explicit native currency and precision."""
+    exact = (offer.billing_parameters or {}).get("provider_monthly_rate")
+    if exact is None:
+        exact = format(minor_to_major(offer.provider_cost_minor, offer.provider_cost_currency), "f")
+    if isinstance(exact, (bool, float)):
+        raise OfferUnavailableError("provider quote has no exact monthly cost evidence")
+    return ProviderCostSnapshot(
+        amount_exact=str(exact),
+        currency=offer.provider_cost_currency,
+        provenance=f"sellable-offer:{offer.id}:provider-monthly-quote:{offer.product_id}",
+    )
+
+
 class MonthlyCheckoutService:
     """The monthly purchase command handler (see module docstring)."""
 
@@ -202,6 +222,7 @@ class MonthlyCheckoutService:
         event_sink: BusinessEventSink | None = None,
         event_market_lookup: Callable[[str], str] | None = None,
         fulfillment_routes: Any | None = None,
+        funding_service: FundingService | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -220,6 +241,7 @@ class MonthlyCheckoutService:
         # ``None`` the order is placed through the provider's logical adapter
         # and no account is pinned.
         self._routes = fulfillment_routes
+        self._funding = funding_service
 
     async def _fulfillment_account(
         self,
@@ -391,7 +413,11 @@ class MonthlyCheckoutService:
                     f"idempotency key {idempotency_key!r} belongs to another user"
                 )
             order = await self._orders.get_by_server(existing.id)
-            wallet = await self._wallets.get(user.id)
+            wallet = (
+                await self._wallets.get(user.id)
+                if existing.funding_source is FundingSource.CUSTOMER_WALLET
+                else None
+            )
             wallet_id = wallet.id if wallet is not None else None
             hold: Hold | None = (
                 await self._holds.get_by_idempotency(wallet_id, hold_key(idempotency_key))
@@ -438,20 +464,42 @@ class MonthlyCheckoutService:
         # 4. Provider account (per-customer link row; created on demand).
         account = await self._accounts.get_or_create_active(user.id, offer.provider_key)
 
-        # 5. Wallet + hold (balance validation lives in the hold).
-        wallet = await self._wallets.get(user.id)
-        if wallet is None or wallet.id is None:
-            raise NoWalletError(f"user {user.id} has no wallet")
-        wallet_id = wallet.id
-        try:
+        source = (
+            await self._funding.resolve_source(user.id)
+            if self._funding is not None
+            else FundingSource.CUSTOMER_WALLET
+        )
+        server_id = (
+            uuid5(NAMESPACE_URL, f"monthly-server:{user.id}:{idempotency_key}")
+            if source is FundingSource.OPERATOR
+            else uuid4()
+        )
+        cost_snapshot = monthly_provider_cost(offer) if source is FundingSource.OPERATOR else None
+        grant_key = order_operation_key(server_id) if source is FundingSource.OPERATOR else None
+        hold: Hold | None = None
+        if source is FundingSource.OPERATOR:
+            assert self._funding is not None and cost_snapshot is not None and grant_key is not None
+            await self._funding.reserve(
+                owner_id=user.id,
+                operator_id=user.id,
+                operation_key=grant_key,
+                resource_key=f"server:{server_id}",
+                purpose=FundingPurpose.MONTHLY_CREATE,
+                nominal_amount_minor=offer.selling_price_minor,
+                nominal_currency=offer.selling_currency,
+                provider_cost_snapshot=cost_snapshot,
+                reason=f"Own monthly purchase of offer {offer.id} for server {server_id}",
+            )
+        else:
+            wallet = await self._wallets.get(user.id)
+            if wallet is None or wallet.id is None:
+                raise NoWalletError(f"user {user.id} has no wallet")
             hold = await self._holds.create_hold(
-                wallet_id,
+                wallet.id,
                 offer.selling_price_minor,
                 offer.selling_currency,
                 hold_key(idempotency_key),
             )
-        except InsufficientHoldBalanceError:
-            raise
 
         # 6. Server intent (REQUESTED, prepaid monthly, OS recorded).
         del at  # created_at is assigned by the repository
@@ -461,7 +509,7 @@ class MonthlyCheckoutService:
         )(offer.provider_key):
             catalog_provenance = {"provider_account_id": offer.provider_account_id}
         server = CloudServer(
-            id=uuid4(),
+            id=server_id,
             user_id=user.id,
             provider_key=offer.provider_key,
             provider_account_id=account.id,
@@ -470,6 +518,8 @@ class MonthlyCheckoutService:
             os=os_name,
             credential_account_id=credential_account_id,
             offer_fingerprint=catalog_provenance,
+            funding_source=source,
+            funding_operator_id=user.id if source is FundingSource.OPERATOR else None,
         )
         intent = ServerCreateIntent(
             catalog_id=None,  # prepaid: offer pinned via provider_orders.offer_id
@@ -517,6 +567,16 @@ class MonthlyCheckoutService:
                 selling_price_minor=offer.selling_price_minor,
                 selling_currency=offer.selling_currency,
                 credential_account_id=credential_account_id,
+                **(
+                    {
+                        "funding_source": source,
+                        "funding_operator_id": user.id,
+                        "funding_grant_operation_key": grant_key,
+                        "provider_cost_snapshot": cost_snapshot.to_dict(),
+                    }
+                    if cost_snapshot is not None
+                    else {}
+                ),
             )
         except Exception:
             await self._fail_intent(created, hold)
@@ -549,7 +609,8 @@ class MonthlyCheckoutService:
                 "os": os_name,
                 "control_panel": panel_name or "",
                 "order_id": str(order.id),
-                "hold_id": str(hold.id) if hold.id is not None else "",
+                "hold_id": str(hold.id) if hold is not None and hold.id is not None else "",
+                "funding_source": source.value,
                 "billing_model": BILLING_MODEL_PREPAID_MONTHLY,
             },
         )
@@ -561,7 +622,7 @@ class MonthlyCheckoutService:
             offer.selling_price_minor,
             offer.selling_currency,
             os_name,
-            hold.id,
+            hold.id if hold is not None else None,
         )
         # Operator channel: the customer confirmed a purchase and a durable
         # intent exists (server + order + operation + hold). Enqueued only —
@@ -586,7 +647,7 @@ class MonthlyCheckoutService:
             server=created, order=order, hold=hold, offer=offer, replayed=False
         )
 
-    async def _fail_intent(self, server: CloudServer, hold: Hold) -> None:
+    async def _fail_intent(self, server: CloudServer, hold: Hold | None) -> None:
         """Best-effort compensation: ERROR + release hold."""
         try:
             server.transition_to(ServerLifecycleState.ERROR)
@@ -595,8 +656,8 @@ class MonthlyCheckoutService:
             logger.exception("failed to mark server %s ERROR after checkout failure", server.id)
         await self._release_hold(hold)
 
-    async def _release_hold(self, hold: Hold) -> None:
-        if hold.id is None:
+    async def _release_hold(self, hold: Hold | None) -> None:
+        if hold is None or hold.id is None:
             return
         try:
             await self._holds.release_hold(hold.id)
@@ -655,6 +716,7 @@ class OfferConfirmView:
     cancel_callback: str
     #: Free control panel chosen during configuration (None = no panel).
     panel_name: str | None = None
+    funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
 
 
 @dataclass(frozen=True, slots=True)
@@ -905,11 +967,12 @@ class CloudConfirmView:
     hourly_price_minor: int
     monthly_estimate_minor: int
     currency: str
-    balance_minor: int
+    balance_minor: int | None
     location_name: str
     location_country: str | None
     back_callback: str
     cancel_callback: str
+    funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
 
 
 class OfferCatalogViewService:
@@ -942,6 +1005,7 @@ class OfferCatalogViewService:
         location_repo: LocationRepository | None = None,
         cloud_providers: Mapping[str, Any] | None = None,
         cloud_resolver: Any | None = None,
+        funding_service: FundingService | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
@@ -957,6 +1021,7 @@ class OfferCatalogViewService:
         # owns the observation. The plain dict stays as the legacy
         # single-adapter fallback. No provider-name branching here.
         self._cloud_resolver = cloud_resolver
+        self._funding = funding_service
 
     # -- storefront: markets / providers / locations -----------------------
 
@@ -2162,8 +2227,16 @@ class OfferCatalogViewService:
         if offer.billing_model != BILLING_MODEL_HOURLY:
             raise OfferUnavailableError(f"offer {offer_id} is not an hourly plan")
         image = await self.cloud_image_by_index(offer, image_index)
-        wallet = await self._wallets.get(user_id)
-        balance = wallet.balance if wallet is not None else 0
+        source = (
+            await self._funding.resolve_source(user_id)
+            if self._funding is not None
+            else FundingSource.CUSTOMER_WALLET
+        )
+        if source is FundingSource.OPERATOR:
+            balance = None
+        else:
+            wallet = await self._wallets.get(user_id)
+            balance = wallet.balance if wallet is not None else 0
         names = await self._location_metadata(offer.provider_key)
         return CloudConfirmView(
             offer=self._view(offer),
@@ -2177,6 +2250,7 @@ class OfferCatalogViewService:
             location_country=names.get(offer.location_id, (offer.location_id, None, None))[1],
             back_callback=self._store_nav_callback("cloud_images", self._offer_ref(offer.id)),
             cancel_callback=self._store_nav_callback("market"),
+            funding_source=source,
         )
 
     async def _card_offers(
@@ -2394,7 +2468,14 @@ class OfferCatalogViewService:
             await self.panel_name_by_index(offer, panel_index) if panel_index is not None else None
         )
 
-        wallet = await self._wallets.get(user_id)
+        source = (
+            await self._funding.resolve_source(user_id)
+            if self._funding is not None
+            else FundingSource.CUSTOMER_WALLET
+        )
+        wallet = (
+            await self._wallets.get(user_id) if source is FundingSource.CUSTOMER_WALLET else None
+        )
         balance = wallet.balance if wallet is not None else 0
 
         back_callback = self._store_nav_callback("panel", self._offer_ref(offer_id), str(os_index))
@@ -2404,10 +2485,11 @@ class OfferCatalogViewService:
             os_name=os_name,
             balance_minor=balance,
             currency=offer.selling_currency,
-            sufficient=balance >= offer.selling_price_minor,
+            sufficient=source is FundingSource.OPERATOR or balance >= offer.selling_price_minor,
             back_callback=back_callback,
             cancel_callback=cancel_callback,
             panel_name=panel_name,
+            funding_source=source,
         )
 
     async def os_screen(

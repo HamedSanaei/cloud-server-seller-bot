@@ -97,6 +97,10 @@ jobs:
           tests/unit/test_financial*.py tests/unit/test_audit_worker_operations.py
           tests/unit/test_audit_provider_operations.py tests/unit/test_hourly_creation_boundaries.py
           tests/unit/test_gateway_management.py
+          tests/unit/test_operator_*.py tests/unit/test_admin_console_*.py
+          tests/unit/test_admin_support_execution.py tests/unit/test_nowpayments_*.py
+          tests/unit/test_superadmin_*.py tests/unit/test_bot_admin*.py
+          tests/unit/test_monthly_bot_ui.py
           tests/unit/test_hetzner_offer_migration_pg.py --no-cov
       - name: Migration compatibility
         if: ${{ !cancelled() }}

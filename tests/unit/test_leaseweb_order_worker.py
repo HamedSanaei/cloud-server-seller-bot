@@ -1751,6 +1751,7 @@ class TestActivatorBranches:
 
         server = server or _server(ServerLifecycleState.PROVISIONING)
         order = order or _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
+        order.settlement_status = SettlementStatus.COMPLETE
         server_repo = FakeServerRepo(server)
         orders_repo = FakeOrdersRepo(order)
         renewal_repo = FakeRenewalRepo()
@@ -2461,6 +2462,7 @@ class TestBusinessLogEmission:
         server.provider_server_id = "vps-1"
         order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
         activator = OrderActivator(
+            # This test starts after the payment settlement barrier.
             server_repo=FakeServerRepo(server),
             offers_repo=FakeOfferRepo(),
             orders_repo=FakeOrdersRepo(order),
@@ -2471,6 +2473,7 @@ class TestBusinessLogEmission:
             event_sink=sink,
             user_repo=None,
         )
+        order.settlement_status = SettlementStatus.COMPLETE
         await activator.activate(
             server=server,
             order=order,
@@ -2493,6 +2496,7 @@ class TestBusinessLogEmission:
         server = _server(ServerLifecycleState.PROVISIONING)
         order = _order(OrderStatus.PROVISIONING, provider_order_id="LS-ORD-1")
         notifier = _RecordingNotifier()
+        order.settlement_status = SettlementStatus.COMPLETE
         activator = OrderActivator(
             server_repo=FakeServerRepo(server),
             offers_repo=FakeOfferRepo(),

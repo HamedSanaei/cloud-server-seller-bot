@@ -121,6 +121,8 @@ class PaymentWebhookService:
 
         session = await self._payments.get_by_external_id(gateway_key, external_id)
         if session is None:
+            if gateway_key == "nowpayments":
+                raise ValueError("unknown NOWPayments invoice")
             if user_id is None or amount_minor is None or currency is None:
                 raise ValueError("unknown payment requires user_id, amount_minor and currency")
             session = PaymentSession(

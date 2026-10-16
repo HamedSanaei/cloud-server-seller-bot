@@ -78,6 +78,9 @@ def _to_domain(row: _PaymentModel) -> PaymentSession:
         created_at=created,
         updated_at=updated,
         payment_details=dict(details_raw) if isinstance(details_raw, dict) else None,
+        provider_payment_id=getattr(row, "provider_payment_id", None)
+        if isinstance(getattr(row, "provider_payment_id", None), str)
+        else None,
     )
     if credited_at is not None:
         session = session.mark_credited(at=credited_at)
@@ -105,6 +108,7 @@ def _to_row(aggregate: PaymentSession) -> _PaymentModel:
         fx_proxy=aggregate.fx_proxy,
         fx_proxy_asset=aggregate.fx_proxy_asset,
         payment_details=aggregate.payment_details,
+        provider_payment_id=aggregate.provider_payment_id,
     )
 
 
@@ -138,6 +142,10 @@ def _validate_save(current: PaymentSession, proposed: PaymentSession) -> None:
                 raise ValueError(f"bound invoice {field_name} is immutable")
     elif proposed.amount_minor != current.amount_minor and not proposed.gateway_payment_id:
         raise ValueError("invoice total can change only when binding a provider invoice")
+    if current.provider_payment_id is not None and (
+        proposed.provider_payment_id != current.provider_payment_id
+    ):
+        raise ValueError("provider payment identity is immutable")
     if current.status is not PaymentSessionStatus.PENDING and proposed.status is not current.status:
         raise InvalidPaymentSessionTransition("persisted payment state is already terminal")
     if proposed.credited_at is not None and proposed.status is not PaymentSessionStatus.SUCCEEDED:
@@ -173,6 +181,48 @@ class SqlAlchemyPaymentSessionRepository:
             result = await db.execute(select(_PaymentModel).where(_PaymentModel.id == session_id))
             row = result.scalar_one_or_none()
             return None if row is None else _to_domain(row)
+
+    async def search_admin(
+        self,
+        query: str,
+        *,
+        status: str | None = None,
+        gateway_key: str | None = None,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> tuple[list[PaymentSession], bool]:
+        """Exact invoice/payment/session/owner lookup with bounded stable pagination."""
+        if type(offset) is not int or not 0 <= offset <= 10_000:
+            raise ValueError("invalid payment offset")
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("invalid payment limit")
+        if not isinstance(query, str) or len(query) > 100:
+            raise ValueError("invalid payment query")
+        stmt = select(_PaymentModel)
+        if query:
+            matches = [
+                _PaymentModel.gateway_payment_id == query,
+                _PaymentModel.provider_payment_id == query,
+            ]
+            try:
+                identity = UUID(query)
+            except ValueError:
+                pass
+            else:
+                matches.extend([_PaymentModel.id == identity, _PaymentModel.user_id == identity])
+            stmt = stmt.where(or_(*matches))
+        if status is not None:
+            stmt = stmt.where(_PaymentModel.status == PaymentSessionStatus(status).value)
+        if gateway_key is not None:
+            stmt = stmt.where(_PaymentModel.gateway_key == gateway_key)
+        stmt = (
+            stmt.order_by(_PaymentModel.created_at.desc(), _PaymentModel.id.desc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
+        async with self._session_factory() as db:
+            rows = list((await db.execute(stmt)).scalars().all())
+            return [_to_domain(row) for row in rows[:limit]], len(rows) > limit
 
     async def get_by_external_id(
         self, gateway_key: str, gateway_payment_id: str
@@ -226,7 +276,10 @@ class SqlAlchemyPaymentSessionRepository:
                         ),
                     ),
                     _PaymentModel.created_at <= cutoff,
-                    _PaymentModel.gateway_payment_id.is_not(None),
+                    or_(
+                        _PaymentModel.gateway_payment_id.is_not(None),
+                        _PaymentModel.gateway_key == "nowpayments",
+                    ),
                 )
                 .order_by(_PaymentModel.created_at.asc())
                 .limit(limit)
@@ -261,6 +314,13 @@ class SqlAlchemyPaymentSessionRepository:
             # Binding that invoice total never modifies the frozen wallet credit.
             cast_any.amount_minor = session.amount_minor
             cast_any.payment_details = session.payment_details
-            await db.commit()
+            cast_any.provider_payment_id = session.provider_payment_id
+            try:
+                await db.commit()
+            except IntegrityError as exc:
+                await db.rollback()
+                raise DuplicateExternalIdError(
+                    "provider payment identity is already bound"
+                ) from exc
             await db.refresh(row)
             return _to_domain(row)

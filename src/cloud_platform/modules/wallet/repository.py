@@ -133,6 +133,7 @@ class SqlAlchemyWalletRepository:
         business_event_factory: Callable[[Wallet], BusinessEvent | None] | None = None,
         expected_currency: str | None = None,
         expected_running_server_id: UUID | None = None,
+        expected_customer_server_id: UUID | None = None,
         admin_configured_ids: tuple[int, ...] | None = None,
     ) -> tuple[Wallet, bool]:
         """Atomically post a delta and ledger, fencing first prepaid charges under row locks."""
@@ -160,6 +161,23 @@ class SqlAlchemyWalletRepository:
                 await authorize_superadmin_transaction(
                     session, audit_actor_id, admin_configured_ids
                 )
+                if entry_type == LedgerEntryType.ADJUSTMENT:
+                    from cloud_platform.db.base import User as TargetUser
+
+                    target_user = (
+                        await session.execute(
+                            select(TargetUser).where(TargetUser.id == user_id).with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        target_user is None
+                        or _attr(target_user, "role") != "user"
+                        or _attr(target_user, "telegram_user_id") in admin_configured_ids
+                        or user_id == audit_actor_id
+                    ):
+                        raise PermissionDeniedError(
+                            "manual adjustments are for customer wallets only"
+                        )
             stmt = (
                 select(SQLAlchemyWallet)
                 .where(SQLAlchemyWallet.user_id == user_id)
@@ -232,8 +250,34 @@ class SqlAlchemyWalletRepository:
                     or _attr(server, "user_id") != user_id
                     or _attr(server, "state") != "running"
                     or _attr(server, "billing_model") != "hourly_prepaid_irt"
+                    or _attr(server, "funding_source") != "customer_wallet"
                 ):
                     raise ValueError("server is not eligible for a prepaid hourly charge")
+
+            if expected_customer_server_id is not None:
+                if (
+                    delta >= 0
+                    or entry_type != LedgerEntryType.CHARGE
+                    or reference_type != "server"
+                    or reference_id != str(expected_customer_server_id)
+                    or expected_currency is None
+                ):
+                    raise ValueError("customer coverage fence requires a bound server charge")
+                server = (
+                    await session.execute(
+                        select(_ServerModel)
+                        .where(_ServerModel.id == expected_customer_server_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    server is None
+                    or _attr(server, "user_id") != user_id
+                    or _attr(server, "funding_source") != "customer_wallet"
+                    or _attr(server, "billing_model") not in {"hourly", "hourly_prepaid_irt"}
+                    or _attr(server, "state") not in {"running", "stopped", "provisioning"}
+                ):
+                    raise ValueError("server is not eligible for customer-funded hourly coverage")
 
             balance = int(_attr(row, "balance"))
             new_balance = balance + delta

@@ -12,13 +12,25 @@ from uuid import UUID
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     ReplyKeyboardMarkup,
 )
 
+from cloud_platform.bot.admin_operations_ui import (
+    AdminHealthUi,
+    AdminMessagingUi,
+    AdminSalesUi,
+    AdminSupportUi,
+)
+from cloud_platform.bot.admin_payments_ui import AdminPaymentsUi
+from cloud_platform.bot.admin_reports_ui import AdminReportsUi
+from cloud_platform.bot.admin_users_ui import AdminUsersUi
+from cloud_platform.bot.admin_wallet_ui import AdminWalletUi
+from cloud_platform.bot.monthly_ui import build_admin_reply_keyboard
 from cloud_platform.bot.ui import BotScreen
-from cloud_platform.core.i18n import Translator
+from cloud_platform.core.i18n import Locale, Translator, get_catalog
 from cloud_platform.core.session_store import BotSessionStore
+from cloud_platform.modules.admin_console.users import AdminUserService
+from cloud_platform.modules.admin_console.wallet import AdminWalletAdjustmentService
 from cloud_platform.modules.fx.domain import currency_exponent
 from cloud_platform.modules.fx.formatting import format_minor
 from cloud_platform.modules.navigation.domain import Callback, encode_telegram_callback
@@ -46,6 +58,14 @@ class AdminBotUi:
         store: BotSessionStore,
         ttl_seconds: int = 900,
         configured_ids: Iterable[int] = (),
+        user_admin: AdminUserService | None = None,
+        wallet_adjustments: AdminWalletAdjustmentService | None = None,
+        payments: Any = None,
+        reports: Any = None,
+        services: Any = None,
+        sales: Any = None,
+        health: Any = None,
+        messaging: Any = None,
     ) -> None:
         self._key = signing_key
         self._gateways = gateways
@@ -56,22 +76,49 @@ class AdminBotUi:
         self._ttl = ttl_seconds
         self._t = Translator()
         self._configured_ids = tuple(configured_ids)
+        self._users_ui = (
+            AdminUsersUi(
+                signing_key,
+                user_admin,
+                store,
+                self._t,
+                ttl_seconds=ttl_seconds,
+                wallet_enabled=wallet_adjustments is not None,
+            )
+            if user_admin is not None
+            else None
+        )
+        self._wallet_ui = (
+            AdminWalletUi(signing_key, wallet_adjustments, store, self._t, ttl_seconds=ttl_seconds)
+            if wallet_adjustments is not None
+            else None
+        )
+        self._extra_sections = {}
+        for name, cls, service in (
+            ("payments", AdminPaymentsUi, payments),
+            ("reports", AdminReportsUi, reports),
+            ("services", AdminSupportUi, services),
+            ("sales", AdminSalesUi, sales),
+            ("health", AdminHealthUi, health),
+            ("messages", AdminMessagingUi, messaging),
+        ):
+            if service is not None:
+                self._extra_sections[name] = cls(
+                    signing_key, service, store, self._t, ttl_seconds=ttl_seconds
+                )
+        self._sections = tuple(
+            section
+            for section in (self._users_ui, self._wallet_ui, *self._extra_sections.values())
+            if section is not None
+        )
 
     def _authorize(self, admin: User) -> None:
         require_superadmin(admin, self._configured_ids)
 
     def reply_keyboard(self, admin: User) -> ReplyKeyboardMarkup:
-        """Dedicated management controls, installed only in authenticated private chats."""
+        """Management keeps the corporate root available at all times."""
         self._authorize(admin)
-        return ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text=self._t.t("admin.gateways"))],
-                [KeyboardButton(text=self._t.t("admin.credit"))],
-                [KeyboardButton(text=self._t.t("nav.menu"))],
-            ],
-            resize_keyboard=True,
-            is_persistent=True,
-        )
+        return build_admin_reply_keyboard(self._t)
 
     def _button(self, text: str, screen: str, *args: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(
@@ -83,7 +130,12 @@ class AdminBotUi:
         self._authorize(admin)
         rows = [
             [self._button(self._t.t("admin.gateways"), "gateways")],
-            [self._button(self._t.t("admin.credit"), "credit")],
+            [
+                self._button(
+                    self._t.t("admin.wallet_adjust" if self._wallet_ui else "admin.credit"),
+                    "wallet_adjust" if self._wallet_ui else "credit",
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text=self._t.t("nav.menu"),
@@ -91,6 +143,10 @@ class AdminBotUi:
                 )
             ],
         ]
+        if self._users_ui is not None:
+            rows.insert(0, [self._button(self._t.t("admin.users"), "users")])
+        for name in self._extra_sections:
+            rows.insert(-1, [self._button(self._t.t(f"admin.{name}"), name)])
         return BotScreen(self._t.t("admin.title"), InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def gateway_screen(self, admin: User) -> BotScreen:
@@ -121,10 +177,75 @@ class AdminBotUi:
 
     async def clear_prompt(self, admin: User) -> None:
         self._authorize(admin)
+        active = await self._store.get("admin-credit-active", str(admin.id))
+        if active is not None:
+            await self._store.delete("admin-credit-confirm", f"{admin.id}:{active['nonce']}")
+            await self._store.delete("admin-credit-active", str(admin.id))
         await self._store.delete("admin-credit", str(admin.id))
+        for section in self._sections:
+            if section is not None:
+                await section.clear_prompt(admin)
+
+    async def handle_navigation(self, text: str, admin: User) -> BotScreen | None:
+        """Dispatch management labels before active identity/customer input.
+
+        New management sections extend this hook and ``handle`` for callbacks;
+        ``handle_text`` remains reserved for active management input.
+        """
+        self._authorize(admin)
+        navigation = [
+            ("admin.gateways", "gateways"),
+            ("admin.credit", "wallet_adjust" if self._wallet_ui else "credit"),
+        ]
+        if self._users_ui is not None:
+            navigation.append(("admin.users", "users"))
+        if self._wallet_ui is not None:
+            navigation.append(("admin.wallet_adjust", "wallet_adjust"))
+        navigation.extend((f"admin.{name}", name) for name in self._extra_sections)
+        for key, screen in navigation:
+            if any(text.strip() == get_catalog(loc).table[key] for loc in (Locale.FA, Locale.EN)):
+                await self.clear_prompt(admin)
+                return await self.handle(Callback("admin", screen), admin)
+        return None
 
     async def handle(self, cb: Callback, admin: User) -> BotScreen:
         self._authorize(admin)
+        if self._wallet_ui is not None and cb.screen == "credit":
+            cb = Callback("admin", "wallet_adjust")
+        if self._wallet_ui is not None and cb.screen == "apply":
+            return BotScreen(self._t.t("nav.expired"), self.menu(admin).keyboard)
+        if cb.screen in {
+            "users",
+            "u_search",
+            "u_page",
+            "u_profile",
+            "u_status",
+            "wallet_adjust",
+            "w_target",
+            "payments",
+            "p_search",
+            "p_pending",
+            "p_review",
+            "p_all",
+            "p_page",
+            "p_profile",
+            "reports",
+            "r_week",
+            "r_month",
+            "services",
+            "s_reason",
+            "sales",
+            "c_page",
+            "c_offer",
+            "c_reason",
+            "health",
+            "h_failed",
+            "messages",
+        }:
+            await self.clear_prompt(admin)
+        for section in self._sections:
+            if section is not None and (screen := await section.handle(cb, admin)) is not None:
+                return screen
         if cb.screen in {"menu", "gateways"}:
             await self.clear_prompt(admin)
         if cb.screen == "gateways":
@@ -133,6 +254,7 @@ class AdminBotUi:
             await self._gateways.set_enabled(admin, cb.args[0], cb.args[1] == "on")
             return await self.gateway_screen(admin)
         if cb.screen == "credit":
+            await self.clear_prompt(admin)
             await self._store.put(
                 "admin-credit", str(admin.id), {"step": "target"}, ttl_seconds=self._ttl
             )
@@ -140,10 +262,12 @@ class AdminBotUi:
         if cb.screen == "cancel":
             if len(cb.args) == 1:
                 await self._store.delete("admin-credit-confirm", f"{admin.id}:{cb.args[0]}")
-            else:
-                await self._store.delete("admin-credit", str(admin.id))
+            await self.clear_prompt(admin)
             return self.menu(admin)
         if cb.screen == "apply" and len(cb.args) == 1:
+            active = await self._store.get("admin-credit-active", str(admin.id))
+            if active is None or active.get("nonce") != cb.args[0]:
+                return BotScreen(self._t.t("nav.expired"), self.menu(admin).keyboard)
             record = await self._store.get("admin-credit-confirm", f"{admin.id}:{cb.args[0]}")
             if record is None:
                 return BotScreen(self._t.t("nav.expired"), self.menu(admin).keyboard)
@@ -183,6 +307,14 @@ class AdminBotUi:
 
     async def handle_text(self, text: str, admin: User) -> BotScreen | None:
         self._authorize(admin)
+        for section in self._sections:
+            if (
+                section is not None
+                and (screen := await section.handle_text(text, admin)) is not None
+            ):
+                return screen
+        if self._wallet_ui is not None:
+            return None
         pending = await self._store.get("admin-credit", str(admin.id))
         if pending is None:
             return None
@@ -237,6 +369,9 @@ class AdminBotUi:
             record = {**pending, "reason": text.strip()}
             await self._store.put(
                 "admin-credit-confirm", f"{admin.id}:{nonce}", record, ttl_seconds=self._ttl
+            )
+            await self._store.put(
+                "admin-credit-active", str(admin.id), {"nonce": nonce}, ttl_seconds=self._ttl
             )
             await self._store.delete("admin-credit", str(admin.id))
             keyboard = InlineKeyboardMarkup(

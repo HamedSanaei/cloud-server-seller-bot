@@ -64,7 +64,7 @@ INQUIRY = {
     "requiresManualDelivery": False,
     "createdAt": "2026-08-05T21:38:56.329Z",
 }
-VERIFY = {**INQUIRY, "status": "confirmed", "paid": True}
+VERIFY = {**INQUIRY, "status": "confirmed", "paid": True, "actualReceivedAmountToman": 259739}
 
 
 def adapter(payload: dict[str, Any], requests: list[httpx.Request]) -> AtlasPayGateway:
@@ -166,6 +166,8 @@ async def test_accepted_underpayment_never_automatically_settles(state: str) -> 
         {"requiresManualDelivery": None},
         {"actualReceivedAmountToman": 200000},
         {"actualReceivedAmountToman": -1},
+        {"actualReceivedAmountToman": None},
+        {"actualReceivedAmountToman": 0},
         {"totalAmountToman": 259739.0},
     ],
 )

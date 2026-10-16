@@ -28,8 +28,10 @@ one CHARGE ledger entry. The key is deterministic per (server, period):
     renewal-charge:<server_id>:<period-start-date>
 
 so two workers, ten passes, or a crash-and-rerun can never double-charge.
-Concurrency is settled in PostgreSQL (row lock on ``renewals`` + the hold's
-unique idempotency key), never in Redis.
+Concurrency is settled in PostgreSQL: a unique financial receipt settles each
+period once, then a compare-and-swap period advance prevents stale replicas
+from rewinding a newer term. No repository read claims to retain a row lock
+across the separate financial transaction.
 
 The renewal amount is ``record.customer_price_minor`` — the LOCAL price the
 customer bought at. It is never re-derived from a current provider quote (§27).
@@ -55,6 +57,14 @@ from cloud_platform.modules.businesslog.domain import (
 )
 from cloud_platform.modules.businesslog.events import service_renewal_event
 from cloud_platform.modules.compute.domain import CloudServer, ServerRepository
+from cloud_platform.modules.funding.domain import (
+    FundingError,
+    FundingPurpose,
+    FundingSource,
+    ProviderCostSnapshot,
+    expense_operation_key,
+)
+from cloud_platform.modules.funding.service import FundingService
 from cloud_platform.modules.renewals.domain import (
     PAYABLE_STATUSES,
     RenewalKind,
@@ -262,6 +272,7 @@ class RenewalNowOutcome:
     period_end: datetime | None = None
     grace_until: datetime | None = None
     auto_renew_enabled: bool = True
+    funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
 
 
 def renewal_charge_key(server_id: UUID, period: datetime) -> str:
@@ -297,6 +308,7 @@ class RenewalChecker:
         admin_notifier: RenewalAdminNotifier | None = None,
         event_sink: BusinessEventSink | None = None,
         clock: Callable[[], datetime] | None = None,
+        funding_service: FundingService | None = None,
     ) -> None:
         self._renewals = renewals_repo
         self._log = notification_repo
@@ -310,6 +322,7 @@ class RenewalChecker:
         self._admin_notifier = admin_notifier or _LoggingRenewalAdminNotifier()
         self._events = event_sink
         self._now = clock or (lambda: datetime.now(UTC))
+        self._funding = funding_service
 
     @property
     def policy(self) -> CommerceRenewalPolicy:
@@ -339,6 +352,7 @@ class RenewalChecker:
     # ------------------------------------------------------------------
 
     async def _check(self, record: RenewalRecord) -> RenewalCheckOutcome:
+        record = await self._renewals.get(record.server_id) or record
         now = self._now()
         if record.provider_renewal_at is None:
             # No known due instant: nothing to bill against. The customer price
@@ -350,6 +364,20 @@ class RenewalChecker:
         server = await self._servers.get(record.server_id)
         if server is None:
             return RenewalCheckOutcome(record.server_id, "skipped")
+        if record.funding_source is not server.funding_source:
+            return RenewalCheckOutcome(record.server_id, "funding_review_required")
+        if server.funding_source is FundingSource.OPERATOR:
+            # The running term remains valid after revocation. A new term must
+            # pass the authoritative reserve check and produce a real expense.
+            if not record.auto_charge_enabled:
+                return RenewalCheckOutcome(record.server_id, "renewal_due")
+            hours_left = (renewal_at - now).total_seconds() / 3600
+            if renewal_at > now and not self._policy.charge_window_open(hours_left):
+                return RenewalCheckOutcome(record.server_id, "skipped")
+            outcome = await self._settle(record, server, 0, renewal_at, period)
+            if outcome.action != "charged":
+                return RenewalCheckOutcome(record.server_id, "operator_authorization_required")
+            return outcome
         balance = await self._wallet_balance(server)
         remaining = renewal_at - now
         hours_left = remaining.total_seconds() / 3600.0
@@ -407,14 +435,15 @@ class RenewalChecker:
             if record.grace_until is None:
                 record.grace_until = renewal_at + timedelta(hours=self._policy.grace_period_hours)
                 record.last_checked_at = self._now()
-                await self._renewals.upsert(record)
+                await self._renewals.advance_period(record, renewal_at)
             return
         if record.status is not RenewalStatus.ACTIVE:
             return
         record.status = RenewalStatus.PAYMENT_DUE
         record.grace_until = renewal_at + timedelta(hours=self._policy.grace_period_hours)
         record.last_checked_at = self._now()
-        await self._renewals.upsert(record)
+        if not await self._renewals.advance_period(record, renewal_at):
+            return
         metrics.record_billing_event("renewal_due", "flagged")
         await self._raise_customer(record, server, balance, RenewalKind.RENEWAL_DUE, 0, period)
 
@@ -431,7 +460,10 @@ class RenewalChecker:
         if record.status is not RenewalStatus.SUSPENDED:
             record.status = RenewalStatus.SUSPENDED
             record.last_checked_at = self._now()
-            await self._renewals.upsert(record)
+            if record.provider_renewal_at is None or not await self._renewals.advance_period(
+                record, record.provider_renewal_at
+            ):
+                return RenewalCheckOutcome(record.server_id, "skipped", balance)
             metrics.record_billing_event("renewal_suspended", "flagged")
         if first:
             # The customer is told the truth: the service is suspended
@@ -470,11 +502,24 @@ class RenewalChecker:
         if not await self._charge(record, server, period):
             return RenewalCheckOutcome(record.server_id, "grace_retry", balance)
         next_renewal = renewal_at + MONTH_PERIOD
+        advanced = replace(
+            record,
+            provider_renewal_at=next_renewal,
+            status=RenewalStatus.ACTIVE,
+            grace_until=None,
+            last_checked_at=self._now(),
+        )
+        if not await self._renewals.advance_period(advanced, renewal_at):
+            current = await self._renewals.get(record.server_id)
+            if current is None or current.provider_renewal_at is None:
+                return RenewalCheckOutcome(record.server_id, "grace_retry", balance)
+            record.provider_renewal_at = current.provider_renewal_at
+            record.status = current.status
+            return RenewalCheckOutcome(record.server_id, "charged", balance)
         record.provider_renewal_at = next_renewal
         record.status = RenewalStatus.ACTIVE
         record.grace_until = None
-        record.last_checked_at = self._now()
-        await self._renewals.upsert(record)
+        record.last_checked_at = advanced.last_checked_at
         first = await self._log.record(server.id, RenewalKind.CHARGED, period)
         if first:
             await self._user_notifier.charged(
@@ -543,6 +588,7 @@ class RenewalChecker:
                 amount_minor=record.customer_price_minor,
                 currency=record.currency,
                 auto_renew_enabled=record.auto_charge_enabled,
+                funding_source=record.funding_source,
             )
         renewal_at = _aware(record.provider_renewal_at)
         now = self._now()
@@ -557,6 +603,7 @@ class RenewalChecker:
             period_end=renewal_at,
             grace_until=_aware(record.grace_until) if record.grace_until else None,
             auto_renew_enabled=record.auto_charge_enabled,
+            funding_source=record.funding_source,
         )
         if record.status not in PAYABLE_STATUSES:
             # No early renewal: only a due/grace/suspended period may be settled.
@@ -572,12 +619,28 @@ class RenewalChecker:
         server = await self._servers.get(server_id)
         if server is None:
             return replace(base, reason="no_renewal_record")
-        wallet = await self._wallets.get(server.user_id)
-        balance = wallet.balance if wallet is not None else 0
-        already = await self._period_captured(server_id, wallet, period)
+        if record.funding_source is not server.funding_source:
+            return replace(base, reason="manual_review_required")
+        base = replace(base, funding_source=server.funding_source)
+        if server.funding_source is FundingSource.OPERATOR:
+            wallet = None
+            balance = 0
+            already = (
+                self._funding is not None
+                and await self._funding.get_expense(
+                    expense_operation_key(renewal_charge_key(server_id, period))
+                )
+                is not None
+            )
+        else:
+            wallet = await self._wallets.get(server.user_id)
+            balance = wallet.balance if wallet is not None else 0
+            already = await self._period_captured(server_id, wallet, period)
 
         outcome = await self._settle(record, server, balance, renewal_at, period)
         if outcome.action != "charged":
+            if server.funding_source is FundingSource.OPERATOR:
+                return replace(base, reason="operator_authorization_required")
             metrics.record_billing_event("renewal_manual", "insufficient")
             return replace(base, reason="insufficient_funds")
         reason = "already_charged" if already else "charged"
@@ -592,6 +655,7 @@ class RenewalChecker:
             period_end=_aware(record.provider_renewal_at or renewal_at),
             grace_until=None,
             auto_renew_enabled=record.auto_charge_enabled,
+            funding_source=server.funding_source,
         )
 
     async def _period_captured(self, server_id: UUID, wallet: object, period: datetime) -> bool:
@@ -618,6 +682,8 @@ class RenewalChecker:
 
     async def _charge(self, record: RenewalRecord, server: CloudServer, period: datetime) -> bool:
         """Exactly-once period debit. True when the renewal is paid for."""
+        if server.funding_source is FundingSource.OPERATOR:
+            return await self._fund_operator_period(record, server, period)
         wallet = await self._wallets.get(server.user_id)
         if wallet is None or wallet.id is None:
             return False
@@ -651,6 +717,54 @@ class RenewalChecker:
             logger.exception("renewal capture failed for server %s", record.server_id)
             return False
         return True
+
+    async def _fund_operator_period(
+        self, record: RenewalRecord, server: CloudServer, period: datetime
+    ) -> bool:
+        if (
+            self._funding is None
+            or server.funding_operator_id != server.user_id
+            or record.funding_source is not FundingSource.OPERATOR
+            or record.funding_operator_id != server.user_id
+            or record.provider_cost_snapshot is None
+            or not (
+                server.provider_server_id
+                and (record.provider_order_ref or record.provider_contract_id)
+            )
+        ):
+            return False
+        key = renewal_charge_key(server.id, period)
+        try:
+            snapshot = ProviderCostSnapshot.from_dict(record.provider_cost_snapshot)
+            grant = await self._funding.get_grant(key)
+            if grant is None:
+                grant = await self._funding.reserve(
+                    owner_id=server.user_id,
+                    operator_id=server.user_id,
+                    operation_key=key,
+                    resource_key=f"server:{server.id}:period:{period.isoformat()}",
+                    purpose=FundingPurpose.MONTHLY_RENEW,
+                    nominal_amount_minor=record.customer_price_minor,
+                    nominal_currency=record.currency,
+                    provider_cost_snapshot=snapshot,
+                    reason=f"Own monthly renewal of server {server.id} ending {period.isoformat()}",
+                )
+            if (
+                grant.owner_user_id != server.user_id
+                or grant.operator_user_id != server.user_id
+                or grant.purpose is not FundingPurpose.MONTHLY_RENEW
+                or grant.resource_key != f"server:{server.id}:period:{period.isoformat()}"
+                or grant.nominal_amount_minor != record.customer_price_minor
+                or grant.nominal_currency != record.currency
+                or grant.provider_cost_snapshot != snapshot
+            ):
+                return False
+            expense = await self._funding.settle(grant)
+            receipt = await self._funding.get_expense(expense_operation_key(key))
+            return receipt == expense and expense.grant_id == grant.id
+        except FundingError:
+            logger.warning("operator renewal authorization or receipt rejected for %s", server.id)
+            return False
 
     # ------------------------------------------------------------------
     # Notifications
@@ -836,5 +950,7 @@ class RenewalChecker:
     # ------------------------------------------------------------------
 
     async def _wallet_balance(self, server: CloudServer) -> int:
+        if server.funding_source is FundingSource.OPERATOR:
+            return 0
         wallet = await self._wallets.get(server.user_id)
         return wallet.balance if wallet is not None else 0

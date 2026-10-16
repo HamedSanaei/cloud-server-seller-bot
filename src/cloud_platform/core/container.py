@@ -318,6 +318,8 @@ class Container:
 
         settings = get_settings()
         return CreateServerService(
+            funding_service=self.funding_service(),
+            operator_billing=self.prepaid_hourly_billing_service(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             account_repo=SqlAlchemyProviderAccountRepository(self.session_factory),
             catalog_repo=self.catalog_repository(),
@@ -446,6 +448,17 @@ class Container:
             SqlAlchemyLedgerRepository(self.session_factory),
         )
 
+    def funding_service(self) -> Any:
+        """Fresh configured RBAC grants corporate coverage without a wallet."""
+        from cloud_platform.modules.funding.repository import SqlAlchemyOperatorFundingRepository
+        from cloud_platform.modules.funding.service import FundingService
+
+        return FundingService(
+            SqlAlchemyOperatorFundingRepository(
+                self.session_factory, configured_ids=get_settings().telegram_superadmin_user_ids
+            )
+        )
+
     def monthly_checkout_service(self) -> Any:
         """The financially safe monthly checkout command (LEASEWEB-MVP)."""
         from cloud_platform.modules.checkout.service import MonthlyCheckoutService
@@ -460,6 +473,7 @@ class Container:
         )
 
         return MonthlyCheckoutService(
+            funding_service=self.funding_service(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             offers_repo=self.sellable_offer_repository(),
             account_repo=SqlAlchemyProviderAccountRepository(self.session_factory),
@@ -491,6 +505,7 @@ class Container:
         from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 
         return OfferCatalogViewService(
+            funding_service=self.funding_service(),
             offers_repo=self.sellable_offer_repository(),
             provider_registry=self.provider_registry,
             wallet_repo=SqlAlchemyWalletRepository(self.session_factory),
@@ -786,6 +801,8 @@ class Container:
         from cloud_platform.modules.wallet.repository import SqlAlchemyHoldRepository
 
         return OrderSettlementService(
+            funding_service=self.funding_service(),
+            renewal_repo=self.renewal_repository(),
             wallet_repo=self.wallet_repository(),
             hold_repo=SqlAlchemyHoldRepository(self.session_factory),
             hold_service=self.hold_service(),
@@ -795,6 +812,177 @@ class Container:
             audit_repo=self.audit_repository(),
             create_attempts=self.create_account_attempt_repository(),
         )
+
+    def admin_user_service(self) -> Any:
+        from cloud_platform.modules.admin_console.users import AdminUserService
+
+        return AdminUserService(
+            user_repo=self.user_repository(),
+            wallet_repo=self.wallet_repository(),
+            server_repo=self.server_repository(),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+        )
+
+    def admin_wallet_adjustment_service(self, fx_resolver: Any | None = None) -> Any:
+        from cloud_platform.modules.admin_console.wallet import AdminWalletAdjustmentService
+
+        return AdminWalletAdjustmentService(
+            self.user_repository(),
+            self.wallet_repository(),
+            self.wallet_admin_service(),
+            self.session_store(),
+            fx=fx_resolver,
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+            ttl_seconds=get_settings().telegram_sessions_prompt_ttl_seconds,
+        )
+
+    def admin_payment_service(self, gateways: dict[str, Any]) -> Any:
+        from cloud_platform.modules.admin_console.payments import AdminPaymentService
+        from cloud_platform.modules.payments.inquiry import AuthoritativePaymentService
+
+        repo = SqlAlchemyPaymentSessionRepository(self.session_factory)
+        webhook = PaymentWebhookService(
+            payments_repo=repo,
+            wallet_repo=self.wallet_repository(),
+            ledger_repo=self.ledger_repository(),
+            event_sink=self.business_event_sink(),
+            user_repo=self.user_repository(),
+        )
+        return AdminPaymentService(
+            self.user_repository(),
+            repo,
+            AuthoritativePaymentService(
+                payments_repo=repo, webhook_service=webhook, gateways=gateways
+            ),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+        )
+
+    def admin_server_support_service(self) -> Any:
+        from cloud_platform.modules.admin_console.support import AdminServerSupportService
+        from cloud_platform.modules.admin_console.support_repository import (
+            SqlAlchemyAdminSupportRepository,
+        )
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+
+        # Only the DI boundary extracts executors: the facade never impersonates owners.
+        power = self.power_command_service()
+        deletion = self.delete_command_service()
+        return AdminServerSupportService(
+            self.user_repository(),
+            self.server_repository(),
+            SqlAlchemyOperationRepository(self.session_factory),
+            self.provider_registry,
+            self.session_store(),
+            SqlAlchemyAdminSupportRepository(self.session_factory),
+            power_executor=power._executor,
+            delete_executor=deletion._executor,
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+            ttl_seconds=get_settings().telegram_sessions_prompt_ttl_seconds,
+        )
+
+    def admin_sales_service(self) -> Any:
+        from cloud_platform.modules.admin_console.operations import AdminSalesService
+        from cloud_platform.modules.admin_console.read_repository import (
+            SqlAlchemyAdminReadRepository,
+        )
+        from cloud_platform.modules.admin_console.sales_repository import (
+            SqlAlchemyAdminSalesRepository,
+        )
+        from cloud_platform.modules.compute.repository import SqlAlchemyMaintenanceSwitchRepository
+        from cloud_platform.modules.compute.service import MaintenanceSwitchService
+
+        return AdminSalesService(
+            self.user_repository(),
+            self.sellable_offer_repository(),
+            self.offer_admin_service(),
+            MaintenanceSwitchService(
+                SqlAlchemyMaintenanceSwitchRepository(self.session_factory), self.audit_repository()
+            ),
+            SqlAlchemyAdminReadRepository(self.session_factory),
+            self.session_store(),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+            ttl_seconds=get_settings().telegram_sessions_prompt_ttl_seconds,
+            mutations=SqlAlchemyAdminSalesRepository(
+                self.session_factory, catalog_currency=get_settings().fx_catalog_pricing_currency
+            ),
+        )
+
+    def admin_health_service(self) -> Any:
+        from cloud_platform.modules.admin_console.operations import AdminHealthService
+        from cloud_platform.modules.admin_console.read_repository import (
+            SqlAlchemyAdminReadRepository,
+        )
+        from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+
+        return AdminHealthService(
+            self.user_repository(),
+            SqlAlchemyOperationRepository(self.session_factory),
+            SqlAlchemyAdminReadRepository(
+                self.session_factory, dependency_probe=self.admin_dependency_health
+            ),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+        )
+
+    async def admin_dependency_health(self) -> dict[str, str]:
+        """Bounded internal read-only probes; never return connection details."""
+        import httpx
+        from redis.asyncio import Redis
+
+        settings = get_settings()
+        result: dict[str, str] = {}
+        redis = Redis.from_url(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        try:
+            await redis.ping()
+            result["redis"] = "ready"
+        except Exception:
+            result["redis"] = "unready"
+        finally:
+            await redis.aclose()
+        if settings.app_env == "production":
+            try:
+                async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+                    response = await client.get("http://api:8000/health/ready")
+                    result["api"] = "ready" if response.status_code == 200 else "unready"
+            except Exception:
+                result["api"] = "unready"
+        return result
+
+    def admin_reports_service(self) -> Any:
+        from cloud_platform.modules.admin_console.report_repository import (
+            SqlAlchemyAdminReportRepository,
+        )
+        from cloud_platform.modules.admin_console.reports import AdminReportsService
+
+        return AdminReportsService(
+            self.user_repository(),
+            SqlAlchemyAdminReportRepository(self.session_factory),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+        )
+
+    def admin_messaging_repository(self) -> Any:
+        from cloud_platform.modules.admin_console.messaging_repository import (
+            SqlAlchemyAdminMessagingRepository,
+        )
+
+        return SqlAlchemyAdminMessagingRepository(
+            self.session_factory, configured_ids=get_settings().telegram_superadmin_user_ids
+        )
+
+    def admin_messaging_service(self) -> Any:
+        from cloud_platform.modules.admin_console.messaging import AdminMessagingService
+
+        return AdminMessagingService(
+            self.user_repository(),
+            self.admin_messaging_repository(),
+            self.session_store(),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+            ttl_seconds=get_settings().telegram_sessions_prompt_ttl_seconds,
+        )
+
+    def admin_messaging_worker(self, sender: Any) -> Any:
+        from cloud_platform.modules.admin_console.messaging import AdminMessagingWorker
+
+        return AdminMessagingWorker(self.admin_messaging_repository(), sender, batch_size=20)
 
     def admin_wallet_service(self) -> Any:
         from cloud_platform.modules.wallet.admin import AdminWalletService
@@ -815,12 +1003,15 @@ class Container:
             SqlAlchemyServerPriceSnapshotRepository,
         )
 
-        resolver = self.fx_resolver_or_none()
-        if resolver is None or not get_settings().fx_allow_usdt_proxy_for_settlement:
-            raise RuntimeError(
-                "IRT prepaid billing requires explicit domestic USD proxy settlement"
-            )
+        # Corporate receipts never require a personal wallet or domestic FX.
+        # The customer path validates its FX policy at the actual charge boundary.
+        resolver = (
+            self.fx_resolver_or_none()
+            if get_settings().fx_allow_usdt_proxy_for_settlement
+            else None
+        )
         return PrepaidHourlyBillingService(
+            funding_service=self.funding_service(),
             server_repo=self.server_repository(),
             wallet_repo=self.wallet_repository(),
             ledger_repo=self.ledger_repository(),
@@ -853,15 +1044,9 @@ class Container:
             SqlAlchemyWalletRepository,
         )
 
-        settings = get_settings()
-        prepaid_billing = (
-            self.prepaid_hourly_billing_service()
-            if settings.fx_enabled
-            and settings.fx_domestic_enabled
-            and settings.fx_allow_usdt_proxy_for_settlement
-            else None
-        )
+        prepaid_billing = self.prepaid_hourly_billing_service()
         return HourlyCloudService(
+            funding_service=self.funding_service(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             prepaid_billing=prepaid_billing,
             period_repo=SqlAlchemyPrepaidHourlyPeriodRepository(self.session_factory),
@@ -918,6 +1103,7 @@ class Container:
         )
 
         return OrderWorker(
+            funding_service=self.funding_service(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             offers_repo=self.sellable_offer_repository(),
             orders_repo=self.provider_order_repository(),
@@ -947,6 +1133,7 @@ class Container:
         )
 
         return OrderReconciler(
+            settlement=self.order_settlement_service(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             offers_repo=self.sellable_offer_repository(),
             orders_repo=self.provider_order_repository(),
@@ -1006,6 +1193,7 @@ class Container:
         )
 
         return OrderManualResolutionService(
+            settlement=self.order_settlement_service(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             offers_repo=self.sellable_offer_repository(),
             orders_repo=self.provider_order_repository(),
@@ -1033,6 +1221,7 @@ class Container:
         )
 
         return RenewalChecker(
+            funding_service=self.funding_service(),
             renewals_repo=self.renewal_repository(),
             notification_repo=self.renewal_notification_repository(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
@@ -1150,6 +1339,7 @@ class Container:
         on gateway keys.
         """
         from cloud_platform.providers.atlaspay.client import AtlasPayGateway
+        from cloud_platform.providers.nowpayments.client import NowPaymentsGateway
         from cloud_platform.providers.tetraminator.client import TetraminatorGateway
         from cloud_platform.providers.zarinpal.client import ZarinPalGateway
 
@@ -1170,11 +1360,22 @@ class Container:
                 timeout_seconds=settings.tetraminator_timeout_seconds,
                 require_https_callback=(settings.app_env or "").strip().lower() == "production",
             )
-        if settings.atlaspay_enabled and settings.atlaspay_api_key:
+        if settings.atlaspay_api_key and settings.atlaspay_api_key.strip() != "CHANGE_ME":
             gateways[AtlasPayGateway.key] = AtlasPayGateway(
                 api_key=settings.atlaspay_api_key,
                 base_url=settings.atlaspay_base_url,
                 timeout_seconds=settings.atlaspay_timeout_seconds,
+            )
+        # Register configured adapters independently of creation policy: old
+        # invoices must remain queryable after an operator disables new orders.
+        if settings.nowpayments_api_key and settings.nowpayments_api_key.strip() != "CHANGE_ME":
+            gateways[NowPaymentsGateway.key] = NowPaymentsGateway(
+                api_key=settings.nowpayments_api_key,
+                base_url=settings.nowpayments_base_url,
+                callback_url=settings.nowpayments_callback_url,
+                auth_email=settings.nowpayments_auth_email,
+                auth_password=settings.nowpayments_auth_password,
+                timeout_seconds=settings.nowpayments_timeout_seconds,
             )
         return gateways
 
@@ -1220,7 +1421,16 @@ class Container:
             configured_keys,
             configured_ids=get_settings().telegram_superadmin_user_ids,
             user_repo=self.user_repository(),
+            gateway_defaults=self.payment_gateway_defaults(),
         )
+
+    @staticmethod
+    def payment_gateway_defaults() -> dict[str, bool]:
+        settings = get_settings()
+        return {
+            "atlaspay": settings.atlaspay_enabled,
+            "nowpayments": settings.nowpayments_enabled,
+        }
 
     def payment_inquiry_service(self, gateways: dict[str, Any]) -> Any:
         from cloud_platform.modules.payments.inquiry import PaymentInquiryService
@@ -1275,6 +1485,8 @@ class Container:
             user_repo=self.user_repository(),
             fx_resolver=fx_resolver,
             gateway_settings=self.gateway_settings_repository(),
+            gateway_defaults=self.payment_gateway_defaults(),
+            configured_ids=get_settings().telegram_superadmin_user_ids,
         )
 
     def fx_config(self) -> Any:
@@ -1436,6 +1648,7 @@ class Container:
         from cloud_platform.modules.wallet.repository import SqlAlchemyHoldRepository
 
         return AccrualJob(
+            operator_billing=self.prepaid_hourly_billing_service(),
             server_repo=self.server_repository(),
             wallet_repo=self.wallet_repository(),
             hold_repo=SqlAlchemyHoldRepository(self.session_factory),
@@ -1558,6 +1771,7 @@ class Container:
         holds = SqlAlchemyHoldRepository(self.session_factory)
         hold_service = self.hold_service()
         final_charge = FinalChargeService(
+            operator_billing=self.prepaid_hourly_billing_service(),
             server_repo=SqlAlchemyServerRepository(self.session_factory),
             wallet_repo=wallets,
             hold_repo=holds,
@@ -2124,3 +2338,25 @@ async def get_payment_webhook_service() -> PaymentWebhookService:
         event_sink=container.business_event_sink(),
         user_repo=container.user_repository(),
     )
+
+
+async def get_nowpayments_callback_service() -> Any:
+    """Native IPNs only schedule provider-authoritative durable reconciliation."""
+    from cloud_platform.modules.payments.inquiry import AuthoritativePaymentService
+    from cloud_platform.modules.payments.nowpayments import NowPaymentsCallbackService
+
+    container = await get_container()
+    repo = SqlAlchemyPaymentSessionRepository(container.session_factory)
+    gateways = container.payment_gateways()
+    # API dependency lifetime owns these per-request HTTP transports.
+    try:
+        yield NowPaymentsCallbackService(
+            payments_repo=repo,
+            authoritative_service=AuthoritativePaymentService(
+                payments_repo=repo,
+                webhook_service=await get_payment_webhook_service(),
+                gateways=gateways,
+            ),
+        )
+    finally:
+        await container.aclose_gateways(gateways)

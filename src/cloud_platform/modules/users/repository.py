@@ -291,6 +291,16 @@ class SqlAlchemyUserRepository:
                 return UserStatus(metadata["status"])
             if target is None:
                 raise UserNotFound(f"User with id {user_id} not found")
+            if admin_configured_ids is not None and (
+                user_id == actor_id
+                or _attr(target, "role") == Role.ADMIN.value
+                or _attr(target, "telegram_user_id") in admin_configured_ids
+            ):
+                from cloud_platform.modules.users.domain import PermissionDeniedError
+
+                raise PermissionDeniedError(
+                    "administrator identities cannot be blocked from the panel"
+                )
             cast(Any, target).status = status.value
             session.add(
                 SQLAlchemyAuditEvent(

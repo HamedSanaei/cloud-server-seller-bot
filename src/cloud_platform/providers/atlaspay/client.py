@@ -182,8 +182,7 @@ class AtlasPayGateway(CapabilityGatedGateway):
             state in _SUCCEEDED
             and payload["paid"]
             and not payload["requiresManualDelivery"]
-            and received is not None
-            and received < total
+            and (received is None or received <= 0 or received < total)
         ):
             raise ProviderError("AtlasPay full-payment evidence conflicts with received amount")
         if state in _FAILED:

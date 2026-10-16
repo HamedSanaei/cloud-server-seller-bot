@@ -80,6 +80,13 @@ class FakeRenewalRepo:
         self.saved.append(record)
         return record
 
+    async def advance_period(self, record: RenewalRecord, expected_period_end: datetime) -> bool:
+        current = self.records.get(record.server_id)
+        if current is None or current.provider_renewal_at != expected_period_end:
+            return False
+        await self.upsert(record)
+        return True
+
     async def lock_for_update(self, server_id: UUID) -> RenewalRecord | None:
         """The production adapter takes a real row lock; the fake only counts."""
         self.locks += 1
@@ -558,6 +565,8 @@ class TestManualSettlement:
         await checker.settle_now(SERVER_ID)
         record.provider_renewal_at = now  # roll the period back
         record.status = RenewalStatus.PAYMENT_DUE
+
+        await checker._renewals.upsert(record)  # simulate the pre-advance persisted row
 
         again = await checker.settle_now(SERVER_ID)
         assert again.reason == "already_charged"

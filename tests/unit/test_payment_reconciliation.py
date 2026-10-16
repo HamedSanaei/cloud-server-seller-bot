@@ -273,7 +273,7 @@ async def test_unbound_atlas_attempts_do_not_starve_bounded_pending_scan() -> No
                 "status": "confirmed",
                 "paid": True,
                 "totalAmountToman": 259739,
-                "actualReceivedAmountToman": None,
+                "actualReceivedAmountToman": 259739,
                 "requiresManualDelivery": False,
                 "createdAt": "2026-08-05T21:38:56.329Z",
             },

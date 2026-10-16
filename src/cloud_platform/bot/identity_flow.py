@@ -34,6 +34,14 @@ class IdentityFlow:
         self._ttl = ttl_seconds
         self._t = Translator()
 
+    async def clear_prompt(self, user: User) -> None:
+        """Cancel only the input challenge, never persisted identity facts."""
+        if user.id is not None:
+            await self._store.delete("identity", str(user.id))
+
+    async def has_prompt(self, user: User) -> bool:
+        return user.id is not None and await self._store.get("identity", str(user.id)) is not None
+
     async def begin(self, message: Message, user: User, resume: str) -> bool:
         if user.id is None:
             return False

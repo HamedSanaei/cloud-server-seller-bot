@@ -378,6 +378,19 @@ api_key = "CHANGE_ME"  # pragma: allowlist secret
 base_url = "https://api.atlaspay.space/api/v1"
 timeout_seconds = 30
 
+[payments.nowpayments]
+# Hosted USD invoice: the customer chooses crypto on the provider's page.
+# Secrets belong ONLY in the server-owned/private configuration, never git.
+# Disabling creation does not stop inquiry/settlement of existing invoices.
+enabled = false
+api_key = "CHANGE_ME"  # pragma: allowlist secret
+auth_email = "merchant@example.com"
+auth_password = "CHANGE_ME"  # pragma: allowlist secret
+ipn_secret = "CHANGE_ME"  # pragma: allowlist secret
+base_url = "https://api.nowpayments.io/v1"
+callback_url = "https://example.com/webhooks/payments/nowpayments"
+timeout_seconds = 30
+
 # ---------------------------------------------------------------------------
 # Currency / FX resolution (platform-level, provider-neutral)
 #

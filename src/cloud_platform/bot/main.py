@@ -35,6 +35,7 @@ from cloud_platform.backup.job import BackupError, PostgresBackupJob, build_back
 from cloud_platform.bot.admin_ui import AdminBotUi
 from cloud_platform.bot.health import PollingHeartbeat
 from cloud_platform.bot.identity_flow import IdentityFlow
+from cloud_platform.bot.identity_ui import is_identity_cancel
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
 from cloud_platform.bot.ui import BotScreen, BotUi, code_entities
 from cloud_platform.core.config import get_settings
@@ -104,9 +105,10 @@ async def _show_main_menu(
         await message.answer(_t.t("admin.denied"))
         return
     user = await _resolve_user(container, message.from_user)
-    if is_superadmin(user, _configured_superadmins()):
-        await message.answer(_t.t("menu.title"), reply_markup=monthly_ui.reply_keyboard(user))
-    screen = monthly_ui.menu_screen(user)
+    # Reinstall Telegram's persistent keyboard even after a role revocation.
+    actor = user if is_superadmin(user, _configured_superadmins()) else None
+    screen = monthly_ui.menu_screen(actor)
+    await message.answer(screen.text, reply_markup=monthly_ui.reply_keyboard(actor))
     text = f"{_t.t('greeting.start')}\n\n{screen.text}" if include_greeting else screen.text
     await message.answer(text, reply_markup=screen.keyboard)
 
@@ -245,16 +247,112 @@ def register_handlers(
     fallback that lands every unmatched update on the main menu.
     """
 
-    async def clear_admin_prompt(message: Message) -> None:
-        if admin_ui is not None and (admin := await _super_admin(message, container)) is not None:
+    async def clear_admin_navigation(admin: User) -> None:
+        if admin_ui is not None:
             await admin_ui.clear_prompt(admin)
+        clearer = getattr(monthly_ui, "clear_transient_input", None)
+        if clearer is not None:
+            await clearer(admin)
+        if identity_flow is not None:
+            await identity_flow.clear_prompt(admin)
+
+    async def prepare_root(message: Message) -> bool:
+        try:
+            admin = await _super_admin(message, container)
+            if admin is not None:
+                await clear_admin_navigation(admin)
+            return True
+        except SessionStoreUnavailable:
+            await message.answer(_t.t("servers.err_retry"))
+            return False
+
+    async def show_admin_root(
+        message: Message, admin: User, *, notice_key: str | None = None
+    ) -> None:
+        await clear_admin_navigation(admin)
+        await message.answer(
+            _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(admin)
+        )
+        screen = monthly_ui.menu_screen(admin)
+        text = f"{_t.t(notice_key)}\n\n{screen.text}" if notice_key else screen.text
+        await message.answer(text, reply_markup=screen.keyboard)
 
     async def show_admin_menu(message: Message, admin: User) -> None:
-        assert admin_ui is not None
-        await admin_ui.clear_prompt(admin)
+        await clear_admin_navigation(admin)
+        if admin_ui is None:
+            await show_admin_root(message, admin, notice_key="admin.denied")
+            return
         screen = admin_ui.menu(admin)
         await message.answer(screen.text, reply_markup=admin_ui.reply_keyboard(admin))
         await message.answer(screen.text, reply_markup=screen.keyboard)
+
+    async def handle_admin_text(message: Message, admin: User) -> bool:
+        """Route a Super Admin's reply-keyboard text to the admin console.
+
+        Returns True when a screen was emitted. The root console preempts the
+        identity/verification flow for admins so a stale prompt cannot swallow
+        a management action; verified identity facts are never cleared.
+        """
+        assert message.text is not None
+        root_keys = (
+            "admin.create_server",
+            "admin.renew_server",
+            "menu.buy",
+            "menu.servers",
+            "menu.support",
+            "menu.admin",
+            "nav.menu",
+            "nav.back",
+            "nav.cancel",
+            "menu.wallet",
+            "menu.recharge",
+        )
+        if any(_button_matches(message.text, key) for key in root_keys) or is_identity_cancel(
+            message.text
+        ):
+            await clear_admin_navigation(admin)
+        if _button_matches(message.text, "admin.create_server") or _button_matches(
+            message.text, "menu.buy"
+        ):
+            await message.answer(
+                _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(admin)
+            )
+            screen = await monthly_ui.markets_screen()
+            await message.answer(screen.text, reply_markup=screen.keyboard)
+            return True
+        if _button_matches(message.text, "admin.renew_server") or _button_matches(
+            message.text, "menu.servers"
+        ):
+            await message.answer(
+                _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(admin)
+            )
+            screen = await monthly_ui.servers_screen(admin)
+            await message.answer(screen.text, reply_markup=screen.keyboard)
+            return True
+        if _button_matches(message.text, "menu.support"):
+            await message.answer(
+                _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(admin)
+            )
+            screen = monthly_ui.support_screen()
+            await message.answer(screen.text, reply_markup=screen.keyboard)
+            return True
+        if _button_matches(message.text, "menu.admin"):
+            await show_admin_menu(message, admin)
+            return True
+        if any(
+            _button_matches(message.text, key) for key in ("nav.menu", "nav.back", "nav.cancel")
+        ) or is_identity_cancel(message.text):
+            await show_admin_root(message, admin)
+            return True
+        if _button_matches(message.text, "menu.wallet") or _button_matches(
+            message.text, "menu.recharge"
+        ):
+            await show_admin_root(message, admin, notice_key="admin.no_personal_wallet")
+            return True
+        if message.text.startswith("/"):
+            await show_admin_root(message, admin)
+            return True
+        return False
 
     async def private_message(message: Message) -> bool:
         if _trusted_sender(message):
@@ -266,10 +364,18 @@ def register_handlers(
     async def _start(message: Message) -> None:
         if not await private_message(message):
             return
-        await clear_admin_prompt(message)
+        if not await prepare_root(message):
+            return
         user = await _resolve_user(container, message.from_user)
-        await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard(user))
-        screen = monthly_ui.menu_screen(user)
+        if is_superadmin(user, _configured_superadmins()):
+            await message.answer(
+                _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(user)
+            )
+            screen = monthly_ui.menu_screen(user)
+            await message.answer(screen.text, reply_markup=screen.keyboard)
+            return
+        await message.answer(_t.t("greeting.start"), reply_markup=monthly_ui.reply_keyboard(None))
+        screen = monthly_ui.menu_screen(None)
         await message.answer(screen.text, reply_markup=screen.keyboard)
 
     @dp.message(Command("admin_credit"))
@@ -283,7 +389,7 @@ def register_handlers(
     @dp.message(Command("admin"))
     async def _admin_command(message: Message) -> None:
         admin = await _super_admin(message, container)
-        if admin is None or admin_ui is None:
+        if admin is None:
             if _trusted_sender(message):
                 await message.answer(
                     _t.t("admin.denied"), reply_markup=monthly_ui.reply_keyboard(None)
@@ -291,22 +397,28 @@ def register_handlers(
             else:
                 await message.answer(_t.t("admin.denied"))
             return
-        await show_admin_menu(message, admin)
+        try:
+            await show_admin_menu(message, admin)
+        except SessionStoreUnavailable:
+            await message.answer(_t.t("servers.err_retry"))
 
     @dp.message(Command("menu"))
     async def _menu(message: Message) -> None:
         if not await private_message(message):
             return
-        await clear_admin_prompt(message)
+        if not await prepare_root(message):
+            return
         await _show_main_menu(message, container=container, monthly_ui=monthly_ui)
 
     @dp.message(Command("help"))
     async def _help(message: Message) -> None:
         if not await private_message(message):
             return
-        await clear_admin_prompt(message)
+        if not await prepare_root(message):
+            return
         user = await _resolve_user(container, message.from_user)
-        await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard(user))
+        actor = user if is_superadmin(user, _configured_superadmins()) else None
+        await message.answer(_t.t("greeting.help"), reply_markup=monthly_ui.reply_keyboard(actor))
 
     @dp.message()
     async def _fallback(message: Message) -> None:
@@ -320,16 +432,6 @@ def register_handlers(
             return
         user = await _resolve_user(container, message.from_user)
         try:
-            if identity_flow is not None and user is not None:
-                handled, resume = await identity_flow.handle(message, user)
-                if handled:
-                    if resume is not None:
-                        user = await _resolve_user(container, message.from_user)
-                        screen = await monthly_ui.handle(resume, user=user, chat_id=message.chat.id)
-                        if screen is None:
-                            screen = await ui.handle(resume, user=user, chat_id=message.chat.id)
-                        await message.answer(screen.text, reply_markup=screen.keyboard)
-                    return
             admin = await _super_admin(message, container)
             if (
                 admin is None
@@ -339,40 +441,66 @@ def register_handlers(
                     for key in ("menu.admin", "admin.credit", "admin.gateways")
                 )
             ):
-                # Telegram keeps reply keyboards until explicitly replaced.
-                # A revoked actor must not retain stale management controls.
                 await message.answer(
                     _t.t("admin.denied"), reply_markup=monthly_ui.reply_keyboard(None)
                 )
                 return
-            if admin_ui is not None and admin is not None and message.text:
-                navigation = any(
-                    _button_matches(message.text, key)
-                    for key in (
-                        "menu.buy",
-                        "menu.servers",
-                        "menu.wallet",
-                        "menu.recharge",
-                        "menu.support",
-                        "nav.menu",
-                    )
-                )
-                if _button_matches(message.text, "menu.admin"):
-                    await show_admin_menu(message, admin)
+            if admin is not None and message.text:
+                # The Super Admin root console (and its sub-flows) preempt the
+                # identity/verification flow so a stale prompt cannot swallow a
+                # management action. Verified identity facts are untouched.
+                if await handle_admin_text(message, admin):
                     return
-                if navigation:
-                    await admin_ui.clear_prompt(admin)
-                    screen = None
-                elif _button_matches(message.text, "admin.gateways"):
-                    await admin_ui.clear_prompt(admin)
-                    screen = await admin_ui.gateway_screen(admin)
-                elif _button_matches(message.text, "admin.credit"):
-                    screen = await admin_ui.handle(Callback("admin", "credit"), admin)
-                else:
-                    screen = await admin_ui.handle_text(message.text, admin)
-                if screen is not None:
-                    await message.answer(screen.text, reply_markup=screen.keyboard)
+                if admin_ui is not None:
+                    navigator = getattr(admin_ui, "handle_navigation", None)
+                    screen = await navigator(message.text, admin) if navigator is not None else None
+                    if screen is None and _button_matches(message.text, "admin.gateways"):
+                        await admin_ui.clear_prompt(admin)
+                        screen = await admin_ui.gateway_screen(admin)
+                    elif screen is None and _button_matches(message.text, "admin.credit"):
+                        screen = await admin_ui.handle(Callback("admin", "credit"), admin)
+                    if screen is None:
+                        screen = await admin_ui.handle_text(message.text, admin)
+                    if screen is not None:
+                        if identity_flow is not None:
+                            await identity_flow.clear_prompt(admin)
+                        clearer = getattr(monthly_ui, "clear_transient_input", None)
+                        if clearer is not None:
+                            await clearer(admin)
+                        await message.answer(
+                            _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(admin)
+                        )
+                        await message.answer(screen.text, reply_markup=screen.keyboard)
+                        return
+            if identity_flow is not None and user is not None:
+                handled, resume = await identity_flow.handle(message, user)
+                if handled:
+                    if resume is not None:
+                        user = await _resolve_user(container, message.from_user)
+                        if admin is not None:
+                            actor = user if is_superadmin(user, _configured_superadmins()) else None
+                            await message.answer(
+                                _t.t("admin.root_title"),
+                                reply_markup=monthly_ui.reply_keyboard(actor),
+                            )
+                        screen = await monthly_ui.handle(resume, user=user, chat_id=message.chat.id)
+                        if screen is None:
+                            screen = await ui.handle(resume, user=user, chat_id=message.chat.id)
+                        await message.answer(screen.text, reply_markup=screen.keyboard)
+                    elif admin is not None and not await identity_flow.has_prompt(admin):
+                        await show_admin_root(message, admin)
                     return
+            if admin is not None:
+                if message.text and not message.text.startswith("/"):
+                    cancel_wallet = getattr(monthly_ui, "cancel_custom_amount", None)
+                    if cancel_wallet is not None:
+                        await cancel_wallet(admin)
+                    screen = await monthly_ui.handle_text(message.text, admin)
+                    if screen is not None:
+                        await message.answer(screen.text, reply_markup=screen.keyboard)
+                        return
+                await show_admin_root(message, admin)
+                return
         except SessionStoreUnavailable:
             await message.answer(_t.t("servers.err_retry"))
             return
@@ -385,6 +513,7 @@ def register_handlers(
                 screen = await monthly_ui.handle_text(message.text, user)
             except SessionStoreUnavailable:
                 logger.error("telegram session store unavailable; refusing text input")
+                await message.answer(_t.t("servers.err_retry"))
                 return
             if screen is not None:
                 await message.answer(screen.text, reply_markup=screen.keyboard)
@@ -434,7 +563,7 @@ def register_handlers(
         if cb is not None and isinstance(query.message, Message):
             try:
                 if cb.flow == "admin":
-                    if admin_ui is None or not is_superadmin(user, _configured_superadmins()):
+                    if not is_superadmin(user, _configured_superadmins()):
                         await query.message.answer(
                             _t.t("admin.denied"), reply_markup=monthly_ui.reply_keyboard(None)
                         )
@@ -457,23 +586,48 @@ def register_handlers(
                         await query.answer(_t.t("admin.denied"), show_alert=True)
                         return
                     assert isinstance(current, User)
+                    if admin_ui is None:
+                        await show_admin_root(query.message, current, notice_key="admin.denied")
+                        await query.answer(_t.t("admin.denied"), show_alert=True)
+                        return
+                    clearer = getattr(monthly_ui, "clear_transient_input", None)
+                    if clearer is not None:
+                        await clearer(current)
+                    if identity_flow is not None:
+                        await identity_flow.clear_prompt(current)
                     admin_screen = await admin_ui.handle(cb, current)
-                    if cb.screen == "menu":
-                        await query.message.answer(
-                            admin_screen.text, reply_markup=admin_ui.reply_keyboard(current)
-                        )
+                    await query.message.answer(
+                        _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(current)
+                    )
                     await query.message.edit_text(
                         admin_screen.text, reply_markup=admin_screen.keyboard
                     )
                     await query.answer()
                     return
-                if admin_ui is not None and is_superadmin(user, _configured_superadmins()):
+                if is_superadmin(user, _configured_superadmins()):
                     assert user is not None
-                    await admin_ui.clear_prompt(user)
-                    if cb.flow == "main" and cb.screen == "menu":
+                    await clear_admin_navigation(user)
+                    if cb.flow in {"wallet", "recharge"}:
+                        # A stale customer wallet/top-up button must never open
+                        # a personal wallet screen for a superadmin.
                         await query.message.answer(
-                            _t.t("menu.title"), reply_markup=monthly_ui.reply_keyboard(user)
+                            _t.t("admin.no_personal_wallet"),
+                            reply_markup=monthly_ui.reply_keyboard(user),
                         )
+                        menu = monthly_ui.menu_screen(user)
+                        await query.message.answer(menu.text, reply_markup=menu.keyboard)
+                        await query.answer()
+                        return
+                    if cb.flow != "main" or cb.screen != "menu":
+                        await query.message.answer(
+                            _t.t("admin.root_title"), reply_markup=monthly_ui.reply_keyboard(user)
+                        )
+                if cb.flow == "main" and cb.screen == "menu":
+                    actor = user if is_superadmin(user, _configured_superadmins()) else None
+                    await query.message.answer(
+                        monthly_ui.menu_screen(actor).text,
+                        reply_markup=monthly_ui.reply_keyboard(actor),
+                    )
                 purchase = (
                     (
                         cb.flow == "store"
@@ -501,9 +655,18 @@ def register_handlers(
         # dead end.
         try:
             screen = await monthly_ui.handle(data, user=user, chat_id=chat_id)
+            if cb is not None and cb.flow == "main" and cb.screen == "menu":
+                actor = user if is_superadmin(user, _configured_superadmins()) else None
+                screen = monthly_ui.menu_screen(actor)
             if screen is None:
                 if _is_foreign_callback(data):
-                    menu = monthly_ui.menu_screen(user)
+                    actor = user if is_superadmin(user, _configured_superadmins()) else None
+                    if actor is not None:
+                        await clear_admin_navigation(actor)
+                    menu = monthly_ui.menu_screen(actor)
+                    await query.message.answer(
+                        menu.text, reply_markup=monthly_ui.reply_keyboard(actor)
+                    )
                     screen = BotScreen(
                         f"{_t.t('nav.expired')}\n\n{menu.text}",
                         menu.keyboard,
@@ -586,6 +749,14 @@ async def main() -> None:
         users=container.user_repository(),
         wallets=container.wallet_repository(),
         wallet_admin=container.wallet_admin_service(),
+        user_admin=container.admin_user_service(),
+        wallet_adjustments=container.admin_wallet_adjustment_service(fx_resolver=fx_resolver),
+        services=container.admin_server_support_service(),
+        sales=container.admin_sales_service(),
+        health=container.admin_health_service(),
+        messaging=container.admin_messaging_service(),
+        payments=container.admin_payment_service(gateways),
+        reports=container.admin_reports_service(),
         store=container.session_store(),
         ttl_seconds=settings.telegram_sessions_prompt_ttl_seconds,
         configured_ids=settings.telegram_superadmin_user_ids,

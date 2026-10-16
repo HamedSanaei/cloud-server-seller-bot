@@ -9,12 +9,15 @@ from decimal import Decimal, localcontext
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import AccrualPeriod as _AccrualPeriodModel
 from cloud_platform.db.base import LedgerEntry as _LedgerEntryModel
+from cloud_platform.db.base import OperatorExpense as _OperatorExpenseModel
+from cloud_platform.db.base import OperatorFundingCutover as _OperatorCutoverModel
+from cloud_platform.db.base import OperatorFundingGrant as _OperatorGrantModel
 from cloud_platform.db.base import PrepaidHourlyPeriod as _PrepaidModel
 from cloud_platform.db.base import Server as _ServerModel
 from cloud_platform.modules.billing.service import (
@@ -23,7 +26,9 @@ from cloud_platform.modules.billing.service import (
     PrepaidHourlyPeriod,
     PrepaidHourlyPeriodStatus,
 )
+from cloud_platform.modules.funding import FundingSource, expense_operation_key
 from cloud_platform.modules.fx.domain import ConversionSnapshot
+from cloud_platform.modules.hourly.domain import OperatorHourlyCutoverCoverage
 
 _ACCRUAL_LOCK_KEY = 777_005
 
@@ -359,10 +364,17 @@ def _prepaid_domain(row: _PrepaidModel) -> PrepaidHourlyPeriod:
         period_start=start,
         period_end=end,
         usd_minor=int(row.usd_minor),
-        irt_minor=int(row.irt_minor),
-        fx_snapshot=ConversionSnapshot.from_dict(dict(row.fx_snapshot)),
+        irt_minor=int(row.irt_minor) if row.irt_minor is not None else None,
+        fx_snapshot=ConversionSnapshot.from_dict(dict(row.fx_snapshot))
+        if row.fx_snapshot is not None
+        else None,
         idempotency_key=str(row.idempotency_key),
         status=PrepaidHourlyPeriodStatus(_attr(row, "status")),
+        funding_source=FundingSource(_attr(row, "funding_source") or "customer_wallet"),
+        funding_operator_id=_attr(row, "funding_operator_id"),
+        operator_grant_id=_attr(row, "operator_grant_id"),
+        operator_expense_id=_attr(row, "operator_expense_id"),
+        nominal_currency=_attr(row, "nominal_currency") or "USD",
     )
 
 
@@ -376,6 +388,10 @@ def _same_prepaid(a: PrepaidHourlyPeriod, b: PrepaidHourlyPeriod) -> bool:
         and a.irt_minor == b.irt_minor
         and a.fx_snapshot == b.fx_snapshot
         and a.idempotency_key == b.idempotency_key
+        and a.funding_source == b.funding_source
+        and a.funding_operator_id == b.funding_operator_id
+        and a.operator_grant_id == b.operator_grant_id
+        and a.nominal_currency == b.nominal_currency
     )
 
 
@@ -386,6 +402,42 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
         self, session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]]
     ) -> None:
         self._session_factory = session_factory
+
+    async def get_operator_cutover_coverage(
+        self, server_id: UUID
+    ) -> OperatorHourlyCutoverCoverage | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(_OperatorCutoverModel)
+                    .where(_OperatorCutoverModel.server_id == server_id)
+                    .order_by(
+                        _OperatorCutoverModel.effective_at.desc(), _OperatorCutoverModel.id.desc()
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            data = _attr(row, "cutover_metadata")
+            coverage = data.get("coverage") if isinstance(data, dict) else None
+            if coverage is None:
+                return None
+            if not isinstance(coverage, dict):
+                raise ValueError("operator cutover coverage metadata must be a mapping")
+            try:
+                return OperatorHourlyCutoverCoverage(
+                    server_id=server_id,
+                    operator_id=_attr(row, "operator_user_id"),
+                    period_start=datetime.fromisoformat(coverage["period_start"]),
+                    period_end=datetime.fromisoformat(coverage["period_end"]),
+                    grant_operation_key=coverage["grant_operation_key"],
+                    expense_operation_key=coverage["expense_operation_key"],
+                    grant_id=UUID(coverage["grant_id"]),
+                    expense_id=UUID(coverage["expense_id"]),
+                )
+            except (KeyError, ValueError, TypeError) as exc:
+                raise ValueError("operator cutover coverage metadata is invalid") from exc
 
     async def get(self, server_id: UUID, start: datetime) -> PrepaidHourlyPeriod | None:
         if start.utcoffset() is None:
@@ -408,12 +460,29 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
                 (
                     await session.execute(
                         select(_PrepaidModel)
-                        .join(
+                        .outerjoin(
                             _LedgerEntryModel,
                             (_LedgerEntryModel.wallet_id == _PrepaidModel.wallet_id)
                             & (_LedgerEntryModel.idempotency_key == _PrepaidModel.idempotency_key),
                         )
-                        .where(_PrepaidModel.status == PrepaidHourlyPeriodStatus.PENDING.value)
+                        .outerjoin(
+                            _OperatorExpenseModel,
+                            _OperatorExpenseModel.grant_id == _PrepaidModel.operator_grant_id,
+                        )
+                        .where(
+                            _PrepaidModel.status == PrepaidHourlyPeriodStatus.PENDING.value,
+                            or_(
+                                and_(
+                                    _PrepaidModel.funding_source
+                                    == FundingSource.CUSTOMER_WALLET.value,
+                                    _LedgerEntryModel.id.is_not(None),
+                                ),
+                                and_(
+                                    _PrepaidModel.funding_source == FundingSource.OPERATOR.value,
+                                    _OperatorExpenseModel.id.is_not(None),
+                                ),
+                            ),
+                        )
                         .order_by(_PrepaidModel.server_id, _PrepaidModel.period_start)
                     )
                 )
@@ -433,6 +502,10 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
                     or existing.usd_minor != period.usd_minor
                     or existing.idempotency_key != period.idempotency_key
                     or existing.period_end != period.period_end
+                    or existing.funding_source != period.funding_source
+                    or existing.funding_operator_id != period.funding_operator_id
+                    or existing.operator_grant_id != period.operator_grant_id
+                    or existing.nominal_currency != period.nominal_currency
                 ):
                     raise ValueError("conflicting prepaid hourly binding")
             return existing
@@ -445,9 +518,16 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
                     period_end=period.period_end.replace(tzinfo=None),
                     usd_minor=period.usd_minor,
                     irt_minor=period.irt_minor,
-                    fx_snapshot=period.fx_snapshot.to_dict(),
+                    fx_snapshot=period.fx_snapshot.to_dict()
+                    if period.fx_snapshot is not None
+                    else None,
                     idempotency_key=period.idempotency_key,
                     status=PrepaidHourlyPeriodStatus.PENDING.value,
+                    funding_source=period.funding_source.value,
+                    funding_operator_id=period.funding_operator_id,
+                    operator_grant_id=period.operator_grant_id,
+                    operator_expense_id=None,
+                    nominal_currency=period.nominal_currency,
                 )
             )
             try:
@@ -462,6 +542,10 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
                     or winner.usd_minor != period.usd_minor
                     or winner.idempotency_key != period.idempotency_key
                     or winner.period_end != period.period_end
+                    or winner.funding_source != period.funding_source
+                    or winner.funding_operator_id != period.funding_operator_id
+                    or winner.operator_grant_id != period.operator_grant_id
+                    or winner.nominal_currency != period.nominal_currency
                 ):
                     raise ValueError("conflicting prepaid hourly binding") from None
                 return winner
@@ -492,6 +576,66 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
             ).scalar_one_or_none()
             if server is None or row is None or not _same_prepaid(_prepaid_domain(row), period):
                 raise ValueError("prepaid coverage cannot advance against a changed FX binding")
+            if period.funding_source is FundingSource.OPERATOR:
+                if (
+                    _attr(server, "funding_source") != FundingSource.OPERATOR.value
+                    or _attr(server, "funding_operator_id") != _attr(server, "user_id")
+                    or period.funding_operator_id != _attr(server, "user_id")
+                    or period.operator_expense_id is None
+                    or (
+                        _attr(row, "operator_expense_id") is not None
+                        and _attr(row, "operator_expense_id") != period.operator_expense_id
+                    )
+                ):
+                    raise ValueError(
+                        "corporate coverage must agree with persisted self-owned source"
+                    )
+                grant = (
+                    await session.execute(
+                        select(_OperatorGrantModel).where(
+                            _OperatorGrantModel.id == period.operator_grant_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                expense = (
+                    await session.execute(
+                        select(_OperatorExpenseModel).where(
+                            _OperatorExpenseModel.id == period.operator_expense_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if (
+                    grant is None
+                    or expense is None
+                    or grant.state != "settled"
+                    or grant.operation_key != period.idempotency_key
+                    or grant.resource_key != str(period.server_id)
+                    or grant.purpose != "hourly_usage"
+                    or grant.owner_user_id != period.funding_operator_id
+                    or grant.operator_user_id != period.funding_operator_id
+                    or grant.nominal_amount_minor != period.usd_minor
+                    or grant.nominal_currency != period.nominal_currency
+                    or expense.grant_id != grant.id
+                    or expense.operation_key != expense_operation_key(grant.operation_key)
+                    or any(
+                        getattr(expense, field) != getattr(grant, field)
+                        for field in (
+                            "owner_user_id",
+                            "operator_user_id",
+                            "resource_key",
+                            "purpose",
+                            "nominal_amount_minor",
+                            "nominal_currency",
+                            "provider_cost_snapshot",
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "corporate coverage requires a coherent immutable expense receipt"
+                    )
+                cast(Any, row).operator_expense_id = period.operator_expense_id
+            elif _attr(server, "funding_source") not in (None, FundingSource.CUSTOMER_WALLET.value):
+                raise ValueError("customer coverage cannot advance after operator cutover")
             current = _aware_or_none(_attr(server, "prepaid_paid_until"))
             if current is not None and current != period.period_start:
                 if current == period.period_end and row.status == PrepaidHourlyPeriodStatus.PAID:

@@ -32,6 +32,7 @@ Safety properties:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -45,7 +46,8 @@ from cloud_platform.modules.payments.domain import (
     session_credit_amount,
     session_credit_currency,
 )
-from cloud_platform.modules.users.domain import Role
+from cloud_platform.modules.users.domain import Role, UserStatus
+from cloud_platform.modules.users.superadmins import validate_telegram_user_ids
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +184,8 @@ class WalletRechargeService:
         user_repo: object | None = None,
         fx_resolver: Any | None = None,
         gateway_settings: Any | None = None,
+        gateway_defaults: Mapping[str, bool] | None = None,
+        configured_ids: tuple[int, ...] = (),
     ) -> None:
         merged: dict[str, RechargeGateway] = dict(gateways or {})
         if gateway is not None:
@@ -190,16 +194,19 @@ class WalletRechargeService:
         self._payments = payments_repo
         self._events = event_sink
         self._users = user_repo
+        self._configured_ids = validate_telegram_user_ids(configured_ids)
         # Optional platform FX resolver (credit -> settlement conversion).
         # Owned by the process (like the gateway collection): this service
         # never closes it.
         self._fx = fx_resolver
         self._gateway_settings = gateway_settings
+        self._gateway_defaults = dict(gateway_defaults or {})
 
     async def _enabled(self, key: str) -> bool:
         if self._gateway_settings is None:
-            return True
-        return await self._gateway_settings.get(key) is not False
+            return self._gateway_defaults.get(key, True)
+        override = await self._gateway_settings.get(key)
+        return self._gateway_defaults.get(key, True) if override is None else override
 
     @property
     def gateway_key(self) -> str:
@@ -506,7 +513,19 @@ class WalletRechargeService:
         """Create (or replay) one pending top-up session."""
         if user is None or getattr(user, "id", None) is None:
             raise RechargeError("a persisted user id is required")
-        if getattr(user, "role", None) == Role.ADMIN:
+        if self._users is not None:
+            persisted = await self._users.get(user.id)
+            if (
+                persisted is None
+                or persisted.status != UserStatus.ACTIVE
+                or persisted.telegram_user_id != getattr(user, "telegram_user_id", None)
+            ):
+                raise RechargeError("an active matching persisted identity is required")
+            user = persisted
+        if (
+            getattr(user, "role", None) == Role.ADMIN
+            or getattr(user, "telegram_user_id", None) in self._configured_ids
+        ):
             raise RechargeAdminForbiddenError("administrator self-top-up is forbidden")
         if type(amount_minor) is not int or not 0 < amount_minor <= 2**63 - 1:
             raise RechargeAmountError("amount must be a positive signed int64 of minor units")
@@ -536,7 +555,27 @@ class WalletRechargeService:
                 ):
                     raise RechargeError("recharge replay does not match its original owner/credit")
                 if not existing.gateway_payment_id:
-                    raise RechargeError("payment creation outcome is unknown; do not create again")
+                    recover = getattr(candidate, "recover_payment", None)
+                    recovered = (
+                        await recover(amount_minor=existing.amount_minor, merchant_order_ref=key)
+                        if callable(recover)
+                        else None
+                    )
+                    if recovered is None:
+                        raise RechargeError(
+                            "payment creation outcome is unknown; do not create again"
+                        )
+                    if (
+                        recovered.amount_minor != existing.amount_minor
+                        or recovered.currency != existing.currency
+                        or recovered.metadata.get("merchant_order_ref") != key
+                    ):
+                        raise RechargeError("recovered invoice does not match the durable attempt")
+                    existing = await self._payments.save(
+                        existing.with_payment_intent(
+                            recovered.gateway_payment_id, recovered.amount_minor, recovered.metadata
+                        )
+                    )
                 details = await self.payment_details(user=user, session_id=existing.id)
                 return RechargeStart(
                     session=existing,
@@ -714,7 +753,13 @@ class WalletRechargeService:
                     amount_minor=amount_minor,
                     currency=currency,
                     idempotency_key=key,
-                    **(snapshot or {}),
+                    **(
+                        snapshot
+                        or {
+                            "credit_amount_minor": amount_minor,
+                            "credit_currency": currency,
+                        }
+                    ),
                 )
             )
         except DuplicateExternalIdError as exc:

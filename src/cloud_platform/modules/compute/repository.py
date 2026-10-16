@@ -34,6 +34,7 @@ from cloud_platform.modules.compute.domain import (
     ServerCreateIntent,
     ServerLifecycleState,
 )
+from cloud_platform.modules.funding.domain import FundingSource
 
 
 def _attr(row: Any, name: str) -> Any:
@@ -84,6 +85,10 @@ def _to_domain(row: _ServerModel, provider_name: str) -> CloudServer:
             if getattr(row, "offer_fingerprint", None) is not None
             else None
         ),
+        funding_source=FundingSource(
+            getattr(row, "funding_source", None) or FundingSource.CUSTOMER_WALLET.value
+        ),
+        funding_operator_id=getattr(row, "funding_operator_id", None),
     )
 
 
@@ -313,12 +318,22 @@ class SqlAlchemyServerRepository:
         server_id: UUID = server.id
         async with self._session_factory() as session:
             row = (
-                await session.execute(_server_stmt().where(_ServerModel.id == server_id))
+                await session.execute(
+                    _server_stmt()
+                    .where(_ServerModel.id == server_id)
+                    .with_for_update(of=_ServerModel)
+                )
             ).first()
             if row is None:
                 raise LookupError(f"server {server_id} not found")
             server_row, provider_name = row
             cast_any: Any = server_row
+            if (
+                (cast_any.funding_source or FundingSource.CUSTOMER_WALLET.value)
+                != server.funding_source.value
+                or cast_any.funding_operator_id != server.funding_operator_id
+            ):
+                raise ServerCreateError("funding source can change only through audited cutover")
             cast_any.state = server.state.value
             cast_any.contained_from = (
                 server.contained_from.value if server.contained_from is not None else None
@@ -343,6 +358,7 @@ class SqlAlchemyServerRepository:
                 cast_any.offer_fingerprint = (
                     dict(server.offer_fingerprint) if server.offer_fingerprint else None
                 )
+            # Ordinary lifecycle saves never rewrite source or sponsorship.
             await session.commit()
             await session.refresh(server_row)
             return _to_domain(server_row, str(provider_name))
@@ -418,6 +434,8 @@ class SqlAlchemyServerRepository:
                 prepaid_paid_until=server.prepaid_paid_until,
                 prepaid_zero_since=server.prepaid_zero_since,
                 idempotency_key=intent.idempotency_key,
+                funding_source=server.funding_source.value,
+                funding_operator_id=server.funding_operator_id,
             )
             session.add(row)
             try:

@@ -64,6 +64,10 @@ class _Session:
 
     async def execute(self, stmt: Any) -> _Result:
         entity = stmt.column_descriptions[0].get("entity")
+        if entity.__name__ == "User":
+            return _Result(
+                SimpleNamespace(id=self.wallet.user_id, role="user", telegram_user_id=TARGET)
+            )
         if entity.__name__ == "Wallet":
             return _Result(self.wallet if self.wallet_present else None)
         if entity.__name__ == "LedgerEntry":

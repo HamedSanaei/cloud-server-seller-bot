@@ -75,7 +75,15 @@ def gateway_worker(monkeypatch):
         requests.append(request)
         if "atlaspay" in request.url.host:
             assert request.method == "POST" and request.url.path.endswith("/verify")
-            return httpx.Response(200, json={**INQUIRY, "status": "confirmed", "paid": True})
+            return httpx.Response(
+                200,
+                json={
+                    **INQUIRY,
+                    "status": "confirmed",
+                    "paid": True,
+                    "actualReceivedAmountToman": INQUIRY["totalAmountToman"],
+                },
+            )
         assert request.method == "GET"
         return httpx.Response(
             200,
@@ -425,7 +433,9 @@ def prepaid_worker(monkeypatch):
         fx_enabled=True, fx_domestic_enabled=True, fx_allow_usdt_proxy_for_settlement=True
     )
     lifecycle = Lifecycle()
-    billing = SimpleNamespace(run=AsyncMock())
+    from cloud_platform.modules.billing.service import PrepaidHourlyRunReport
+
+    billing = SimpleNamespace(run=AsyncMock(return_value=PrepaidHourlyRunReport()))
     servers, wallets = Servers(), Wallets()
     container = SimpleNamespace(
         initialize=AsyncMock(),
@@ -461,7 +471,7 @@ async def test_disabled_fx_still_enforces_expired_hourly_coverage_only(disabled,
     env = prepaid_worker
     setattr(env.settings, disabled, False)
     await ws.reconcile_prepaid_hourly({})
-    env.billing.run.assert_not_awaited()
+    env.billing.run.assert_awaited_once_with(customer_enabled=False)
     assert env.lifecycle.unpaid == [row.id for row in env.expired]
     assert all(row.state is ServerLifecycleState.STOPPED for row in env.expired)
     assert env.covered.state is env.legacy.state is ServerLifecycleState.RUNNING
@@ -505,6 +515,7 @@ async def test_prepaid_service_report_errors_are_not_a_successful_worker_pass(
     env.billing.run.return_value = SimpleNamespace(
         stop_requested_server_ids=[row.id for row in env.expired],
         errors={env.covered.id: SECRET},
+        operator_suspend_server_ids=[],
     )
     with caplog.at_level(logging.WARNING, logger="cloud_platform.worker.settings"):
         with pytest.raises(ExceptionGroup) as raised:

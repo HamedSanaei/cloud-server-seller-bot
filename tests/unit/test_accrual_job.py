@@ -272,9 +272,21 @@ class Harness:
             reference_type="",
             reference_id="",
             description="",
+            expected_currency=None,
+            expected_customer_server_id=None,
         ):
             if key in self.h.entries:
                 return self.h.wallet, False
+            if expected_currency is not None:
+                assert expected_currency == self.h.wallet.currency
+            if expected_customer_server_id is not None:
+                assert reference_type == "server"
+                assert str(expected_customer_server_id) == reference_id
+                target = next(
+                    (s for s in self.h.servers if s.id == expected_customer_server_id), None
+                )
+                if target is not None and target.funding_source.value != "customer_wallet":
+                    raise ValueError("customer charge requires a customer-funded server")
             if delta < 0:
                 await self.h.debit(user_id, -delta, key)
             else:

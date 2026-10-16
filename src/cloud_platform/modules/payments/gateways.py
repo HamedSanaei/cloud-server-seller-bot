@@ -6,7 +6,7 @@ registered when switched off so existing invoices remain reconcilable.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
@@ -44,11 +44,13 @@ class GatewayManagementService:
         *,
         configured_ids: Iterable[int] = (),
         user_repo: UserRepository | None = None,
+        gateway_defaults: Mapping[str, bool] | None = None,
     ) -> None:
         self._repository = repository
         self._keys = tuple(dict.fromkeys(configured_keys))
         self._configured_ids = validate_telegram_user_ids(tuple(configured_ids))
         self._users = user_repo
+        self._defaults = dict(gateway_defaults or {})
 
     async def _require_admin(self, admin: object) -> UUID:
         actor = require_superadmin(admin, self._configured_ids)
@@ -64,7 +66,10 @@ class GatewayManagementService:
     async def list(self, admin: object) -> list[GatewayAvailability]:
         await self._require_admin(admin)
         overrides = await self._repository.list()
-        return [GatewayAvailability(key, overrides.get(key, True)) for key in self._keys]
+        return [
+            GatewayAvailability(key, overrides.get(key, self._defaults.get(key, True)))
+            for key in self._keys
+        ]
 
     async def set_enabled(self, admin: object, key: str, enabled: bool) -> None:
         actor_id = await self._require_admin(admin)

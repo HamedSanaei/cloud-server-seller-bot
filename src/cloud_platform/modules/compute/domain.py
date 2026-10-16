@@ -7,6 +7,8 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from cloud_platform.modules.funding.domain import FundingSource
+
 
 class ServerLifecycleState(StrEnum):
     REQUESTED = "requested"
@@ -147,6 +149,13 @@ class CloudServer:
     image_id: str | None = None
     #: Immutable checkout contract used to reject stale/replayed creates.
     offer_fingerprint: dict[str, object] | None = None
+    #: Whether this server's provider cost is funded by the platform operator
+    #: (organisation-funded) or by the customer's wallet. Defaults to the
+    #: historical customer-wallet path for every existing server; never
+    #: inferred from a provider name and never accepted from a public payload.
+    funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
+    #: The funding operator's user id when ``funding_source`` is operator.
+    funding_operator_id: UUID | None = None
 
     @property
     def is_prepaid_monthly(self) -> bool:
@@ -161,6 +170,21 @@ class CloudServer:
         if target not in _ALLOWED[self.state]:
             raise ValueError(f"invalid lifecycle transition: {self.state} -> {target}")
         self.state = target
+
+    def mark_operator_suspended(self, *, provider_server_id: str) -> None:
+        """Record proven operator-policy suspension without delivering RUNNING service."""
+        if (
+            self.funding_source is not FundingSource.OPERATOR
+            or self.funding_operator_id != self.user_id
+            or self.is_prepaid_monthly
+            or self.state is not ServerLifecycleState.PROVISIONING
+            or not provider_server_id
+            or self.provider_server_id != provider_server_id
+        ):
+            raise ValueError(
+                "operator suspension requires a self-owned provisioning provider resource"
+            )
+        self.state = ServerLifecycleState.STOPPED
 
     def reset_to_requested(self) -> None:
         """MANUAL resolution only: ERROR -> REQUESTED.

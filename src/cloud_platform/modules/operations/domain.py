@@ -145,6 +145,8 @@ class Operation:
         self.provider_response = dict(correlation)
         if "create_routing" in existing:
             self.provider_response["create_routing"] = existing["create_routing"]
+        if "admin_support" in existing:
+            self.provider_response["admin_support"] = existing["admin_support"]
         self.error = None
 
     def fail(self, error: str) -> None:
@@ -325,6 +327,10 @@ def plan_state_repair(local: ServerLifecycleState, remote: ProviderServerState) 
 
 class OperationRepository(Protocol):
     """Port for the durable operation ledger."""
+
+    async def authorize_admin_support(self, operation: Operation) -> UUID:
+        """Validate persisted configured actor and request proof before dispatch."""
+        ...
 
     async def get_or_create(
         self,

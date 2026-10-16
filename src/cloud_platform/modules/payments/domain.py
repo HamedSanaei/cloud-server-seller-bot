@@ -93,6 +93,15 @@ class PaymentSession:
     created_at: datetime | None = None
     updated_at: datetime | None = None
     payment_details: dict[str, Any] | None = None
+    provider_payment_id: str | None = None
+
+    def bind_provider_payment(self, payment_id: str) -> PaymentSession:
+        """Pin the concrete provider payment independently of its invoice."""
+        if not payment_id or not payment_id.strip():
+            raise ValueError("provider payment id is required")
+        if self.provider_payment_id not in (None, payment_id):
+            raise ValueError("provider payment identity is already bound")
+        return replace(self, provider_payment_id=payment_id)
 
     def __post_init__(self) -> None:
         if type(self.amount_minor) is not int or not 0 < self.amount_minor <= 2**63 - 1:
@@ -186,6 +195,7 @@ class PaymentSession:
             created_at=self.created_at,
             updated_at=self.updated_at,
             payment_details=self.payment_details,
+            provider_payment_id=self.provider_payment_id,
         )
 
     def mark_succeeded(self, *, gateway_payment_id: str) -> PaymentSession:
@@ -214,6 +224,7 @@ class PaymentSession:
             created_at=self.created_at,
             updated_at=self.updated_at,
             payment_details=self.payment_details,
+            provider_payment_id=self.provider_payment_id,
         )
 
     def mark_failed(self, *, gateway_payment_id: str) -> PaymentSession:
@@ -242,6 +253,7 @@ class PaymentSession:
             created_at=self.created_at,
             updated_at=self.updated_at,
             payment_details=self.payment_details,
+            provider_payment_id=self.provider_payment_id,
         )
 
     def mark_manual_review(self) -> PaymentSession:
@@ -279,6 +291,7 @@ class PaymentSession:
             created_at=self.created_at,
             updated_at=self.updated_at,
             payment_details=self.payment_details,
+            provider_payment_id=self.provider_payment_id,
         )
 
 

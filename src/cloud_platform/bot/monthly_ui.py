@@ -62,7 +62,10 @@ from cloud_platform.bot.servers_ui import ServerManagementUi
 from cloud_platform.bot.sessions import CheckoutSelection, CheckoutSessions, ServerSessions
 from cloud_platform.bot.ui import BotScreen
 from cloud_platform.core.i18n import Translator
-from cloud_platform.core.session_store import NS_PROMPT, InMemoryBotSessionStore
+from cloud_platform.core.session_store import (
+    NS_PROMPT,
+    InMemoryBotSessionStore,
+)
 from cloud_platform.modules.checkout.service import (
     CheckoutError,
     CheckoutProviderUnavailableError,
@@ -147,17 +150,38 @@ def recharge_presets(currency: str) -> tuple[int, ...]:
     return RECHARGE_PRESETS_MINOR
 
 
+def build_admin_reply_keyboard(t: Translator) -> ReplyKeyboardMarkup:
+    """Dedicated Super Admin root keyboard: no personal wallet or top-up."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t.t("admin.create_server"))],
+            [
+                KeyboardButton(text=t.t("admin.renew_server")),
+                KeyboardButton(text=t.t("menu.servers")),
+            ],
+            [
+                KeyboardButton(text=t.t("menu.admin")),
+                KeyboardButton(text=t.t("menu.support")),
+            ],
+            [KeyboardButton(text=t.t("nav.menu"))],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def build_main_reply_keyboard(
     t: Translator, user: User | None = None, *, configured_ids: Iterable[int] = ()
 ) -> ReplyKeyboardMarkup:
-    """Persistent menu; administrators manage customers instead of topping up."""
-    admin = is_superadmin(user, configured_ids)
+    """Persistent menu; administrators get the dedicated admin root."""
+    if is_superadmin(user, configured_ids):
+        return build_admin_reply_keyboard(t)
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=t.t("menu.buy")), KeyboardButton(text=t.t("menu.servers"))],
             [
                 KeyboardButton(text=t.t("menu.wallet")),
-                KeyboardButton(text=t.t("menu.admin" if admin else "menu.recharge")),
+                KeyboardButton(text=t.t("menu.recharge")),
             ],
             [KeyboardButton(text=t.t("menu.support")), KeyboardButton(text=t.t("nav.menu"))],
         ],
@@ -321,9 +345,54 @@ class MonthlyBotUi:
 
     # -- main menu ---------------------------------------------------------
 
+    def admin_menu_screen(self, user: User | None = None) -> BotScreen:
+        """The Super Admin root: management navigation, never a personal wallet."""
+        if not is_superadmin(user, self._configured_ids):
+            return self.menu_screen(None)
+        rows = [
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("admin.create_server"),
+                    callback_data=self._callback("store", "market"),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("admin.renew_server"),
+                    callback_data=self._callback("servers", "list"),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("menu.servers"),
+                    callback_data=self._callback("servers", "list"),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("menu.admin"),
+                    callback_data=self._callback("admin", "menu"),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("menu.support"),
+                    callback_data=self._callback("support", "contact"),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=self._t.t("nav.menu"),
+                    callback_data=self._callback("main", "menu"),
+                )
+            ],
+        ]
+        return BotScreen(self._t.t("admin.root_title"), InlineKeyboardMarkup(inline_keyboard=rows))
+
     def menu_screen(self, user: User | None = None) -> BotScreen:
         """The customer main menu; the first entry is the MARKET selector."""
-        admin = is_superadmin(user, self._configured_ids)
+        if is_superadmin(user, self._configured_ids):
+            return self.admin_menu_screen(user)
         rows = [
             [
                 InlineKeyboardButton(
@@ -345,10 +414,8 @@ class MonthlyBotUi:
             ],
             [
                 InlineKeyboardButton(
-                    text=self._t.t("menu.admin" if admin else "menu.recharge"),
-                    callback_data=self._callback("admin", "menu")
-                    if admin
-                    else self._callback("recharge", "amounts"),
+                    text=self._t.t("menu.recharge"),
+                    callback_data=self._callback("recharge", "amounts"),
                 )
             ],
             [
@@ -1215,8 +1282,11 @@ class MonthlyBotUi:
             "store.price_per_month",
             price=await self._price_label(view.monthly_estimate_minor, view.currency),
         )
+        operator_funded = view.funding_source == "operator"
         lines = [
-            self._t.t("store.cloud_confirm_title"),
+            self._t.t(
+                "store.cloud_operator_title" if operator_funded else "store.cloud_confirm_title"
+            ),
             "",
             self._t.t(
                 "store.cloud_confirm_provider",
@@ -1239,12 +1309,20 @@ class MonthlyBotUi:
             "",
             self._t.t("store.cloud_confirm_cost", hourly=hourly, monthly=monthly),
             "",
-            self._t.t("store.cloud_confirm_warning"),
+            self._t.t(
+                "store.cloud_operator_warning" if operator_funded else "store.cloud_confirm_warning"
+            ),
         ]
+        if operator_funded:
+            lines.append(self._t.t("offers.operator_authorization"))
         rows: list[list[InlineKeyboardButton]] = [
             [
                 InlineKeyboardButton(
-                    text=self._t.t("store.cloud_confirm_create"),
+                    text=self._t.t(
+                        "offers.operator_button"
+                        if operator_funded
+                        else "store.cloud_confirm_create"
+                    ),
                     callback_data=encode_telegram_callback(
                         Callback("store", "cloud_buy", (nonce,)), self._key
                     ),
@@ -1473,6 +1551,12 @@ class MonthlyBotUi:
         record = await store.get(NS_PROMPT, str(user.id))
         if record is not None and record.get("kind") == _CUSTOM_AMOUNT_PROMPT:
             await store.delete(NS_PROMPT, str(user.id))
+
+    async def clear_transient_input(self, user: User | None) -> None:
+        """Drop stale input; storage failures must prevent navigation."""
+        if user is None or user.id is None:
+            return
+        await self._sessions._store.delete(NS_PROMPT, str(user.id))
 
     async def custom_amount_screen(self, user: User | None) -> BotScreen:
         """Ask for a wallet-currency amount only after an explicit button click."""
@@ -1863,8 +1947,9 @@ class MonthlyBotUi:
             )
         except Exception:
             return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
+        operator_funded = view.funding_source == "operator"
         lines = [
-            self._t.t("offers.confirm_title"),
+            self._t.t("offers.operator_title" if operator_funded else "offers.confirm_title"),
             self._t.t("offers.confirm_offer", name=view.offer.name),
             self._t.t(
                 "offers.confirm_specs",
@@ -1880,21 +1965,27 @@ class MonthlyBotUi:
             ),
             self._t.t("offers.confirm_location", location=view.offer.location_id),
             self._t.t(
-                "offers.confirm_price",
+                "offers.operator_cost" if operator_funded else "offers.confirm_price",
                 price=await self._price_label(view.offer.monthly_price_minor, view.currency),
             ),
-            self._t.t("offers.confirm_billing"),
-            self._t.t(
-                "offers.confirm_wallet",
-                balance=format_minor(view.balance_minor, view.currency),
-            ),
         ]
-        if not view.sufficient:
+        if operator_funded:
+            lines.append(self._t.t("offers.operator_authorization"))
+        else:
+            lines.append(self._t.t("offers.confirm_billing"))
+            lines.append(
+                self._t.t(
+                    "offers.confirm_wallet", balance=format_minor(view.balance_minor, view.currency)
+                )
+            )
+        if not operator_funded and not view.sufficient:
             lines.append(self._t.t("offers.confirm_insufficient"))
         rows = [
             [
                 InlineKeyboardButton(
-                    text=self._t.t("offers.confirm_button"),
+                    text=self._t.t(
+                        "offers.operator_button" if operator_funded else "offers.confirm_button"
+                    ),
                     callback_data=encode_telegram_callback(
                         Callback("store", "buy", (nonce,)), self._key
                     ),

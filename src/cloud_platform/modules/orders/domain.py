@@ -43,6 +43,8 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from cloud_platform.modules.funding.domain import FundingSource
+
 
 class OrderStatus(StrEnum):
     PENDING_SUBMIT = "pending_submit"  # intent persisted, not yet POSTed
@@ -129,6 +131,10 @@ class ProviderOrder:
     settlement_attempted_at: datetime | None = None
     settlement_attempts: int = 0
     settlement_error: str | None = None
+    funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
+    funding_operator_id: UUID | None = None
+    funding_grant_operation_key: str | None = None
+    provider_cost_snapshot: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not self.operation_key or not self.operation_key.strip():
@@ -289,6 +295,10 @@ class ProviderOrderRepository(Protocol):
         selling_price_minor: int | None = None,
         selling_currency: str | None = None,
         credential_account_id: str | None = None,
+        funding_source: FundingSource = FundingSource.CUSTOMER_WALLET,
+        funding_operator_id: UUID | None = None,
+        funding_grant_operation_key: str | None = None,
+        provider_cost_snapshot: dict[str, object] | None = None,
     ) -> ProviderOrder:
         """Create the PENDING_SUBMIT row (unique per server + key) with the
         order-fact snapshots committed before any provider call.

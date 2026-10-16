@@ -57,6 +57,16 @@ def _to_domain(row: _OperationModel) -> Operation:
 class SqlAlchemyOperationRepository:
     """Durable operation ledger with atomic claims."""
 
+    async def authorize_admin_support(self, operation):
+        from cloud_platform.core.config import get_settings
+        from cloud_platform.modules.admin_console.support_repository import (
+            SqlAlchemyAdminSupportRepository,
+        )
+
+        return await SqlAlchemyAdminSupportRepository(self._session_factory).authorize_dispatch(
+            operation, get_settings().telegram_superadmin_user_ids
+        )
+
     def __init__(
         self,
         session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],

@@ -59,7 +59,98 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "menu.recharge": "⬆️ شارژ حساب",
         "menu.support": "🎧 پشتیبانی",
         "menu.admin": "مدیریت",
+        "admin.root_title": "🛠 پنل مدیر — یکی از گزینه‌ها را انتخاب کنید:",  # noqa: RUF001
+        "admin.create_server": "🖥 ساخت سرور سازمانی",
+        "admin.renew_server": "🔄 تمدید سرور",
+        "admin.no_personal_wallet": (
+            "سوپرادمین کیف پول شخصی ندارد؛ شارژ حساب مشتریان از «مدیریت» انجام می‌شود."
+        ),
         "admin.title": "مدیریت سوپرادمین",
+        "admin.users": "مدیریت کاربران",
+        "admin.payments": "پرداخت‌ها",  # noqa: RUF001
+        "admin.payments_search": "جستجوی فاکتور",
+        "admin.payments_search_prompt": (
+            "UUID فاکتور یا کاربر، شناسه فاکتور یا پرداخت درگاه را وارد کنید (حداکثر 100 نویسه)."
+        ),
+        "admin.payments_pending": "در انتظار پرداخت",
+        "admin.payments_review": "نیازمند بررسی",
+        "admin.payments_all": "همه فاکتورها",
+        "admin.payments_page": "فاکتورهای این صفحه: {count}",
+        "admin.payment_profile": (
+            "فاکتور: {id}\nکاربر: {owner}\nدرگاه: {gateway}\nوضعیت: {status}\n"  # noqa: RUF001
+            "مبلغ پرداخت: {charge}\nاعتبار کیف پول: {credit}\nایجاد: {created}\nشارژ: {credited}"  # noqa: RUF001
+        ),
+        "admin.payment_inquire": "استعلام از درگاه",
+        "admin.payment_inquiry_result": "نتیجه استعلام: {status}",
+        "admin.payment_review_held": (
+            "توقف بررسی دستی همچنان برقرار است؛ این استعلام مجوز شارژ دستی نیست."
+        ),
+        "admin.reports": "گزارش‌ها",  # noqa: RUF001
+        "admin.report_week": "گزارش هفتگی",
+        "admin.report_month": "گزارش ماهانه",
+        "admin.report_title": "گزارش مالی UTC: {start} تا {end}",
+        "admin.report_receipts": "دریافتی تأییدشده از درگاه‌ها",  # noqa: RUF001
+        "admin.report_charges": "درآمد تسویه‌شده خدمات با پرداخت از کیف پول",
+        "admin.report_refunds": "بازپرداخت خدمات به کیف پول",
+        "admin.report_net": "خالص خدمات پرداخت‌شده از کیف پول پس از بازپرداخت",
+        "admin.report_corporate_nominal": "هزینه اسمی سازمان",
+        "admin.report_corporate_native": "هزینه دقیق سازمان نزد ارائه‌دهنده",
+        "admin.report_monthly_orders": "سفارش ماهانه مشتری با تسویه کامل: {count}",
+        "admin.report_separate": (
+            "دریافتی، درآمد و هزینه سازمان جدا هستند و با هم جمع نمی‌شوند؛ مبالغ هر ارز مستقل است."
+        ),
+        "admin.report_empty": "موردی ثبت نشده",
+        "admin.services": "پشتیبانی سرویس‌ها",  # noqa: RUF001
+        "admin.sales": "کنترل فروش",
+        "admin.health": "سلامت سیستم",
+        "admin.messages": "ارسال پیام به کاربران",
+        "admin.support_prompt": "UUID سرور را وارد کنید.",
+        "admin.support_detail": (
+            "سرور {id}\nمالک: {owner}\nارائه‌دهنده: {provider}\nوضعیت: {status}\nIP: {ip}"  # noqa: RUF001
+        ),
+        "admin.support_confirm": "تأیید عملیات {action}\nهدف: {id}\nدلیل: {reason}",  # noqa: RUF001
+        "admin.operation_status": "وضعیت عملیات: {status}",
+        "admin.failed_operations": "عملیات ناموفق (حداکثر 20 مورد)",
+        "admin.message_targets": "شناسه تلگرام 1 تا 100 کاربر، با فاصله یا ویرگول جدا کنید.",
+        "admin.message_body": "متن پیام را بنویسید (حداکثر 3000 نویسه).",
+        "admin.message_confirm": "تأیید ارسال به {count} کاربر\nمتن:\n{body}\nدلیل: {reason}",
+        "admin.message_queued": "پیام در صف پایدار ثبت شد: {id}",
+        "admin.action.power_on": "روشن کردن",
+        "admin.action.power_off": "خاموش کردن",
+        "admin.action.reboot": "راه‌اندازی مجدد",
+        "admin.action.delete": "حذف سرور",
+        "admin.action.show": "فعال کردن فروش",
+        "admin.action.hide": "توقف فروش",
+        "admin.action.set_price": "تعیین قیمت فروش",
+        "admin.price_prompt": (
+            "قیمت فروش را با عدد صحیح مثبت در واحد خرد {currency} وارد کنید. "
+            "برای USD، عدد 125 یعنی 1.25 دلار."
+        ),
+        "admin.action.block_location": "توقف سفارش در این موقعیت",
+        "admin.action.unblock_location": "رفع توقف این موقعیت",
+        "admin.action.block_provider": "توقف سفارش این ارائه‌دهنده",
+        "admin.action.unblock_provider": "رفع توقف ارائه‌دهنده",
+        "admin.users_title": "کاربران: {count} نتیجه در این صفحه",
+        "admin.users_search": "جستجوی کاربر",
+        "admin.users_search_prompt": "شناسه تلگرام یا نام کاربری را بنویسید (حداکثر 100 نویسه).",
+        "admin.user_profile": (
+            "کاربر {tid} — {username}\nوضعیت: {status}\nموجودی: {balance}\nتعداد سرویس: {count}"  # noqa: RUF001
+        ),
+        "admin.user_block": "مسدود کردن",
+        "admin.user_unblock": "رفع مسدودی",
+        "admin.user_status_confirm": "تأیید وضعیت {status} برای کاربر {tid}\nدلیل: {reason}",
+        "admin.user_status_done": "وضعیت ثبت شد: {status}",
+        "admin.confirm_action": "✅ تأیید عملیات",
+        "admin.wallet_adjust": "افزایش یا کاهش اعتبار مشتری",
+        "admin.toman_amount_prompt": (
+            "مبلغ صحیح به تومان؛ مثبت برای افزایش و منفی برای کاهش اعتبار."
+        ),
+        "admin.toman_confirm": (
+            "کاربر {tid}\nمبلغ: {toman} تومان\nتغییر کیف پول: {amount}\n"
+            "نرخ: {rate} — {source}\nزمان نرخ: {observed}\nدلیل: {reason}"  # noqa: RUF001
+        ),
+        "admin.debit_insufficient": "موجودی آزاد برای این کاهش کافی نیست؛ تغییری ثبت نشد.",
+        "admin.fx_unavailable": "نرخ تبدیل معتبر در دسترس نیست؛ دوباره تلاش کنید.",
         "admin.gateways": "مدیریت درگاه‌ها",  # noqa: RUF001
         "admin.credit": "شارژ دستی مشتری",
         "admin.enabled": "روشن",
@@ -69,7 +160,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "admin.target_prompt": "شناسه عددی تلگرام یا UUID مشتری را ارسال کنید.",
         "admin.invalid_target": "مشتری پیدا نشد؛ شارژ حساب سوپرادمین مجاز نیست.",
         "admin.amount_prompt": "مبلغ شارژ را به {currency} وارد کنید (مثلاً 10.50 USD).",
-        "admin.reason_prompt": "دلیل شارژ را بنویسید (حداکثر ۵۰۰ کاراکتر).",  # noqa: RUF001
+        "admin.reason_prompt": "دلیل عملیات را بنویسید (حداکثر ۵۰۰ کاراکتر).",  # noqa: RUF001
         "admin.confirm_credit": "تأیید شارژ",
         "admin.credit_confirm": "مشتری: {user_id}\nمبلغ: {amount}\nدلیل: {reason}",
         "admin.credit_done": "شارژ انجام شد. موجودی فعلی: {balance}",
@@ -111,6 +202,15 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "offers.os_title": "🖥️ انتخاب سیستم‌عامل:",
         "offers.os_row": "{name}",
         "offers.confirm_title": "🧾 تأیید نهایی خرید",
+        "offers.operator_title": "🧾 تأیید ساخت سرور سازمانی",
+        "store.cloud_operator_title": "☁️ مجوز ساخت سرور ساعتی سازمانی",
+        "store.cloud_operator_warning": (
+            "هزینه سازمان تا زمان حذف سرور ادامه دارد؛ "
+            "خاموش کردن، هزینه ارائه‌دهنده را متوقف نمی‌کند."
+        ),
+        "offers.operator_cost": "هزینه ماهانه قرارداد سازمانی: {price}",
+        "offers.operator_authorization": "تأمین هزینه توسط سازمان؛ نیازمند مجوز هزینه اپراتور.",
+        "offers.operator_button": "✅ تأیید مجوز هزینه و ساخت",
         "offers.confirm_offer": "پلن: {name}",
         "offers.confirm_specs": "مشخصات: {vcpu} vCPU / {ram} GB RAM / {disk} GB{traffic}",
         "offers.confirm_os": "سیستم‌عامل: {os}",
@@ -557,7 +657,100 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "menu.recharge": "⬆️ Top up",
         "menu.support": "🎧 Support",
         "menu.admin": "Management",
+        "admin.root_title": "Admin console — pick an option:",
+        "admin.create_server": "🖥 Create organizational server",
+        "admin.renew_server": "🔄 Renew server",
+        "admin.no_personal_wallet": (
+            "A superadmin has no personal wallet; customer top-ups are handled under Management."
+        ),
         "admin.title": "Superadmin management",
+        "admin.users": "Manage users",
+        "admin.payments": "Payments",
+        "admin.payments_search": "Search invoices",
+        "admin.payments_search_prompt": (
+            "Enter invoice or owner UUID, provider invoice or payment ID (100 characters maximum)."
+        ),
+        "admin.payments_pending": "Pending invoices",
+        "admin.payments_review": "Manual review",
+        "admin.payments_all": "All invoices",
+        "admin.payments_page": "Invoices on this page: {count}",
+        "admin.payment_profile": (
+            "Invoice: {id}\nOwner: {owner}\nGateway: {gateway}\nStatus: {status}\n"
+            "Payment: {charge}\nWallet credit: {credit}\nCreated: {created}\nCredited: {credited}"
+        ),
+        "admin.payment_inquire": "Verify with gateway",
+        "admin.payment_inquiry_result": "Inquiry result: {status}",
+        "admin.payment_review_held": (
+            "Manual review remains held; inquiry does not authorize manual credit."
+        ),
+        "admin.reports": "Reports",
+        "admin.report_week": "Weekly report",
+        "admin.report_month": "Monthly report",
+        "admin.report_title": "Financial report UTC: {start} to {end}",
+        "admin.report_receipts": "Verified gateway receipts",
+        "admin.report_charges": "Settled wallet-funded service charges",
+        "admin.report_refunds": "Wallet-funded service refunds",
+        "admin.report_net": "Net wallet-funded service charges after refunds",
+        "admin.report_corporate_nominal": "Corporate nominal expenses",
+        "admin.report_corporate_native": "Exact corporate provider costs",
+        "admin.report_monthly_orders": "Fully settled customer monthly orders: {count}",
+        "admin.report_separate": (
+            "Receipts, customer charges and corporate costs are separate measures; "
+            "currencies are never combined."
+        ),
+        "admin.report_empty": "No entries",
+        "admin.services": "Service support",
+        "admin.sales": "Sales controls",
+        "admin.health": "System health",
+        "admin.messages": "Message users",
+        "admin.support_prompt": "Enter the server UUID.",
+        "admin.support_detail": (
+            "Server {id}\nOwner: {owner}\nProvider: {provider}\nStatus: {status}\nIP: {ip}"
+        ),
+        "admin.support_confirm": "Confirm {action}\nTarget: {id}\nReason: {reason}",
+        "admin.operation_status": "Operation status: {status}",
+        "admin.failed_operations": "Failed operations (up to 20)",
+        "admin.message_targets": "Enter 1 to 100 Telegram IDs separated by spaces or commas.",
+        "admin.message_body": "Enter message text (up to 3000 characters).",
+        "admin.message_confirm": (
+            "Confirm message to {count} users\nText:\n{body}\nReason: {reason}"
+        ),
+        "admin.message_queued": "Message queued durably: {id}",
+        "admin.action.power_on": "Power on",
+        "admin.action.power_off": "Power off",
+        "admin.action.reboot": "Reboot",
+        "admin.action.delete": "Delete server",
+        "admin.action.show": "Enable sales",
+        "admin.action.hide": "Pause sales",
+        "admin.action.set_price": "Set selling price",
+        "admin.price_prompt": (
+            "Enter a positive integer price in {currency} minor units (125 means USD 1.25)."
+        ),
+        "admin.action.block_location": "Block orders at this location",
+        "admin.action.unblock_location": "Unblock location",
+        "admin.action.block_provider": "Block provider orders",
+        "admin.action.unblock_provider": "Unblock provider",
+        "admin.users_title": "Users: {count} results on this page",
+        "admin.users_search": "Search users",
+        "admin.users_search_prompt": "Enter a Telegram ID or username (up to 100 characters).",
+        "admin.user_profile": (
+            "User {tid} — {username}\nStatus: {status}\nBalance: {balance}\nServices: {count}"
+        ),
+        "admin.user_block": "Block user",
+        "admin.user_unblock": "Unblock user",
+        "admin.user_status_confirm": "Confirm {status} for user {tid}\nReason: {reason}",
+        "admin.user_status_done": "Status recorded: {status}",
+        "admin.confirm_action": "✅ Confirm action",
+        "admin.wallet_adjust": "Credit or debit customer",
+        "admin.toman_amount_prompt": "Enter whole Toman: positive to credit, negative to debit.",
+        "admin.toman_confirm": (
+            "User {tid}\nAmount: {toman} Toman\nWallet change: {amount}\n"
+            "Rate: {rate} — {source}\nObserved: {observed}\nReason: {reason}"
+        ),
+        "admin.debit_insufficient": (
+            "Insufficient available balance for this debit; nothing changed."
+        ),
+        "admin.fx_unavailable": "A valid conversion rate is unavailable. Please retry.",
         "admin.gateways": "Manage gateways",
         "admin.credit": "Manual Customer Wallet Credit",
         "admin.enabled": "Enabled",
@@ -567,7 +760,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "admin.target_prompt": "Send the customer's Telegram numeric ID or platform UUID.",
         "admin.invalid_target": "Customer not found; superadmin top-up is not allowed.",
         "admin.amount_prompt": "Enter the credit in {currency} major units (e.g. 10.50 USD).",
-        "admin.reason_prompt": "Enter a reason for the credit (maximum 500 characters).",
+        "admin.reason_prompt": "Enter an operation reason (maximum 500 characters).",
         "admin.confirm_credit": "Confirm credit",
         "admin.credit_confirm": "Customer: {user_id}\nAmount: {amount}\nReason: {reason}",
         "admin.credit_done": "Credit posted. Current balance: {balance}",
@@ -604,6 +797,16 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "offers.os_title": "🖥️ Choose an operating system:",
         "offers.os_row": "{name}",
         "offers.confirm_title": "🧾 Final purchase confirmation",
+        "offers.operator_title": "🧾 Corporate server authorization",
+        "store.cloud_operator_title": "☁️ Corporate hourly server authorization",
+        "store.cloud_operator_warning": (
+            "Corporate expenses continue until deletion; powering off does not stop provider costs."
+        ),
+        "offers.operator_cost": "Monthly corporate contract amount: {price}",
+        "offers.operator_authorization": (
+            "Funded by the organization; operator expense authorization is required."
+        ),
+        "offers.operator_button": "✅ Authorize expense and create",
         "offers.confirm_offer": "Plan: {name}",
         "offers.confirm_specs": "Specs: {vcpu} vCPU / {ram} GB RAM / {disk} GB{traffic}",
         "offers.confirm_os": "Operating system: {os}",

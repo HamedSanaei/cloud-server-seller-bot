@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import ProviderOrder as _ProviderOrderModel
 from cloud_platform.db.timestamps import from_db_utc_or_none, to_db_utc, utc_now
+from cloud_platform.modules.funding.domain import FundingSource
 from cloud_platform.modules.orders.domain import (
     OrderStatus,
     ProviderOrder,
@@ -60,6 +61,10 @@ def _to_domain(row: _ProviderOrderModel) -> ProviderOrder:
         settlement_attempted_at=_attr(row, "settlement_attempted_at"),
         settlement_attempts=int(_attr(row, "settlement_attempts") or 0),
         settlement_error=_attr(row, "settlement_error"),
+        funding_source=FundingSource(row.funding_source),
+        funding_operator_id=row.funding_operator_id,
+        funding_grant_operation_key=row.funding_grant_operation_key,
+        provider_cost_snapshot=row.provider_cost_snapshot,
     )
 
 
@@ -125,6 +130,10 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
         selling_price_minor: int | None = None,
         selling_currency: str | None = None,
         credential_account_id: str | None = None,
+        funding_source: FundingSource = FundingSource.CUSTOMER_WALLET,
+        funding_operator_id: UUID | None = None,
+        funding_grant_operation_key: str | None = None,
+        provider_cost_snapshot: dict[str, object] | None = None,
     ) -> ProviderOrder:
         async with self._session_factory() as session:
             row = _ProviderOrderModel(
@@ -134,6 +143,10 @@ class SqlAlchemyProviderOrderRepository(ProviderOrderRepository):
                 offer_id=offer_id,
                 status=OrderStatus.PENDING_SUBMIT.value,
                 credential_account_id=credential_account_id,
+                funding_source=funding_source.value,
+                funding_operator_id=funding_operator_id,
+                funding_grant_operation_key=funding_grant_operation_key,
+                provider_cost_snapshot=provider_cost_snapshot,
                 product_id=product_id,
                 location_id=location_id,
                 os_name=os_name,

@@ -111,6 +111,14 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("payments", "atlaspay", "api_key"): "atlaspay_api_key",
     ("payments", "atlaspay", "base_url"): "atlaspay_base_url",
     ("payments", "atlaspay", "timeout_seconds"): "atlaspay_timeout_seconds",
+    ("payments", "nowpayments", "enabled"): "nowpayments_enabled",
+    ("payments", "nowpayments", "api_key"): "nowpayments_api_key",
+    ("payments", "nowpayments", "auth_email"): "nowpayments_auth_email",
+    ("payments", "nowpayments", "auth_password"): "nowpayments_auth_password",
+    ("payments", "nowpayments", "ipn_secret"): "nowpayments_ipn_secret",
+    ("payments", "nowpayments", "base_url"): "nowpayments_base_url",
+    ("payments", "nowpayments", "callback_url"): "nowpayments_callback_url",
+    ("payments", "nowpayments", "timeout_seconds"): "nowpayments_timeout_seconds",
     ("security", "provider_credential_encryption_key"): ("provider_credential_encryption_key"),
     ("security", "backup_encryption_key"): "backup_encryption_key",
     ("billing", "price_book_name"): "price_book_name",
@@ -884,6 +892,14 @@ class Settings(BaseSettings):
     atlaspay_api_key: str = ""
     atlaspay_base_url: str = "https://api.atlaspay.space/api/v1"
     atlaspay_timeout_seconds: float = Field(default=30.0, gt=0)
+    nowpayments_enabled: bool = False
+    nowpayments_api_key: str = Field(default="", repr=False)
+    nowpayments_auth_email: str = Field(default="", repr=False)
+    nowpayments_auth_password: str = Field(default="", repr=False)
+    nowpayments_ipn_secret: str = Field(default="", repr=False)
+    nowpayments_base_url: str = "https://api.nowpayments.io/v1"
+    nowpayments_callback_url: str = ""
+    nowpayments_timeout_seconds: float = Field(default=30.0, gt=0, allow_inf_nan=False)
     payment_gateway_secrets: dict[str, str] = Field(default_factory=dict)
     # --- Currency / FX resolution (`[fx]` + `[fx.abantether]`) ---------------
     # Platform-level financial subsystem (provider-neutral). The first live
@@ -1165,6 +1181,52 @@ class Settings(BaseSettings):
             and "low_balance_threshold_minor" not in self.model_fields_set
         ):
             self.low_balance_threshold_minor = 200_000
+        return self
+
+    @model_validator(mode="after")
+    def _validate_nowpayments_configuration(self) -> Settings:
+        """Validate hosted-invoice credentials and the cloud-only native IPN path."""
+        if not self.nowpayments_enabled:
+            return self
+        from urllib.parse import urlsplit
+
+        for label, value in (
+            ("api_key", self.nowpayments_api_key),
+            ("auth_email", self.nowpayments_auth_email),
+            ("auth_password", self.nowpayments_auth_password),
+            ("ipn_secret", self.nowpayments_ipn_secret),
+        ):
+            normalized = value.strip().lower().replace("-", "_")
+            if (
+                not normalized
+                or normalized.startswith(
+                    ("change_me", "changeme", "your_", "replace_", "placeholder")
+                )
+                or "<" in value
+                or ">" in value
+            ):
+                raise ValueError(f"payments.nowpayments.{label} is required (no placeholders)")
+        if "@" not in self.nowpayments_auth_email or not self.nowpayments_auth_email.isascii():
+            raise ValueError("payments.nowpayments.auth_email must be a valid email address")
+        for label, value in (
+            ("base_url", self.nowpayments_base_url),
+            ("callback_url", self.nowpayments_callback_url),
+        ):
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or any(ord(char) < 33 for char in value)
+            ):
+                raise ValueError(f"payments.nowpayments.{label} must be an absolute HTTPS URL")
+            if label == "callback_url" and parsed.path != "/webhooks/payments/nowpayments":
+                raise ValueError(
+                    "payments.nowpayments.callback_url must use the native cloud IPN path"
+                )
         return self
 
     @model_validator(mode="after")

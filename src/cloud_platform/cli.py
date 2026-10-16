@@ -4260,11 +4260,42 @@ async def business_log_doctor() -> DoctorResult:
     return DoctorResult(ok=ok, lines=lines)
 
 
+async def funding_cutover(manifest_path: str, apply: bool = False) -> int:
+    """Explicit bounded manifest only; preview is always the default."""
+    import json
+    from pathlib import Path
+
+    from cloud_platform.core.container import create_container
+    from cloud_platform.modules.funding.cli import run_manifest
+    from cloud_platform.modules.funding.cutover import SqlAlchemyOperatorFundingCutover
+
+    payload = json.loads(await asyncio.to_thread(Path(manifest_path).read_text, encoding="utf-8"))
+    container = create_container()
+    try:
+        result = await run_manifest(
+            SqlAlchemyOperatorFundingCutover(
+                container.session_factory,
+                configured_ids=get_settings().telegram_superadmin_user_ids,
+            ),
+            payload,
+            apply=apply,
+        )
+        print(json.dumps(result, default=str))
+        return 1 if any(row.get("status") == "needs_review" for row in result["results"]) else 0
+    finally:
+        await container.close()
+
+
 def _parser() -> argparse.ArgumentParser:
     from cloud_platform.modules.markets.domain import MARKET_ORDER
 
     parser = argparse.ArgumentParser(prog="cloud_platform.cli")
     sub = parser.add_subparsers(dest="command", required=True)
+    funding = sub.add_parser("funding", help="audited explicit-manifest funding administration")
+    funding_sub = funding.add_subparsers(dest="subcommand", required=True)
+    cutover = funding_sub.add_parser("cutover", help="preview a bounded explicit server manifest")
+    cutover.add_argument("manifest", help="operator-owned JSON manifest path")
+    cutover.add_argument("--apply", action="store_true", help="commit the reviewed manifest")
 
     lsw = sub.add_parser("leaseweb", help="Leaseweb ordering operations")
     lsw_sub = lsw.add_subparsers(dest="subcommand", required=True)
@@ -4525,6 +4556,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 async def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "funding":
+        return await funding_cutover(args.manifest, args.apply)
     if args.command == "fx":
         if args.subcommand == "doctor":
             result = await fx_doctor()

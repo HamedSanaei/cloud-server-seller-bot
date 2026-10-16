@@ -415,8 +415,8 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
                 and settings.fx_domestic_enabled
                 and settings.fx_allow_usdt_proxy_for_settlement
             )
-            renewal = (
-                await container.prepaid_hourly_billing_service().run() if billing_enabled else None
+            renewal = await container.prepaid_hourly_billing_service().run(
+                customer_enabled=billing_enabled
             )
             policy = PrepaidBalancePolicyService(
                 container.server_repository(), container.wallet_repository()
@@ -479,9 +479,20 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
                 if bot is not None:
                     await bot.session.close()
             lifecycle = container.prepaid_provider_lifecycle_service()
+            for server_id in renewal.operator_suspend_server_ids:
+                try:
+                    outcome = await lifecycle.suspend_operator(server_id)
+                    logger.warning("operator hourly suspension %s: %s", server_id, outcome.value)
+                except Exception as exc:
+                    logger.error(
+                        "operator hourly suspension failed for %s (%s)",
+                        server_id,
+                        type(exc).__name__,
+                    )
+                    errors.append(RuntimeError("operator hourly suspension failed"))
             expired = (
                 renewal.stop_requested_server_ids
-                if renewal is not None
+                if billing_enabled
                 else [
                     server.id
                     for server in await container.server_repository().list_running()
@@ -691,7 +702,12 @@ async def _process_deletes_impl(ctx: dict[str, object], owned_resources: list[An
         hold_service = HoldService(
             wallet_repo, hold_repo, SqlAlchemyLedgerRepository(SessionFactory)
         )
+        from cloud_platform.core.container import create_container
+
+        financial_container = create_container()
+        owned_resources.append(financial_container)
         final_charge = FinalChargeService(
+            operator_billing=financial_container.prepaid_hourly_billing_service(),
             server_repo=SqlAlchemyServerRepository(SessionFactory),
             wallet_repo=wallet_repo,
             hold_repo=hold_repo,
@@ -1532,6 +1548,81 @@ async def reconcile_atlaspay_payments(ctx: dict[str, object]) -> None:
                 await container.close()
 
 
+async def reconcile_nowpayments_payments(ctx: dict[str, object]) -> None:
+    """Recover durable hosted invoices via read-only verification, even disabled."""
+    del ctx
+    async with metrics.job("reconcile_nowpayments_payments"):
+        from datetime import timedelta
+
+        from cloud_platform.core.container import create_container
+        from cloud_platform.modules.payments.reconcile import PaymentReconciliationService
+        from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
+        from cloud_platform.modules.payments.service import PaymentWebhookService
+        from cloud_platform.providers.nowpayments.client import NowPaymentsGateway
+
+        settings = get_settings()
+        if not settings.nowpayments_api_key or settings.nowpayments_api_key == "CHANGE_ME":
+            return
+        container = create_container()
+        gateway = None
+        try:
+            gateway = NowPaymentsGateway(
+                api_key=settings.nowpayments_api_key,
+                base_url=settings.nowpayments_base_url,
+                callback_url=settings.nowpayments_callback_url,
+                auth_email=settings.nowpayments_auth_email,
+                auth_password=settings.nowpayments_auth_password,
+                timeout_seconds=settings.nowpayments_timeout_seconds,
+            )
+            repo = SqlAlchemyPaymentSessionRepository(container.session_factory)
+            service = PaymentReconciliationService(
+                payments_repo=repo,
+                webhook_service=PaymentWebhookService(
+                    payments_repo=repo,
+                    wallet_repo=container.wallet_repository(),
+                    ledger_repo=container.ledger_repository(),
+                    event_sink=container.business_event_sink(),
+                    user_repo=container.user_repository(),
+                ),
+                gateway=gateway,
+                audit_repo=container.audit_repository(),
+                stale_after=timedelta(seconds=0),
+            )
+            report = await service.run()
+            logger.info("nowpayments reconcile: %s", report.render())
+        finally:
+            try:
+                if gateway is not None:
+                    await gateway.close()
+            finally:
+                await container.close()
+
+
+async def deliver_admin_messages(ctx: dict[str, object]) -> None:
+    """Deliver only previously confirmed durable administrator campaigns."""
+    del ctx
+    async with metrics.job("deliver_admin_messages"):
+        token = _telegram_bot_token()
+        if token is None:
+            return
+        from aiogram import Bot
+
+        from cloud_platform.bot.admin_delivery import TelegramAdminMessageSender
+        from cloud_platform.core.container import create_container
+
+        bot = Bot(token=token)
+        container = create_container()
+        try:
+            await container.admin_messaging_worker(
+                TelegramAdminMessageSender(bot)
+            ).process_pending()
+        finally:
+            try:
+                await bot.session.close()
+            finally:
+                await container.close()
+
+
 async def deliver_business_log_events(ctx: dict[str, object]) -> None:
     """Deliver queued operator and private customer cards from the durable outbox.
 
@@ -1609,9 +1700,11 @@ def _cron_jobs() -> list[Any]:
         cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
         cron(deliver_business_log_events, minute=every_minute, run_at_startup=True),
+        cron(deliver_admin_messages, minute=every_minute, run_at_startup=True),
         cron(reconcile_tetraminator_payments, minute=every_fifteen_minutes, run_at_startup=True),
         cron(reconcile_payments, minute=every_fifteen_minutes, run_at_startup=True),
         cron(reconcile_atlaspay_payments, minute=every_minute, run_at_startup=True),
+        cron(reconcile_nowpayments_payments, minute=every_minute, run_at_startup=True),
     ]
 
 
@@ -1636,8 +1729,10 @@ class WorkerSettings:
         reconcile_leaseweb_orders,
         reconcile_tetraminator_payments,
         reconcile_atlaspay_payments,
+        reconcile_nowpayments_payments,
         check_renewals,
         deliver_business_log_events,
+        deliver_admin_messages,
     ]
     cron_jobs: ClassVar[list[Any]] = _cron_jobs()
     on_startup = startup
@@ -1674,6 +1769,7 @@ BILLING_FUNCTIONS: list[Any] = [
     reconcile_payments,
     reconcile_tetraminator_payments,
     reconcile_atlaspay_payments,
+    reconcile_nowpayments_payments,
     check_renewals,
     deliver_business_log_events,
 ]
@@ -1718,10 +1814,12 @@ def _role_cron_jobs(role: str) -> list[Any]:
                 reconcile_tetraminator_payments, minute=every_fifteen_minutes, run_at_startup=True
             ),
             cron(reconcile_atlaspay_payments, minute=every_minute, run_at_startup=True),
+            cron(reconcile_nowpayments_payments, minute=every_minute, run_at_startup=True),
             cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
         ]
     return [
         cron(deliver_business_log_events, minute=every_minute, run_at_startup=True),
+        cron(deliver_admin_messages, minute=every_minute, run_at_startup=True),
         cron(evaluate_low_balance, minute=every_fifteen_minutes, run_at_startup=True),
         cron(check_renewals, hour={3}, minute={23}, run_at_startup=True),
     ]
@@ -1751,6 +1849,7 @@ class NotifyWorkerSettings(WorkerSettings):
     queue_name = "notify"
     functions: ClassVar[list[Any]] = [
         deliver_business_log_events,
+        deliver_admin_messages,
         evaluate_low_balance,
         check_renewals,
     ]

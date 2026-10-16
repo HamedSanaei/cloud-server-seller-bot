@@ -176,7 +176,10 @@ def test_menu_command_renders_menu(
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=2, message=_message("/menu", user_id=42)))
-    _patch_outgoing["answer"].assert_awaited_once()
+    assert _patch_outgoing["answer"].await_count == 2
+    assert _patch_outgoing["answer"].await_args_list[0].kwargs["reply_markup"] == fakes[
+        "monthly_ui"
+    ].reply_keyboard(None)
     assert _patch_outgoing["answer"].await_args.args[0] == "screen"
     # The customer menu is the storefront's (market selector first).
     fakes["monthly_ui"].menu_screen.assert_called_once()
@@ -293,7 +296,10 @@ def test_menu_shows_same_canonical_menu_as_start(
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=11, message=_message("/menu")))
-    _patch_outgoing["answer"].assert_awaited_once()
+    assert _patch_outgoing["answer"].await_count == 2
+    assert _patch_outgoing["answer"].await_args_list[0].kwargs["reply_markup"] == fakes[
+        "monthly_ui"
+    ].reply_keyboard(None)
     assert _patch_outgoing["answer"].await_args.args[0] == "screen"
     fakes["monthly_ui"].menu_screen.assert_called_once()
 
@@ -325,7 +331,10 @@ def test_random_text_without_pending_prompt_shows_menu(
         _patch_outgoing["answer"].reset_mock()
         fakes["monthly_ui"].menu_screen.reset_mock()
         _dispatch(dp, Update(update_id=update_id, message=_message(text)))
-        _patch_outgoing["answer"].assert_awaited_once()
+        assert _patch_outgoing["answer"].await_count == 2
+        assert _patch_outgoing["answer"].await_args_list[0].kwargs["reply_markup"] == fakes[
+            "monthly_ui"
+        ].reply_keyboard(None)
         assert _patch_outgoing["answer"].await_args.args[0] == "screen"
         fakes["monthly_ui"].menu_screen.assert_called_once()
 
@@ -338,7 +347,10 @@ def test_unknown_slash_command_shows_menu(
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=24, message=_message("/buy123")))
-    _patch_outgoing["answer"].assert_awaited_once()
+    assert _patch_outgoing["answer"].await_count == 2
+    assert _patch_outgoing["answer"].await_args_list[0].kwargs["reply_markup"] == fakes[
+        "monthly_ui"
+    ].reply_keyboard(None)
     assert _patch_outgoing["answer"].await_args.args[0] == "screen"
     fakes["monthly_ui"].menu_screen.assert_called_once()
 
@@ -364,7 +376,10 @@ def test_unsupported_media_shows_menu(
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=25, message=_media_message()))
-    _patch_outgoing["answer"].assert_awaited_once()
+    assert _patch_outgoing["answer"].await_count == 2
+    assert _patch_outgoing["answer"].await_args_list[0].kwargs["reply_markup"] == fakes[
+        "monthly_ui"
+    ].reply_keyboard(None)
     assert _patch_outgoing["answer"].await_args.args[0] == "screen"
     fakes["monthly_ui"].menu_screen.assert_called_once()
 
@@ -423,7 +438,13 @@ def test_reply_keyboard_buttons_dispatch(
     dp = Dispatcher()
     register_handlers(dp, fakes["ui"], fakes["monthly_ui"], fakes["container"])
     _dispatch(dp, Update(update_id=50, message=_message(button_text)))
-    _patch_outgoing["answer"].assert_awaited_once()
+    if expected_method == "menu_screen":
+        assert _patch_outgoing["answer"].await_count == 2
+        assert _patch_outgoing["answer"].await_args_list[0].kwargs["reply_markup"] == fakes[
+            "monthly_ui"
+        ].reply_keyboard(None)
+    else:
+        _patch_outgoing["answer"].assert_awaited_once()
     target_mock = getattr(fakes["monthly_ui"], expected_method)
     target_mock.assert_called_once()
 

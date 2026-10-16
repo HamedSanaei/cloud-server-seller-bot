@@ -46,6 +46,8 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.funding import FundingService, FundingSource
+from cloud_platform.modules.hourly.domain import operator_funded
 from cloud_platform.modules.pricing.domain import (
     OfferCost,
     SellingPrice,
@@ -75,7 +77,10 @@ from cloud_platform.observability.metrics import metrics
 from cloud_platform.providers.errors import ProviderCapacityError, ProviderError
 
 if TYPE_CHECKING:
-    from cloud_platform.modules.billing.service import AccrualPeriodRepository
+    from cloud_platform.modules.billing.service import (
+        AccrualPeriodRepository,
+        PrepaidHourlyBillingService,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +167,8 @@ class CreateServerService:
         terms: TermsGate | None = None,
         cost_breaker: CostCircuitBreaker | None = None,
         fulfillment_routes: Any | None = None,
+        funding_service: FundingService | None = None,
+        operator_billing: PrepaidHourlyBillingService | None = None,
     ) -> None:
         if not book_name or not book_name.strip():
             raise ValueError("book_name must not be empty")
@@ -179,6 +186,8 @@ class CreateServerService:
         self._terms = terms
         self._cost_breaker = cost_breaker
         self._fulfillment_routes = fulfillment_routes
+        self._funding = funding_service
+        self._operator_billing = operator_billing
 
     @staticmethod
     def _hold_key(idempotency_key: str) -> str:
@@ -256,6 +265,18 @@ class CreateServerService:
                 raise CreateServerCommandError(
                     f"idempotency key {idempotency_key!r} belongs to another user"
                 )
+            if operator_funded(existing):
+                snapshot = await self._snapshots.get_snapshot(existing.id)
+                if snapshot is None or self._operator_billing is None:
+                    raise CreateServerCommandError(
+                        "operator hourly intent lacks immutable funding evidence"
+                    )
+                await self._operator_billing.verify_operator_period(
+                    existing, snapshot, existing.created_at
+                )
+                return CreateServerResult(
+                    server=existing, snapshot=snapshot, hold=None, replayed=True
+                )
             wallet = await self._wallets.get(user.id)
             wallet_id = wallet.id if wallet is not None and wallet.id is not None else None
             hold: Hold | None = (
@@ -320,6 +341,7 @@ class CreateServerService:
             offer_ref.location_id,
             offer.price_per_quantum,
             offer.currency,
+            provider_rate_exact=getattr(offer, "provider_rate_exact", None),
         )
         price: SellingPrice = await self._books.sell_price(
             book_name=self._book_name, offer=cost, at=when
@@ -363,13 +385,30 @@ class CreateServerService:
                 ) from None
 
         # 6. Wallet + hold (balance validation lives in the hold).
-        wallet = await self._wallets.get(user.id)
-        if wallet is None or wallet.id is None:
-            raise NoWalletError(f"user {user.id} has no wallet")
-        wallet_id = wallet.id
-        hold = await self._holds.create_hold(
-            wallet_id, price.selling_minor, offer.currency, hold_key
+        source = (
+            await self._funding.resolve_source(user.id)
+            if self._funding
+            else FundingSource.CUSTOMER_WALLET
         )
+        corporate = source is FundingSource.OPERATOR
+        wallet_id = None
+        hold = None
+        if corporate:
+            if self._operator_billing is None or not isinstance(
+                price.offer.provider_rate_exact, str
+            ):
+                raise CreateServerCommandError(
+                    "operator hourly creation requires native exact catalog cost "
+                    "and corporate billing"
+                )
+        else:
+            wallet = await self._wallets.get(user.id)
+            if wallet is None or wallet.id is None:
+                raise NoWalletError(f"user {user.id} has no wallet")
+            wallet_id = wallet.id
+            hold = await self._holds.create_hold(
+                wallet_id, price.selling_minor, offer.currency, hold_key
+            )
 
         # 7. Server intent (REQUESTED row + idempotency key).
         server = CloudServer(
@@ -379,6 +418,8 @@ class CreateServerService:
             provider_account_id=account.id,
             credential_account_id=credential_account_id,
             state=ServerLifecycleState.REQUESTED,
+            funding_source=source,
+            funding_operator_id=user.id if corporate else None,
         )
         intent = ServerCreateIntent(
             catalog_id=offer.id,
@@ -393,8 +434,10 @@ class CreateServerService:
             # check and the insert. Resolve to the original intent.
             original = await self._servers.get_by_idempotency_key(idempotency_key)
             if original is not None and original.user_id == user.id:
-                original_hold: Hold | None = await self._holds.get_by_idempotency(
-                    wallet_id, hold_key
+                original_hold: Hold | None = (
+                    await self._holds.get_by_idempotency(wallet_id, hold_key)
+                    if wallet_id is not None
+                    else None
                 )
                 original_snapshot = await self._snapshots.get_snapshot(original.id)
                 return CreateServerResult(
@@ -416,6 +459,9 @@ class CreateServerService:
                 actor=None,
                 reason="server create request",
             )
+            if corporate:
+                assert self._operator_billing is not None
+                await self._operator_billing.prepare_operator_first_hour(created, snapshot)
         except Exception:
             await self._fail_intent(created, hold, wallet_id)
             raise
@@ -434,19 +480,22 @@ class CreateServerService:
                 "currency": offer.currency,
                 "book": self._book_name,
                 "book_version": price.version,
-                "hold_id": str(hold.id) if hold.id is not None else "",
+                "hold_id": str(hold.id) if hold is not None and hold.id is not None else "",
+                "funding_source": source.value,
             },
         )
         logger.info(
             "create intent for server %s (hold %s, book %s v%d)",
             created.id,
-            hold.id,
+            hold.id if hold is not None else None,
             self._book_name,
             price.version,
         )
         return CreateServerResult(server=created, snapshot=snapshot, hold=hold, replayed=False)
 
-    async def _fail_intent(self, server: CloudServer, hold: Hold, wallet_id: UUID) -> None:
+    async def _fail_intent(
+        self, server: CloudServer, hold: Hold | None, wallet_id: UUID | None
+    ) -> None:
         """Best-effort compensation for a failed intent: ERROR + release hold."""
         try:
             server.transition_to(ServerLifecycleState.ERROR)
@@ -455,8 +504,8 @@ class CreateServerService:
             logger.exception("failed to mark server %s ERROR after create failure", server.id)
         await self._release_hold(hold)
 
-    async def _release_hold(self, hold: Hold) -> None:
-        if hold.id is None:
+    async def _release_hold(self, hold: Hold | None) -> None:
+        if hold is None or hold.id is None:
             return
         try:
             await self._holds.release_hold(hold.id)

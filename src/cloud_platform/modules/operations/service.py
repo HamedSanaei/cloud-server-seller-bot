@@ -37,6 +37,8 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.funding import FundingAuthorizationError
+from cloud_platform.modules.hourly.domain import operator_funded
 from cloud_platform.modules.navigation.domain import Callback, encode_callback
 from cloud_platform.modules.notifications.domain import ProvisioningProgressService
 from cloud_platform.modules.operations.create_attempts import (
@@ -59,6 +61,7 @@ from cloud_platform.modules.operations.domain import (
     plan_state_repair,
 )
 from cloud_platform.modules.provider_routes.service import ProviderRouteSelector
+from cloud_platform.modules.users.domain import PermissionDeniedError
 from cloud_platform.modules.wallet.domain import (
     HoldRepository,
     HoldStatus,
@@ -940,6 +943,8 @@ class ProvisioningWorker:
 
     async def _release_hold(self, server: CloudServer) -> None:
         """Best-effort release of the create hold (keyed by the command key)."""
+        if operator_funded(server):
+            return
         if server.idempotency_key is None:
             return
         wallet = await self._wallets.get(server.user_id)
@@ -1489,6 +1494,8 @@ class CreateTimeoutReconciler:
         )
 
     async def _release_hold(self, server: CloudServer) -> None:
+        if operator_funded(server):
+            return
         if server.idempotency_key is None:
             return
         wallet = await self._wallets.get(server.user_id)
@@ -1509,6 +1516,17 @@ async def _require_hourly_prepayment(
     server: CloudServer,
     prepay: Callable[[CloudServer], Awaitable[CloudServer]] | None,
 ) -> None:
+    if operator_funded(server):
+        if prepay is None:
+            raise RuntimeError("operator hourly receipt verification is not configured")
+        funded = await prepay(server)
+        if funded.prepaid_paid_until is None or (
+            funded.prepaid_paid_until.replace(tzinfo=UTC)
+            if funded.prepaid_paid_until.tzinfo is None
+            else funded.prepaid_paid_until
+        ) <= datetime.now(UTC):
+            raise FundingAuthorizationError("operator hourly receipt does not cover activation")
+        return
     if server.is_prepaid_monthly:
         return
     if server.is_prepaid_hourly_irt:
@@ -1629,9 +1647,8 @@ class ServerStateReconciler:
         # particular, a stopped zero-balance server must not be resurrected
         # by this provider-status repair.
         if (
-            server.billing_model == BILLING_MODEL_PREPAID_HOURLY_IRT
-            and remote_state is ProviderServerState.RUNNING
-        ):
+            server.billing_model == BILLING_MODEL_PREPAID_HOURLY_IRT or operator_funded(server)
+        ) and remote_state is ProviderServerState.RUNNING:
             if server.state is ServerLifecycleState.PROVISIONING:
                 if self._prepaid_capture is None:
                     return StateReconciliationOutcome.INCONCLUSIVE
@@ -1877,6 +1894,19 @@ _POWER_TARGET: dict[PowerAction, ServerLifecycleState | None] = {
 POWER_OPERATION_TYPES: tuple[OperationType, ...] = tuple(_POWER_OP_TYPE.values())
 
 
+def _operator_suspension_intent(operation: Operation, server: CloudServer) -> bool:
+    evidence = operation.provider_response or {}
+    return (
+        operation.operation_type is OperationType.POWER_OFF
+        and operation.resource_id == server.id
+        and operation.resource_type == RESOURCE_TYPE_SERVER
+        and operator_funded(server)
+        and evidence.get("operator_funding_suspension") is True
+        and evidence.get("operator_id") == str(server.user_id)
+        and evidence.get("provider_server_id") == server.provider_server_id
+    )
+
+
 def power_operation_key(action: PowerAction, server_id: UUID, idempotency_key: str) -> str:
     """Deterministic ledger key for one power intent (unique per command key)."""
     return f"{action.value}:{server_id}:{idempotency_key}"
@@ -2034,6 +2064,17 @@ class PowerOperationExecutor:
         actor_id: UUID | None = None,
     ) -> PowerExecutionResult:
         """The original execution body (runs inside the operation span)."""
+        if "admin_support" in (operation.provider_response or {}):
+            try:
+                actor_id = await self._ops.authorize_admin_support(operation)
+            except PermissionDeniedError:
+                await self._fail(
+                    operation,
+                    ActorType.SYSTEM,
+                    None,
+                    "administrator dispatch authorization revoked",
+                )
+            actor_type = ActorType.ADMIN
         action = _OP_TYPE_TO_ACTION.get(operation.operation_type)
         if action is None:
             raise PowerCommandError(f"operation {operation.id} is not a power operation")
@@ -2042,7 +2083,13 @@ class PowerOperationExecutor:
             await self._fail(operation, actor_type, actor_id, "server row missing")
         if not server.provider_server_id:
             await self._fail(operation, actor_type, actor_id, "server has no provider resource id")
-        if server.state not in _POWER_PRECONDITION[action]:
+        corporate_suspend = (
+            actor_type is ActorType.SYSTEM
+            and actor_id is None
+            and server.state is ServerLifecycleState.PROVISIONING
+            and _operator_suspension_intent(operation, server)
+        )
+        if server.state not in _POWER_PRECONDITION[action] and not corporate_suspend:
             # The state moved since the intent was created (drift, a newer
             # command, containment). Never call the provider against a
             # mismatched state.
@@ -2066,9 +2113,26 @@ class PowerOperationExecutor:
             )
         if Capability.POWER not in provider.capabilities:
             await self._fail(operation, actor_type, actor_id, "provider lacks POWER capability")
+        if corporate_suspend:
+            remote = await provider.get_server(server.provider_server_id)
+            remote_state = (
+                normalize_provider_status(remote.status)
+                if remote
+                else ProviderServerState.NOT_FOUND
+            )
+            if remote_state is ProviderServerState.STOPPED:
+                return await self._finish_power(operation, server, action, actor_type, actor_id)
+            if remote_state is not ProviderServerState.RUNNING:
+                operation.requeue("operator suspension awaits proven provider running state")
+                await self._ops.save(operation)
+                return PowerExecutionResult.REQUEUED
         if action in {PowerAction.POWER_ON, PowerAction.REBOOT}:
             try:
                 await _require_hourly_prepayment(server, self._prepay_server)
+            except FundingAuthorizationError:
+                await self._fail(
+                    operation, actor_type, actor_id, "operator funding authorization is unavailable"
+                )
             except InsufficientBalanceError:
                 await self._fail(
                     operation, actor_type, actor_id, "insufficient balance for next hour"
@@ -2145,6 +2209,17 @@ class PowerOperationExecutor:
         """Send the power mutation. Returns False when re-queued (retryable
         error); raises on permanent failure."""
         method = getattr(provider, action.value)
+        if "admin_support" in (operation.provider_response or {}):
+            try:
+                actor_id = await self._ops.authorize_admin_support(operation)
+            except PermissionDeniedError:
+                await self._fail(
+                    operation,
+                    ActorType.SYSTEM,
+                    None,
+                    "administrator dispatch authorization revoked",
+                )
+            actor_type = ActorType.ADMIN
         try:
             await method(server.provider_server_id, IdempotencyKey(operation.operation_key))
         except ProviderError as exc:
@@ -2179,9 +2254,24 @@ class PowerOperationExecutor:
         actor_id: UUID | None,
     ) -> PowerExecutionResult:
         """Record completion, apply the target state, and audit the action."""
-        operation.complete({"action": action.value, "idempotency_key": operation.operation_key})
+        corporate_suspend = (
+            actor_type is ActorType.SYSTEM
+            and actor_id is None
+            and server.state is ServerLifecycleState.PROVISIONING
+            and _operator_suspension_intent(operation, server)
+        )
+        operation.complete(
+            {
+                "action": action.value,
+                "idempotency_key": operation.operation_key,
+                **(operation.provider_response or {} if corporate_suspend else {}),
+            }
+        )
         await self._ops.save(operation)
         target = _POWER_TARGET[action]
+        if corporate_suspend:
+            server.mark_operator_suspended(provider_server_id=server.provider_server_id or "")
+            await self._servers.save(server)
         if target is not None and server.state is not target:
             if server.state in _POWER_PRECONDITION[action]:
                 try:
@@ -2325,6 +2415,43 @@ class PowerCommandService:
         self, user_id: UUID, server_id: UUID, idempotency_key: str
     ) -> PowerCommandResult:
         return await self._execute(PowerAction.POWER_ON, user_id, server_id, idempotency_key)
+
+    async def _suspend_operator_provisioning(
+        self, server_id: UUID, idempotency_key: str
+    ) -> PowerCommandResult:
+        """Internal policy action; public user power state gates remain unchanged."""
+        server = await self._servers.get(server_id)
+        if server is None or not operator_funded(server) or not server.provider_server_id:
+            raise PowerActionNotAllowedError("operator suspension source/identity is unavailable")
+        if server.state is not ServerLifecycleState.PROVISIONING:
+            raise PowerActionNotAllowedError("internal suspension requires provisioning source")
+        operation = await self._ops.get_or_create(
+            operation_key=power_operation_key(PowerAction.POWER_OFF, server.id, idempotency_key),
+            operation_type=OperationType.POWER_OFF,
+            resource_type=RESOURCE_TYPE_SERVER,
+            resource_id=server.id,
+            provider_key=server.provider_key,
+        )
+        if operation.status is OperationStatus.COMPLETED:
+            return PowerCommandResult(server=server, replayed=True)
+        if operation.status is not OperationStatus.PENDING:
+            raise PowerOperationInProgressError("operator suspension is in progress")
+        operation.provider_response = {
+            "operator_funding_suspension": True,
+            "operator_id": str(server.user_id),
+            "provider_server_id": server.provider_server_id,
+            "reason": "Operator hourly spending authorization is unavailable",
+        }
+        await self._ops.save(operation)
+        claimed = await self._ops.claim(operation.id)
+        if claimed is None:
+            raise PowerOperationInProgressError("operator suspension is in progress")
+        result = await self._executor.execute(claimed, actor_type=ActorType.SYSTEM, actor_id=None)
+        return PowerCommandResult(
+            server=await self._servers.get(server.id) or server,
+            replayed=False,
+            requeued=result is PowerExecutionResult.REQUEUED,
+        )
 
     async def power_off(
         self, user_id: UUID, server_id: UUID, idempotency_key: str
@@ -3079,6 +3206,17 @@ class DeleteOperationExecutor:
         actor_id: UUID | None = None,
     ) -> DeleteExecutionResult:
         """The original execution body (runs inside the operation span)."""
+        if "admin_support" in (operation.provider_response or {}):
+            try:
+                actor_id = await self._ops.authorize_admin_support(operation)
+            except PermissionDeniedError:
+                await self._fail(
+                    operation,
+                    ActorType.SYSTEM,
+                    None,
+                    "administrator dispatch authorization revoked",
+                )
+            actor_type = ActorType.ADMIN
         server = await self._servers.get(operation.resource_id)
         if server is None:
             await self._fail(operation, actor_type, actor_id, "server row missing")
@@ -3145,7 +3283,9 @@ class DeleteOperationExecutor:
 
         charged_minor = 0
         charge_capped = False
-        if server.provider_server_id and not server.is_prepaid_hourly_irt:
+        if operator_funded(server) or (
+            server.provider_server_id and not server.is_prepaid_hourly_irt
+        ):
             # A server that had a provider resource carries its final usage
             # segment (idempotent: a crash-replay settles nothing twice). A
             # server that never had one (failed before provisioning) has no
@@ -3231,6 +3371,17 @@ class DeleteOperationExecutor:
         absence is confirmed.
         """
         assert server.provider_server_id is not None
+        if "admin_support" in (operation.provider_response or {}):
+            try:
+                actor_id = await self._ops.authorize_admin_support(operation)
+            except PermissionDeniedError:
+                await self._fail(
+                    operation,
+                    ActorType.SYSTEM,
+                    None,
+                    "administrator dispatch authorization revoked",
+                )
+            actor_type = ActorType.ADMIN
         try:
             await provider.delete_server(
                 server.provider_server_id, IdempotencyKey(operation.operation_key)
@@ -3297,6 +3448,8 @@ class DeleteOperationExecutor:
 
     async def _release_reservation(self, server: CloudServer) -> None:
         """Return an uncaptured creation hold after provider absence is confirmed."""
+        if operator_funded(server):
+            return
         if not server.idempotency_key:
             return
         wallet = await self._wallets.get(server.user_id)
@@ -3479,6 +3632,54 @@ class PrepaidProviderLifecycleService:
         self._power = power_commands
         self._delete = delete_commands
 
+    async def suspend_operator(
+        self, server_id: UUID, *, now: datetime | None = None
+    ) -> PrepaidProviderLifecycleOutcome:
+        """Stop/report a corporate resource idempotently, retaining IDs and disks."""
+        server = await self._servers.get(server_id)
+        if server is None or not operator_funded(server):
+            return PrepaidProviderLifecycleOutcome.SKIPPED
+        if not server.provider_server_id or server.state not in (
+            ServerLifecycleState.RUNNING,
+            ServerLifecycleState.STOPPED,
+            ServerLifecycleState.PROVISIONING,
+        ):
+            return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+        try:
+            provider = provider_for(
+                self._registry, server.provider_key, server.credential_account_id
+            )
+            remote = await provider.get_server(server.provider_server_id)
+        except (KeyError, ProviderError):
+            return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+        state = (
+            ProviderServerState.NOT_FOUND
+            if remote is None
+            else normalize_provider_status(remote.status)
+        )
+        if state is ProviderServerState.STOPPED:
+            if server.state is ServerLifecycleState.PROVISIONING:
+                server.mark_operator_suspended(provider_server_id=server.provider_server_id)
+                await self._servers.save(server)
+            if server.state is ServerLifecycleState.RUNNING:
+                server.transition_to(ServerLifecycleState.STOPPED)
+                await self._servers.save(server)
+            return PrepaidProviderLifecycleOutcome.STOPPED
+        if (
+            state is not ProviderServerState.RUNNING
+            or Capability.POWER not in provider.capabilities
+        ):
+            return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+        boundary = server.prepaid_paid_until or server.created_at
+        key = "operator-suspend:" + str(boundary.isoformat() if boundary else "uncovered")
+        if server.state is ServerLifecycleState.PROVISIONING:
+            await self._power._suspend_operator_provisioning(server.id, key)
+            return PrepaidProviderLifecycleOutcome.STOP_REQUESTED
+        if server.state is not ServerLifecycleState.RUNNING:
+            return PrepaidProviderLifecycleOutcome.INCONCLUSIVE
+        await self._power.power_off(server.user_id, server.id, key)
+        return PrepaidProviderLifecycleOutcome.STOP_REQUESTED
+
     async def enforce(
         self, server_id: UUID, *, now: datetime | None = None
     ) -> PrepaidProviderLifecycleOutcome:
@@ -3497,6 +3698,10 @@ class PrepaidProviderLifecycleService:
         if moment.tzinfo is None:
             raise ValueError("now must be timezone-aware")
         server = await self._servers.get(server_id)
+        if server is not None and operator_funded(server):
+            # Wallet zero/grace and unpaid-wallet work queues never delete or
+            # power off an operator server. Corporate policy owns suspension.
+            return PrepaidProviderLifecycleOutcome.SKIPPED
         if server is None or not server.is_prepaid_hourly_irt:
             return PrepaidProviderLifecycleOutcome.SKIPPED
         zero_since = server.prepaid_zero_since

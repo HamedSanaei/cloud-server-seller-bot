@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, localcontext
 from enum import StrEnum
@@ -26,6 +26,15 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
     ServerRepository,
 )
+from cloud_platform.modules.funding import (
+    FundingAuthorizationError,
+    FundingGrantState,
+    FundingPurpose,
+    FundingService,
+    FundingSource,
+    ProviderCostSnapshot,
+    expense_operation_key,
+)
 from cloud_platform.modules.fx.domain import (
     SUPPORTED_CURRENCIES,
     ConversionSnapshot,
@@ -34,6 +43,7 @@ from cloud_platform.modules.fx.domain import (
     major_to_minor,
     minor_to_major,
 )
+from cloud_platform.modules.hourly.domain import OperatorHourlyCutoverCoverage, operator_funded
 from cloud_platform.modules.pricing.domain import ServerPriceSnapshot, ServerPriceSnapshotRepository
 from cloud_platform.modules.wallet.domain import (
     HoldRepository,
@@ -380,6 +390,7 @@ class AccrualJob:
         audit_repo: AuditRepository,
         lock: JobLock | None = None,
         clock: Callable[[], datetime] | None = None,
+        operator_billing: PrepaidHourlyBillingService | None = None,
     ) -> None:
         self._servers = server_repo
         self._wallets = wallet_repo
@@ -391,6 +402,7 @@ class AccrualJob:
         self._audit = AuditTrail(audit_repo)
         self._lock = lock
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._operator_billing = operator_billing
 
     async def prepay_server(
         self, server: CloudServer, now: datetime | None = None, *, renew_ahead_seconds: int = 0
@@ -401,6 +413,10 @@ class AccrualJob:
         power-on/reboot. The shared billing lock serializes cap checks with
         periodic billing. The supplied domain object receives the new version.
         """
+        if operator_funded(server):
+            if self._operator_billing is None:
+                raise RuntimeError("operator hourly billing is not configured")
+            return await self._operator_billing.ensure_operator_coverage(server)
         if server.is_prepaid_monthly or server.is_prepaid_hourly_irt:
             return server
         moment = _aware(now or self._clock(), "now")
@@ -423,6 +439,12 @@ class AccrualJob:
         current = await self._servers.get(server.id)
         if current is None or current.provider_server_id != server.provider_server_id:
             raise ValueError("hourly prepayment requires the persisted provider resource")
+        if operator_funded(current):
+            if self._operator_billing is None:
+                raise RuntimeError("operator hourly billing is not configured")
+            server.funding_source = current.funding_source
+            server.funding_operator_id = current.funding_operator_id
+            return await self._operator_billing.ensure_operator_coverage(current)
         server.billing_started_at = current.billing_started_at
         server.last_accrued_at = current.last_accrued_at
         server.state = current.state
@@ -449,6 +471,8 @@ class AccrualJob:
 
     async def _request_unpaid_deletion(self, server: CloudServer, now: datetime) -> None:
         """Use the existing stop/delete saga, never a grace period of free usage."""
+        if operator_funded(server):
+            raise FundingAuthorizationError("operator servers must be suspended without deletion")
         if (
             server.last_accrued_at is not None
             and _aware(server.last_accrued_at, "paid through") > now
@@ -519,6 +543,7 @@ class AccrualJob:
             for s in active
             if not s.is_prepaid_monthly
             and not s.is_prepaid_hourly_irt
+            and not operator_funded(s)
             and s.provider_server_id
             and (
                 s.state is not ServerLifecycleState.PROVISIONING or s.billing_started_at is not None
@@ -564,7 +589,7 @@ class AccrualJob:
         self, server: CloudServer, now: datetime, report: AccrualRunReport
     ) -> int:
         """Purchase every due period, including the hour starting exactly now."""
-        if server.is_prepaid_monthly or server.is_prepaid_hourly_irt:
+        if operator_funded(server) or server.is_prepaid_monthly or server.is_prepaid_hourly_irt:
             return 0
         if server.billing_started_at is None:
             raise ValueError("hourly server has no provider-running billing anchor")
@@ -595,10 +620,12 @@ class AccrualJob:
         report: AccrualRunReport,
     ) -> tuple[int, bool]:
         """Settle one period. Returns (posted: 0/1, stop: bool)."""
+        persisted = await self._servers.get(server.id)
+        if persisted is not None and operator_funded(persisted):
+            raise FundingAuthorizationError("customer accrual source changed to operator funding")
         wallet = await self._wallets.get(server.user_id)
         if wallet is None or wallet.id is None:
             raise ValueError(f"server {server.id}: no persisted wallet")
-
         snapshot = await self._snapshots.get(server.id)
         if snapshot is None:
             raise MissingSnapshotError(f"server {server.id} has no price snapshot")
@@ -838,6 +865,8 @@ class AccrualJob:
                 reference_type="server",
                 reference_id=str(server.id),
                 description=description,
+                expected_currency=selling_currency,
+                expected_customer_server_id=server.id,
             )
 
         # Business record for the margin report. The ledger entry above is
@@ -927,11 +956,13 @@ class FinalChargeService:
         snapshot_repo: ServerPriceSnapshotRepository,
         audit_repo: AuditRepository,
         lock: JobLock | None = None,
+        operator_billing: PrepaidHourlyBillingService | None = None,
     ) -> None:
         self._wallets = wallet_repo
         self._hold_repo = hold_repo
         self._holds = hold_service
         self._lock = lock
+        self._operator_billing = operator_billing
         self._prepayment = AccrualJob(
             server_repo=server_repo,
             wallet_repo=wallet_repo,
@@ -952,6 +983,11 @@ class FinalChargeService:
             return await self._close_contract(server, deleted_at)
 
     async def _close_contract(self, server: CloudServer, deleted_at: datetime) -> FinalChargeResult:
+        if operator_funded(server):
+            if self._operator_billing is None:
+                raise RuntimeError("operator hourly final receipt handling is not configured")
+            await self._operator_billing.close_operator_contract(server)
+            return FinalChargeResult(0, False, None, False, False)
         if server.is_prepaid_hourly_irt:
             raise ValueError("prepaid hourly coverage is settled in advance; no final usage charge")
         if server.state is not ServerLifecycleState.DELETED:
@@ -993,15 +1029,20 @@ class PrepaidHourlyPeriod:
     """Binding quote saved before funds move; payment can be repaired after a crash."""
 
     server_id: UUID
-    wallet_id: UUID
+    wallet_id: UUID | None
     period_start: datetime
     period_end: datetime
     usd_minor: int
-    irt_minor: int
-    fx_snapshot: ConversionSnapshot
+    irt_minor: int | None
+    fx_snapshot: ConversionSnapshot | None
     idempotency_key: str
     status: PrepaidHourlyPeriodStatus = PrepaidHourlyPeriodStatus.PENDING
     id: UUID | None = None
+    funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
+    funding_operator_id: UUID | None = None
+    operator_grant_id: UUID | None = None
+    operator_expense_id: UUID | None = None
+    nominal_currency: str = "USD"
 
     def __post_init__(self) -> None:
         if self.period_start.utcoffset() is None or self.period_end.utcoffset() is None:
@@ -1010,6 +1051,40 @@ class PrepaidHourlyPeriod:
         object.__setattr__(self, "period_end", self.period_end.astimezone(UTC))
         if self.period_end - self.period_start != timedelta(hours=1):
             raise ValueError("prepaid billing requires exactly one hour of coverage")
+        if self.idempotency_key != prepaid_hourly_key(self.server_id, self.period_start):
+            raise ValueError("prepaid period idempotency key does not match its boundary")
+        if self.funding_source is FundingSource.OPERATOR:
+            if (
+                self.wallet_id is not None
+                or self.irt_minor is not None
+                or self.fx_snapshot is not None
+                or not isinstance(self.funding_operator_id, UUID)
+                or not isinstance(self.operator_grant_id, UUID)
+                or type(self.usd_minor) is not int
+                or not 0 < self.usd_minor <= 2**63 - 1
+                or len(self.nominal_currency) != 3
+                or not self.nominal_currency.isascii()
+                or not self.nominal_currency.isupper()
+                or not self.nominal_currency.isalpha()
+                or (
+                    self.status is PrepaidHourlyPeriodStatus.PAID
+                    and not isinstance(self.operator_expense_id, UUID)
+                )
+            ):
+                raise ValueError(
+                    "operator coverage requires corporate grant evidence and no wallet/FX"
+                )
+            return
+        if (
+            self.funding_source is not FundingSource.CUSTOMER_WALLET
+            or self.wallet_id is None
+            or self.fx_snapshot is None
+            or self.funding_operator_id is not None
+            or self.operator_grant_id is not None
+            or self.operator_expense_id is not None
+            or self.nominal_currency != "USD"
+        ):
+            raise ValueError("wallet coverage cannot carry operator sponsorship")
         if any(
             isinstance(amount, bool)
             or not isinstance(amount, int)
@@ -1044,6 +1119,12 @@ def prepaid_hourly_key(server_id: UUID, start: datetime) -> str:
 class PrepaidHourlyPeriodRepository(Protocol):
     async def get(self, server_id: UUID, start: datetime) -> PrepaidHourlyPeriod | None: ...
 
+    async def get_operator_cutover_coverage(
+        self, server_id: UUID
+    ) -> OperatorHourlyCutoverCoverage | None:
+        """Read immutable conversion evidence without rewriting a personal period."""
+        ...
+
     async def list_charged_pending(self) -> list[PrepaidHourlyPeriod]:
         """List pending bindings with a committed wallet/key receipt, in boundary order."""
         ...
@@ -1069,6 +1150,8 @@ class PrepaidHourlyRunReport:
     replayed: int = 0
     stop_requested_server_ids: list[UUID] = field(default_factory=list)
     errors: dict[UUID, str] = field(default_factory=dict)
+    operator_suspend_server_ids: list[UUID] = field(default_factory=list)
+    operator_expenses_settled: int = 0
 
 
 class PrepaidHourlyBillingService:
@@ -1082,8 +1165,9 @@ class PrepaidHourlyBillingService:
         ledger_repo: LedgerRepository,
         snapshot_repo: ServerPriceSnapshotRepository,
         period_repo: PrepaidHourlyPeriodRepository,
-        fx_resolver: PrepaidFxResolver,
+        fx_resolver: PrepaidFxResolver | None,
         lock: JobLock | None = None,
+        funding_service: FundingService | None = None,
     ) -> None:
         self._servers = server_repo
         self._wallets = wallet_repo
@@ -1092,6 +1176,272 @@ class PrepaidHourlyBillingService:
         self._periods = period_repo
         self._fx = fx_resolver
         self._lock = lock
+        self._funding = funding_service
+
+    def _require_operator_funding(self) -> FundingService:
+        if self._funding is None:
+            raise RuntimeError("operator hourly funding is not configured")
+        return self._funding
+
+    @staticmethod
+    def _operator_cost(server: CloudServer, price: ServerPriceSnapshot) -> ProviderCostSnapshot:
+        exact = price.offer.provider_rate_exact
+        if not isinstance(exact, str):
+            raise ValueError("operator hourly cost requires the immutable native exact rate")
+        return ProviderCostSnapshot(
+            amount_exact=exact,
+            currency=price.offer.currency,
+            provenance=f"accepted hourly price snapshot {server.id}",
+        )
+
+    async def prepare_operator_first_hour(
+        self, server: CloudServer, price: ServerPriceSnapshot
+    ) -> PrepaidHourlyPeriod:
+        if not operator_funded(server) or server.created_at is None:
+            raise ValueError("operator first-hour preparation requires a persisted operator server")
+        return await self._bind_operator(server, _aware(server.created_at, "created_at"), price)
+
+    async def _bind_operator(
+        self, server: CloudServer, start: datetime, price: ServerPriceSnapshot
+    ) -> PrepaidHourlyPeriod:
+        if not operator_funded(server):
+            raise ValueError("operator coverage requires self-owned source")
+        funding = self._require_operator_funding()
+        grant = await funding.reserve(
+            operator_id=server.user_id,
+            owner_id=server.user_id,
+            operation_key=prepaid_hourly_key(server.id, start),
+            resource_key=str(server.id),
+            purpose=FundingPurpose.HOURLY_USAGE,
+            nominal_amount_minor=price.selling_minor,
+            nominal_currency=price.selling_currency,
+            provider_cost_snapshot=self._operator_cost(server, price),
+            reason=(
+                f"Authorize operator hourly coverage for server {server.id} at {start.isoformat()}"
+            ),
+        )
+        period = PrepaidHourlyPeriod(
+            server_id=server.id,
+            wallet_id=None,
+            period_start=start,
+            period_end=start + timedelta(hours=1),
+            usd_minor=price.selling_minor,
+            irt_minor=None,
+            fx_snapshot=None,
+            idempotency_key=grant.operation_key,
+            funding_source=FundingSource.OPERATOR,
+            funding_operator_id=server.user_id,
+            operator_grant_id=grant.id,
+            nominal_currency=price.selling_currency,
+        )
+        return await self._periods.bind(period)
+
+    async def verify_operator_period(
+        self,
+        server: CloudServer,
+        price: ServerPriceSnapshot,
+        start: datetime,
+        *,
+        authorize_new_dispatch: bool = False,
+    ) -> PrepaidHourlyPeriod:
+        if not operator_funded(server):
+            raise ValueError("server source is not operator")
+        funding = self._require_operator_funding()
+        if authorize_new_dispatch:
+            await funding.authorize_new_period(owner_id=server.user_id, operator_id=server.user_id)
+        period = await self._periods.get(server.id, start)
+        if (
+            period is None
+            or period.funding_source is not FundingSource.OPERATOR
+            or period.funding_operator_id != server.user_id
+            or period.usd_minor != price.selling_minor
+            or period.nominal_currency != price.selling_currency
+            or period.idempotency_key != prepaid_hourly_key(server.id, start)
+        ):
+            raise ValueError("operator hourly period evidence is missing or inconsistent")
+        grant = await funding.get_grant(period.idempotency_key)
+        if (
+            grant is None
+            or grant.id != period.operator_grant_id
+            or grant.owner_user_id != server.user_id
+            or grant.operator_user_id != server.user_id
+            or grant.resource_key != str(server.id)
+            or grant.purpose is not FundingPurpose.HOURLY_USAGE
+            or grant.nominal_amount_minor != period.usd_minor
+            or grant.nominal_currency != period.nominal_currency
+            or grant.provider_cost_snapshot != self._operator_cost(server, price)
+            or grant.state is FundingGrantState.CANCELLED
+        ):
+            raise ValueError("operator hourly grant differs from the immutable resource contract")
+        if period.status is PrepaidHourlyPeriodStatus.PAID:
+            expense = await funding.get_expense(expense_operation_key(grant.operation_key))
+            if (
+                expense is None
+                or expense.id != period.operator_expense_id
+                or expense.grant_id != grant.id
+            ):
+                raise ValueError("operator paid coverage has no coherent corporate expense")
+            # Repository settlement replay compares every immutable expense
+            # fact against the original grant and never creates a second cost.
+            await funding.settle(grant)
+        return period
+
+    async def _settle_operator_period(
+        self, server: CloudServer, price: ServerPriceSnapshot, start: datetime
+    ) -> PrepaidHourlyPeriod:
+        period = await self.verify_operator_period(server, price, start)
+        if period.status is PrepaidHourlyPeriodStatus.PAID:
+            return period
+        funding = self._require_operator_funding()
+        grant = await funding.get_grant(period.idempotency_key)
+        if grant is None:
+            raise ValueError("operator grant disappeared before corporate settlement")
+        expense = await funding.settle(grant)
+        paid = replace(period, operator_expense_id=expense.id)
+        await self._periods.mark_paid(paid)
+        return replace(paid, status=PrepaidHourlyPeriodStatus.PAID)
+
+    async def close_operator_contract(self, server: CloudServer) -> None:
+        if not operator_funded(server):
+            raise ValueError("corporate close requires operator source")
+        if server.provider_server_id:
+            # Accepted creation may disappear before its first ready poll.
+            # Its original expense remains recordable after revocation.
+            await self.capture_operator_first_hour(server)
+            return
+        funding = self._require_operator_funding()
+        key = prepaid_hourly_key(server.id, _aware(server.created_at, "created_at"))
+        grant = await funding.get_grant(key)
+        if grant is not None and grant.state is FundingGrantState.AUTHORIZED:
+            await funding.cancel(grant, reason="Hourly create closed without provider acceptance")
+
+    async def _verified_operator_cutover(
+        self, server: CloudServer, price: ServerPriceSnapshot
+    ) -> OperatorHourlyCutoverCoverage:
+        read = getattr(self._periods, "get_operator_cutover_coverage", None)
+        receipt = await read(server.id) if callable(read) else None
+        if (
+            receipt is None
+            or receipt.server_id != server.id
+            or receipt.operator_id != server.user_id
+        ):
+            raise ValueError("operator source lacks a coherent corporate cutover receipt")
+        if receipt.grant_operation_key != prepaid_hourly_key(
+            server.id, receipt.period_start
+        ) or receipt.expense_operation_key != expense_operation_key(receipt.grant_operation_key):
+            raise ValueError("operator cutover receipt keys differ from accepted coverage")
+        funding = self._require_operator_funding()
+        grant = await funding.get_grant(receipt.grant_operation_key)
+        expense = await funding.get_expense(receipt.expense_operation_key)
+        if (
+            grant is None
+            or expense is None
+            or grant.id != receipt.grant_id
+            or expense.id != receipt.expense_id
+            or expense.grant_id != grant.id
+            or grant.state is not FundingGrantState.SETTLED
+            or grant.owner_user_id != server.user_id
+            or grant.operator_user_id != server.user_id
+            or grant.resource_key != str(server.id)
+            or grant.purpose is not FundingPurpose.HOURLY_USAGE
+            or grant.nominal_amount_minor != price.selling_minor
+            or grant.nominal_currency != price.selling_currency
+            or grant.provider_cost_snapshot != self._operator_cost(server, price)
+            or any(
+                getattr(expense, field) != getattr(grant, field)
+                for field in (
+                    "owner_user_id",
+                    "operator_user_id",
+                    "resource_key",
+                    "purpose",
+                    "nominal_amount_minor",
+                    "nominal_currency",
+                    "provider_cost_snapshot",
+                )
+            )
+        ):
+            raise ValueError("operator cutover receipt differs from immutable funding facts")
+        await funding.settle(grant)
+        return receipt
+
+    async def _verify_current_operator_coverage(
+        self, server: CloudServer, price: ServerPriceSnapshot
+    ) -> None:
+        boundary = _aware(server.prepaid_paid_until, "operator paid coverage")
+        start = boundary - timedelta(hours=1)
+        period = await self._periods.get(server.id, start)
+        if period is not None and period.funding_source is FundingSource.OPERATOR:
+            verified = await self.verify_operator_period(server, price, start)
+            if (
+                verified.status is not PrepaidHourlyPeriodStatus.PAID
+                or verified.period_end != boundary
+            ):
+                raise ValueError("operator coverage watermark has no paid corporate receipt")
+            return
+        receipt = await self._verified_operator_cutover(server, price)
+        if receipt.period_start != start or receipt.period_end != boundary:
+            raise ValueError("operator cutover receipt does not cover the current watermark")
+
+    async def capture_operator_first_hour(
+        self, server: CloudServer
+    ) -> PrepaidHourlyPeriod | OperatorHourlyCutoverCoverage:
+        if not server.provider_server_id:
+            raise ValueError("corporate receipt requires an accepted provider resource")
+        price = await self._snapshots.get(server.id)
+        if price is None:
+            raise ValueError("operator hourly snapshot is missing")
+        initial = await self._periods.get(server.id, _aware(server.created_at, "created_at"))
+        if initial is None or initial.funding_source is not FundingSource.OPERATOR:
+            return await self._verified_operator_cutover(server, price)
+        return await self._settle_operator_period(
+            server, price, _aware(server.created_at, "created_at")
+        )
+
+    async def ensure_operator_coverage(self, server: CloudServer) -> CloudServer:
+        """Fresh policy before restart/new service; recover accepted receipts independently."""
+        funding = self._require_operator_funding()
+        if not operator_funded(server):
+            raise ValueError("operator coverage requires stored operator source")
+        await funding.authorize_new_period(owner_id=server.user_id, operator_id=server.user_id)
+        current = await self._servers.get(server.id)
+        if current is None or current.provider_server_id != server.provider_server_id:
+            raise ValueError("operator hourly coverage requires the persisted provider resource")
+        if current.prepaid_paid_until is None:
+            await self.capture_operator_first_hour(current)
+        else:
+            await self._renew_operator(current, datetime.now(UTC), PrepaidHourlyRunReport())
+        refreshed = await self._servers.get(server.id)
+        if (
+            refreshed is None
+            or refreshed.prepaid_paid_until is None
+            or _aware(refreshed.prepaid_paid_until, "prepaid_paid_until") <= datetime.now(UTC)
+        ):
+            raise ValueError("corporate receipt did not establish current hourly coverage")
+        server.prepaid_paid_until = refreshed.prepaid_paid_until
+        server.updated_at = refreshed.updated_at
+        return refreshed
+
+    async def _renew_operator(
+        self, server: CloudServer, now: datetime, report: PrepaidHourlyRunReport
+    ) -> None:
+        funding = self._require_operator_funding()
+        # Even ahead of the renewal boundary, revocation requests suspension.
+        await funding.authorize_new_period(owner_id=server.user_id, operator_id=server.user_id)
+        start = _aware(server.prepaid_paid_until, "operator paid coverage")
+        price = await self._snapshots.get(server.id)
+        if price is None:
+            raise ValueError("operator hourly snapshot is missing")
+        await self._verify_current_operator_coverage(server, price)
+        if now < start - timedelta(minutes=1):
+            return
+        if now >= start + timedelta(hours=1):
+            raise ValueError("operator coverage gap requires explicit reviewed recovery")
+        period = await self._periods.get(server.id, start)
+        if period is None:
+            await self._bind_operator(server, start, price)
+        await self._settle_operator_period(server, price, start)
+        report.replayed += int(period is not None)
+        report.operator_expenses_settled += int(period is None)
 
     async def prepare_first_hour(
         self,
@@ -1103,6 +1453,8 @@ class PrepaidHourlyBillingService:
         hold_repo: HoldRepository | None = None,
     ) -> PrepaidHourlyPeriod:
         """Checkout: persist FX evidence BEFORE the exact IRT hold or provider create."""
+        if operator_funded(server):
+            raise ValueError("operator hourly preparation must use corporate grant evidence")
         if not server.is_prepaid_hourly_irt or server.idempotency_key is None:
             raise ValueError("first-hour preparation requires a prepaid hourly checkout")
         if _aware(start, "period_start") != _aware(server.created_at, "server.created_at"):
@@ -1152,6 +1504,8 @@ class PrepaidHourlyBillingService:
             return prior
         if isinstance(usd_minor, bool) or not isinstance(usd_minor, int) or usd_minor <= 0:
             raise ValueError("positive USD cents are required")
+        if self._fx is None:
+            raise RuntimeError("customer prepaid FX resolver is not configured")
         quote = await self._fx.snapshot(usd_minor, "USD", "IRT", FxPurpose.CHARGE)
         if quote.expires_at is None or quote.expires_at <= datetime.now(UTC):
             raise ValueError("prepaid FX quote expired before binding")
@@ -1171,6 +1525,8 @@ class PrepaidHourlyBillingService:
         self, server: CloudServer, hold_repo: HoldRepository, hold_service: HoldService
     ) -> PrepaidHourlyPeriod:
         """Post the checkout's reserved IRT once, then durably cover the first hour."""
+        if operator_funded(server):
+            return await self.capture_operator_first_hour(server)
         if not server.is_prepaid_hourly_irt or not server.idempotency_key:
             raise ValueError("server is not a prepaid hourly checkout")
         start = _aware(server.created_at, "server.created_at")
@@ -1211,34 +1567,66 @@ class PrepaidHourlyBillingService:
         await self._periods.mark_paid(period)
         return period
 
-    async def run(self, now: datetime | None = None) -> PrepaidHourlyRunReport:
+    async def run(
+        self, now: datetime | None = None, *, customer_enabled: bool = True
+    ) -> PrepaidHourlyRunReport:
         moment = _aware(now or datetime.now(UTC), "now")
         if self._lock is None:
-            return await self._run(moment)
+            return await self._run(moment, customer_enabled=customer_enabled)
         async with self._lock.guard() as acquired:
             if not acquired:
                 return PrepaidHourlyRunReport()
-            return await self._run(moment)
+            return await self._run(moment, customer_enabled=customer_enabled)
 
-    async def _run(self, now: datetime) -> PrepaidHourlyRunReport:
+    async def _run(self, now: datetime, *, customer_enabled: bool = True) -> PrepaidHourlyRunReport:
         result = PrepaidHourlyRunReport()
         # Repair committed money before filtering by lifecycle: policy may have stopped
         # a server after its debit succeeded but its coverage transaction failed.
         for period in await self._periods.list_charged_pending():
             try:
+                if period.funding_source is FundingSource.OPERATOR:
+                    server = await self._servers.get(period.server_id)
+                    price = await self._snapshots.get(period.server_id)
+                    if server is None or price is None:
+                        raise ValueError(
+                            "operator coverage repair requires stored resource and quote"
+                        )
+                    await self._settle_operator_period(server, price, period.period_start)
+                    result.replayed += 1
+                    continue
                 await self._verify_charge(period)
                 await self._periods.mark_paid(period)
                 result.replayed += 1
             except Exception:
                 result.errors[period.server_id] = "prepaid committed coverage repair failed"
                 logger.exception("prepaid coverage repair failed for server %s", period.server_id)
-        for server in await self._servers.list_running():
-            if not server.is_prepaid_hourly_irt:
+        active = list(await self._servers.list_running())
+        # Powered-off provider resources can still incur native hourly costs.
+        # Their corporate source never enters personal-wallet collection.
+        for name in ("list_stopped", "list_provisioning"):
+            read = getattr(self._servers, name, None)
+            if callable(read):
+                active.extend(
+                    server
+                    for server in await read()
+                    if operator_funded(server) and server.provider_server_id
+                )
+        for server in {server.id: server for server in active}.values():
+            corporate = operator_funded(server)
+            if not corporate and not customer_enabled:
+                continue
+            if not server.is_prepaid_hourly_irt and not corporate:
                 continue
             try:
-                await self._renew(server, now, result)
+                if corporate:
+                    await self._renew_operator(server, now, result)
+                else:
+                    await self._renew(server, now, result)
             except Exception as exc:
                 result.errors[server.id] = str(exc)
+                if corporate:
+                    result.operator_suspend_server_ids.append(server.id)
+                    continue
                 if server.prepaid_paid_until is None or now >= _aware(
                     server.prepaid_paid_until, "prepaid_paid_until"
                 ):
@@ -1249,6 +1637,10 @@ class PrepaidHourlyBillingService:
     async def _renew(
         self, server: CloudServer, now: datetime, report: PrepaidHourlyRunReport
     ) -> None:
+        persisted = await self._servers.get(server.id)
+        if persisted is not None and operator_funded(persisted):
+            await self._renew_operator(persisted, now, report)
+            return
         paid_until = server.prepaid_paid_until
         if paid_until is None:
             raise ValueError("running prepaid server lacks paid first-hour coverage")
@@ -1396,7 +1788,7 @@ class PrepaidBalancePolicyService:
         # A stopped zero-balance server still needs its 24-hour deletion decision.
         servers = [*await self._servers.list_running(), *await self._servers.list_stopped()]
         for server in servers:
-            if not server.is_prepaid_hourly_irt:
+            if operator_funded(server) or not server.is_prepaid_hourly_irt:
                 continue
             try:
                 wallet = await self._wallets.get(server.user_id)
@@ -1582,7 +1974,7 @@ class LowBalancePolicyService:
         # Prepaid monthly servers are billed by the renewal checker, never by
         # the hourly low-balance/auto-delete policy (LEASEWEB-MVP).
         for server in await self._servers.list_running():
-            if server.billing_model != "hourly":
+            if operator_funded(server) or server.billing_model != "hourly":
                 continue
             report.servers_checked += 1
             try:
@@ -1609,6 +2001,8 @@ class LowBalancePolicyService:
         config: LowBalancePolicyConfig,
         now: datetime,
     ) -> LowBalanceDecision:
+        if operator_funded(server):
+            return LowBalanceDecision.NONE
         wallet = await self._wallets.get(server.user_id)
         if wallet is None or wallet.currency != config.currency:
             # A threshold in one currency must never be applied to another

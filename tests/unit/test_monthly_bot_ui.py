@@ -198,6 +198,26 @@ class FakeOffersView:
         return view
 
 
+async def test_operator_confirmation_displays_corporate_authorization_without_wallet(monkeypatch):
+    from cloud_platform.modules.funding.domain import FundingSource
+
+    ui, deps = _ui()
+    original = deps["view"].confirmation
+
+    async def corporate_confirmation(**kwargs):
+        return replace(
+            await original(**kwargs), funding_source=FundingSource.OPERATOR, balance_minor=0
+        )
+
+    monkeypatch.setattr(deps["view"], "confirmation", corporate_confirmation)
+    screen = await ui.confirm_screen(USER_A, OFFER_ID, 0)
+    assert "Corporate server authorization" in screen.text
+    assert "Monthly corporate contract amount" in screen.text
+    assert "Wallet balance" not in screen.text
+    assert "auto renewal from wallet" not in screen.text
+    assert screen.keyboard.inline_keyboard[0][0].text == "✅ Authorize expense and create"
+
+
 class FakeCheckout:
     def __init__(self, *, replay: bool = False) -> None:
         self.replay = replay

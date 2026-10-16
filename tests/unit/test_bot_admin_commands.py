@@ -496,8 +496,11 @@ async def test_each_configured_superadmin_gets_dedicated_persistent_management_k
     assert keyboard.is_persistent is True
     assert keyboard.resize_keyboard is True
     assert [button.text for row in keyboard.keyboard for button in row] == [
-        Translator().t("admin.gateways"),
-        Translator().t("admin.credit"),
+        Translator().t("admin.create_server"),
+        Translator().t("admin.renew_server"),
+        Translator().t("menu.servers"),
+        Translator().t("menu.admin"),
+        Translator().t("menu.support"),
         Translator().t("nav.menu"),
     ]
     assert second.kwargs["reply_markup"].inline_keyboard
