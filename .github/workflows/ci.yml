@@ -236,7 +236,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Validate GitHub workflows
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+        run: |
+          command -v shellcheck >/dev/null || { echo "::error::ShellCheck is required"; exit 1; }
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - uses: docker/setup-buildx-action@v4
       - name: Validate shell and shared production compose
         env:

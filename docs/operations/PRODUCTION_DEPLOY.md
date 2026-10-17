@@ -36,6 +36,9 @@ migration bridge, physical schema, PostgreSQL contracts, provider-neutrality,
 generated-contract and image-smoke gates as release CI; no fast-check exemption.
 Images and Compose candidates come from that same tested commit. SHA tags are
 immutable, and OCI revision plus platform-contract labels are checked.
+Workflow validation requires Linux ShellCheck plus actionlint, not just a
+Windows-only syntax pass. The SSH wrapper's runtime regressions verify token
+stdin, a private temporary registry directory and cleanup on every exit.
 
 Both lanes share one non-cancelling deployment job group and directory-scoped
 `flock`. Website and native releases additionally serialize through

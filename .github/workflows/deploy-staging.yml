@@ -201,9 +201,9 @@ jobs:
           set -Eeuo pipefail
           printf -v invoke 'DEPLOY_PATH=%q CONFIGURATION_PATH=%q PLATFORM_IMAGE_NEW=%q EXPECTED_HEAD=%q CANDIDATE_COMPOSE_FILE=%q EXPECTED_COMPOSE_SHA256=%q DEPLOY_PROFILE=staging bash -s' \
             "$DEPLOY_PATH" "$CONFIGURATION_PATH" "$RELEASE_IMAGE" "$EXPECTED_HEAD" "$DEPLOY_PATH/$CANDIDATE" "$COMPOSE_SHA"
-          printf -v login 'printf "%%s" "$registry_token" | docker login ghcr.io -u %q --password-stdin >/dev/null' "$GHCR_ACTOR"
-          cleanup='rm -rf -- "$DOCKER_CONFIG"'
-          printf -v remote 'set -Eeuo pipefail; DOCKER_CONFIG="$(mktemp -d)"; export DOCKER_CONFIG; trap %q EXIT; IFS= read -r registry_token; %s; unset registry_token GHCR_TOKEN; %s' "$cleanup" "$login" "$invoke"
+          printf -v login "printf '%%s' \"\$registry_token\" | docker login ghcr.io -u %q --password-stdin >/dev/null" "$GHCR_ACTOR"
+          cleanup="rm -rf -- \"\$DOCKER_CONFIG\""
+          printf -v remote "set -Eeuo pipefail; DOCKER_CONFIG=\"\$(mktemp -d)\"; export DOCKER_CONFIG; trap %q EXIT; IFS= read -r registry_token; %s; unset registry_token GHCR_TOKEN; %s" "$cleanup" "$login" "$invoke"
           { printf '%s\n' "$GHCR_TOKEN"; cat scripts/deploy-production.sh; } |
             ssh -i "$HOME/.ssh/deploy_key" -p "${DEPLOY_PORT:-22}" \
               -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
