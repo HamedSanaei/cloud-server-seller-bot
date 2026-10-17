@@ -39,6 +39,11 @@ immutable, and OCI revision plus platform-contract labels are checked.
 Workflow validation requires Linux ShellCheck plus actionlint, not just a
 Windows-only syntax pass. The SSH wrapper's runtime regressions verify token
 stdin, a private temporary registry directory and cleanup on every exit.
+The coverage floor remains **88%**. Reports use six-digit precision; both CI
+and `scripts/verify_ci.py` also run `scripts/check_coverage.py` against the XML's
+integer line counts. A rounded display or successful plugin exit cannot authorize
+a result below the exact floor. The gate rejects the observed 39112/44452-line
+artifact rather than treating its rounded 88% display as success.
 
 Both lanes share one non-cancelling deployment job group and directory-scoped
 `flock`. Website and native releases additionally serialize through

@@ -13,9 +13,9 @@ Usage:
         --test tests/unit/test_business_log.py \
         --test tests/unit/test_hourly_state_machine.py   # targeted + staging gate
 
-Steps (--staging): the same complete gates as --push-ready. Staging is isolated,
-not a lower-confidence release lane. --test runs explicitly named regressions
-first, but never skips the full suite, type checking, secret scan or coverage.
+Steps (--staging): the same complete gates as --push-ready. Staging updates the
+same live runtime; it is not a lower-confidence release lane. --test runs named
+regressions first, never skipping full tests, types, secret scan or exact coverage.
 
 Steps (--push-ready):
     1. ruff check
@@ -23,12 +23,13 @@ Steps (--push-ready):
     3. mypy
     4. pre-commit (must exit 0 AND modify zero files)
     5. full pytest + coverage into .ci-artifacts/
-    6. migration gate
-    7. provider-branching gate
-    8. Leaseweb generated-contract gate
-    9. task validation
-    10. generated-artifact gate
-    11. git status / diff audit (reports only; never commits)
+    6. exact, unrounded source-line coverage gate
+    7. migration gate
+    8. provider-branching gate
+    9. Leaseweb generated-contract gate
+    10. task validation
+    11. generated-artifact gate
+    12. git status / diff audit (reports only; never commits)
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ PUSH_READY_STEPS: list[list[str]] = [
         "--cov-report=term",
         "--cov-fail-under=88",
     ],
+    ["uv", "run", "python", "scripts/check_coverage.py", ".ci-artifacts/coverage.xml"],
     ["uv", "run", "python", "scripts/check_migrations.py"],
     ["uv", "run", "python", "scripts/check_domain_provider_branching.py"],
     ["uv", "run", "python", "scripts/gen_leaseweb_coverage.py", "--check"],

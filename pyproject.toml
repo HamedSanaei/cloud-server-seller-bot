@@ -63,3 +63,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q --strict-markers"
+
+[tool.coverage.report]
+precision = 6

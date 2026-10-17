@@ -206,21 +206,19 @@ class TestAvailableBalance:
     """available_balance = wallet.balance - sum(active holds)."""
 
     async def test_available_balance_computed(self) -> None:
-        wallet_id = uuid4()
+        user_id, wallet_id = uuid4(), uuid4()
+        wallet = Wallet(user_id=user_id, id=wallet_id, balance=1000, currency="EUR")
         wallet_repo = AsyncMock()
         wallet_repo.get = AsyncMock(
-            return_value=Wallet(
-                user_id=uuid4(),
-                id=wallet_id,
-                balance=1000,
-                currency="EUR",
-            )
+            side_effect=lambda identity: wallet if identity == user_id else None
         )
         hold_repo = AsyncMock()
-        hold_repo.active_hold_sum = AsyncMock(return_value=300)
+        hold_repo.active_hold_sum = AsyncMock(
+            side_effect=lambda identity: 300 if identity == wallet_id else 0
+        )
 
         service = HoldService(wallet_repo, hold_repo, AsyncMock())  # type: ignore[arg-type]
-        assert await service.available_balance(wallet_id) == 700
+        assert await service.available_balance(user_id) == 700
 
     async def test_available_balance_wallet_not_found(self) -> None:
         wallet_repo = AsyncMock()
@@ -231,11 +229,11 @@ class TestAvailableBalance:
             await service.available_balance(uuid4())
 
     async def test_available_balance_no_holds(self) -> None:
-        wallet_id = uuid4()
+        user_id, wallet_id = uuid4(), uuid4()
         wallet_repo = AsyncMock()
         wallet_repo.get = AsyncMock(
             return_value=Wallet(
-                user_id=uuid4(),
+                user_id=user_id,
                 id=wallet_id,
                 balance=250,
                 currency="EUR",
@@ -245,4 +243,4 @@ class TestAvailableBalance:
         hold_repo.active_hold_sum = AsyncMock(return_value=0)
 
         service = HoldService(wallet_repo, hold_repo, AsyncMock())  # type: ignore[arg-type]
-        assert await service.available_balance(wallet_id) == 250
+        assert await service.available_balance(user_id) == 250

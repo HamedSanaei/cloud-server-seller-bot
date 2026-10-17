@@ -190,3 +190,9 @@ immediately before provider execution, including worker retries. Ordinary/legacy
 power routes continue denying the reserved resource. JSONB model defaults now
 use SQL expressions matching the existing migrations; no additional financial
 schema revision or customer-data rewrite is required for that correction.
+
+Hourly restart affordability resolves the canonical **user ID** to its IRT wallet,
+then subtracts active holds by the distinct **wallet ID**. Mixing these identities
+made funded restarts remain unavailable and could prevent balance-policy evaluation.
+The real PostgreSQL/HTTP regression checks below-hour funding, restoration at the
+exact next-hour amount and an idempotent single prepayment/provider dispatch.

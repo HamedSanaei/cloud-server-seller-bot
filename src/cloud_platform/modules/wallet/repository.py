@@ -1433,10 +1433,10 @@ class HoldService:
         assert hold.id is not None  # persisted holds always carry a DB-assigned id
         return hold
 
-    async def available_balance(self, wallet_id: UUID) -> int:
-        """Compute balance minus active holds. Locks wallet row."""
-        wallet = await self._wallet_repo.get(wallet_id)
-        if wallet is None:
-            raise ValueError(f"wallet {wallet_id} not found")
-        held = await self._hold_repo.active_hold_sum(wallet_id)
+    async def available_balance(self, user_id: UUID) -> int:
+        """Read a user's spendable balance, subtracting holds on their wallet."""
+        wallet = await self._wallet_repo.get(user_id)
+        if wallet is None or wallet.id is None:
+            raise ValueError(f"wallet for user {user_id} not found")
+        held = await self._hold_repo.active_hold_sum(wallet.id)
         return wallet.balance - held

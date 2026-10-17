@@ -1189,7 +1189,7 @@ class PrepaidHourlyBillingService:
         if wallet is None or wallet.id is None or wallet.currency != "IRT":
             raise ValueError("hourly billing requires the owner's IRT wallet")
         return (
-            await self._available_balance(wallet.id)
+            await self._available_balance(server.user_id)
             if self._available_balance is not None
             else wallet.balance
         )

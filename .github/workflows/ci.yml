@@ -130,6 +130,8 @@ jobs:
           --cov-report=xml:.ci-artifacts/coverage.xml
           --cov-report=term
           --cov-fail-under=88
+      - name: Verify exact unrounded source coverage
+        run: uv run --no-sync python scripts/check_coverage.py .ci-artifacts/coverage.xml
       - name: Upload JUnit results
         if: always()
         uses: actions/upload-artifact@v7

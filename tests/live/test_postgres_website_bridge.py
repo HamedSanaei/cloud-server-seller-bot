@@ -1277,3 +1277,106 @@ async def test_missing_canonical_wallet_cannot_start_a_payable_invoice(console_r
     async with ctx.database() as session:
         assert await session.scalar(select(func.count()).select_from(PaymentSession)) == 0
         assert await session.scalar(select(func.count()).select_from(LedgerEntry)) == 0
+
+
+async def test_hourly_restart_hides_until_next_hour_is_funded_then_prepays_exactly_once(
+    console_runtime, monkeypatch
+):
+    from datetime import UTC, datetime, timedelta
+    from decimal import Decimal
+
+    from cloud_platform.core.config import get_settings
+    from cloud_platform.core.container import Container
+    from cloud_platform.db.base import Wallet
+    from cloud_platform.modules.compute.domain import BILLING_MODEL_PREPAID_HOURLY_IRT
+    from cloud_platform.modules.pricing.domain import MarginRule, OfferCost, ServerPriceSnapshot
+    from cloud_platform.modules.pricing.repository import SqlAlchemyServerPriceSnapshotRepository
+    from tests.unit.test_prepaid_hourly_billing import Fx
+
+    ctx = console_runtime
+    fx = Fx(rate=1000)
+    monkeypatch.setattr(Container, "fx_resolver_or_none", lambda _self: fx)
+    monkeypatch.setenv("FX_ALLOW_USDT_PROXY_FOR_SETTLEMENT", "true")
+    get_settings.cache_clear()
+    expired = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=1)
+    server_id, account_id = uuid4(), uuid4()
+    async with ctx.database.begin() as session:
+        template = await session.get(Server, ctx.server.id)
+        session.add(
+            ProviderAccount(id=account_id, provider_id=template.provider_id, user_id=ctx.customer)
+        )
+        await session.flush()
+        session.add(
+            Server(
+                id=server_id,
+                user_id=ctx.customer,
+                provider_id=template.provider_id,
+                provider_account_id=account_id,
+                credential_account_id="verified-account",
+                provider_server_id="hourly-instance",
+                ipv4="192.0.2.45",
+                state="stopped",
+                price_per_quantum=100,
+                currency="USD",
+                quantum_seconds=3600,
+                billing_model=BILLING_MODEL_PREPAID_HOURLY_IRT,
+                prepaid_paid_until=expired,
+                created_at=expired - timedelta(hours=1),
+                funding_source="customer_wallet",
+            )
+        )
+    await SqlAlchemyServerPriceSnapshotRepository(ctx.database).create(
+        ServerPriceSnapshot(
+            server_id=server_id,
+            offer=OfferCost(
+                provider_key="leaseweb",
+                plan_id="hourly-test",
+                location_id="TEST-01",
+                currency="USD",
+                cost_minor=50,
+            ),
+            selling_minor=100,
+            selling_currency="USD",
+            book_name="isolated",
+            book_version=1,
+            rule=MarginRule(provider="*", plan="*", location="*", margin_factor=Decimal("2")),
+            priced_at=datetime.now(UTC),
+        )
+    )
+    ctx.provider.info = replace(ctx.provider.info, id="hourly-instance", state="STOPPED")
+    admin, _ = await linked_token(ctx, ctx.owner)
+    customer, _ = await linked_token(ctx, ctx.customer)
+    adjustment = f"/v1/console/admin/users/{ctx.customer}/wallet-adjustments"
+    funded = await ctx.client.post(
+        adjustment,
+        headers=bearer(admin, "hourly-below-price"),
+        json={"amountMinor": 999, "reason": "isolated next-hour boundary"},
+    )
+    assert funded.status_code == 200
+    path = f"/v1/console/servers/{server_id}"
+    unfunded = await ctx.client.get(path, headers=bearer(customer))
+    assert unfunded.status_code == 200
+    assert ServerOperation.START.value not in unfunded.json()["data"]["operations"]
+    refused = await ctx.client.post(
+        path + "/actions/power-on", headers=bearer(customer, "unfunded-hour"), json={}
+    )
+    assert refused.status_code == 409 and ctx.provider.dispatches == 0
+    replenished = await ctx.client.post(
+        adjustment,
+        headers=bearer(admin, "hourly-exact-price"),
+        json={"amountMinor": 1, "reason": "isolated exact next-hour price"},
+    )
+    assert replenished.status_code == 200
+    eligible = await ctx.client.get(path, headers=bearer(customer))
+    assert ServerOperation.START.value in eligible.json()["data"]["operations"]
+    for _ in range(2):
+        started = await ctx.client.post(
+            path + "/actions/power-on", headers=bearer(customer, "funded-hour"), json={}
+        )
+        assert started.status_code == 202
+    assert ctx.provider.dispatches == 1
+    async with ctx.database() as session:
+        wallet = await session.scalar(select(Wallet).where(Wallet.user_id == ctx.customer))
+        assert wallet.currency == "IRT" and wallet.balance == 0
+        stored = await session.get(Server, server_id)
+        assert stored.user_id == ctx.customer and stored.prepaid_paid_until > expired
