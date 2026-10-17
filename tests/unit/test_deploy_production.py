@@ -1,7 +1,7 @@
 """Tests for the production CD pipeline (GHCR build + SSH deploy).
 
 Acceptance: production requires explicit approval and successful exact-SHA main
-CI; staging uses its independent target. Images are immutable. Writers drain
+CI; staging updates the same production target. Images are immutable. Writers drain
 before encrypted backup and migration; health and single-bot gates determine
 activation. Rollback never downgrades a database or starts an incompatible epoch.
 
@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import selectors
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -69,6 +71,94 @@ def _bash_available() -> bool:
 needs_bash = pytest.mark.skipif(not _bash_available(), reason="no POSIX bash available")
 
 
+@pytest.fixture(autouse=True)
+def isolated_shared_host_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep lock semantics without requiring/writing the host's real /var/lock.
+
+    Only this module's test copy changes. Production never receives a path
+    override that could bypass its global lock. The test copy shortens only
+    the bounded cross-project lock wait so a real contention test fails fast.
+    """
+    source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    isolated = tmp_path / "deploy-test.sh"
+    isolated.write_text(
+        source.replace(
+            "/var/lock/servercloud-platform-release.lock",
+            (tmp_path / "shared-release.lock").as_posix(),
+        ).replace("flock -w 600 8", "flock -w 1 8"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "DEPLOY_SCRIPT", isolated)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="real flock requires Linux")
+@pytest.mark.parametrize("different_target", [False, True])
+@pytest.mark.parametrize("first_exit", [0, 1])
+def test_real_flock_excludes_parallel_release_and_unlocks_after_exit(
+    tmp_path: Path, different_target: bool, first_exit: int
+) -> None:
+    assert shutil.which("flock"), "Linux release validation requires real flock"
+    first_target = tmp_path / "first"
+    first_target.mkdir()
+    second_target = tmp_path / "second" if different_target else first_target
+    second_target.mkdir(exist_ok=True)
+    first_marker, next_marker = tmp_path / "first-entered", tmp_path / "next-entered"
+
+    def command(target: Path, marker: Path, *, hold: bool, status: int) -> str:
+        return f"""
+            export DEPLOY_PRODUCTION_SOURCED=1
+            export DEPLOY_PATH={shlex.quote(target.as_posix())}
+            export PLATFORM_IMAGE_NEW=ghcr.io/example/platform:{"a" * 40}
+            export CANDIDATE_COMPOSE_FILE={shlex.quote((target / "candidate.yml").as_posix())}
+            export EXPECTED_COMPOSE_SHA256={"a" * 64}
+            source {shlex.quote(DEPLOY_SCRIPT.as_posix())}
+            deploy() {{
+                printf entered > {shlex.quote(marker.as_posix())}
+                printf 'entered\\n'
+                {"IFS= read -r release" if hold else ":"}
+                return {status}
+            }}
+            main
+        """
+
+    first = subprocess.Popen(
+        [BASH, "-c", command(first_target, first_marker, hold=True, status=first_exit)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert first.stdout is not None
+        with selectors.DefaultSelector() as ready:
+            ready.register(first.stdout, selectors.EVENT_READ)
+            assert ready.select(timeout=15), "first release never acquired its locks"
+        assert first.stdout.readline().strip() == "entered"
+        blocked = subprocess.run(
+            [BASH, "-c", command(second_target, next_marker, hold=False, status=0)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert blocked.returncode != 0, blocked.stdout + blocked.stderr
+        assert not next_marker.exists(), "a concurrent release entered its mutation phase"
+        first.communicate(input="release\n", timeout=10)
+        assert first.returncode == first_exit
+        resumed = subprocess.run(
+            [BASH, "-c", command(second_target, next_marker, hold=False, status=0)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+        assert next_marker.read_text() == "entered"
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.communicate(timeout=10)
+
+
 def _bash_functions(body: str) -> str:
     """Run `body` with the deploy script's functions loaded (no deployment)."""
     result = subprocess.run(
@@ -83,6 +173,21 @@ def _bash_functions(body: str) -> str:
     )
     assert result.returncode == 0, f"bash failed: {result.stderr}"
     return result.stdout.strip()
+
+
+def _application_starts(calls: str | list[str], *, canonical: bool | None = None) -> list[str]:
+    """Classify executed service starts by release target, not optional CLI flags."""
+    starts = []
+    for call in calls.splitlines() if isinstance(calls, str) else calls:
+        args = shlex.split(call)
+        if args[-3:] != ["api", "worker", "bot"] or "up" not in args or "-d" not in args:
+            continue
+        if canonical is not None:
+            compose = Path(args[args.index("-f") + 1])
+            if (compose.name == "docker-compose.yml") is not canonical:
+                continue
+        starts.append(call)
+    return starts
 
 
 class TestDeployScriptStatic:
@@ -114,7 +219,7 @@ class TestDeployScriptStatic:
             if "run --rm --no-deps migrate" in line and "get_settings" not in line
         ]
         assert migrate_lines == []
-        assert "up -d api worker bot" not in calls
+        assert not _application_starts(calls)
         # Nothing was mutated and nothing needed rolling back.
         assert (deploy_dir / "deploy.env").read_bytes() == env_before
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
@@ -400,7 +505,7 @@ case " $* " in
         printf '%s\n' "${ALEMBIC_DB_HEAD:-0034 (head)}"
         exit 0
         ;;
-    *" up -d api worker bot "*)
+    *" up -d api worker bot "*|*" up -d --no-deps api worker bot "*)
         n="$(cat "$UP_FAIL_COUNTER" 2>/dev/null || echo 0)"
         n=$((n + 1))
         printf '%s' "$n" > "$UP_FAIL_COUNTER"
@@ -822,7 +927,7 @@ case " $* " in
         [ "$FAIL_MIGRATE" = "1" ] && exit 1
         exit 0
         ;;
-    *" up -d api worker bot "*)
+    *" up -d api worker bot "*|*" up -d --no-deps api worker bot "*)
         n="$(cat "$UP_FAIL_COUNTER" 2>/dev/null || echo 0)"
         n=$((n + 1))
         printf '%s' "$n" > "$UP_FAIL_COUNTER"
@@ -1039,7 +1144,7 @@ class TestReleaseComposeContract:
         schema = next(
             i for i, call in enumerate(calls) if "cloud_platform.db.schema_parity" in call
         )
-        start = next(i for i, call in enumerate(calls) if " up -d api worker bot" in call)
+        start = calls.index(_application_starts(calls, canonical=False)[0])
         smoke = next(i for i, call in enumerate(calls) if "post_deploy_smoke.py" in call)
         assert stop < migration < schema < start < smoke
         assert all(
@@ -1172,7 +1277,7 @@ class TestReleaseComposeContract:
         assert "no rollback needed" in result.stdout
         calls = _stub_calls(tmp_path, "docker-calls.log")
         assert "alembic upgrade" not in calls
-        assert "up -d api worker bot" not in calls
+        assert not _application_starts(calls)
         assert (deploy_dir / "deploy.env").read_bytes() == env_before
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
 
@@ -1193,7 +1298,7 @@ class TestReleaseComposeContract:
         assert "no rollback needed" in result.stdout
         calls = _stub_calls(tmp_path, "docker-calls.log")
         assert "alembic upgrade" not in calls
-        assert "up -d api worker bot" not in calls
+        assert not _application_starts(calls)
         assert candidate.exists()
         assert (deploy_dir / "deploy.env").read_bytes() == env_before
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
@@ -1230,7 +1335,8 @@ class TestReleaseComposeContract:
         assert "multiple migration revisions" in result.stderr
         calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
         assert not any(call.endswith(" run --rm --no-deps migrate") for call in calls)
-        assert not any(" stop " in call or " up -d api worker bot" in call for call in calls)
+        assert not any(" stop " in call for call in calls)
+        assert not _application_starts(calls)
         assert (deploy_dir / "deploy.env").read_bytes() == env_before
 
     @needs_bash
@@ -1251,10 +1357,7 @@ class TestReleaseComposeContract:
         assert "schema transition attempted" in result.stderr
         calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
         assert any("candidate.yml stop --timeout 45 api worker bot" in call for call in calls)
-        assert not any(
-            " up -d api worker bot" in call or " up -d --no-deps api worker bot" in call
-            for call in calls
-        )
+        assert not _application_starts(calls)
         assert (deploy_dir / "deploy.env").read_bytes() == env_before.replace(
             _OLD_IMAGE.encode(), _NEW_IMAGE.encode()
         )
@@ -1271,14 +1374,14 @@ class TestReleaseComposeContract:
         )
         assert "MAIN_RC=1" in result.stdout
         calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
-        starts = [call for call in calls if " up -d api worker bot" in call]
+        starts = _application_starts(calls, canonical=False)
         assert len(starts) == 1 and "candidate" in starts[0]
         assert calls.index(starts[0]) < next(
             i
             for i, call in enumerate(calls)
             if "candidate.yml stop --timeout 45 api worker bot" in call
         )
-        assert not any(" up -d --no-deps api worker bot" in call for call in calls)
+        assert not _application_starts(calls, canonical=True)
         assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
 
     @needs_bash
@@ -1286,14 +1389,14 @@ class TestReleaseComposeContract:
         result, _, _, _, _, _ = _release_harness(tmp_path, previous_image="", fail_up_api=True)
         assert "MAIN_RC=1" in result.stdout
         calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
-        start = next(i for i, call in enumerate(calls) if " up -d api worker bot" in call)
+        start = calls.index(_application_starts(calls, canonical=False)[0])
         stop = next(
             i
             for i, call in enumerate(calls)
             if "candidate.yml stop --timeout 45 api worker bot" in call
         )
         assert start < stop
-        assert not any(" up -d --no-deps api worker bot" in call for call in calls)
+        assert not _application_starts(calls, canonical=True)
 
     @needs_bash
     @pytest.mark.parametrize("service", ["worker", "bot"])
@@ -1369,7 +1472,7 @@ class TestReleaseComposeContract:
         )
         assert "MAIN_RC=1" in result.stdout
         calls = _stub_calls(tmp_path, "docker-calls.log")
-        assert " up -d --no-deps api worker bot" not in calls
+        assert not _application_starts(calls, canonical=True)
 
     @needs_bash
     @pytest.mark.parametrize("signal", ["HUP", "INT", "TERM"])
@@ -1382,7 +1485,7 @@ class TestReleaseComposeContract:
         assert "MAIN_RC=0" in result.stdout, result.stderr
         assert canonical.read_bytes() == b"# release candidate contract\nservices: {}\n"
         calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
-        assert sum(" up -d api worker bot" in call for call in calls) == 1
+        assert len(_application_starts(calls, canonical=False)) == 1
 
     @needs_bash
     def test_second_bot_appearing_during_stabilization_fails_closed(self, tmp_path: Path) -> None:

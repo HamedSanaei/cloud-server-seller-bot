@@ -15,7 +15,9 @@ import time
 from pathlib import Path
 
 HEARTBEAT_PATH = Path(tempfile.gettempdir()) / "cloud-platform-bot-polling.json"
-MAX_POLL_AGE_SECONDS = 90
+# Allow bounded scheduler starvation and a long-poll round trip. Only a real,
+# successful GetUpdates response can refresh this; probes never call Telegram.
+MAX_POLL_AGE_SECONDS = 180
 
 
 def polling_healthy(path: Path = HEARTBEAT_PATH, *, now: float | None = None) -> bool:

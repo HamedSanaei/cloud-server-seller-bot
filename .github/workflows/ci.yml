@@ -263,6 +263,27 @@ jobs:
         run: |
           docker run --rm platform:ci migrate --help
           docker run --rm platform:ci python -c 'import cloud_platform.api.app'
+      - name: Isolated health probes fail closed without live service evidence
+        run: |
+          set -euo pipefail
+          probe_log="$(mktemp)"
+          trap 'rm -f -- "$probe_log"' EXIT
+          for service in api worker bot; do
+            case "$service" in
+              api) probe=core/http_health.py ;;
+              worker) probe=worker/health.py ;;
+              bot) probe=bot/health.py ;;
+            esac
+            set +e
+            docker run --rm platform:ci python -I -S "/app/src/cloud_platform/$probe" >"$probe_log" 2>&1
+            rc=$?
+            set -e
+            [ "$rc" = 1 ] || { echo "::error::$service probe must reject absent service evidence"; exit 1; }
+            if grep -Eq 'Traceback|ModuleNotFoundError|ImportError' "$probe_log"; then
+              echo "::error::$service probe crashed instead of reporting missing health evidence"
+              exit 1
+            fi
+          done
 
   required:
     name: Required CI checks

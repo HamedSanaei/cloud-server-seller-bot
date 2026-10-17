@@ -72,10 +72,10 @@ USER app
 
 EXPOSE 8000
 
-# slim has no curl; the healthcheck uses the standard library against the
-# liveness endpoint (readiness is for orchestrators that can check deps).
-HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2).status==200 else 1)"
+# Isolated stdlib-only probe: no site hooks, application imports or config/DB load.
+# The real HTTP liveness endpoint remains authoritative; CD also checks readiness.
+HEALTHCHECK --interval=45s --timeout=15s --start-period=120s --retries=4 --start-interval=45s \
+    CMD ["python", "-I", "-S", "/app/src/cloud_platform/core/http_health.py"]
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["api"]

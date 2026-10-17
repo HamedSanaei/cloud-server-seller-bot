@@ -329,3 +329,86 @@ Leaseweb key, the Telegram token, the callback signing key, or payment
 secrets. Configuration validation suppresses input values. The workflow sends
 the GHCR token on stdin, unsets it and removes its private temporary Docker
 credential directory on exit. Never bypass SSH host-key verification to deploy.
+
+## 9. CPU-starved startup and health policy
+
+The image and production Compose use the same isolated `python -I -S` HTTP
+liveness probe (no application/configuration imports): interval/start-interval
+45s, timeout 15s, startup grace 120s, four retries. Worker and bot probes run
+every 60s, including startup, with timeout 20s, startup grace 120s and three
+retries. Explicit start intervals prevent Docker's faster startup probing from
+adding load precisely when a cold process is CPU-starved.
+The explicit start interval requires Docker Engine 25+; verify Engine and
+Compose support before approving rollout (see the Docker HEALTHCHECK reference).
+
+Both process-local heartbeat windows are bounded at 180s. Worker evidence is
+refreshed only when ARQ's real Redis sentinel changes (the ARQ cadence remains
+30s); polling evidence only follows a successful response from the EXISTING
+Telegram poller. Probes never send `getUpdates`, refresh heartbeat files, read
+secrets or declare a merely existing process healthy. Persistent event-loop,
+Redis or Telegram failures still fail closed after this bounded grace.
+
+`/health/ready` executes the existing PostgreSQL/session-store probes against
+the cached application container (Redis is mandatory in production). A failed
+dependency or the 3s probe deadline returns HTTP 503, without exception details
+or credentials. `/health/live` remains independent of those dependencies.
+
+CD allows 96 readiness/health attempts with 5s retry intervals (a nominal
+480s retry budget, plus probe execution time) and 45 minutes overall; backup,
+migration-head/physical-schema, single-poller, storefront, financial and
+stabilization gates remain mandatory. Both lanes share the GitHub deployment
+group, a per-target host lock and the website/platform host lock. Alembic also
+holds the existing PostgreSQL transaction advisory lock during online migration.
+CI candidates include run ID/attempt to avoid overwriting active artifacts;
+canonical Compose is promoted only after all checks pass.
+
+This preparation commit does not authorize a push, deployment or restart.
+High hypervisor CPU steal is an infrastructure problem: these bounded tolerances
+do not repair unavailable CPU capacity.
+
+
+## 10. Approval-gated staged production rollout
+
+1. **Select the tested release, not a branch name.** Record the full commit SHA,
+   immutable image digest, candidate Compose checksum, previous image/digest,
+   canonical Compose checksum and pre-deploy database head. Push to `staging`
+   automatically deploys the existing production runtime after CI; ordinary
+   `main` pushes do not. Manual `main` release additionally requires explicit
+   confirmation and the protected production Environment. Do not push this
+   preparation commit without a new approval.
+2. **Preflight before draining.** Verify Engine 25+ / compatible Compose,
+   available CPU/PIDs/memory/disk, SSH host key, private configuration, image
+   provenance, unchanged contract and off-host encrypted backup/restore evidence.
+   Retain the previous image and Compose; never print expanded secret values.
+3. **Serialize and drain.** Use the existing pipeline, target-directory flock,
+   shared website/platform flock and PostgreSQL transaction advisory lock.
+   Stop the previous API/worker/bot writers and confirm the old Telegram poller
+   exited; do not start a second poller for testing or rollback.
+4. **Back up and migrate once.** Require the canonical encrypted backup job to
+   succeed after writers drain. Run the one-shot migrate container once for
+   this release, then require the expected single Alembic head and physical
+   schema parity. Failure stops activation. Do not separately launch another
+   `alembic upgrade` from an operator shell or service startup.
+5. **Activate the tested application set.** The pipeline starts API, worker
+   and exactly one bot with `up -d --no-deps` after the successful migration
+   gate; resolving dependencies again would rerun the migrate service. Require
+   real API liveness/readiness (including PostgreSQL/Redis), observed ARQ
+   progress and successful responses from the existing Telegram poller. No
+   probe sends `getUpdates` or refreshes its own evidence. Docker startup grace
+   is 120s; each CD health wait uses the bounded attempt budget described above.
+6. **Prove stability before promotion.** Check healthy service-specific probes,
+   container identities, restart counts, process/PID budget, worker queue smoke,
+   storefront and read-only wallet/payment reconciliation. Inventory other
+   containers/host services capable of using the same bot token privately;
+   a single Compose replica alone does not exclude an external poller. Require
+   exactly one authorized poller and no Telegram conflict errors. Only then
+   atomically promote the candidate Compose and record the deployed SHA/digest.
+7. **Failure is not a successful release.** Stop candidate writers. With no
+   schema/financial-epoch transition, allow the existing rollback only after
+   physical-schema and contract compatibility checks, using the previous
+   canonical Compose/image without overlapping pollers. Re-run readiness,
+   worker/bot health and read-only smoke; keep the workflow failed.
+8. **Never blindly downgrade the database.** After a schema transition, unknown
+   partial migration, or incompatible financial epoch, do not restart old
+   writers and do not run `alembic downgrade`. Keep writers drained and review
+   a forward fix or separately authorized isolated-restore recovery.

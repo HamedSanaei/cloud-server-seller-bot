@@ -21,7 +21,9 @@ def process(monkeypatch):
     monkeypatch.setattr(health, "_process_started", started)
 
 
-@pytest.mark.parametrize("age, expected", [(0, True), (45, True), (45.001, False), (-0.001, False)])
+@pytest.mark.parametrize(
+    "age, expected", [(0, True), (120, True), (180, True), (180.001, False), (-0.001, False)]
+)
 def test_probe_enforces_actual_progress_window(tmp_path: Path, process, age, expected):
     path = tmp_path / "heartbeat.json"
     path.write_text(json.dumps({"pid": 42, "process_started": "12345", "observed_at": 1000}))
@@ -63,7 +65,7 @@ async def test_observer_does_not_freshen_a_stale_redis_sentinel(tmp_path: Path, 
             raise asyncio.CancelledError
 
     monkeypatch.setattr(health, "_process_started", lambda _pid: "current-process")
-    monkeypatch.setattr(health.asyncio, "sleep", tick)
+    monkeypatch.setattr(asyncio, "sleep", tick)
     with pytest.raises(asyncio.CancelledError):
         await health.observe_heartbeat(Redis(), path)
     assert observations[:2] == [None, None]

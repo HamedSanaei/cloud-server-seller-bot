@@ -145,8 +145,14 @@ services:
     volumes:
       - *platform-config
       - *management-ssh
-    # The image HEALTHCHECK (GET /health/live on :8000) is kept exactly here:
-    # api is the only service that serves HTTP.
+    # Keep this explicit policy aligned with the image HEALTHCHECK.
+    healthcheck:
+      test: ["CMD", "python", "-I", "-S", "/app/src/cloud_platform/core/http_health.py"]
+      interval: 45s
+      start_interval: 45s
+      timeout: 15s
+      start_period: 120s
+      retries: 4
     ports:
       - "${API_BIND_ADDRESS:-0.0.0.0}:${API_PORT:-8000}:8000"
     networks:
@@ -166,10 +172,11 @@ services:
     command: ["worker"]
     # ARQ's expiring Redis sentinel proves the event loop actually ran.
     healthcheck:
-      test: ["CMD", "python", "-m", "cloud_platform.worker.health"]
-      interval: 15s
-      timeout: 10s
-      start_period: 45s
+      test: ["CMD", "python", "-I", "-S", "/app/src/cloud_platform/worker/health.py"]
+      interval: 60s
+      start_interval: 60s
+      timeout: 20s
+      start_period: 120s
       retries: 3
     depends_on:
       postgres:
@@ -195,10 +202,11 @@ services:
     # Local heartbeat is refreshed only by successful Telegram long polls.
     # This probe never calls getUpdates and never consumes a customer update.
     healthcheck:
-      test: ["CMD", "python", "-m", "cloud_platform.bot.health"]
-      interval: 15s
-      timeout: 5s
-      start_period: 45s
+      test: ["CMD", "python", "-I", "-S", "/app/src/cloud_platform/bot/health.py"]
+      interval: 60s
+      start_interval: 60s
+      timeout: 20s
+      start_period: 120s
       retries: 3
     deploy:
       replicas: 1

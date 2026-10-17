@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import logging
 import math
 import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any
 
 HEARTBEAT_PATH = Path(tempfile.gettempdir()) / "cloud-platform-worker-heartbeat.json"
-MAX_HEARTBEAT_AGE_SECONDS = 45
+# Six real 30s ARQ heartbeat periods / three 60s Docker probe intervals.
+# Bounded CPU-starvation tolerance; a dead worker/Redis still becomes stale.
+MAX_HEARTBEAT_AGE_SECONDS = 180
 
 
 def _process_started(pid: int) -> str:
@@ -39,6 +42,9 @@ def worker_healthy(path: Path = HEARTBEAT_PATH, *, now: float | None = None) -> 
 
 async def observe_heartbeat(redis: Any, path: Path = HEARTBEAT_PATH) -> None:
     # Imported only by the existing worker, never by the healthcheck subprocess.
+    import asyncio
+    import logging
+
     from arq.constants import default_queue_name, health_check_key_suffix
 
     key = (getattr(redis, "default_queue_name", "") or default_queue_name) + health_check_key_suffix

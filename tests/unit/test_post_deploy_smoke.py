@@ -33,7 +33,7 @@ def _fake_http(responses: dict[str, tuple[int, str]]) -> object:
 
 OK = {
     "http://x/health/live": (200, json.dumps({"status": "ok"})),
-    "http://x/health/ready": (200, json.dumps({"status": "ok", "mode": "starter"})),
+    "http://x/health/ready": (200, json.dumps({"status": "ok"})),
     "http://x/metrics": (200, "cloud_platform_api_requests_total 1\n"),
 }
 

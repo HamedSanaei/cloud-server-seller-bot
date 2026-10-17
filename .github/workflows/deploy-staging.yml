@@ -140,7 +140,8 @@ jobs:
     needs: build
     if: github.ref == 'refs/heads/staging' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Backup/migration plus bounded cold-start/health windows on the shared host.
+    timeout-minutes: 45
     environment: staging
     # The active deploy is never cancelled. GitHub may coalesce pending jobs.
     concurrency:
@@ -197,7 +198,8 @@ jobs:
           # image, so a staging release can never mix an image with another
           # commit's compose file.
           sha="${{ needs.build.outputs.sha }}"
-          candidate=".docker-compose.${sha}.candidate.yml"
+          # Retries/parallel lanes must never overwrite an active release artifact.
+          candidate=".docker-compose.${sha}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.candidate.yml"
           compose_sha="$(sha256sum deploy/production/docker-compose.yml | awk '{print $1}')"
           echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
           echo "sha256=${compose_sha}" >> "${GITHUB_OUTPUT}"
@@ -234,12 +236,18 @@ jobs:
 
       - name: Report deployment
         if: always()
+        env:
+          DEPLOYMENT_RESULT: ${{ job.status }}
         run: |
           echo "commit: ${{ needs.build.outputs.sha }}"
           echo "image: ${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}"
           echo "lane: staging; runtime: production (cloud-platform-production)"
           echo "expected alembic head: ${{ needs.build.outputs.head }}"
-          echo "The original website and single Telegram bot are updated."
+          if [ "$DEPLOYMENT_RESULT" = success ]; then
+            echo "Canonical platform deployment verified (single Telegram poller)."
+          else
+            echo "::warning::Platform deployment was not verified; inspect the failed step and runtime before retrying."
+          fi
 
 
       - name: Remove ephemeral SSH key

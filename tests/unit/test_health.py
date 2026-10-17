@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from cloud_platform.api.routes import health as http_health
+from cloud_platform.core.container import get_container
 from cloud_platform.core.health import (
     CheckResult,
     PostgresReadiness,
@@ -166,3 +174,67 @@ class TestCheckReadiness:
         first = checks[0]
         for key in ("name", "status", "latency_ms", "detail"):
             assert key in first
+
+
+def _http_health_app(factory: _FakeSessionFactory, redis: _FakeRedis) -> FastAPI:
+    app = FastAPI()
+    app.include_router(http_health.router)
+    app.dependency_overrides[get_container] = lambda: SimpleNamespace(
+        session_factory=factory, session_store=lambda: redis
+    )
+    return app
+
+
+@pytest.mark.parametrize(
+    "database_fails,redis_fails,status",
+    [(False, False, 200), (True, False, 503), (False, True, 503)],
+)
+async def test_http_readiness_gates_activation_without_exposing_dependency_errors(
+    database_fails: bool, redis_fails: bool, status: int
+) -> None:
+    private_detail = "dependency-error-must-not-be-public"
+    app = _http_health_app(
+        _FakeSessionFactory(execute_error=RuntimeError(private_detail) if database_fails else None),
+        _FakeRedis(ping_error=ConnectionError(private_detail) if redis_fails else None),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://health.test"
+    ) as client:
+        response = await client.get("/health/ready")
+    assert response.status_code == status
+    assert response.json()["status"] == ("ok" if status == 200 else "unready")
+    assert {check["name"]: check["status"] for check in response.json()["checks"]} == {
+        "postgres": "unready" if database_fails else "ready",
+        "redis": "unready" if redis_fails else "ready",
+    }
+    assert private_detail not in response.text
+
+
+async def test_stalled_dependency_has_bounded_unready_response(monkeypatch) -> None:
+    class StalledRedis(_FakeRedis):
+        async def ping(self) -> object:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(http_health, "READINESS_TIMEOUT_SECONDS", 0.01)
+    app = _http_health_app(_FakeSessionFactory(), StalledRedis())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://health.test"
+    ) as client:
+        response = await asyncio.wait_for(client.get("/health/ready"), timeout=1)
+    assert response.status_code == 503
+    assert response.json()["status"] == "unready"
+
+
+async def test_liveness_does_not_require_container_or_dependencies() -> None:
+    app = _http_health_app(_FakeSessionFactory(), _FakeRedis())
+
+    def unavailable_container() -> None:
+        raise RuntimeError("database and session store are down")
+
+    app.dependency_overrides[get_container] = unavailable_container
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://health.test"
+    ) as client:
+        response = await client.get("/health/live")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}

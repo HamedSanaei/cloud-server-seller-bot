@@ -177,7 +177,8 @@ jobs:
     name: Deploy to production
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Backup/migration plus bounded cold-start/health windows on the shared host.
+    timeout-minutes: 45
     environment: production
     # Both branches share this job group and the on-host website/platform lock.
     concurrency:
@@ -230,7 +231,8 @@ jobs:
           # default-branch context cannot silently supply a different compose:
           # a mixed image/compose release is impossible.
           sha="${{ needs.build.outputs.sha }}"
-          candidate=".docker-compose.${sha}.candidate.yml"
+          # Retries/parallel lanes must never overwrite an active release artifact.
+          candidate=".docker-compose.${sha}.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.candidate.yml"
           compose_sha="$(sha256sum deploy/production/docker-compose.yml | awk '{print $1}')"
           echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
           echo "sha256=${compose_sha}" >> "${GITHUB_OUTPUT}"

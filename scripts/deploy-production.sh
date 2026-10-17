@@ -44,7 +44,7 @@
 #   ENV_FILE               default: ${DEPLOY_PATH}/deploy.env
 #   CONFIGURATION_PATH     default: /etc/cloud-server-seller/configuration.toml
 #   EXPECTED_HEAD          alembic head revision the database must report
-#   HEALTH_ATTEMPTS        default: 36 (x HEALTH_INTERVAL seconds for the API)
+#   HEALTH_ATTEMPTS        default: 96 (x HEALTH_INTERVAL seconds for the API)
 #   HEALTH_INTERVAL        default: 5 (seconds between health probes)
 #   STABILIZE_SECONDS      default: 15 (worker/bot restart-stability window)
 #   DEPLOY_PROFILE         default: production. `staging` keeps every gate
@@ -100,7 +100,9 @@ load_config() {
     ENV_FILE="${ENV_FILE:-${DEPLOY_PATH}/deploy.env}"
     CONFIGURATION_PATH="${CONFIGURATION_PATH:-/etc/cloud-server-seller/configuration.toml}"
     EXPECTED_HEAD="${EXPECTED_HEAD:-}"
-    HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-36}"
+    # 480s accommodates 120s cold startup plus the service-specific probe cadence
+    # and retries under CPU contention. No readiness/heartbeat gate is skipped.
+    HEALTH_ATTEMPTS="${HEALTH_ATTEMPTS:-96}"
     HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"
     STABILIZE_SECONDS="${STABILIZE_SECONDS:-15}"
     DEPLOY_PROFILE="${DEPLOY_PROFILE:-production}"
@@ -610,7 +612,9 @@ deploy() {
 
     log "starting api + worker + bot (bot replicas = 1)"
     APP_START_ATTEMPTED="yes"
-    compose_candidate up -d api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
+    # Migration already completed and schema/dependency health were verified.
+    # Resolving Compose dependencies here would run the migrate service again.
+    compose_candidate up -d --no-deps api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
 
     local api_port
     api_port="$(dotenv_value "${ENV_FILE}" API_PORT)"
