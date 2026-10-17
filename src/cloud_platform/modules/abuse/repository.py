@@ -125,6 +125,20 @@ class SqlAlchemyAbuseCaseRepository:
         row = _to_row(case)
         async with self._session_factory() as session:
             session.add(row)
+            await session.flush()
+            from cloud_platform.modules.notifications.outbox import notice_row
+
+            session.add(
+                notice_row(
+                    key=f"abuse:{row.id}:opened",
+                    user_id=case.user_id,
+                    text=(
+                        "گزارش تخلف برای سرویس شما ثبت شد؛ "
+                        "برای دریافت جزئیات و رفع مورد با پشتیبانی تماس بگیرید."
+                    ),
+                    server_id=str(case.server_id) if case.server_id else None,
+                )
+            )
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)

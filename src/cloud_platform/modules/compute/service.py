@@ -61,6 +61,7 @@ from cloud_platform.modules.provider_accounts.domain import (
     NoProviderAccountError,
     ProviderAccountRepository,
 )
+from cloud_platform.modules.servers.test_identity import is_test_resource
 from cloud_platform.modules.users.domain import (
     Permission,
     PermissionChecker,
@@ -267,7 +268,11 @@ class CreateServerService:
                 )
             if operator_funded(existing):
                 snapshot = await self._snapshots.get_snapshot(existing.id)
-                if snapshot is None or self._operator_billing is None:
+                if (
+                    snapshot is None
+                    or self._operator_billing is None
+                    or existing.created_at is None
+                ):
                     raise CreateServerCommandError(
                         "operator hourly intent lacks immutable funding evidence"
                     )
@@ -603,7 +608,7 @@ class MyServersService:
     async def get_server(self, user_id: UUID, server_id: UUID) -> ServerDetail | None:
         """One server the user owns, or None (missing or foreign alike)."""
         server = await self._servers.get(server_id)
-        if server is None or server.user_id != user_id:
+        if server is None or server.user_id != user_id or is_test_resource(server):
             return None
         return ServerDetail(
             server_id=server.id,

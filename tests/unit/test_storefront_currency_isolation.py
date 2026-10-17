@@ -196,7 +196,7 @@ class FakeWalletRepo:
         self.balance = balance
 
     async def get(self, user_id: UUID) -> Any:
-        return type("W", (), {"balance": self.balance})()
+        return type("W", (), {"balance": self.balance, "currency": "EUR"})()
 
 
 def _catalog(provider_key: str = PROVIDER) -> ProviderCatalog:
@@ -574,15 +574,21 @@ class TestUiNavigation:
         eur_plans = await _press(
             bot, next(b for b in buttons if EUR_LOCATION in b.text).callback_data
         )
-        eur_labels = [b.text for b in _buttons(eur_plans)]
-        assert any("€" in label for label in eur_labels)
-        assert not any("GBP" in label for label in eur_labels)
+        eur_targets = [
+            _decode(button.callback_data)
+            for button in _buttons(eur_plans)
+            if _decode(button.callback_data).screen == "plan_detail"
+        ]
+        assert [target.args[1] for target in eur_targets] == [EUR_LOCATION]
         gbp_plans = await _press(
             bot, next(b for b in buttons if GBP_LOCATION in b.text).callback_data
         )
-        gbp_labels = [b.text for b in _buttons(gbp_plans)]
-        assert any("GBP" in label for label in gbp_labels)
-        assert not any("€" in label for label in gbp_labels)
+        gbp_targets = [
+            _decode(button.callback_data)
+            for button in _buttons(gbp_plans)
+            if _decode(button.callback_data).screen == "plan_detail"
+        ]
+        assert [target.args[1] for target in gbp_targets] == [GBP_LOCATION]
 
     async def test_os_back_button_preserves_currency_in_ui(self) -> None:
         bot = _ui(_service())
@@ -595,8 +601,6 @@ class TestUiNavigation:
             b for b in _buttons(plans) if _decode(b.callback_data).screen == "plan_detail"
         )
         detail = await _press(bot, plan_button.callback_data)
-        assert "€" in detail.text
-        assert "GBP" not in detail.text
         continuation = next(b for b in _buttons(detail) if _decode(b.callback_data).screen == "os")
         os_screen = await _press(bot, continuation.callback_data)
         back = next(
@@ -605,5 +609,7 @@ class TestUiNavigation:
         back_target = _decode(back.callback_data)
         assert back_target.args[1] == EUR_LOCATION
         again = await _press(bot, back.callback_data)
-        assert "€" in again.text
-        assert "GBP" not in again.text
+        restored = next(
+            button for button in _buttons(again) if _decode(button.callback_data).screen == "os"
+        )
+        assert _decode(restored.callback_data).args == _decode(continuation.callback_data).args

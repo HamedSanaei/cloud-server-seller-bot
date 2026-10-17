@@ -22,11 +22,11 @@ from cloud_platform.db.base import BusinessLogEvent, LedgerEntry
 from cloud_platform.db.base import PaymentSession as PaymentRow
 from cloud_platform.modules.payments.domain import DuplicateExternalIdError, PaymentSession
 from cloud_platform.modules.payments.inquiry import AuthoritativePaymentService
-from cloud_platform.modules.payments.nowpayments import NowPaymentsCallbackService
 from cloud_platform.modules.payments.repository import SqlAlchemyPaymentSessionRepository
 from cloud_platform.modules.payments.service import PaymentWebhookService
 from cloud_platform.modules.wallet.repository import SqlAlchemyWalletRepository
 from cloud_platform.providers.nowpayments import NowPaymentsGateway
+from cloud_platform.providers.nowpayments.callbacks import NowPaymentsCallbackService
 
 pytestmark = pytest.mark.skipif(not DB_URL, reason="requires opt-in scratch PostgreSQL URL")
 
@@ -82,7 +82,7 @@ async def test_concurrent_native_and_poll_settlement_pin_payment_and_credit_once
         "scratch-fixture-key",
         callback_url="https://app.test/webhooks/payments/nowpayments",
         auth_email="scratch@example.test",
-        auth_password="scratch-fixture-password",
+        auth_password="scratch-fixture-password",  # pragma: allowlist secret
         transport=httpx.MockTransport(respond),
     )
     webhook = PaymentWebhookService(

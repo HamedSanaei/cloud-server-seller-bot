@@ -2,6 +2,20 @@
 
 A production-oriented starter for a Telegram-first, hourly-billed cloud server platform.
 
+Website integration shares the same wallet, pricing and server commands with
+Telegram. See [Website integration](docs/WEBSITE_INTEGRATION.md) for account linking,
+deployment boundaries and the shared superadmin test VPS **leaseweb-test**:
+**Public IPv4 217.20.121.89**, **Id 12717238**. No live test-server mutation is
+performed by installing this integration.
+
+Release policy: full CI on `main`/`staging` pushes and pull requests. An authorized
+push to `staging` automatically updates the SAME live production services, DB,
+Redis and original Telegram bot; only the one-shot catalog refresh is omitted.
+The manual main lane still requires explicit confirmation and Environment approval.
+Runbooks: [Staging](deploy/staging/README.md) and
+[Production](docs/operations/PRODUCTION_DEPLOY.md). Build in CI; migrate only after
+an encrypted backup, and never roll old financial writers onto a newer DB epoch.
+
 The first provider is Hetzner Cloud. The architecture is intentionally provider-neutral so Iranian or other providers can be added later without rewriting wallet, billing, Telegram UX, or orchestration.
 
 ## Architecture in one line

@@ -1,3 +1,4 @@
 # Shell scripts must keep LF endings even on Windows checkouts; a CRLF
 # entrypoint breaks OCI containers that exec it directly.
 *.sh text eol=lf
+scripts/guest/* text eol=lf

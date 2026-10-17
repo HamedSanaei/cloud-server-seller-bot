@@ -256,6 +256,21 @@ class TestOwnership:
             await deps.service.reboot(USER_ID, uuid4(), "key-1")
         assert deps.provider.calls == []
 
+    async def test_reserved_test_resource_rejects_legacy_owner_callback_before_any_intent(
+        self,
+    ) -> None:
+        from cloud_platform.modules.servers.test_identity import TEST_PROVIDER_ID
+
+        server = _server()
+        server.provider_key = "leaseweb"
+        server.provider_server_id = TEST_PROVIDER_ID
+        server.ipv4 = "192.0.2.1"  # metadata drift cannot restore ordinary ownership access
+        deps = _Deps(server)
+        with pytest.raises(NotServerOwnerError):
+            await deps.service.power_on(USER_ID, SERVER_ID, "stale-owner-callback")
+        assert deps.ops.by_key == {}
+        assert deps.provider.calls == []
+
 
 class TestCapabilityGate:
     @pytest.mark.parametrize(

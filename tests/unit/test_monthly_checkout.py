@@ -8,7 +8,9 @@ the original intent instead of double-charging or double-ordering.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -28,6 +30,9 @@ from cloud_platform.modules.compute.domain import (
     CloudServer,
     ServerLifecycleState,
 )
+from cloud_platform.modules.fx.cache import InMemoryFxCache
+from cloud_platform.modules.fx.domain import FxMarketQuote
+from cloud_platform.modules.fx.service import FxConfig, FxResolver
 from cloud_platform.modules.navigation.domain import decode_callback
 from cloud_platform.modules.offers.domain import SellableOffer
 from cloud_platform.modules.operations.domain import Operation, OperationStatus
@@ -286,6 +291,7 @@ def _make_service(
     hold_repo: FakeHoldRepo | None = None,
     event_sink: Any | None = None,
     market_lookup: Any | None = None,
+    fx_resolver: Any | None = None,
 ) -> tuple[MonthlyCheckoutService, dict[str, Any]]:
     wallet_repo = FakeWalletRepo(balance)
     if hold_repo is None:
@@ -315,6 +321,7 @@ def _make_service(
         provider_registry=registry,
         event_sink=event_sink,
         event_market_lookup=market_lookup,
+        fx_resolver=fx_resolver,
     )
     deps = {
         "wallet": wallet_repo,
@@ -326,6 +333,80 @@ def _make_service(
         "event_sink": event_sink,
     }
     return service, deps
+
+
+class UsdtSettlementSource:
+    source_name = "test-USDTIRT"
+
+    def __init__(self, *, expired: bool = False) -> None:
+        self.rate = Decimal("100000")
+        self.expired = expired
+
+    async def get_quote(self, base: str, quote: str) -> FxMarketQuote:
+        assert (base, quote) == ("USDT", "IRT")
+        moment = datetime.now(UTC)
+        return FxMarketQuote(
+            base_currency=base,
+            quote_currency=quote,
+            buy_rate=self.rate,
+            sell_rate=self.rate,
+            source=self.source_name,
+            source_market="USDTIRT",
+            observed_at=moment - timedelta(seconds=120) if self.expired else moment,
+            expires_at=moment + timedelta(seconds=-60 if self.expired else 60),
+        )
+
+    async def close(self) -> None:
+        pass
+
+
+async def test_usd_monthly_order_reserves_toman_once_and_preserves_provider_cost() -> None:
+    source = UsdtSettlementSource()
+    resolver = FxResolver(
+        source=source,
+        cache=InMemoryFxCache(),
+        config=FxConfig(allow_usdt_proxy_for_settlement=True),
+    )
+    offer = replace(_offer(), selling_currency="USD")
+    service, deps = _make_service(offer=offer, balance=2_000_000, fx_resolver=resolver)
+    deps["wallet"].wallet.currency = "IRT"
+    result = await service.create_order(
+        user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="usd-irt"
+    )
+    assert result.hold.currency == result.order.selling_currency == "IRT"
+    assert result.hold.amount == result.order.selling_price_minor == 1_299_000
+    assert (result.order.provider_cost_minor, result.order.provider_cost_currency) == (999, "EUR")
+    snapshot = result.server.offer_fingerprint["settlement_fx"]
+    assert (snapshot["source_currency"], snapshot["target_currency"]) == ("USD", "IRT")
+    assert snapshot["proxy_asset"] == "USDT"
+    source.rate *= 2
+    replay = await service.create_order(
+        user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="usd-irt"
+    )
+    assert replay.replayed and replay.server.id == result.server.id
+    assert replay.hold.amount == 1_299_000
+    assert len(deps["holds"].holds) == len(deps["servers"].servers) == 1
+    assert deps["ordering"].place_order_calls == 0
+
+
+@pytest.mark.parametrize("expired, allow_proxy", [(True, True), (False, False)])
+async def test_unusable_settlement_fx_cannot_reserve_or_create_order(
+    expired: bool, allow_proxy: bool
+) -> None:
+    resolver = FxResolver(
+        source=UsdtSettlementSource(expired=expired),
+        cache=InMemoryFxCache(),
+        config=FxConfig(allow_usdt_proxy_for_settlement=allow_proxy),
+    )
+    offer = replace(_offer(), selling_currency="USD")
+    service, deps = _make_service(offer=offer, balance=2_000_000, fx_resolver=resolver)
+    deps["wallet"].wallet.currency = "IRT"
+    with pytest.raises(OfferUnavailableError):
+        await service.create_order(
+            user=_user(), offer_id=OFFER_ID, os_name="Ubuntu 24.04", idempotency_key="bad-fx"
+        )
+    assert deps["holds"].holds == {} and deps["servers"].servers == []
+    assert deps["wallet"].wallet.balance == 2_000_000
 
 
 class TestCheckoutSafety:

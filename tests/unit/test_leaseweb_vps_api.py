@@ -1702,6 +1702,25 @@ class TestAcceptedSemantics:
             await api.aclose()
 
     @respx.mock
+    async def test_labeled_trial_contract_does_not_break_server_inventory(self) -> None:
+        from cloud_platform.providers.leaseweb.ordering import LeaseWebOrderingProvider
+
+        payload = {
+            **VPS_DETAIL,
+            "contract": {**VPS_DETAIL["contract"], "term": "Trial 1 month"},
+        }
+        respx.get(f"{BASE}/publicCloud/v1/vps/{VPS}").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        provider = LeaseWebOrderingProvider(KEY, BASE, throttle=_no_sleep())
+        try:
+            info = await provider.get_vps_info(VPS)
+        finally:
+            await provider.vps_api.aclose()
+        assert info is not None and info.id == VPS and info.state == "RUNNING"
+        assert info.contract_term == "Trial 1 month"
+
+    @respx.mock
     async def test_get_vps_parses_full_detail(self) -> None:
         respx.get(f"{BASE}/publicCloud/v1/vps/{VPS}").mock(
             return_value=httpx.Response(200, json=VPS_DETAIL)

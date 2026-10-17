@@ -56,6 +56,7 @@ from cloud_platform.providers.vps_ports import (
     VpsReinstallImage,
     VpsSnapshotRecord,
 )
+from tests.unit.test_website_bridge import ReceiptRepository
 
 CUSTOMER = uuid4()
 OTHER_CUSTOMER = uuid4()
@@ -423,6 +424,7 @@ def make_service(
         audit_repo=audit,  # type: ignore[arg-type]
         power=power,  # type: ignore[arg-type]
         event_sink=sink,
+        operations=ReceiptRepository(),  # type: ignore[arg-type]
         credential_store=SimpleNamespace(
             invalidate_for_owner=AsyncMock(),
             replace_issued=AsyncMock(),

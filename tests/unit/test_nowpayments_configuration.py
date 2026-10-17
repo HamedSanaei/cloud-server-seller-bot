@@ -20,10 +20,10 @@ from cloud_platform.core.container import Container
 
 FIXTURE = {
     "nowpayments_enabled": True,
-    "nowpayments_api_key": "np-config-fixture-api-key",
+    "nowpayments_api_key": "np-config-fixture-api-key",  # pragma: allowlist secret
     "nowpayments_auth_email": "fixture@merchant.test",
-    "nowpayments_auth_password": "np-config-strong-todo-password",
-    "nowpayments_ipn_secret": "np-config-fixture-ipn-secret",
+    "nowpayments_auth_password": "np-config-strong-todo-password",  # pragma: allowlist secret
+    "nowpayments_ipn_secret": "np-config-fixture-ipn-secret",  # pragma: allowlist secret
     "nowpayments_base_url": "https://api.nowpayments.io/v1",
     "nowpayments_callback_url": "https://app.test/webhooks/payments/nowpayments",
     "nowpayments_timeout_seconds": 17.5,
@@ -104,11 +104,14 @@ def test_enabled_requires_complete_nonplaceholder_credentials(key, invalid):
         ("callback_url", "https://app.test/webhooks/payments/nowpayments/ipn"),
         ("callback_url", "https://app.test/webhooks/payments/atlaspay"),
         ("callback_url", "http://app.test/webhooks/payments/nowpayments"),
-        ("callback_url", "https://name:password@app.test/webhooks/payments/nowpayments"),
+        (
+            "callback_url",
+            "https://u:p@app.test/webhooks/payments/nowpayments",  # pragma: allowlist secret
+        ),
         ("callback_url", "https://app.test/webhooks/payments/nowpayments?token=invalid"),
         ("callback_url", "https://app.test/webhooks/payments/nowpayments#fragment"),
         ("base_url", "http://api.nowpayments.io/v1"),
-        ("base_url", "https://name:password@api.nowpayments.io/v1"),
+        ("base_url", "https://u:p@api.nowpayments.io/v1"),  # pragma: allowlist secret
         ("base_url", "https://api.nowpayments.io/v1?token=invalid"),
         ("timeout_seconds", 0),
         ("timeout_seconds", -1),
@@ -124,9 +127,9 @@ def test_unsafe_configuration_fails_before_any_provider_request(key, value):
 def test_disabled_example_may_retain_placeholders():
     disabled = settings(
         nowpayments_enabled=False,
-        nowpayments_api_key="CHANGE_ME",
-        nowpayments_auth_password="CHANGE_ME",
-        nowpayments_ipn_secret="CHANGE_ME",
+        nowpayments_api_key="CHANGE_ME",  # pragma: allowlist secret
+        nowpayments_auth_password="CHANGE_ME",  # pragma: allowlist secret
+        nowpayments_ipn_secret="CHANGE_ME",  # pragma: allowlist secret
     )
     assert disabled.nowpayments_enabled is False
 

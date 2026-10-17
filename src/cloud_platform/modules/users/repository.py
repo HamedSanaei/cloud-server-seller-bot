@@ -302,6 +302,18 @@ class SqlAlchemyUserRepository:
                     "administrator identities cannot be blocked from the panel"
                 )
             cast(Any, target).status = status.value
+            from cloud_platform.modules.notifications.outbox import notice_row
+
+            session.add(
+                notice_row(
+                    key=f"user-status:{actor_id}:{idempotency_key}",
+                    user_id=user_id,
+                    text=(
+                        f"وضعیت حساب شما به {status.value} تغییر یافت؛ "
+                        "برای بررسی با پشتیبانی تماس بگیرید."
+                    ),
+                )
+            )
             session.add(
                 SQLAlchemyAuditEvent(
                     actor_type=ActorType.ADMIN.value,

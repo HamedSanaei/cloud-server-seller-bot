@@ -162,7 +162,10 @@ class TestAbuseCaseRepository:
 
         created = await repo.create(case)
 
-        db.add.assert_called_once()
+        assert db.add.call_count == 2  # abuse case + atomic customer notice
+        notice = db.add.call_args_list[1].args[0]
+        assert notice.event_type == "customer.notice"
+        assert notice.payload["user_id"] == str(case.user_id)
         db.commit.assert_awaited_once()
         assert created.id == new_id
         assert created.status is AbuseStatus.OPEN

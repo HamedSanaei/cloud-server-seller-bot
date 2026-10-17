@@ -321,7 +321,7 @@ class TestBusinessLogEmission:
             gateway_key="zarinpal", external_id=EXT, status="succeeded"
         )
         assert outcome.action is WebhookAction.CREDITED
-        (event,) = outbox_store.business_events()
+        (event,) = outbox_store.business_events("recharge.succeeded")
         assert event.event_type == "recharge.succeeded" and event.status == "PENDING"
         assert event.payload["amount"] == "€5.00"
         assert event.payload["gateway"] == "zarinpal"
@@ -333,7 +333,7 @@ class TestBusinessLogEmission:
     async def test_balance_after_is_reported_when_available(self, outbox_store) -> None:
         service = self._persistent_service(outbox_store, balance=734)
         await service.process_callback(gateway_key="zarinpal", external_id=EXT, status="succeeded")
-        (event,) = outbox_store.business_events()
+        (event,) = outbox_store.business_events("recharge.succeeded")
         assert event.payload["balance_after"] == "€12.34"
         assert (await outbox_store.wallets.get(USER_ID)).balance == 1234
 
@@ -347,7 +347,12 @@ class TestBusinessLogEmission:
         )
         assert first.action is WebhookAction.CREDITED
         assert second.action is WebhookAction.DUPLICATE_IGNORED
-        assert len(outbox_store.business_events()) == len(outbox_store.ledger()) == 1
+        assert (
+            len(outbox_store.business_events("recharge.succeeded"))
+            == len(outbox_store.ledger())
+            == 1
+        )
+        assert len(outbox_store.business_events("customer.notice")) == 1
         assert (await outbox_store.wallets.get(USER_ID)).balance == 500
 
     async def test_failed_callback_enqueues_recharge_failed_once(self) -> None:
@@ -378,4 +383,9 @@ class TestBusinessLogEmission:
         )
         assert outcome.action is WebhookAction.CREDITED
         assert (await outbox_store.wallets.get(USER_ID)).balance == 500
-        assert len(outbox_store.business_events()) == len(outbox_store.ledger()) == 1
+        assert (
+            len(outbox_store.business_events("recharge.succeeded"))
+            == len(outbox_store.ledger())
+            == 1
+        )
+        assert len(outbox_store.business_events("customer.notice")) == 1

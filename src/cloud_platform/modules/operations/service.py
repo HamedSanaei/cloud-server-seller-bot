@@ -61,6 +61,7 @@ from cloud_platform.modules.operations.domain import (
     plan_state_repair,
 )
 from cloud_platform.modules.provider_routes.service import ProviderRouteSelector
+from cloud_platform.modules.servers.test_identity import is_test_resource
 from cloud_platform.modules.users.domain import PermissionDeniedError
 from cloud_platform.modules.wallet.domain import (
     HoldRepository,
@@ -2479,7 +2480,7 @@ class PowerCommandService:
             raise PowerCommandError("idempotency_key too long")
 
         server = await self._servers.get(server_id)
-        if server is None or server.user_id != user_id:
+        if server is None or server.user_id != user_id or is_test_resource(server):
             raise NotServerOwnerError("server not found")
 
         # Replays of an existing intent are resolved from the ledger BEFORE any
@@ -2625,7 +2626,7 @@ class PowerControlsService:
     async def detail(self, user_id: UUID, server_id: UUID) -> ServerPowerView | None:
         """The detail screen of one server the user owns, or None."""
         server = await self._servers.get(server_id)
-        if server is None or server.user_id != user_id:
+        if server is None or server.user_id != user_id or is_test_resource(server):
             return None
 
         try:
@@ -2641,7 +2642,7 @@ class PowerControlsService:
         if server.is_prepaid_hourly_irt and not operator_funded(server):
             allowed = self._hourly_can_start is not None and await self._hourly_can_start(server)
             if not allowed:
-                controls = tuple(control for control in controls if control.action != "power_on")
+                controls = [control for control in controls if control.action != "power_on"]
         actions = tuple(
             PowerActionOption(
                 action=PowerAction(control.action),
@@ -3057,7 +3058,7 @@ class DeleteConfirmationService:
         if stage not in (1, 2):
             raise ValueError("stage must be 1 or 2")
         server = await self._servers.get(server_id)
-        if server is None or server.user_id != user_id:
+        if server is None or server.user_id != user_id or is_test_resource(server):
             return None
         if server.state not in DELETE_PRECONDITION_STATES:
             # The delete command would reject this state: hide the button.
@@ -3553,7 +3554,7 @@ class DeleteCommandService:
             raise DeleteCommandError("idempotency_key too long")
 
         server = await self._servers.get(server_id)
-        if server is None or server.user_id != user_id:
+        if server is None or server.user_id != user_id or is_test_resource(server):
             raise DeleteNotOwnerError("server not found")
 
         # Replays of an existing intent are resolved from the ledger BEFORE any
@@ -4261,7 +4262,7 @@ class RebuildCommandService:
             raise RebuildCommandError("a non-empty image reference (max 128 chars) is required")
 
         server = await self._servers.get(server_id)
-        if server is None or server.user_id != user_id:
+        if server is None or server.user_id != user_id or is_test_resource(server):
             raise RebuildNotOwnerError("server not found")
 
         # Replay resolution BEFORE state gates (same convention as delete).
@@ -4701,7 +4702,7 @@ class RescueCommandService:
 
     async def _owned(self, user_id: UUID, server_id: UUID) -> CloudServer:
         server = await self._servers.get(server_id)
-        if server is None or server.user_id != user_id:
+        if server is None or server.user_id != user_id or is_test_resource(server):
             raise RescueNotOwnerError("server not found")
         return server
 

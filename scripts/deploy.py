@@ -1,334 +1,125 @@
-"""Rolling / blue-green deploy driver (M12-006).
+"""Deploy an immutable image through the same guarded engine used by GitHub Actions.
 
-Acceptance: API/bot/worker deploy without double consumers.
-
-The platform has two kinds of runtime consumers:
-
-- **Exclusive consumers** - the arq ``worker`` and the Telegram ``bot``
-  (long polling). Two generations running at once would double-consume
-  queue jobs / poll getUpdates concurrently. For these the ONLY safe
-  order is DRAIN-THEN-START: the old generation is stopped and fully gone
-  before the new generation starts. This holds in BOTH strategies.
-- **Replaceable consumers** - the stateless ``api``. It may roll behind
-  health checks, or go blue-green (a sibling project serves while the old
-  one drains).
-
-This driver makes that order DATA, not convention: :func:`build_plan`
-emits an explicit step list, :func:`assert_no_double_consumers` proves the
-exclusive-consumer invariant on any plan (and refuses to run otherwise),
-and :class:`Deployer` executes steps through an injectable command runner,
-so the whole thing is testable without Docker.
-
-Usage::
-
-    uv run python scripts/deploy.py --image registry/repo:<sha> \
-        --strategy rolling --dry-run     # print + validate the plan
-    uv run python scripts/deploy.py --image registry/repo:<sha> \
-        --strategy rolling               # execute against docker compose
-
-Blue-green runs the new stack under a sibling compose project
-(``<project>-green``): migrate once (shared), start the green api, gate on
-health, drain ALL blue exclusive consumers, start the green ones, cut the
-api over, tear the blue stack down. The exclusive services never overlap
-across colors - that is exactly what the invariant enforces.
+Both release lanes update the existing production path, database, Redis, private
+TOML and single Telegram bot. Staging skips only the one-shot catalog refresh.
+There is no rolling/blue-green executor that can bypass backup, writer draining
+or rollback guards. --dry-run describes the release without changing files.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
+import re
 import subprocess
-import sys
-from collections.abc import Sequence
-from dataclasses import dataclass
+from pathlib import Path
 
-
-class DeployError(Exception):
-    """A deploy step failed; message names the step."""
-
-
-class DoubleConsumerError(Exception):
-    """A plan would run two generations of an exclusive consumer."""
-
-
-#: Services that must NEVER have two live generations (queue jobs /
-#: Telegram long-polling would be consumed twice).
-EXCLUSIVE_SERVICES: tuple[str, ...] = ("worker", "bot")
-
-
-@dataclass(frozen=True)
-class Step:
-    """One concrete command of a deploy plan."""
-
-    name: str
-    service: str  # "" for whole-stack steps
-    kind: str  # preflight | migrate | start | drain | smoke | teardown
-    argv: tuple[str, ...]
-
-
-def _compose(project: str | None, *args: str) -> tuple[str, ...]:
-    argv = ["docker", "compose"]
-    if project:
-        argv += ["-p", project]
-    return (*argv, *args)
-
-
-def build_plan(
-    strategy: str,
-    *,
-    image: str,
-    compose_file: str = "deploy/staging/docker-compose.yml",
-    project: str | None = None,
-    exclusive_services: Sequence[str] = EXCLUSIVE_SERVICES,
-) -> list[Step]:
-    """The ordered deploy steps for ``strategy``.
-
-    ``image`` is exported into the environment by the caller (the compose
-    file reads PLATFORM_IMAGE); every ``up`` here recreates with it.
-    """
-    if strategy not in {"rolling", "blue-green"}:
-        raise ValueError(f"unknown strategy: {strategy!r}")
-    services: list[str] = []
-    for service in exclusive_services:
-        if service not in EXCLUSIVE_SERVICES:
-            raise ValueError(
-                f"{service!r} is not an exclusive consumer (known: {', '.join(EXCLUSIVE_SERVICES)})"
-            )
-        services.append(service)
-
-    env_arg = ("--env-file", ".env")
-    steps: list[Step] = [
-        Step(
-            "validate compose file",
-            "",
-            "preflight",
-            _compose(project, "-f", compose_file, *env_arg, "config", "--quiet"),
-        ),
-        # migrations ALWAYS first and only once: both colors share one DB.
-        Step(
-            "apply migrations",
-            "",
-            "migrate",
-            _compose(project, "-f", compose_file, *env_arg, "up", "-d", "--wait", "migrate"),
-        ),
-    ]
-
-    if strategy == "rolling":
-        # Health-gated recreation of the stateless api first...
-        steps.append(
-            Step(
-                "roll api (health-gated)",
-                "api",
-                "start",
-                _compose(
-                    project, "-f", compose_file, *env_arg, "up", "-d", "--no-deps", "--wait", "api"
-                ),
-            )
-        )
-        # ...then each exclusive consumer: FULLY drained before started.
-        for service in services:
-            steps.append(
-                Step(
-                    f"drain {service} (SIGTERM, wait exit)",
-                    service,
-                    "drain",
-                    _compose(
-                        project, "-f", compose_file, *env_arg, "stop", "--timeout", "30", service
-                    ),
-                )
-            )
-            steps.append(
-                Step(
-                    f"wait {service} fully stopped",
-                    service,
-                    "drain",
-                    _compose(
-                        project, "-f", compose_file, *env_arg, "ps", "--status", "running", service
-                    ),
-                )
-            )
-            steps.append(
-                Step(
-                    f"start {service} (new image)",
-                    service,
-                    "start",
-                    _compose(
-                        project,
-                        "-f",
-                        compose_file,
-                        *env_arg,
-                        "up",
-                        "-d",
-                        "--no-deps",
-                        "--wait",
-                        service,
-                    ),
-                )
-            )
-        return steps
-
-    # ---- blue-green -----------------------------------------------------
-    # Green is a SIBLING PROJECT sharing the network/volumes/DB.
-    green = f"{project or 'cloud-platform-staging'}-green"
-    steps.append(
-        Step(
-            "start green api",
-            "api",
-            "start",
-            _compose(green, "-f", compose_file, *env_arg, "up", "-d", "--wait", "api"),
-        )
-    )
-    # Exclusive consumers: drain EVERY blue generation before ANY green
-    # generation starts - across projects, not just within one.
-    for service in services:
-        steps.append(
-            Step(
-                f"drain blue {service}",
-                service,
-                "drain",
-                _compose(project, "-f", compose_file, *env_arg, "stop", "--timeout", "30", service),
-            )
-        )
-        steps.append(
-            Step(
-                f"wait blue {service} fully stopped",
-                service,
-                "drain",
-                _compose(
-                    project, "-f", compose_file, *env_arg, "ps", "--status", "running", service
-                ),
-            )
-        )
-    # Cutover: green takes the traffic (published port moves with the
-    # project's api service), then the blue api is retired.
-    steps.append(
-        Step(
-            "cut traffic over to green",
-            "api",
-            "cutover",
-            _compose(project, "-f", compose_file, *env_arg, "stop", "--timeout", "30", "api"),
-        )
-    )
-    for service in services:
-        steps.append(
-            Step(
-                f"start green {service}",
-                service,
-                "start",
-                _compose(green, "-f", compose_file, *env_arg, "up", "-d", "--wait", service),
-            )
-        )
-    steps.append(
-        Step(
-            "retire blue api container",
-            "api",
-            "teardown",
-            _compose(project, "-f", compose_file, *env_arg, "rm", "--force", "-v", "api"),
-        )
-    )
-    return steps
-
-
-def assert_no_double_consumers(plan: Sequence[Step]) -> None:
-    """Prove the exclusive-consumer invariant on a plan.
-
-    For every exclusive service there must exist a completed drain step
-    (``stop`` AND a verified-empty ``ps``) BEFORE its first start step -
-    including across blue/green projects. A plan that starts a second
-    generation while the first may still consume raises.
-    """
-    for service in EXCLUSIVE_SERVICES:
-        relevant = [s for s in plan if s.service == service]
-        if not relevant:
-            continue
-        drained = False
-        for step in relevant:
-            if _is_drain_verification(step):
-                # the verification half of the drain: empty output means gone
-                drained = True
-                continue
-            if step.kind == "start" and not drained:
-                raise DoubleConsumerError(
-                    f"plan starts {service!r} before it is fully drained (double consumers)"
-                )
-
-
-class Runner:
-    """Executes one command; returns (exit code, combined output)."""
-
-    def run(self, argv: Sequence[str]) -> tuple[int, str]:  # pragma: no cover - trivial
-        completed = subprocess.run(argv, check=False, capture_output=True, text=True)
-        sys.stdout.write(completed.stdout)
-        sys.stderr.write(completed.stderr)
-        return completed.returncode, completed.stdout + completed.stderr
-
-
-def _is_drain_verification(step: Step) -> bool:
-    return (
-        step.kind == "drain"
-        and "ps" in step.argv
-        and "--status" in step.argv
-        and "running" in step.argv
-    )
-
-
-class Deployer:
-    def __init__(self, runner: Runner, plan: Sequence[Step]) -> None:
-        self._runner = runner
-        self.plan = list(plan)
-
-    def execute(self) -> None:
-        assert_no_double_consumers(self.plan)
-        for step in self.plan:
-            code, output = self._runner.run(step.argv)
-            if _is_drain_verification(step):
-                # `compose ps --status running <svc>` lists any STILL-RUNNING
-                # generation. A non-empty listing means the old generation is
-                # not gone yet - starting the new one now would double-consume.
-                if output.strip():
-                    raise DeployError(
-                        f"step {step.name!r}: {step.service} still has running "
-                        "containers - refusing to start a second generation"
-                    )
-                continue
-            if code != 0:
-                raise DeployError(f"step {step.name!r} failed (exit {code})")
-
-    def dry_run(self) -> str:
-        """Validate the plan WITHOUT executing; returns the rendered plan."""
-        assert_no_double_consumers(self.plan)
-        lines = [f"$ {' '.join(step.argv)}  # {step.kind}: {step.name}" for step in self.plan]
-        return "\n".join(lines)
+ROOT = Path(__file__).resolve().parent.parent
+IMAGE_RE = re.compile(r"ghcr\.io/[a-z0-9._-]+/[a-z0-9._-]+:([0-9a-f]{40})\Z")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", required=True, help="PLATFORM_IMAGE ref (registry/repo:<sha>)")
-    parser.add_argument("--strategy", choices=("rolling", "blue-green"), default="rolling")
-    parser.add_argument("--compose-file", default="deploy/staging/docker-compose.yml")
-    parser.add_argument("--project-name", default=None, help="compose project name")
-    parser.add_argument("--dry-run", action="store_true", help="print + validate only")
-    args = parser.parse_args(argv)
-
-    import os
-
-    os.environ.setdefault("PLATFORM_IMAGE", args.image)
-    plan = build_plan(
-        args.strategy,
-        image=args.image,
-        compose_file=args.compose_file,
-        project=args.project_name,
+    parser.add_argument("--image", required=True, help="ghcr.io/owner/repo:<full-commit-sha>")
+    parser.add_argument(
+        "--environment",
+        required=True,
+        choices=("staging", "production"),
+        help="release lane; both lanes update the same production runtime",
     )
-    deployer = Deployer(Runner(), plan)
+    parser.add_argument("--deploy-path", required=True, type=Path)
+    parser.add_argument("--configuration-path", required=True, type=Path)
+    parser.add_argument("--confirm-production", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+    match = IMAGE_RE.fullmatch(args.image)
+    if match is None:
+        parser.error("image must use an immutable full 40-character commit SHA")
+    if args.environment == "production" and not args.confirm_production:
+        parser.error("production requires separate explicit --confirm-production approval")
+    if not args.deploy_path.is_absolute() or not args.configuration_path.is_absolute():
+        parser.error("deployment and private configuration paths must be absolute")
+    compose = ROOT / "deploy" / "production" / "docker-compose.yml"
+    content = compose.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    sha = match.group(1)
+    candidate = args.deploy_path / f".docker-compose.{sha}.candidate.yml"
+    if args.dry_run:
+        print(
+            f"Release lane: {args.environment}; "
+            "runtime/project: production/cloud-platform-production"
+        )
+        print(f"Release: {sha}; image: {args.image}; compose SHA-256: {digest}")
+        print(f"Target: {args.deploy_path}; server-owned configuration: {args.configuration_path}")
+        print(
+            "Engine: deploy-production.sh (lock, preflight, drain, encrypted backup, "
+            "migration, health, safe rollback)"
+        )
+        return 0
+    if os.name != "posix":
+        parser.error("execute on the authorized Linux deployment target")
+    if not args.deploy_path.is_dir() or not args.configuration_path.is_file():
+        parser.error("the shared production target and its private configuration must exist")
+    # The manual path must not pair an approved image with uncommitted or
+    # different-branch release scripts. CI performs its own exact-SHA CI proof.
+    branch = "main" if args.environment == "production" else "staging"
     try:
-        if args.dry_run:
-            print(deployer.dry_run())
-            return 0
-        deployer.execute()
-    except (DoubleConsumerError, DeployError) as exc:
-        print(f"DEPLOY FAILED: {exc}", file=sys.stderr)
-        return 1
-    print("deploy complete: migrations applied, api rolled, exclusive consumers drained")
-    return 0
+        remote = (
+            subprocess.run(
+                ["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=True,
+                timeout=30,
+            )
+            .stdout.decode()
+            .split()
+        )
+        if not remote or remote[0] != sha:
+            parser.error("image is not the current commit of the selected remote branch")
+        for relative in ("deploy/production/docker-compose.yml", "scripts/deploy-production.sh"):
+            approved = subprocess.run(
+                ["git", "show", f"{sha}:{relative}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=True,
+                timeout=30,
+            ).stdout
+            if (ROOT / relative).read_bytes() != approved:
+                parser.error("release-owned files differ from the selected immutable commit")
+    except (OSError, subprocess.SubprocessError):
+        parser.error(
+            "cannot verify the approved branch/commit; fetch it or use "
+            "the protected GitHub workflow"
+        )
+    environment = os.environ.copy()
+    environment.pop("DEPLOY_PRODUCTION_SOURCED", None)
+    environment.update(
+        DEPLOY_PROFILE=args.environment,
+        DEPLOY_PATH=str(args.deploy_path),
+        PLATFORM_IMAGE_NEW=args.image,
+        CONFIGURATION_PATH=str(args.configuration_path),
+        CANDIDATE_COMPOSE_FILE=str(candidate),
+        CURRENT_COMPOSE_FILE=str(args.deploy_path / "docker-compose.yml"),
+        ENV_FILE=str(args.deploy_path / "deploy.env"),
+        EXPECTED_COMPOSE_SHA256=digest,
+    )
+    # Never overwrite a candidate belonging to another active deployment.
+    try:
+        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        parser.error("release candidate already exists; inspect the active deployment first")
+    with os.fdopen(descriptor, "wb") as output:
+        output.write(content)
+    try:
+        return subprocess.run(
+            ["bash", str(ROOT / "scripts" / "deploy-production.sh")],
+            env=environment,
+            check=False,
+        ).returncode
+    finally:
+        candidate.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

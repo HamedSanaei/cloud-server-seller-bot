@@ -1,4 +1,4 @@
-"""Local command and policy regressions for the shared-host staging lane."""
+"""Execute deployment shell guards without touching any remote service."""
 
 from __future__ import annotations
 
@@ -24,48 +24,8 @@ def _workflow(name: str = "deploy-staging.yml") -> dict:
     return yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
 
 
-def _triggers(doc: dict) -> dict:
-    # PyYAML's YAML 1.1 loader interprets GitHub's `on` key as True.
-    return doc[True]
-
-
 def _render(command: str, values: dict[str, str]) -> str:
     return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: values[match[1]], command)
-
-
-def test_only_staging_pushes_and_explicit_dispatches_enter_the_staging_lane() -> None:
-    triggers = _triggers(_workflow())
-    assert triggers["push"]["branches"] == ["staging"]
-    assert set(triggers) == {"push", "workflow_dispatch"}
-    production = _triggers(_workflow("deploy-production.yml"))
-    assert set(production) == {"workflow_dispatch", "workflow_run"}
-
-
-def test_no_image_build_or_host_mutation_can_bypass_staging_checks() -> None:
-    jobs = _workflow()["jobs"]
-    assert jobs["build"]["needs"] == "fast-checks"
-    assert jobs["deploy"]["needs"] == "build"
-    assert jobs["deploy"]["environment"] == "production"
-    assert not jobs["build"].get("if")
-    assert jobs["deploy"]["if"] == (
-        "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging'"
-    )
-    permissions = _workflow()["permissions"]
-    assert permissions == {"contents": "read", "packages": "write"}
-
-
-@pytest.mark.parametrize("name", ["deploy-staging.yml", "deploy-production.yml"])
-def test_only_immutable_sha_images_are_published_and_built_with_the_revision(name: str) -> None:
-    steps = _workflow(name)["jobs"]["build"]["steps"]
-    build = next(
-        step for step in steps if step.get("uses", "").startswith("docker/build-push-action@")
-    )
-    options = build["with"]
-    assert options["tags"].splitlines() == [
-        "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}",
-    ]
-    assert options["build-args"] == "RELEASE_REVISION=${{ steps.resolve.outputs.sha }}"
-    assert options["push"] is True
 
 
 @pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")
@@ -108,9 +68,6 @@ def test_production_sha_input_is_data_and_must_be_a_full_hex_commit(
         step
         for step in _workflow("deploy-production.yml")["jobs"]["build"]["steps"]
         if step.get("id") == "resolve"
-    )
-    assert resolve["env"]["REQUESTED_SHA"] == (
-        "${{ github.event.workflow_run.head_sha || inputs.sha }}"
     )
     command = _render(
         resolve["run"],

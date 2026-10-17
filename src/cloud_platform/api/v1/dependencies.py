@@ -20,7 +20,7 @@ from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, Request, Response
 
-from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
+from cloud_platform.modules.tokens.domain import InvalidTokenError, TokenAuthentication, TokenScope
 
 from .errors import ApiError, ErrorCode
 
@@ -54,7 +54,10 @@ async def get_token_authentication(
         authenticator = getattr(request.app.state, "authenticate_token", None)
         if authenticator is None:
             raise ApiError(ErrorCode.UNAUTHORIZED, "token authentication unavailable")
-        auth = await authenticator(authorization.removeprefix("Bearer ").strip())
+        try:
+            auth = await authenticator(authorization.removeprefix("Bearer ").strip())
+        except InvalidTokenError:
+            raise ApiError(ErrorCode.UNAUTHORIZED, "invalid or revoked credentials") from None
         return auth  # type: ignore[no-any-return]
 
     # The flag alone must never enable header identity outside local dev/test.

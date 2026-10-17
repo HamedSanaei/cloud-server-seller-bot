@@ -108,7 +108,7 @@ class HourlyRunwayWarningService:
                         kind=LowBalanceNotificationKind.RUNWAY,
                         balance_minor=balance,
                         currency="IRT",
-                        episode=now,
+                        episode=last or datetime(1970, 1, 1, tzinfo=UTC),
                         at=now,
                         runway_hours=Decimal((expires - now) // timedelta(seconds=1))
                         / Decimal(3600),

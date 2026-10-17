@@ -39,7 +39,7 @@ class AdminPaymentsUi:
             callback_data=encode_telegram_callback(Callback("admin", screen, args), self._key),
         )
 
-    def _screen(self, text: str, rows: list | None = None) -> BotScreen:
+    def _screen(self, text: str, rows: list[list[InlineKeyboardButton]] | None = None) -> BotScreen:
         rows = list(rows or [])
         rows.append([self._button("nav.back", "menu")])
         return BotScreen(text, InlineKeyboardMarkup(inline_keyboard=rows))

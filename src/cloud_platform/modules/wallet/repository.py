@@ -312,6 +312,18 @@ class SqlAlchemyWalletRepository:
             if new_balance > 2**63 - 1:
                 raise ValueError("wallet balance exceeds signed int64 bounds")
             cast(Any, row).balance = new_balance
+            from cloud_platform.modules.fx.formatting import format_minor
+            from cloud_platform.modules.notifications.outbox import notice_row
+
+            if entry_type == LedgerEntryType.ADJUSTMENT:
+                session.add(
+                    notice_row(
+                        key=f"wallet-adjust:{wallet_id}:{new_key}",
+                        user_id=user_id,
+                        text=f"موجودی کیف پول تغییر کرد: {format_minor(delta, wallet_currency)}\n"
+                        f"موجودی جدید: {format_minor(new_balance, wallet_currency)}",
+                    )
+                )
             session.add(
                 _LEModel(
                     wallet_id=wallet_id,
@@ -513,6 +525,17 @@ class SqlAlchemyWalletRepository:
             if bal + amount > 2**63 - 1:
                 raise ValueError("wallet balance exceeds signed int64 bounds")
             cast(Any, row).balance = bal + amount
+            from cloud_platform.modules.fx.formatting import format_minor
+            from cloud_platform.modules.notifications.outbox import notice_row
+
+            session.add(
+                notice_row(
+                    key=f"wallet-deposit:{wallet_id}:{new_key}",
+                    user_id=user_id,
+                    text=f"شارژ کیف پول تأیید شد: {format_minor(amount, actual_currency)}\n"
+                    f"موجودی جدید: {format_minor(bal + amount, actual_currency)}",
+                )
+            )
             session.add(
                 _LEModel(
                     wallet_id=wallet_id,

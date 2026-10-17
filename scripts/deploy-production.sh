@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 # Application-image deployment (idempotent, safe to re-run).
 #
-# Shared deploy engine for BOTH lanes: the `main` release path
-# (deploy-production.yml, manual dispatch) and the `staging` development
-# path (deploy-staging.yml, every push). Both deploy the SAME image to the
-# SAME server/compose project, so the same safety gates apply; the only
-# difference is DEPLOY_PROFILE (see below). There is exactly one bot
-# container for the single Telegram token in either lane.
+# Shared deploy engine for the manually approved main release and the automatic
+# staging release. Both update the SAME production project, private config,
+# database, Redis and Telegram bot. DEPLOY_PROFILE only selects the fast lane.
 #
 # Ownership model:
 #
@@ -107,6 +104,8 @@ load_config() {
     HEALTH_INTERVAL="${HEALTH_INTERVAL:-5}"
     STABILIZE_SECONDS="${STABILIZE_SECONDS:-15}"
     DEPLOY_PROFILE="${DEPLOY_PROFILE:-production}"
+    PROJECT="cloud-platform-production"
+    export PLATFORM_NETWORK="${PROJECT}-bridge"
 }
 
 log() {
@@ -120,12 +119,12 @@ fail() {
 
 compose_candidate() {
     # Forward deployment ALWAYS uses the release candidate contract.
-    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" docker compose --project-name cloud-platform-production --env-file "${ENV_FILE}" -f "${CANDIDATE_COMPOSE_FILE}" "$@"
+    PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" docker compose --project-name "${PROJECT}" --env-file "${ENV_FILE}" -f "${CANDIDATE_COMPOSE_FILE}" "$@"
 }
 
 compose_current() {
     # Rollback and canonical status ALWAYS use the previous canonical contract.
-    docker compose --project-name cloud-platform-production --env-file "${ENV_FILE}" -f "${CURRENT_COMPOSE_FILE}" "$@"
+    docker compose --project-name "${PROJECT}" --env-file "${ENV_FILE}" -f "${CURRENT_COMPOSE_FILE}" "$@"
 }
 
 file_sha256() {
@@ -215,6 +214,15 @@ rollback() {
     if [ -z "${PREV_IMAGE}" ]; then
         log "ROLLBACK: no previous image recorded; candidate writers remain stopped"
         return 0
+    fi
+    if [ "${APP_START_ATTEMPTED}" = "yes" ]; then
+        local previous_contract new_contract
+        previous_contract="$(docker image inspect -f '{{index .Config.Labels "io.servercloud.platform-contract"}}' "${PREV_IMAGE}")" || return 1
+        new_contract="$(docker image inspect -f '{{index .Config.Labels "io.servercloud.platform-contract"}}' "${PLATFORM_IMAGE_NEW}")" || return 1
+        if [ -z "${previous_contract}" ] || [ "${previous_contract}" != "${new_contract}" ]; then
+            fail "ROLLBACK: previous image does not support the activated integration contract; writers remain stopped"
+            return 1
+        fi
     fi
     if [ "${MIGRATION_STARTED}" = "yes" ]; then
         local observed
@@ -310,8 +318,14 @@ verify_application_configuration() {
         fail "release image revision does not match its immutable commit tag"
         return 1
     }
+    local contract
+    contract="$(docker image inspect -f '{{index .Config.Labels "io.servercloud.platform-contract"}}' \
+        "${PLATFORM_IMAGE_NEW}" 2>/dev/null)" || { fail "cannot inspect platform contract"; return 1; }
+    [ "${contract}" = "1" ] || {
+        fail "release image does not support the canonical platform contract"; return 1;
+    }
     if ! PLATFORM_IMAGE="${PLATFORM_IMAGE_NEW}" compose_candidate run --rm --no-deps migrate \
-        python -c 'from cloud_platform.core.config import get_settings; get_settings()' >/dev/null 2>&1; then
+        python -c "from cloud_platform.core.config import get_settings; s=get_settings(); valid=(s.app_env == 'production' and s.default_currency == 'IRT' and s.fx_default_display_currency == 'IRT' and not s.api_allow_header_identity and len(s.callback_signing_key.encode()) >= 32 and s.fx_enabled and s.fx_domestic_enabled and s.fx_allow_usdt_proxy_for_settlement); raise SystemExit(0 if valid else 1)" >/dev/null 2>&1; then
         fail "server configuration rejected by the release image (validate the server-owned configuration locally; nothing was changed)"
         return 1
     fi
@@ -415,6 +429,17 @@ deploy() {
             return 1
             ;;
     esac
+    existing_projects="$(docker ps -a \
+        --filter "label=com.docker.compose.project.working_dir=${DEPLOY_PATH}" \
+        --format '{{.Label "com.docker.compose.project"}}')" || {
+        fail "cannot inspect existing deployment ownership"; return 1;
+    }
+    while IFS= read -r existing_project; do
+        if [ -n "${existing_project}" ] && [ "${existing_project}" != "${PROJECT}" ]; then
+            fail "deployment path belongs to another environment/project; nothing was changed"
+            return 1
+        fi
+    done <<< "${existing_projects}"
     log "deploy profile      : ${DEPLOY_PROFILE}"
 
     # Still before the mutation window: a rejected configuration must leave
@@ -483,6 +508,11 @@ deploy() {
             fail "cannot stop existing application writers; refusing migrations"
             return 1
         }
+    fi
+    log "creating encrypted pre-migration database backup"
+    if ! compose_candidate --profile backup run --rm backup; then
+        fail "encrypted pre-migration backup failed; refusing schema changes"
+        return 1
     fi
     log "running database migrations (alembic upgrade head)"
     MIGRATION_STARTED="yes"
@@ -727,6 +757,12 @@ main() {
     command -v flock >/dev/null || { fail "flock is required for shared-host deployment safety"; return 1; }
     exec 9> "${DEPLOY_PATH}/.deployment.lock" || return 1
     flock -n 9 || { fail "another deployment owns the shared-host lock"; return 1; }
+    exec 8> /var/lock/servercloud-platform-release.lock || {
+        fail "cannot open the shared website/platform release lock"; return 1;
+    }
+    flock -w 600 8 || {
+        fail "another website/platform release is still active; retry the current SHA"; return 1;
+    }
     # SSH disconnect/cancellation must not interrupt schema changes or leave
     # half-replaced services. Both workflows also disable auto-cancellation.
     trap '' HUP INT TERM

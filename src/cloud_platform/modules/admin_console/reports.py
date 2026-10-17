@@ -103,6 +103,8 @@ class AdminReportsService:
 
     async def _authorize(self, actor: User) -> None:
         claimed = require_superadmin(actor, self._ids)
+        if claimed.id is None:
+            raise PermissionDeniedError("persisted administrator required")
         fresh = require_superadmin(await self._users.get(claimed.id), self._ids)
         if fresh.id != claimed.id or fresh.telegram_user_id != claimed.telegram_user_id:
             raise PermissionDeniedError("persisted administrator identity changed")

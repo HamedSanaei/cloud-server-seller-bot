@@ -64,6 +64,7 @@ from cloud_platform.modules.operations.service import (
     NotServerOwnerError,
     PowerActionNotAllowedError,
     PowerCommandError,
+    PowerCommandResult,
     PowerCommandService,
     PowerOutcomeUnknownError,
 )
@@ -91,6 +92,7 @@ from cloud_platform.modules.servers.models import (
     format_bytes,
 )
 from cloud_platform.modules.servers.policies import ServerManagementPolicy
+from cloud_platform.modules.servers.test_identity import is_test_resource
 from cloud_platform.providers.errors import ProviderError, ProviderOutcomeUnknown
 from cloud_platform.providers.registry import ProviderRegistry
 from cloud_platform.providers.routing import provider_for
@@ -255,6 +257,10 @@ class ServerManagementService:
         credential_store: ServerCredentialStore | None = None,
         delete_command: DeleteCommandService | None = None,
         hourly_can_start: Callable[[CloudServer], Awaitable[bool]] | None = None,
+        authorize_test_server: Callable[[CloudServer], Awaitable[bool]] | None = None,
+        actor_user_id: UUID | None = None,
+        operator_power: Callable[[CloudServer, str, str], Awaitable[PowerCommandResult]]
+        | None = None,
     ) -> None:
         self._servers = servers
         self._registry = registry
@@ -266,6 +272,9 @@ class ServerManagementService:
         self._credential_store = credential_store
         self._delete_command = delete_command
         self._hourly_can_start = hourly_can_start
+        self._authorize_test_server = authorize_test_server
+        self._actor_user_id = actor_user_id
+        self._operator_power = operator_power
         self._events = event_sink
         # The commercial collector (RenewalChecker) is optional: a deployment
         # that exposes no billing capability simply renders no commercial lines.
@@ -657,7 +666,12 @@ class ServerManagementService:
             "reboot": self._power.reboot,
         }[action]
         try:
-            result = await method(customer_id, server.id, key)
+            if is_test_resource(server):
+                if self._operator_power is None:
+                    raise ServerUnavailableError("operator power authorization is unavailable")
+                result = await self._operator_power(server, action, key)
+            else:
+                result = await method(customer_id, server.id, key)
         except NotServerOwnerError as exc:
             # Ownership was verified above; this only happens if the row moved
             # under us. Same uniform answer as a missing server.
@@ -710,6 +724,7 @@ class ServerManagementService:
         *,
         image_ref: str,
         confirmation_token: str | None,
+        idempotency_key: str | None = None,
     ) -> ServerActionOutcome:
         """Reinstall with a provider-fetched image (destructive, confirmed)."""
         server = await self._owned(customer_id, server_id)
@@ -731,6 +746,25 @@ class ServerManagementService:
         selected = next((image for image in images if image.ref == str(image_ref)), None)
         if selected is None:
             raise ServerUnavailableError("selected reinstall image is no longer available")
+        return await self._execute_confirmed(
+            server,
+            customer_id,
+            ServerOperation.REINSTALL,
+            arguments,
+            confirmation_token,
+            idempotency_key,
+            lambda: self._reinstall_provider(context, server, customer_id, arguments, image_ref),
+        )
+
+    async def _reinstall_provider(
+        self,
+        context: _ProviderContext,
+        server: CloudServer,
+        customer_id: UUID,
+        arguments: dict[str, Any],
+        image_ref: str,
+    ) -> ServerActionOutcome:
+        await self._owned(customer_id, server.id)
         try:
             response = await self._call(
                 context.provider.reinstall_vps(_provider_id(server), str(image_ref)),
@@ -783,7 +817,7 @@ class ServerManagementService:
                 server_id=server.id,
                 provider_server_id=_provider_id(server),
                 password=password,
-                username="root",
+                username=getattr(response, "username", "root"),
             )
         except ServerAmbiguousOutcomeError:
             raise
@@ -800,6 +834,12 @@ class ServerManagementService:
     ) -> ServerActionOutcome:
         """Run the authorized deletion saga, including provider absence and final billing."""
         server = await self._owned(customer_id, server_id)
+        if is_test_resource(server):
+            raise ServerOperationNotAllowedError(
+                "the shared operator fixture cannot be deleted",
+                operation=ServerOperation.DELETE,
+                reason="protected_resource",
+            )
         if self._delete_command is None:
             raise ServerUnavailableError("deletion workflow is unavailable")
         consumed = await self._consume(
@@ -842,6 +882,7 @@ class ServerManagementService:
         server_id: UUID,
         *,
         confirmation_token: str | None,
+        idempotency_key: str | None = None,
     ) -> ServerActionOutcome:
         """Reset the OS password and encrypt its provider-issued replacement."""
         server = await self._owned(customer_id, server_id)
@@ -858,13 +899,32 @@ class ServerManagementService:
         )
         if consumed is not None:
             return consumed
+        return await self._execute_confirmed(
+            server,
+            customer_id,
+            ServerOperation.PASSWORD_RESET,
+            {},
+            confirmation_token,
+            idempotency_key,
+            lambda: self._reset_password_provider(context, server, customer_id),
+        )
+
+    async def _reset_password_provider(
+        self,
+        context: _ProviderContext,
+        server: CloudServer,
+        customer_id: UUID,
+    ) -> ServerActionOutcome:
+        await self._owned(customer_id, server.id)
         response = await self._call(
             context.provider.reset_vps_password(_provider_id(server)),
             operation=ServerOperation.PASSWORD_RESET,
             server=server,
             customer_id=customer_id,
         )
-        await self._save_provider_password(server, customer_id, response, required=True)
+        # Leaseweb returns 202 without a password. Its recorded management
+        # command waits for a changed provider credential before success.
+        await self._save_provider_password(server, customer_id, response, required=False)
         await self._emit(
             BusinessEventType.SERVER_PASSWORD_RESET_REQUESTED,
             server,
@@ -872,7 +932,60 @@ class ServerManagementService:
             operation=ServerOperation.PASSWORD_RESET.value,
             result="accepted",
         )
-        return ServerActionOutcome(operation=ServerOperation.PASSWORD_RESET, accepted=True)
+        return ServerActionOutcome(
+            operation=ServerOperation.PASSWORD_RESET,
+            accepted=True,
+            detail="provider_credential_stored"
+            if getattr(response, "root_password", None) is not None
+            else "awaiting_provider_credential",
+        )
+
+    async def _execute_confirmed(
+        self,
+        server: CloudServer,
+        customer_id: UUID,
+        operation: ServerOperation,
+        arguments: dict[str, Any],
+        token: str | None,
+        key: str | None,
+        dispatch: Callable[[], Awaitable[ServerActionOutcome]],
+    ) -> ServerActionOutcome:
+        from cloud_platform.modules.servers.commands import (
+            ManagementReceiptConflict,
+            execute_management,
+        )
+        from cloud_platform.modules.servers.management_lifecycle import prepare_observation
+
+        if self._operations is None:
+            raise ServerUnavailableError("durable management receipts are unavailable")
+        actor_id = self._actor_user_id or customer_id
+        request_key = key or "confirmed:" + sha256((token or "").encode()).hexdigest()
+        try:
+            result = await execute_management(
+                self._operations,
+                key=request_key,
+                user_id=actor_id,
+                server=server,
+                action=operation.value,
+                arguments=arguments,
+                prepare=lambda: prepare_observation(
+                    self._registry, server, actor_id, operation.value, arguments
+                ),
+                dispatch=dispatch,
+            )
+        except ManagementReceiptConflict:
+            raise ServerUnavailableError(
+                "management command is already dispatched; inspect history"
+            ) from None
+        return ServerActionOutcome(
+            operation=operation,
+            accepted=bool(result["accepted"]),
+            replayed=bool(result.get("replayed")),
+            outcome_unknown=bool(result.get("outcome_unknown")),
+            detail=result.get("detail"),
+            status=result["status"],
+            receipt_id=result["receiptId"],
+        )
 
     async def create_snapshot(
         self,
@@ -1414,6 +1527,10 @@ class ServerManagementService:
             )
         server = await self._servers.get(server_id)
         if server is None or server.user_id != customer_id:
+            raise ServerNotFoundError("server not found")
+        if is_test_resource(server) and (
+            self._authorize_test_server is None or not await self._authorize_test_server(server)
+        ):
             raise ServerNotFoundError("server not found")
         return server
 

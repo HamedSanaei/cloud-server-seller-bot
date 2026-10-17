@@ -1,99 +1,47 @@
 # Deployment (GHCR image + SSH)
 
-How a commit reaches the server — the fast `staging` validation/build lane and
-automatic `main` release lane — plus the one-time server bootstrap an operator
-performs first. Companion documents:
+Pushes and pull requests run the full CI gate. Staging delivery automatically
+updates the SAME live Production runtime. The main lane remains an explicit
+approved dispatch after successful exact-SHA main CI. Companion documents:
 [`PRODUCTION_HARDENING.md`](PRODUCTION_HARDENING.md) (topology and guarantees),
 [`RUNBOOK.md`](RUNBOOK.md) (day-2 operations), [`PRODUCTION_RUNBOOK.md`](PRODUCTION_RUNBOOK.md).
 
 ## 1. Pipeline overview
 
-```text
-DEVELOPMENT LANE: push to `staging`
-  -> deploy-staging workflow: fast static/import checks, targeted financial and
-     deployment regressions, historical/fresh PostgreSQL migration contracts
-  -> cached Docker build of the EXACT pushed SHA -> GHCR
-  -> STOP (no automatic host mutation)
-  -> optional explicit deploy-staging dispatch on staging: checked SHA deploys
-     through scripts/deploy-production.sh DEPLOY_PROFILE=staging
-
-RELEASE LANE (automatic): push to `main`
-  -> `ci` workflow (ruff, mypy, secrets, pytest+coverage, migration,
-     provider-branching, task, migration-smoke, leaseweb-contract gates)
-  -> completed successful same-repository push CI triggers deploy-production
-       1. resolve the CI head SHA (not the workflow_run default-branch SHA)
-       2. verify ci.yml run provenance and current main HEAD before checkout
-       3. build the Dockerfile, push ghcr.io/<org>/<repo>:<full-sha>
-          (an existing SHA tag is never rebuilt or overwritten)
-       4. verify the pushed image (entrypoint smoke + production compose config)
-       5. recheck main HEAD/CI, SSH with verified host key, log in to GHCR
-       6. run scripts/deploy-production.sh with that exact image
-       7. report; fail the workflow when health checks fail (even after rollback)
+```mermaid
+flowchart TD
+  PR[Pull request: main or staging] --> CI[Full CI gates]
+  Stage[Push staging] --> SCI[Reusable full CI]
+  SCI --> Image[Build immutable exact-SHA image in CI]
+  Image --> StageDeploy[Automatic shared production deploy]
+  Main[Push main] --> MainCI[Full main CI]
+  MainCI --> Approval[Explicit production dispatch and Environment approval]
+  Approval --> Production[Deploy exact approved current-main SHA]
+  StageDeploy --> Live[Same DB, Redis and single original bot]
+  Production --> Live
 ```
 
-`main` owns automatic delivery to the existing server and single Telegram bot.
-Staging pushes cannot overwrite production; only an explicit staging dispatch
-can replace it. Pull-request, fork, failed, cancelled, incomplete, wrong-workflow
-and stale-main CI runs never release. The exact successful CI run is verified
-through GitHub's API before source checkout/build and again before host access.
-Manual production dispatch remains available on `main`, with a full SHA equal
-to current `main` HEAD and the same successful push-CI proof; it is not a bypass
-or a historical rollback mechanism. No manual dispatch/approval is required by
-the workflow for normal successful main pushes (environment protection rules
-can still add an administrator-configured approval).
+Production dispatch must supply the complete current-main SHA and explicit
+confirmation. A failed, cancelled, incomplete, wrong-workflow or stale CI run
+cannot authorize a release. Main pushes alone never deploy production.
 
-Both lanes disable cancellation of active runs and use the same deploy-job
-concurrency group, `telegram-shared-host-deploy`. Builds for one SHA are also
-serialized. The deploy engine additionally holds a server-side `flock` through
-failure recovery; direct operator invocations cannot bypass that exclusion.
-Once mutation begins, the engine ignores HUP/INT/TERM rather than interrupting
-a migration or service replacement. New pushes may replace pending runs, not
-interrupt an active deployment.
+Both lanes use `scripts/deploy-production.sh` and Compose project
+`cloud-platform-production`: one existing directory, private configuration,
+database, Redis, volumes, production bridge and original bot token. Staging
+only skips the one-shot provider catalog refresh; scheduled refresh and every
+release/financial/readiness gate remain active. See [staging lane](../../deploy/staging/README.md).
 
-### The staging lane in one screen
+Staging uses the same lint, format, mypy, secret scan, complete pytest/coverage,
+migration bridge, physical schema, PostgreSQL contracts, provider-neutrality,
+generated-contract and image-smoke gates as release CI; no fast-check exemption.
+Images and Compose candidates come from that same tested commit. SHA tags are
+immutable, and OCI revision plus platform-contract labels are checked.
 
-* **Trigger**: every push to `staging` validates/builds only. `workflow_dispatch`
-  on `staging` additionally deploys that dispatch's checked SHA; a feature
-  branch is never deployable through this lane.
-* **Checks**: `uv sync --locked --all-groups`, the canonical staging
-  static/import gate, targeted financial/worker/deployment regressions, the
-  historical migration bridge, fresh physical-schema parity and live
-  PostgreSQL contracts. A PostgreSQL 17 service and matching backup/restore
-  clients are provided. Build and optional manual deploy depend on this job succeeding.
-  The full release suite, coverage, mypy and pre-commit remain release gates;
-  the staging pipeline does not substitute for them.
-* **Image**: only `ghcr.io/<org>/<repo>:<pushed full SHA>`, never rebuilt or
-  overwritten when it exists. Registry errors fail closed rather than being
-  interpreted as a missing tag. No mutable convenience tag is deployed.
-* **Target**: the SAME server, the SAME compose project
-  (`cloud-platform-production`), the SAME server-owned
-  `deploy.env`/`configuration.toml` and the SAME Telegram bot as production,
-  because the existing GitHub `production` environment is where `PROD_SSH_KEY`,
-  `PROD_KNOWN_HOSTS` and the `PROD_*` variables live (no duplicated secrets).
-  That environment has no protection rules today, so the staging lane adds no
-  approval step; if required reviewers are ever enabled there, move those
-  values to a shared environment (or dedicated staging credentials) BEFORE,
-  otherwise staging deploys inherit the approval.
-* **Deploy engine**: the same `scripts/deploy-production.sh`.
-  `DEPLOY_PROFILE=staging` skips only the one-shot provider catalog refresh,
-  because the worker's scheduled coordinator owns provider facts.
-  Configuration, migration/head/physical-schema, catalog normalization,
-  single-poller, service health, financial reconciliation and storefront gates
-  remain enabled.
-* **Database**: the shared database, forward only (`alembic upgrade head`);
-  never reset, recreated, restamped to hide a conflict, or downgraded.
-* **Bot safety**: old application writers are stopped before migrations.
-  Compose uses the explicit project `cloud-platform-production` and
-  `bot.replicas: 1`. Promotion requires exactly one running, healthy bot and
-  a fresh heartbeat written by its existing successful `getUpdates` poll;
-  the health check never starts another poller.
-* **Failure safety**: image rollback is conditional, not universally safe.
-  An intended or observed schema advance leaves writers stopped for operator
-  recovery; see §6. Active deployments are not cancelled by newer pushes.
-* **Not** used by this lane: `deploy/staging/docker-compose.yml` (M12-004,
-  `scripts/deploy.py`) describes a separate isolated stack with its own
-  database, secrets and bot token; the staging lane replaces the running stack
-  instead. Do not start a second database, Redis, deploy path, or bot.
+Both lanes share one non-cancelling deployment job group and directory-scoped
+`flock`. Website and native releases additionally serialize through
+`/var/lock/servercloud-platform-release.lock`, opened by the same deployment OS
+user. A release never interrupts an active migration for a newer push.
+
 
 ## 2. Server layout and ownership
 
@@ -124,12 +72,13 @@ it is used for automatic image rollback only when the database remains
 compatible under §6. Manual dispatch cannot select an older main SHA or undo
 a financial/schema transition.
 
-* `deploy.env` holds ONLY `PLATFORM_IMAGE`, `POSTGRES_PASSWORD`, `API_PORT`
-  and optionally `CONFIGURATION_PATH`. Automated deploys rewrite a single
-  line there (`PLATFORM_IMAGE`); the password is never rewritten.
-* `configuration.toml` is mounted read-only into every container. It is
-  never committed, never uploaded from the repository, and never overwritten
-  by a deployment — the deploy script only checks that it EXISTS.
+* `deploy.env` holds infrastructure values: immutable `PLATFORM_IMAGE`,
+  `POSTGRES_PASSWORD`, API bind/port, optional management SSH directory and
+  configuration path. Releases update only their image selection, not passwords.
+* `configuration.toml` is mounted read-only. Deploys validate its environment,
+  IRT wallet/display and FX policy, identity mode and signing key without printing
+  values. They never overwrite the server-owned file. Staging URLs must address
+  that stack's `postgres` and `redis`, not production or an external shared DB.
 * No production application secret lives in GitHub (repository, workflow, or
   logs). The only credentials GitHub holds are the SSH access below and the
   ephemeral `GITHUB_TOKEN` used for one GHCR pull per deploy.
@@ -223,10 +172,10 @@ ufw --force enable
 #    short-lived GITHUB_TOKEN over the SSH session (never printed or saved).
 ```
 
-First deployment: push/merge to `main` and let successful CI trigger production
-(or dispatch `deploy-production` with current `main` SHA after its successful
-push CI). The workflow pulls the image, runs migrations, starts
-api + worker + one bot, and health-checks before declaring success.
+First production deployment: after successful current-main push CI, dispatch
+`deploy-production` with that full SHA and explicit confirmation, then obtain
+the protected production Environment approval. Staging pushes deploy only to
+their separately bootstrapped staging Environment.
 
 ## 4. GitHub configuration the operator must set manually
 
@@ -237,11 +186,10 @@ Repository settings:
   `PUT /repos/{owner}/{repo}/vulnerability-alerts`. A disabled graph makes the
   dependency-review API return HTTP 403; fix the repository setting rather
   than skipping or weakening the dependency review check.
-* Protect `main`: require a pull request, resolved conversations and the
-  up-to-date **Required CI checks** status from the GitHub Actions application.
-  Enforce these rules for administrators and disallow force pushes and branch
-  deletion. Merging to `main` now authorizes an automatic production release
-  after successful push CI; review and approve that release intent before merge.
+* Protect `main`: require a pull request, resolved conversations and up-to-date
+  required CI checks, including administrators; disallow force pushes/deletion.
+  Separately protect the production Environment with a required reviewer and
+  a `main`-only deployment branch policy. A merge is not deployment approval.
 
 Environment **`production`** (repository → Settings → Environments):
 
@@ -254,11 +202,12 @@ Environment **`production`** (repository → Settings → Environments):
 | Variable | `PROD_USER` | `deploy` |
 | Variable | `PROD_DEPLOY_PATH` | `/opt/cloud-server-seller` |
 
-Both lanes read this ONE environment (no duplicated infrastructure secrets):
-`deploy-staging.yml` declares `environment: production` for exactly this
-reason, and its deploy job joins the shared-host concurrency group so the two
-lanes never overlap. Any change made here (rotation, renaming a variable)
-applies to both lanes at once — verify both workflows afterwards.
+The **`staging`** GitHub release Environment contains secrets `DEPLOY_HOST`,
+`DEPLOY_PORT`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS`, and variables
+`DEPLOY_PATH`, `CONFIGURATION_PATH`, all selecting the SAME existing Production
+runtime/private TOML. Restrict its branch to `staging`; it is an automatic release
+lane, not runtime isolation. The operator elected to supply these secrets.
+Never upload the operator's existing private SSH key or hide missing credentials.
 
 Package visibility: the GHCR image may stay private. Each workflow supplies the
 short-lived `GITHUB_TOKEN` on stdin within one SSH session. That session creates
@@ -270,16 +219,17 @@ operator authorization. Application secrets remain server-owned.
 
 ## 5. Deployment sequence (what the script does)
 
-1. Acquire the shared-host lock; validate tools, bounded health settings,
-   server-owned files and the candidate compose's SHA-256. Reject symlinks,
-   invalid profiles and non-SHA image references before service mutation.
-2. Pull the exact image; require its OCI revision to match its full SHA tag.
+1. Acquire the target-directory lock; validate tools, bounded health settings,
+   server-owned files, directory/project ownership and candidate Compose SHA-256.
+   Reject symlinks, invalid profiles and non-SHA references before service mutation.
+2. Pull the exact image; require its OCI revision and platform-contract labels.
    Validate the mounted server configuration without printing its values.
 3. Record the previous image, change only `PLATFORM_IMAGE` in `deploy.env`,
    and establish PostgreSQL/Redis health. Read the database and image heads;
    a database with multiple revisions is not deployable.
-4. Stop API, worker and the single bot before `alembic upgrade head`.
-   Alembic also holds a PostgreSQL transaction-scoped migration lock.
+4. Stop API, worker and the single bot. Create an encrypted backup with the
+   canonical backup job, then run `alembic upgrade head`. A backup failure
+   prevents migration. Alembic also holds a PostgreSQL migration lock.
 5. Require the database head to equal the image head and verify the physical
    schema, including the uniqueness/partial-index contracts used by upserts.
    A version stamp alone is not schema evidence.
@@ -317,9 +267,9 @@ retry the forward migration.
 
 ### Recovery rules
 
-* Require a recent encrypted off-host backup and a successful clean-target
-  restore drill before approving a schema/financial-epoch advance. Backups are
-  not created or restored automatically by deployment.
+* Deploy creates a fresh encrypted backup after draining writers and before
+  migration. Also require a recent off-host copy and successful clean-target
+  restore drill before approving a schema/financial-epoch advance.
 * `alembic downgrade` is never part of recovery. Physical parity does not prove
   that an old image understands a new currency or financial epoch.
 * After a migration is attempted, if either the target image head or observed
@@ -327,8 +277,8 @@ retry the forward migration.
   stopped and **old-image restart is refused**, even when the migration fails
   before stamping. Recover with a reviewed forward fix or a separately
   verified operator recovery procedure.
-* When no schema transition was attempted, the prior image must pass physical
-  parity before automatic restoration with the previous canonical compose.
+* Without a schema transition, an old image may restart only after physical
+  parity and (after candidate activation) matching platform-contract checks.
   Failure recovery still leaves the workflow red.
 * A first deployment has no rollback image; failed candidate writers are
   stopped. Never report an unavailable rollback target as success.
@@ -344,12 +294,12 @@ docker compose --env-file deploy.env -f docker-compose.yml ps
 docker compose --env-file deploy.env -f docker-compose.yml logs --tail=200 api worker bot
 docker compose --env-file deploy.env -f docker-compose.yml exec -T api alembic current
 curl -fsS http://127.0.0.1:8000/health/ready
-# one encrypted backup run (manual/scheduled, never part of deploy):
+# additional manual encrypted backup (deployment also creates one):
 docker compose --env-file deploy.env -f docker-compose.yml --profile backup run --rm backup
 ```
 
 Deployments never delete volumes (`docker compose down -v` is forbidden in
-automation); the `backup` profile stays manual/scheduled.
+automation). Extra scheduled/manual backups use the same encrypted backup job.
 
 ## 8. Secrets discipline (quick reference)
 

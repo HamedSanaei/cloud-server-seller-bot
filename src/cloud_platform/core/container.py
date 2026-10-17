@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -488,6 +489,7 @@ class Container:
             # Select before persistence; an unaccepted create may move only
             # under the durable refusal/attempt fence, never after acceptance.
             fulfillment_routes=self.provider_route_selector(),
+            fx_resolver=self.fx_resolver_or_none(),
         )
 
     def provider_route_selector(self) -> Any:
@@ -515,6 +517,7 @@ class Container:
             location_repo=SqlAlchemyLocationRepository(self.session_factory),
             cloud_providers=self.hourly_cloud_providers(),
             cloud_resolver=self.hourly_cloud_resolver(),
+            fx_resolver=self.fx_resolver_or_none(),
         )
 
     def hourly_cloud_resolver(self) -> Any | None:
@@ -965,7 +968,7 @@ class Container:
         )
 
         return SqlAlchemyAdminMessagingRepository(
-            self.session_factory, configured_ids=get_settings().telegram_superadmin_user_ids
+            self.session_factory, configured_ids=tuple(get_settings().telegram_superadmin_user_ids)
         )
 
     def admin_messaging_service(self) -> Any:
@@ -1299,18 +1302,13 @@ class Container:
     def business_event_sink(self) -> Any:
         """The business-event sink to inject into application services.
 
-        Disabled configuration yields the null sink, so call sites stay
-        unconditional and no financial path gains a Telegram dependency.
+        Customer outbox events remain enabled independently of the optional
+        operator channel. No financial path performs Telegram delivery inline.
         """
-        from cloud_platform.modules.businesslog.domain import (
-            NullBusinessEventSink,
-            OutboxBusinessEventSink,
-        )
+        from cloud_platform.modules.notifications.customer import CustomerEventSink
 
         policy = self.business_log_policy()
-        if not policy.active:
-            return NullBusinessEventSink()
-        return OutboxBusinessEventSink(self.business_log_repository(), policy)
+        return CustomerEventSink(self.business_log_repository(), policy)
 
     def customer_provisioned_sink(self) -> Any:
         """Outbox for customer success cards, independent of operator logger."""
@@ -1487,7 +1485,7 @@ class Container:
             fx_resolver=fx_resolver,
             gateway_settings=self.gateway_settings_repository(),
             gateway_defaults=self.payment_gateway_defaults(),
-            configured_ids=get_settings().telegram_superadmin_user_ids,
+            configured_ids=tuple(get_settings().telegram_superadmin_user_ids),
             wallet_repo=self.wallet_repository(),
         )
 
@@ -1734,7 +1732,7 @@ class Container:
         settings = get_settings()
         policy = self.server_management_policy()
         return ConfirmationVerifier(
-            settings.callback_signing_key or "unset-callback-key",
+            settings.callback_signing_key,
             store=SharedConfirmationStore(
                 self.session_store(),
                 replay_ttl_seconds=settings.telegram_sessions_replay_ttl_seconds,
@@ -1808,16 +1806,77 @@ class Container:
             can_fund_hour=self.prepaid_hourly_billing_service().can_fund_hour,
         )
 
-    def server_management_service(self) -> Any:
+    def server_management_service(self, *, actor_user_id: UUID | None = None) -> Any:
         """Customer-facing, ownership-safe server management (Telegram).
 
         Power keeps flowing through :class:`PowerCommandService` (the existing
         operation ledger), while every other provider call goes through the
         provider-neutral VPS ports.
         """
+        from hashlib import sha256
+
+        from cloud_platform.modules.admin_console.support import server_binding
+        from cloud_platform.modules.admin_console.support_repository import (
+            SqlAlchemyAdminSupportRepository,
+        )
+        from cloud_platform.modules.audit.domain import ActorType
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
+        from cloud_platform.modules.operations.domain import OperationStatus
         from cloud_platform.modules.operations.repository import SqlAlchemyOperationRepository
+        from cloud_platform.modules.operations.service import (
+            NotServerOwnerError,
+            PowerCommandResult,
+            PowerExecutionResult,
+            PowerOperationFailedError,
+            PowerOperationInProgressError,
+        )
         from cloud_platform.modules.servers.service import ServerManagementService
+        from cloud_platform.modules.servers.test_identity import is_test_server
+        from cloud_platform.modules.users.superadmins import is_superadmin
+
+        async def authorize_test_server(server: Any) -> bool:
+            actor = (
+                await self.user_repository().get(actor_user_id)
+                if actor_user_id is not None
+                else None
+            )
+            return is_test_server(server) and is_superadmin(
+                actor, get_settings().telegram_superadmin_user_ids
+            )
+
+        async def operator_power(server: Any, action: str, key: str) -> PowerCommandResult:
+            if actor_user_id is None or not await authorize_test_server(server):
+                raise NotServerOwnerError("server not found")
+            operations = SqlAlchemyOperationRepository(self.session_factory)
+            intent = await SqlAlchemyAdminSupportRepository(self.session_factory).enqueue(
+                actor_id=actor_user_id,
+                server_id=server.id,
+                action=action,
+                operation_key="operator-power:"
+                + sha256(f"{actor_user_id}:{server.id}:{key}".encode()).hexdigest(),
+                reason="Explicit shared test-server power request",
+                expected_binding=server_binding(server),
+                expected_state=server.state.value,
+                configured_ids=get_settings().telegram_superadmin_user_ids,
+            )
+            if intent.status is OperationStatus.FAILED:
+                raise PowerOperationFailedError("operator power request failed")
+            if intent.status is OperationStatus.COMPLETED:
+                return PowerCommandResult(server=server, replayed=True)
+            claimed = await operations.claim(intent.id)
+            if claimed is None:
+                raise PowerOperationInProgressError("operator power request is in progress")
+            result = await self.power_command_service()._executor.execute(
+                claimed, actor_type=ActorType.ADMIN, actor_id=actor_user_id
+            )
+            current = await self.server_repository().get(server.id)
+            if current is None:
+                raise NotServerOwnerError("server not found")
+            return PowerCommandResult(
+                server=current,
+                replayed=False,
+                requeued=result is PowerExecutionResult.REQUEUED,
+            )
 
         return ServerManagementService(
             servers=SqlAlchemyServerRepository(self.session_factory),
@@ -1835,6 +1894,9 @@ class Container:
             # can never disagree about the price or the idempotency key.
             renewal_collector=self.renewal_checker(),
             hourly_can_start=self.prepaid_hourly_billing_service().can_start,
+            authorize_test_server=authorize_test_server,
+            actor_user_id=actor_user_id,
+            operator_power=operator_power,
         )
 
     @asynccontextmanager
@@ -2347,7 +2409,7 @@ async def get_payment_webhook_service() -> PaymentWebhookService:
 async def get_nowpayments_callback_service() -> Any:
     """Native IPNs only schedule provider-authoritative durable reconciliation."""
     from cloud_platform.modules.payments.inquiry import AuthoritativePaymentService
-    from cloud_platform.modules.payments.nowpayments import NowPaymentsCallbackService
+    from cloud_platform.providers.nowpayments.callbacks import NowPaymentsCallbackService
 
     container = await get_container()
     repo = SqlAlchemyPaymentSessionRepository(container.session_factory)

@@ -24,8 +24,8 @@ from cloud_platform.modules.payments.domain import (
     DuplicateExternalIdError,
     InvalidPaymentSessionTransition,
 )
-from cloud_platform.modules.payments.nowpayments import NowPaymentsCallbackService
 from cloud_platform.modules.payments.service import PaymentWebhookService
+from cloud_platform.providers.nowpayments.callbacks import NowPaymentsCallbackService
 from cloud_platform.providers.nowpayments.signatures import SignatureError, verify_ipn_signature
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])

@@ -51,6 +51,7 @@ class OperationType(StrEnum):
     SERVER_REBUILD = "server_rebuild"
     RESCUE_ENABLE = "rescue_enable"
     RESCUE_DISABLE = "rescue_disable"
+    SERVER_MANAGEMENT = "server_management"
 
 
 class OperationStatus(StrEnum):

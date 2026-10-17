@@ -1,17 +1,28 @@
 """Bounded local catalog and aggregate operation/queue health reads."""
 
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager
+from typing import Any
+
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import AdminMessageDelivery, Operation, SellableOffer, Server
+from cloud_platform.modules.offers.domain import SellableOffer as Offer
 from cloud_platform.modules.offers.repository import _to_domain
 
 
 class SqlAlchemyAdminReadRepository:
-    def __init__(self, session_factory, *, dependency_probe=None):
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+        *,
+        dependency_probe: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+    ) -> None:
         self._sessions = session_factory
         self._probe = dependency_probe
 
-    async def list_offers(self, *, offset=0, limit=10):
+    async def list_offers(self, *, offset: int = 0, limit: int = 10) -> tuple[Offer, ...]:
         if (
             type(offset) is not int
             or not 0 <= offset <= 10000
@@ -34,7 +45,7 @@ class SqlAlchemyAdminReadRepository:
             )
             return tuple(_to_domain(row) for row in rows)
 
-    async def health(self):
+    async def health(self) -> dict[str, Any]:
         async with self._sessions() as session:
             await session.execute(select(1))
             operations = (
@@ -56,7 +67,7 @@ class SqlAlchemyAdminReadRepository:
             return {
                 "database": "ok",
                 "dependencies": dependencies,
-                "servers": dict(servers),
-                "operations": dict(operations),
-                "message_deliveries": dict(messages),
+                "servers": {str(state): int(count) for state, count in servers},
+                "operations": {str(state): int(count) for state, count in operations},
+                "message_deliveries": {str(state): int(count) for state, count in messages},
             }

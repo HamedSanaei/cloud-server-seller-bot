@@ -25,7 +25,7 @@ import hmac
 import json
 import math
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 __all__ = ["SignatureError", "canonical_json", "verify_ipn_signature"]
 
@@ -201,4 +201,4 @@ def verify_ipn_signature(
         raise SignatureError("IPN contains invalid signing data") from None
     if not hmac.compare_digest(expected, candidate.lower()):
         raise SignatureError("IPN signature does not match")
-    return _materialize(parsed)
+    return cast(dict[str, Any], _materialize(parsed))

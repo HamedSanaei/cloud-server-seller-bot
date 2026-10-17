@@ -21,7 +21,7 @@ from cloud_platform.providers.nowpayments import (
     verify_ipn_signature,
 )
 
-SECRET = "ipn-fixture-secret-0001"
+SECRET = "ipn-fixture-secret-0001"  # pragma: allowlist secret
 DUMMY_SIGNATURE = "0" * 128
 
 

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy import select, text, update
@@ -78,7 +79,7 @@ class SqlAlchemyAdminMessagingRepository:
             if existing is not None:
                 if existing.facts_hash != facts_hash:
                     raise ValueError("campaign idempotency facts differ")
-                return existing.id
+                return cast(UUID, existing.id)
             targets = (
                 (
                     await session.execute(
@@ -93,7 +94,8 @@ class SqlAlchemyAdminMessagingRepository:
             )
             expected = {row.user_id: row.telegram_user_id for row in recipients}
             if len(targets) != len(expected) or any(
-                row.telegram_user_id != expected[row.id] or row.status != UserStatus.ACTIVE.value
+                row.telegram_user_id != expected[cast(UUID, row.id)]
+                or row.status != UserStatus.ACTIVE.value
                 for row in targets
             ):
                 raise PermissionDeniedError("frozen recipient identity or status changed")
@@ -266,13 +268,14 @@ class SqlAlchemyAdminMessagingRepository:
             raise ValueError("invalid delivery outcome")
         now = datetime.now(UTC)
         async with self._sessions() as session, session.begin():
-            result = await session.execute(
+            matched = await session.scalar(
                 update(AdminMessageDelivery)
                 .where(
                     AdminMessageDelivery.id == delivery.id,
                     AdminMessageDelivery.status == "leased",
                     AdminMessageDelivery.claim_token == delivery.claim_token,
                 )
+                .returning(AdminMessageDelivery.id)
                 .values(
                     status=status,
                     error_code=error_code,
@@ -282,4 +285,4 @@ class SqlAlchemyAdminMessagingRepository:
                     next_attempt_at=now + timedelta(seconds=min(3600, max(0, retry_seconds))),
                 )
             )
-            return result.rowcount == 1
+            return matched is not None

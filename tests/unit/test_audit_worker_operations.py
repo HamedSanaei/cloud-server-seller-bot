@@ -446,6 +446,7 @@ def prepaid_worker(monkeypatch):
         close=AsyncMock(),
         server_repository=lambda: servers,
         wallet_repository=lambda: wallets,
+        business_log_repository=lambda: SimpleNamespace(enqueue=AsyncMock(return_value=True)),
         prepaid_hourly_billing_service=lambda: billing,
         prepaid_provider_lifecycle_service=lambda: lifecycle,
     )

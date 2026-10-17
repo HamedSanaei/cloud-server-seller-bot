@@ -258,6 +258,9 @@ class Fakes:
 
         @dataclass
         class _ServerRepo:
+            async def get(self, server_id):
+                return next((server for server in h.servers if server.id == server_id), None)
+
             async def list_running(self):
                 return [s for s in h.servers if s.state is ServerLifecycleState.RUNNING]
 
@@ -288,8 +291,12 @@ class Fakes:
                 reference_type="",
                 reference_id="",
                 description="",
+                expected_currency=None,
+                expected_customer_server_id=None,
             ):
                 """Atomic balance + ledger mutation (the real repository's contract)."""
+                if expected_currency is not None and expected_currency != h.wallet.currency:
+                    raise ValueError("wallet currency changed")
                 if key in h.entries:
                     return h.wallet, False
                 if delta < 0:
@@ -364,6 +371,9 @@ class Fakes:
 
         @dataclass
         class _ServerRepo:
+            async def get(self, server_id):
+                return next((server for server in h.servers if server.id == server_id), None)
+
             async def save(self, server):
                 return await h.save(server)
 

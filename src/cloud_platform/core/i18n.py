@@ -571,7 +571,9 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "store.detail_unknown": "اطلاعات در کاتالوگ ارائه نشده",
         "store.detail_yes": "دارد",
         "store.detail_no": "ندارد",
-        "store.price_unavailable": "قیمت تبدیل‌شده لحظه‌ای در دسترس نیست؛ قیمت اصلی اعمال می‌شود.",
+        "store.price_unavailable": (
+            "قیمت تومانی معتبر موقتاً در دسترس نیست؛ تسویه ارزی جایگزین انجام نمی‌شود."
+        ),
         "recharge.title": "⬆️ شارژ کیف پول",
         "recharge.amount_row": "{amount}",
         "recharge.custom_button": "✏️ مبلغ دلخواه",
@@ -1165,7 +1167,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "store.detail_unknown": "not stated in the provider catalog",
         "store.detail_yes": "yes",
         "store.detail_no": "no",
-        "store.price_unavailable": "The live converted price is temporarily unavailable; the native price applies.",  # noqa: E501
+        "store.price_unavailable": "A valid toman price is temporarily unavailable; no foreign-currency fallback charge is made.",  # noqa: E501
         "recharge.title": "⬆️ Wallet top-up",
         "recharge.amount_row": "{amount}",
         "recharge.custom_button": "✏️ Custom amount",

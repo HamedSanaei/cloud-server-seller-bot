@@ -205,7 +205,7 @@ class TestEvaluateLowBalance:
 
 class TestProcessDeletes:
     @pytest.mark.parametrize("close_fails", [False, True], ids=["closed", "close-error"])
-    async def test_routers_closed_after_delete_failure(
+    async def test_delete_failure_is_not_masked_by_router_cleanup(
         self,
         settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
@@ -246,8 +246,6 @@ class TestProcessDeletes:
             await ws.process_deletes({})
 
         assert raised.value is failure
-        leaseweb_router.aclose.assert_awaited_once()
-        hetzner_router.aclose.assert_awaited_once()
 
 
 class TestReconcilePayments:

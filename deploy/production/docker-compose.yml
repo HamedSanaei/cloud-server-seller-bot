@@ -49,7 +49,7 @@ x-platform: &platform
     # Server-owned configuration: never committed, never overwritten by a
     # deploy. CONFIGURATION_PATH may point elsewhere; the default is the
     # documented server path.
-    - ${CONFIGURATION_PATH:-/etc/cloud-server-seller/configuration.toml}:/etc/cloud-server-seller/configuration.toml:ro
+    - &platform-config ${CONFIGURATION_PATH:-/etc/cloud-server-seller/configuration.toml}:/etc/cloud-server-seller/configuration.toml:ro
   restart: unless-stopped
   stop_grace_period: 45s
   mem_limit: 1g
@@ -62,6 +62,17 @@ x-platform: &platform
     options:
       max-size: "10m"
       max-file: "3"
+
+# This server-owned directory is excluded from Git and image build contexts.
+# An empty directory keeps guest management disabled; installing a pinned config
+# is an explicit operator action. Workers/migration/backup never receive SSH keys.
+x-management-ssh: &management-ssh
+  type: bind
+  source: ${MANAGEMENT_SSH_DIR:-./management-ssh}
+  target: /etc/cloud-platform/management-ssh
+  read_only: true
+  bind:
+    create_host_path: true
 
 services:
   postgres:
@@ -128,10 +139,17 @@ services:
   api:
     <<: *platform
     command: ["api"]
+    volumes:
+      - *platform-config
+      - *management-ssh
     # The image HEALTHCHECK (GET /health/live on :8000) is kept exactly here:
     # api is the only service that serves HTTP.
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "${API_BIND_ADDRESS:-0.0.0.0}:${API_PORT:-8000}:8000"
+    networks:
+      default:
+      platform-bridge:
+        aliases: [cloud-platform-api]
     depends_on:
       postgres:
         condition: service_healthy
@@ -145,7 +163,7 @@ services:
     command: ["worker"]
     # ARQ's expiring Redis sentinel proves the event loop actually ran.
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; from arq.worker import check_health; from cloud_platform.worker.settings import WorkerSettings; sys.exit(check_health(WorkerSettings))"]
+      test: ["CMD", "python", "-m", "cloud_platform.worker.health"]
       interval: 15s
       timeout: 10s
       start_period: 45s
@@ -168,6 +186,9 @@ services:
   bot:
     <<: *platform
     command: ["bot"]
+    volumes:
+      - *platform-config
+      - *management-ssh
     # Local heartbeat is refreshed only by successful Telegram long polls.
     # This probe never calls getUpdates and never consumes a customer update.
     healthcheck:
@@ -227,3 +248,7 @@ volumes:
   pgdata:
   redisdata:
   backups:
+
+networks:
+  platform-bridge:
+    name: ${PLATFORM_NETWORK:-cloud-platform-production-bridge}

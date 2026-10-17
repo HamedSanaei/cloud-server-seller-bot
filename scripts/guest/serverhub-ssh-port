@@ -1,0 +1,60 @@
+#!/bin/sh
+# Install on the TEST VPS as root, mode 0755. Use a restricted sudoers rule.
+# Adds a port without closing the old SSH port. Never disables firewall rules.
+set -eu
+port=${1:-}
+operation=${2:-}
+case "$port" in ''|*[!0-9]*) exit 64;; esac
+[ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || exit 64
+case "$operation" in ''|*[!a-f0-9]*) exit 64;; esac
+[ "${#operation}" -eq 64 ] || exit 64
+[ "$(id -u)" -eq 0 ] || exit 77
+command -v flock >/dev/null
+exec 9>/run/serverhub-ssh-port.lock
+flock -w 10 9
+# Socket activation changes require a separate, reviewed socket-unit override.
+if systemctl is-active --quiet ssh.socket || systemctl is-active --quiet sshd.socket; then
+  echo 'socket-activated SSH is unsupported by this helper' >&2
+  exit 69
+fi
+sshd=$(command -v sshd || printf /usr/sbin/sshd)
+"$sshd" -t
+mkdir -p /var/lib/serverhub/ssh-port
+receipt=/var/lib/serverhub/ssh-port/$operation
+if [ -f "$receipt" ]; then
+  [ "$(cat "$receipt")" = "$port" ] || exit 65
+  exit 0
+fi
+config=/etc/ssh/sshd_config
+backup=$(mktemp /etc/ssh/serverhub-sshd.XXXXXX)
+cp -p "$config" "$backup"
+restore() { mv -f "$backup" "$config"; }
+trap restore HUP INT TERM
+# Explicitly preserve every currently active port before adding the new one.
+ports=$("$sshd" -T | awk '$1 == "port" && !seen[$2]++ {print $2}')
+temporary=$(mktemp /etc/ssh/serverhub-port.XXXXXX)
+# Preserve owner/mode; replace the previous managed block, not the whole policy.
+cp -p "$config" "$temporary"
+: > "$temporary"
+printf '# BEGIN SERVERHUB SSH PORTS\n' >> "$temporary"
+for old in $ports; do printf 'Port %s\n' "$old" >> "$temporary"; done
+if ! printf '%s\n' "$ports" | grep -qx "$port"; then printf 'Port %s\n' "$port" >> "$temporary"; fi
+printf '# END SERVERHUB SSH PORTS\n' >> "$temporary"
+awk '/^# BEGIN SERVERHUB SSH PORTS$/ {managed=1; next}
+     /^# END SERVERHUB SSH PORTS$/ {managed=0; next}
+     !managed {print}' "$config" >> "$temporary"
+if ! "$sshd" -t -f "$temporary"; then rm -f "$temporary"; rm -f "$backup"; exit 65; fi
+mv -f "$temporary" "$config"
+if ! "$sshd" -t; then restore; exit 65; fi
+# Add an allow rule only for UFW-managed hosts; custom firewalls remain operator-owned.
+if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+  if ! ufw allow "$port/tcp"; then restore; exit 69; fi
+fi
+if ! systemctl reload ssh.service && ! systemctl reload sshd.service; then
+  restore
+  exit 69
+fi
+printf '%s' "$port" > "$receipt"
+rm -f "$backup"
+trap - HUP INT TERM
+printf 'SSH additional port configured\n'

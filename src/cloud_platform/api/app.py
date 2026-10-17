@@ -109,6 +109,11 @@ def create_app() -> FastAPI:
 
     install_error_handlers(app)
     app.include_router(v1_router)
+    from cloud_platform.api.v1.console import link_router
+    from cloud_platform.api.v1.console import router as console_router
+
+    app.include_router(console_router)
+    app.include_router(link_router)
 
     # M14-003: admin surface (RBAC + audited actions).
     from cloud_platform.api.v1.admin import router as admin_router

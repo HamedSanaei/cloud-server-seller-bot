@@ -1201,6 +1201,8 @@ class PrepaidHourlyBillingService:
         if server.state is ServerLifecycleState.RUNNING and server.prepaid_paid_until is not None:
             period = await self._periods.get(server.id, server.prepaid_paid_until)
             if period is not None and period.status is PrepaidHourlyPeriodStatus.PENDING:
+                if period.irt_minor is None:
+                    raise ValueError("customer hourly period has no toman amount")
                 return period.irt_minor
         price = await self._snapshots.get(server.id)
         if price is None or price.selling_currency != "USD" or self._fx is None:
@@ -1310,6 +1312,8 @@ class PrepaidHourlyBillingService:
     ) -> PrepaidHourlyPeriod:
         if not operator_funded(server):
             raise ValueError("operator coverage requires self-owned source")
+        if price.selling_currency is None:
+            raise ValueError("operator hourly price has no nominal currency")
         funding = self._require_operator_funding()
         grant = await funding.reserve(
             operator_id=server.user_id,
@@ -1423,7 +1427,9 @@ class PrepaidHourlyBillingService:
         self, server: CloudServer, price: ServerPriceSnapshot
     ) -> OperatorHourlyCutoverCoverage:
         read = getattr(self._periods, "get_operator_cutover_coverage", None)
-        receipt = await read(server.id) if callable(read) else None
+        receipt: OperatorHourlyCutoverCoverage | None = (
+            await read(server.id) if callable(read) else None
+        )
         if (
             receipt is None
             or receipt.server_id != server.id
@@ -1571,6 +1577,8 @@ class PrepaidHourlyBillingService:
         ):
             raise ValueError("first-hour amount must equal the immutable USD price snapshot")
         period = await self._bind(server, wallet_id, start, usd_minor)
+        if period.fx_snapshot is None:
+            raise ValueError("customer first-hour binding has no settlement FX")
         if period.fx_snapshot.expires_at is None or period.fx_snapshot.expires_at <= datetime.now(
             UTC
         ):
@@ -1627,7 +1635,7 @@ class PrepaidHourlyBillingService:
 
     async def capture_first_hour(
         self, server: CloudServer, hold_repo: HoldRepository, hold_service: HoldService
-    ) -> PrepaidHourlyPeriod:
+    ) -> PrepaidHourlyPeriod | OperatorHourlyCutoverCoverage:
         """Post the checkout's reserved IRT once, then durably cover the first hour."""
         if operator_funded(server):
             return await self.capture_operator_first_hour(server)
@@ -1638,7 +1646,12 @@ class PrepaidHourlyBillingService:
         if period is None:
             raise ValueError("first-hour FX binding is missing")
         wallet = await self._wallets.get(server.user_id)
-        if wallet is None or wallet.id != period.wallet_id or wallet.currency != "IRT":
+        if (
+            wallet is None
+            or wallet.id is None
+            or wallet.id != period.wallet_id
+            or wallet.currency != "IRT"
+        ):
             raise ValueError("first-hour wallet identity or currency changed")
         hold_key = f"server-create:{server.idempotency_key}"
         hold = await hold_repo.get_by_idempotency(wallet.id, hold_key)
@@ -1775,6 +1788,8 @@ class PrepaidHourlyBillingService:
     async def _pay_customer_period(
         self, server: CloudServer, period: PrepaidHourlyPeriod, *, resuming: bool = False
     ) -> bool:
+        if period.irt_minor is None:
+            raise ValueError("customer hourly period has no toman amount")
         description = (
             f"prepaid hour {period.period_start.isoformat()} to {period.period_end.isoformat()}"
         )
@@ -1796,6 +1811,8 @@ class PrepaidHourlyBillingService:
         return posted
 
     async def _verify_charge(self, period: PrepaidHourlyPeriod) -> None:
+        if period.wallet_id is None or period.irt_minor is None:
+            raise ValueError("customer hourly period has no wallet or toman amount")
         charge = await self._ledger.get_entry_by_idempotency(
             period.wallet_id, period.idempotency_key
         )

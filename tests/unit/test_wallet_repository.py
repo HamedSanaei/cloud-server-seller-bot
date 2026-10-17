@@ -119,8 +119,11 @@ class TestCreditDeposit:
         wallet, applied = await repo.credit_deposit(orm.user_id, 500, "deposit-tetraminator-pay-1")
         assert applied is True
         assert wallet.balance == 600
-        session.add.assert_called_once()
-        entry = session.add.call_args.args[0]
+        assert session.add.call_count == 2  # ledger + atomic customer outbox
+        notice = session.add.call_args_list[0].args[0]
+        assert notice.event_type == "customer.notice"
+        assert notice.payload["user_id"] == str(orm.user_id)
+        entry = session.add.call_args_list[1].args[0]
         assert entry.idempotency_key == "deposit-tetraminator-pay-1"
         assert entry.amount == 500
         assert entry.entry_type.value == "deposit"

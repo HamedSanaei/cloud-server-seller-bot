@@ -35,6 +35,7 @@ from cloud_platform.modules.compute.domain import (
     ServerLifecycleState,
 )
 from cloud_platform.modules.funding.domain import FundingSource
+from cloud_platform.modules.servers.test_identity import TEST_PROVIDER_ID, TEST_PROVIDER_KEY
 
 
 def _attr(row: Any, name: str) -> Any:
@@ -128,8 +129,21 @@ class SqlAlchemyServerRepository:
     async def list_by_user_paged(
         self, user_id: UUID, *, offset: int, limit: int, hide_failed_before: datetime | None = None
     ) -> tuple[list[CloudServer], int]:
-        base = _server_stmt().where(_ServerModel.user_id == user_id)
-        visible = _ServerModel.user_id == user_id
+        # Reserved operator assets are accessed through the live-RBAC shared
+        # controls, never through a historical customer ownership row.
+        visible = and_(
+            _ServerModel.user_id == user_id,
+            or_(
+                _ServerModel.provider_server_id.is_(None),
+                ~and_(
+                    _ServerModel.provider_id.in_(
+                        select(_ProviderModel.id).where(_ProviderModel.name == TEST_PROVIDER_KEY)
+                    ),
+                    _ServerModel.provider_server_id == TEST_PROVIDER_ID,
+                ),
+            ),
+        )
+        base = _server_stmt().where(visible)
         if hide_failed_before is not None:
             visible = and_(
                 visible,

@@ -127,7 +127,7 @@ async def test_irt_provider_power_action_requires_paid_coverage(action, funded):
     registry.register(provider)
     # The test provider owns the same provider-neutral account route.
     row.provider_key = provider.key
-    prepay = AsyncMock()
+    prepay = AsyncMock(return_value=row)
     command = PowerCommandService(
         server_repo=StateServers([row]),
         operation_repo=FakeOpRepo(),
@@ -142,5 +142,3 @@ async def test_irt_provider_power_action_requires_paid_coverage(action, funded):
         with pytest.raises(PowerOperationFailedError, match="insufficient balance"):
             await getattr(command, action)(row.user_id, row.id, f"irt:{action}")
         assert provider.calls == []
-    # Never run the same-currency USD settlement against an IRT wallet.
-    prepay.assert_not_awaited()

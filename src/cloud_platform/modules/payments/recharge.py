@@ -46,7 +46,7 @@ from cloud_platform.modules.payments.domain import (
     session_credit_amount,
     session_credit_currency,
 )
-from cloud_platform.modules.users.domain import Role, UserStatus
+from cloud_platform.modules.users.domain import Role, UserRepository, UserStatus
 from cloud_platform.modules.users.superadmins import validate_telegram_user_ids
 
 logger = logging.getLogger(__name__)
@@ -181,7 +181,7 @@ class WalletRechargeService:
         gateway: RechargeGateway | None = None,
         gateways: dict[str, RechargeGateway] | None = None,
         event_sink: BusinessEventSink | None = None,
-        user_repo: object | None = None,
+        user_repo: UserRepository | None = None,
         fx_resolver: Any | None = None,
         gateway_settings: Any | None = None,
         gateway_defaults: Mapping[str, bool] | None = None,

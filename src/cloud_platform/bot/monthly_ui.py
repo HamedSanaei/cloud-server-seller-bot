@@ -1276,7 +1276,9 @@ class MonthlyBotUi:
             return BotScreen(self._t.t("store.cloud_retry_later"), self._menu_only())
         hourly = self._t.t(
             "store.price_per_hour",
-            price=await self._price_label(view.hourly_price_minor, view.currency),
+            price=format_minor(view.settlement_minor, "IRT")
+            if view.settlement_minor is not None
+            else await self._price_label(view.hourly_price_minor, view.currency),
         )
         monthly = self._t.t(
             "store.price_per_month",
@@ -1453,13 +1455,7 @@ class MonthlyBotUi:
         return listings or provider_key
 
     async def _display_equivalent(self, amount_minor: int, currency: str) -> str | None:
-        """Supplementary display-currency equivalent (None when unavailable).
-
-        The authoritative native price is always shown by the caller; this
-        only adds the ``≈ X`` equivalent. Same-currency needs no FX call; a
-        briefly-down FX source degrades to native-only (never a fabricated
-        or zero price, never hides the offer).
-        """
+        """Public price equivalent; unavailable FX never becomes a native-currency charge."""
         target = (self._fx_display_currency or "").upper()
         source = (currency or "").upper()
         if not target or not source or target == source or self._fx is None:
@@ -1473,12 +1469,11 @@ class MonthlyBotUi:
         return format_minor(resolved.target_amount_minor, resolved.target_currency)
 
     async def _price_label(self, amount_minor: int, currency: str) -> str:
-        """Native price plus the FX display equivalent when convertible."""
-        native = format_minor(amount_minor, currency)
+        """Customer-facing prices stay in the configured domestic display currency."""
+        if currency.upper() == self._fx_display_currency:
+            return format_minor(amount_minor, currency)
         equivalent = await self._display_equivalent(amount_minor, currency)
-        if equivalent:
-            return f"{native} (≈ {equivalent})"
-        return native
+        return f"≈ {equivalent}" if equivalent else self._t.t("store.price_unavailable")
 
     # -- recharge flow -----------------------------------------------------
 
@@ -1966,7 +1961,9 @@ class MonthlyBotUi:
             self._t.t("offers.confirm_location", location=view.offer.location_id),
             self._t.t(
                 "offers.operator_cost" if operator_funded else "offers.confirm_price",
-                price=await self._price_label(view.offer.monthly_price_minor, view.currency),
+                price=format_minor(view.settlement_minor, "IRT")
+                if view.settlement_minor is not None
+                else await self._price_label(view.offer.monthly_price_minor, view.currency),
             ),
         ]
         if operator_funded:
@@ -1975,7 +1972,8 @@ class MonthlyBotUi:
             lines.append(self._t.t("offers.confirm_billing"))
             lines.append(
                 self._t.t(
-                    "offers.confirm_wallet", balance=format_minor(view.balance_minor, view.currency)
+                    "offers.confirm_wallet",
+                    balance=format_minor(view.balance_minor, view.wallet_currency),
                 )
             )
         if not operator_funded and not view.sufficient:

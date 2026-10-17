@@ -39,6 +39,7 @@ FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c
 
 ARG RELEASE_REVISION=unknown
 LABEL org.opencontainers.image.revision=$RELEASE_REVISION
+LABEL io.servercloud.platform-contract="1"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -50,7 +51,7 @@ RUN groupadd --system app \
 # postgres client tools only: the `migrate` and `backup` entry points drive
 # psql/pg_dump over the network (the server never runs in this image).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client \
+    && apt-get install -y --no-install-recommends postgresql-client openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -64,6 +65,7 @@ COPY --chown=app:app src ./src
 COPY --chown=app:app alembic.ini ./alembic.ini
 COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app scripts/post_deploy_smoke.py ./scripts/post_deploy_smoke.py
+COPY --chown=app:app scripts/register_test_server.py ./scripts/register_test_server.py
 COPY --chmod=755 --chown=app:app docker-entrypoint.sh /app/docker-entrypoint.sh
 
 USER app

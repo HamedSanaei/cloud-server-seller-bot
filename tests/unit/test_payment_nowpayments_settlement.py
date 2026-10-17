@@ -31,11 +31,11 @@ from cloud_platform.modules.payments.inquiry import (
     AuthoritativePaymentService,
     PaymentInquiryService,
 )
-from cloud_platform.modules.payments.nowpayments import NowPaymentsCallbackService
 from cloud_platform.modules.payments.recharge import WalletRechargeService
 from cloud_platform.modules.payments.reconcile import PaymentReconciliationService
 from cloud_platform.modules.payments.repository import _validate_save
 from cloud_platform.modules.payments.service import PaymentWebhookService
+from cloud_platform.providers.nowpayments.callbacks import NowPaymentsCallbackService
 from cloud_platform.providers.nowpayments.signatures import canonical_json
 
 
@@ -232,7 +232,7 @@ async def test_native_route_bounded_signature_and_generic_sha256_refusal(monkeyp
         webhooks,
         "get_settings",
         lambda: SimpleNamespace(
-            nowpayments_ipn_secret="fixture-ipn-secret",
+            nowpayments_ipn_secret="fixture-ipn-secret",  # pragma: allowlist secret
             payment_gateway_secrets={"nowpayments": "unsafe-generic-sha256-secret"},
         ),
     )

@@ -1,21 +1,21 @@
 name: deploy-production
 
-# Successful same-repository push CI on the CURRENT main HEAD releases
-# automatically. PR/fork/failed/stale runs cannot build or touch the host.
-# Staging pushes only validate/build; shared-host staging deploys are manual.
-# Both lanes serialize host mutations and never cancel an active deployment.
+# Production is explicit: current main, successful exact-SHA release CI,
+# affirmative manual dispatch, and the protected production Environment.
+# Staging automatically updates this same runtime through its protected branch.
 
 on:
-  workflow_run:
-    workflows: [ci]
-    branches: [main]
-    types: [completed]
   workflow_dispatch:
     inputs:
       sha:
         description: "Full 40-char commit SHA to deploy (must be current main HEAD with successful CI)"
         required: true
         type: string
+      confirm_production:
+        description: "Approve deployment to Production"
+        type: boolean
+        required: true
+        default: false
 
 concurrency:
   group: production-deploy
@@ -30,23 +30,34 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  policy:
+    name: Require explicit production approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject unapproved or wrong-branch requests
+        env:
+          CONFIRM_PRODUCTION: ${{ inputs.confirm_production }}
+          REQUESTED_SHA: ${{ inputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch &&
+             "$GITHUB_REF" == refs/heads/main &&
+             "$CONFIRM_PRODUCTION" == true &&
+             "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::Production requires explicit confirmation on main and a full commit SHA"
+            exit 1
+          }
   build:
     name: Build immutable image
+    needs: policy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Both lanes can build the same commit; serialize the inspect/push pair.
     concurrency:
-      group: immutable-image-${{ github.event.workflow_run.head_sha || inputs.sha }}
+      group: immutable-image-${{ inputs.sha }}
       cancel-in-progress: false
-    if: >-
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.status == 'completed' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch == 'main' &&
-       github.event.workflow_run.repository.full_name == github.repository &&
-       github.event.workflow_run.head_repository.full_name == github.repository)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirm_production
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       image: ${{ steps.resolve.outputs.image }}
@@ -56,7 +67,7 @@ jobs:
       - name: Resolve deployment SHA
         id: resolve
         env:
-          REQUESTED_SHA: ${{ github.event.workflow_run.head_sha || inputs.sha }}
+          REQUESTED_SHA: ${{ inputs.sha }}
         run: |
           set -Eeuo pipefail
           sha="${REQUESTED_SHA}"
@@ -75,7 +86,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_SHA: ${{ steps.resolve.outputs.sha }}
-          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -Eeuo pipefail
           # API proof precedes checkout: never execute source from an untrusted run.
@@ -84,10 +94,7 @@ jobs:
             echo "Release SHA is stale: only current main HEAD may deploy"
             exit 1
           }
-          run_id="${SOURCE_RUN_ID}"
-          if [ -z "$run_id" ]; then
-            run_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${RELEASE_SHA}&branch=main&event=push&per_page=1" --jq '.workflow_runs[0].id // empty')"
-          fi
+          run_id="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${RELEASE_SHA}&branch=main&event=push&per_page=1" --jq '.workflow_runs[0].id // empty')"
           [[ "$run_id" =~ ^[0-9]+$ ]] || { echo "No exact release CI run found"; exit 1; }
           trusted="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq \
             '(.path == ".github/workflows/ci.yml" and .status == "completed" and .conclusion == "success" and .event == "push" and .head_branch == "main" and .head_sha == "'"$RELEASE_SHA"'" and .repository.full_name == "'"$GITHUB_REPOSITORY"'" and .head_repository.full_name == "'"$GITHUB_REPOSITORY"'")')"
@@ -172,12 +179,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
-    # Shared-host serialization: the staging lane deploys to the SAME server
-    # and deploy path, so a release deploy and a staging deploy must never
-    # overlap. Job-level concurrency composes with the workflow-level
-    # `production-deploy` group above (both must be satisfied).
+    # Both branches share this job group and the on-host website/platform lock.
     concurrency:
-      group: telegram-shared-host-deploy
+      group: platform-production-deploy
       cancel-in-progress: false
     steps:
       - name: Recheck current main and release CI before host access

@@ -1,67 +1,65 @@
-# Staging deployment (M12-004)
+# Staging — automatic fast release to the original production runtime
 
-Repeatable staging: the immutable release image (M12-002) + PostgreSQL +
-Redis, with migrations applied BEFORE the api and worker start, backups
-run on demand (M11-007), and state kept in named volumes so the same
-commands redeploy the same environment.
+The operator explicitly selected **one shared runtime**, not an independent test
+stack. A successful push to `staging` runs complete reusable CI, publishes the
+exact commit image in GHCR and updates the original API, worker and Telegram bot.
+It uses the **existing** production database, Redis, deployment directory,
+server-owned `configuration.toml`, bot token and Compose project
+`cloud-platform-production`. Never create a second bot poller or financial ledger.
 
-## One-time setup
+`DEPLOY_PROFILE=staging` skips only the one-shot provider catalog refresh. The
+worker's scheduled coordinator still refreshes the catalog; migration, financial,
+health, reconciliation and storefront-readiness gates are unchanged. The actual
+application environment remains `production`, including Console contract headers.
 
-```bash
-cd deploy/staging
-cp .env.example .env       # then fill in the secrets
-```
+## GitHub configuration
 
-## Deploy (repeatable - run this for every release)
+The `staging` GitHub Environment is a release-credential/branch boundary, not a
+separate application environment. Restrict its deployment branch to `staging`.
+Configure these entries for the SAME existing production target:
 
-```bash
-# 1) build + publish the immutable image from the release commit
-uv run python scripts/release_oci_image.py --image registry.example.com/cloud-server-platform --push
+- GitHub secret entries — `DEPLOY_HOST`, `DEPLOY_PORT`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`,
+  `DEPLOY_KNOWN_HOSTS` (host key verified out of band).
+- Variables: `DEPLOY_PATH`, `CONFIGURATION_PATH` (existing live private TOML).
+- Grant the repository's scoped `GITHUB_TOKEN` access to the GHCR package.
 
-# 2) point the environment at that image
-echo "PLATFORM_IMAGE=registry.example.com/cloud-server-platform:$(git rev-parse HEAD)" >> .env
+The operator elected to install these secrets personally. Do not upload their
+existing private SSH key or silently bypass an empty Environment. A normal main
+push runs CI only. The manual main lane retains explicit dispatch confirmation
+and protected `production` Environment approval; both lanes address the same data.
 
-# 3) up - the migrate job runs alembic upgrade head first; api/worker wait
-cd deploy/staging
-docker compose up -d
-```
+## Release and recovery
 
-Or use the deploy driver (M12-006), which validates the consumer-safety
-plan before executing (exclusive consumers - worker/bot - are fully
-drained, verified against `compose ps`, before any new generation starts):
+Use `deploy/production/docker-compose.yml` for both lanes. Both deploy jobs share
+one concurrency group and the target-directory lock. The web/native engines also
+hold `/var/lock/servercloud-platform-release.lock` using the same deployment OS
+user, preventing cross-repository migration/restart overlap. Build only in CI.
 
-```bash
-uv run python scripts/deploy.py --image "$PLATFORM_IMAGE" --strategy rolling \
-    --dry-run    # preview the plan
-uv run python scripts/deploy.py --image "$PLATFORM_IMAGE" --strategy rolling
-```
+The engine verifies image SHA/revision/contract, private configuration and existing
+project ownership before draining writers. It encrypts a backup, migrates, checks
+physical schema parity, starts the API/worker and exactly one bot, checks health
+and stable restart counts, reconciles finance, then verifies storefront readiness.
+After a schema/financial epoch transition, rollback never starts old writers or
+downgrades the database; an approved forward fix or verified restore is required.
 
-## Verify
-
-```bash
-curl -fsS http://127.0.0.1:8000/health/live    # {"status":"ok"}
-curl -fsS http://127.0.0.1:8000/health/ready    # {"status":"ok", ...}
-curl -fsS http://127.0.0.1:8000/metrics | head  # prometheus output
-docker compose ps                               # api/worker Up (healthy), migrate Exited (0)
-docker compose logs worker | head               # arq started, jobs registered
-```
-
-## Backup / restore drill
+Read-only release inspection (substitute the existing live paths):
 
 ```bash
-docker compose --profile backup run --rm backup      # one encrypted dump
-docker compose cp backup:/backups/cloud-backup-....dump.enc .   # fetch for the drill
+uv run python scripts/deploy.py --environment staging \
+  --deploy-path /opt/cloud-server-seller \
+  --configuration-path /etc/cloud-server-seller/configuration.toml \
+  --image "ghcr.io/OWNER/REPOSITORY:FULL_40_CHARACTER_COMMIT_SHA" --dry-run
 ```
 
-The restore path is `docs/operations/RUNBOOK.md` → "Restore drill" (M11-008).
+Do not use the shared live wallet or a customer's VPS for synthetic finance tests.
+Network `/website` linking requires an actual authorized Telegram user interaction.
+Live test-VPS mutations retain their separate identity/dependency/recovery and
+operation-specific approval requirements.
 
-## Tear down / reset
+The final-image application worker and a reconciliation queue job were exercised
+against a disposable local DB/Redis namespace. Its lightweight PID-bound ARQ
+health probe succeeded; this does not establish health of the still-old remote
+worker or prove network delivery by the original Telegram bot.
 
-```bash
-docker compose down        # stop everything; volumes (state) are kept
-docker compose down -v     # also delete state - a truly clean environment
-```
-
-Every deploy therefore runs the identical sequence: same image reference
-model (SHA tag), same service graph, same migration-first ordering - which
-is what makes the staging deploy repeatable.
+Backup/restore: [operations runbook](../../docs/operations/RUNBOOK.md). Never run
+`docker compose down -v` on an environment holding retained state.

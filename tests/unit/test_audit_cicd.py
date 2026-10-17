@@ -221,6 +221,7 @@ def test_remote_registry_credentials_are_private_and_cleaned_on_every_exit(
     step = next(step for step in deploy["steps"] if "GHCR_TOKEN" in step.get("env", {}))
     replacements = {
         "github.actor": "test-runner",
+        "secrets.GITHUB_TOKEN": "test-ephemeral-token",
         "vars.PROD_PORT || 22": "22",
         "vars.PROD_USER": "deploy",
         "vars.PROD_HOST": "localhost",
@@ -232,6 +233,10 @@ def test_remote_registry_credentials_are_private_and_cleaned_on_every_exit(
         "steps.compose.outputs.sha256": "b" * 64,
     }
     command = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: replacements[m[1]], step["run"])
+    step_environment = {
+        key: re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: replacements[match[1]], str(value))
+        for key, value in step.get("env", {}).items()
+    }
     (tmp_path / "scripts").mkdir()
     (tmp_path / "probe").mkdir()
     (tmp_path / "scripts/deploy-production.sh").write_text(
@@ -277,11 +282,17 @@ def test_remote_registry_credentials_are_private_and_cleaned_on_every_exit(
         cwd=tmp_path,
         env={
             **os.environ,
+            **step_environment,
             "GHCR_TOKEN": "test-ephemeral-token",
             "TEST_TOKEN": "test-ephemeral-token",
             "CHECK_POSIX_MODE": "0" if os.name == "nt" else "1",
             "LOGIN_EXIT": str(login_exit),
             "DEPLOY_EXIT": str(deploy_exit),
+            "DEPLOY_HOST": "localhost",
+            "DEPLOY_PORT": "22",
+            "DEPLOY_USER": "deploy",
+            "DEPLOY_PATH": "/srv/platform-staging",
+            "CONFIGURATION_PATH": "/etc/platform-staging/configuration.toml",
         },
         capture_output=True,
         text=True,

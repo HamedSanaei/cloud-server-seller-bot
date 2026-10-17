@@ -56,6 +56,7 @@ class BusinessEventType(StrEnum):
     PROVIDER_ACCEPTED = "purchase.provider_accepted"
     VPS_PROVISIONED = "purchase.vps_provisioned"
     CUSTOMER_PROVISIONED = "customer.server_provisioned"
+    CUSTOMER_NOTICE = "customer.notice"
     PURCHASE_FAILED = "purchase.failed"
     RECHARGE_CREATED = "recharge.created"
     RECHARGE_SUCCEEDED = "recharge.succeeded"
@@ -109,6 +110,7 @@ _FLAGS: Mapping[BusinessEventType, str] = {
     BusinessEventType.PROVIDER_ACCEPTED: "log_purchases",
     BusinessEventType.VPS_PROVISIONED: "log_purchases",
     BusinessEventType.CUSTOMER_PROVISIONED: "log_purchases",
+    BusinessEventType.CUSTOMER_NOTICE: "log_server_management",
     BusinessEventType.PURCHASE_FAILED: "log_order_failures",
     BusinessEventType.RECHARGE_CREATED: "log_recharges",
     BusinessEventType.RECHARGE_SUCCEEDED: "log_recharges",
@@ -735,7 +737,10 @@ class BusinessLogDispatcher:
                 abandoned += 1
                 continue
             try:
-                if event_type == BusinessEventType.CUSTOMER_PROVISIONED.value:
+                if event_type in {
+                    BusinessEventType.CUSTOMER_PROVISIONED.value,
+                    BusinessEventType.CUSTOMER_NOTICE.value,
+                }:
                     if self._users is None:
                         raise ValueError("customer delivery is not configured")
                     payload = dict(getattr(record, "payload", {}) or {})
@@ -744,7 +749,12 @@ class BusinessLogDispatcher:
                     chat_id = getattr(user, "telegram_user_id", None)
                     if not isinstance(chat_id, int) or isinstance(chat_id, bool) or chat_id <= 0:
                         raise ValueError("customer has no Telegram identity")
-                    await self._channel.send_customer(chat_id, render_customer_provisioned(payload))
+                    text = (
+                        render_customer_provisioned(payload)
+                        if event_type == BusinessEventType.CUSTOMER_PROVISIONED.value
+                        else str(payload["text"])
+                    )
+                    await self._channel.send_customer(chat_id, text)
                 else:
                     await self._channel.send(self.render(record))
             except Exception as exc:
@@ -791,6 +801,8 @@ class BusinessLogDispatcher:
             payload["at"] = str(created)
         if event_type is BusinessEventType.CUSTOMER_PROVISIONED:
             return render_customer_provisioned(payload)
+        if event_type is BusinessEventType.CUSTOMER_NOTICE:
+            return str(payload.get("text", "اعلان حساب"))
         return render_event(event_type, payload)
 
 

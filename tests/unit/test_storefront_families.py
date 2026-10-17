@@ -194,7 +194,7 @@ class FakeRegistry:
 
 class FakeWalletRepo:
     async def get(self, user_id: UUID) -> Any:
-        return type("W", (), {"balance": 50_000})()
+        return type("W", (), {"balance": 50_000, "currency": "EUR"})()
 
 
 def _service(

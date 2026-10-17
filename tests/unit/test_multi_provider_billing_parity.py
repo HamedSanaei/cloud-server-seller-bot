@@ -378,8 +378,12 @@ class ParityHarness:
         reference_type: str = "",
         reference_id: str = "",
         description: str = "",
+        expected_currency: str | None = None,
+        expected_customer_server_id: UUID | None = None,
     ) -> tuple[Wallet, bool]:
         wallet = self.wallets[user_id]
+        if expected_currency is not None and wallet.currency != expected_currency:
+            raise ValueError("wallet currency changed")
         assert wallet.id is not None
         if (wallet.id, key) in self.entries:
             return wallet, False
@@ -493,6 +497,8 @@ class ParityHarness:
                 reference_type="",
                 reference_id="",
                 description="",
+                expected_currency=None,
+                expected_customer_server_id=None,
             ):
                 return await h.adjust(
                     user_id,
@@ -502,6 +508,8 @@ class ParityHarness:
                     reference_type=reference_type,
                     reference_id=reference_id,
                     description=description,
+                    expected_currency=expected_currency,
+                    expected_customer_server_id=expected_customer_server_id,
                 )
 
         @dataclass
@@ -581,6 +589,8 @@ class ParityHarness:
                 reference_type="",
                 reference_id="",
                 description="",
+                expected_currency=None,
+                expected_customer_server_id=None,
             ):
                 return await h.adjust(
                     user_id,
@@ -590,6 +600,8 @@ class ParityHarness:
                     reference_type=reference_type,
                     reference_id=reference_id,
                     description=description,
+                    expected_currency=expected_currency,
+                    expected_customer_server_id=expected_customer_server_id,
                 )
 
         @dataclass

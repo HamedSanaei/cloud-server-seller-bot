@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import or_, select
@@ -276,7 +276,10 @@ class SqlAlchemyOperatorFundingCutover:
                         )
                     results.append(
                         CutoverPreview(
-                            entry.server_id, "replayed", "immutable receipt", receipt_id=prior.id
+                            entry.server_id,
+                            "replayed",
+                            "immutable receipt",
+                            receipt_id=cast(UUID, prior.id),
                         )
                     )
                     continue
@@ -345,9 +348,11 @@ class SqlAlchemyOperatorFundingCutover:
             or account.provider_id != server.provider_id
         ):
             plan.review.append("provider account owner or provider differs from server")
-        if _aware(server.last_accrued_at) != _aware(entry.expected_last_accrued_at) or _aware(
-            server.prepaid_paid_until
-        ) != _aware(entry.expected_paid_until):
+        if _aware(cast(datetime | None, server.last_accrued_at)) != _aware(
+            entry.expected_last_accrued_at
+        ) or _aware(cast(datetime | None, server.prepaid_paid_until)) != _aware(
+            entry.expected_paid_until
+        ):
             plan.review.append("billing watermark changed")
         plan.order = (
             await session.execute(
@@ -423,6 +428,13 @@ class SqlAlchemyOperatorFundingCutover:
         self, session: AsyncSession, manifest: CutoverManifest, plan: _Plan
     ) -> None:
         entry, server = plan.entry, plan.server
+        if (
+            entry.period_start is None
+            or entry.period_end is None
+            or entry.provider_cost_snapshot is None
+        ):
+            plan.review.append("accepted coverage facts are incomplete")
+            return
         now = self._now()
         if not (entry.period_start <= manifest.effective_at <= now < entry.period_end):
             plan.review.append("accepted coverage must contain effective_at and current time")
@@ -501,8 +513,8 @@ class SqlAlchemyOperatorFundingCutover:
                 )
             if entry.period_end - now <= self._monthly_guard:
                 plan.review.append("monthly renewal is in the competing charge window")
-            period = entry.period_start.astimezone(UTC).date().isoformat()
-            plan.funding_key = f"renewal-charge:{server.id}:{period}"
+            period_date = entry.period_start.astimezone(UTC).date().isoformat()
+            plan.funding_key = f"renewal-charge:{server.id}:{period_date}"
             plan.purpose = FundingPurpose.MONTHLY_RENEW
             boundary = entry.period_start.astimezone(UTC).replace(
                 hour=0, minute=0, second=0, microsecond=0
@@ -595,7 +607,7 @@ class SqlAlchemyOperatorFundingCutover:
             if row.currency != plan.wallet.currency or row.amount <= 0:
                 raise CutoverNeedsReview("related correction has ambiguous amount or currency")
             if row.entry_type == "refund":
-                credits += row.amount
+                credits += int(row.amount)
             else:
                 audits = list(
                     (
@@ -633,7 +645,7 @@ class SqlAlchemyOperatorFundingCutover:
                 if abs(delta) != row.amount:
                     raise CutoverNeedsReview("adjustment audit differs from ledger magnitude")
                 credits += delta
-        original = sum(row.amount for row in charges)
+        original = sum(int(row.amount) for row in charges)
         net = min(original, max(0, original - credits))
         if net != plan.entry.expected_refund_minor:
             raise CutoverNeedsReview(
@@ -654,6 +666,15 @@ class SqlAlchemyOperatorFundingCutover:
         entry, server = plan.entry, plan.server
         coverage = None
         if not entry.classification_only:
+            if (
+                plan.purpose is None
+                or plan.funding_key is None
+                or plan.resource_key is None
+                or entry.provider_cost_snapshot is None
+                or entry.period_start is None
+                or entry.period_end is None
+            ):
+                raise FundingValidationError("accepted corporate funding facts are incomplete")
             grant_id, expense_id = uuid4(), uuid4()
             facts = dict(
                 owner_user_id=entry.owner_id,
@@ -685,7 +706,9 @@ class SqlAlchemyOperatorFundingCutover:
             )
             await session.flush()
             grant = await session.get(db.OperatorFundingGrant, grant_id)
-            grant.state = "settled"
+            if grant is None:
+                raise FundingValidationError("persisted corporate funding grant is missing")
+            cast(Any, grant).state = "settled"
             coverage = dict(
                 period_start=entry.period_start.astimezone(UTC).isoformat(),
                 period_end=entry.period_end.astimezone(UTC).isoformat(),

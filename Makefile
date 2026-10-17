@@ -24,15 +24,11 @@ test:
 check: lint format-check typecheck test
 	uv run python scripts/validate_tasks.py
 
-# Fast staging-lane checks: exactly what .github/workflows/deploy-staging.yml
-# runs before building (ruff check, ruff format --check, compileall over src,
-# import smoke of api/worker/bot). No pytest, no coverage, no mypy: the
-# release lane (`make check`, `verify_ci.py --push-ready`) keeps those.
+# Full release gates before staging, including types, tests, coverage and secrets.
 staging-check:
 	uv run python scripts/verify_ci.py --staging
 
-# The complete staging-lane validation in one command: ONLY the tests you name,
-# then the fast staging gate. No full suite, no coverage, no mypy, no Docker.
+# Run named regressions first, then all mandatory release gates.
 # Usage: make staging-test TESTS="tests/unit/test_business_log.py tests/unit/test_hourly_state_machine.py"
 staging-test:
 	uv run python scripts/verify_ci.py --staging $(addprefix --test ,$(TESTS))

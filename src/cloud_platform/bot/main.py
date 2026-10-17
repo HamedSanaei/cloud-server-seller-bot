@@ -247,6 +247,9 @@ def register_handlers(
     specific commands first, then the active text flow, then the generic
     fallback that lands every unmatched update on the main menu.
     """
+    from cloud_platform.bot.platform_bridge import register_bridge_handlers
+
+    register_bridge_handlers(dp, container, _resolve_user)
 
     async def clear_admin_navigation(admin: User) -> None:
         if admin_ui is not None:

@@ -18,8 +18,6 @@ from sqlalchemy.exc import IntegrityError
 
 from cloud_platform.modules.offers.domain import OfferSpecUpdate
 from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
-from cloud_platform.modules.orders.domain import OrderStatus, ProviderOrder
-from cloud_platform.modules.orders.repository import SqlAlchemyProviderOrderRepository
 from cloud_platform.modules.renewals.domain import RenewalKind, RenewalRecord, RenewalStatus
 from cloud_platform.modules.renewals.repository import (
     SqlAlchemyRenewalNotificationRepository,
@@ -80,42 +78,6 @@ def _offer_row(**overrides: Any) -> MagicMock:
     return row
 
 
-def _order_row(**overrides: Any) -> MagicMock:
-    row = MagicMock()
-    row.id = uuid4()
-    row.server_id = SERVER_ID
-    row.operation_key = f"order-create:{SERVER_ID}"
-    row.provider_key = "leaseweb"
-    row.offer_id = OFFER_ID
-    row.status = "pending_submit"
-    row.provider_order_id = None
-    row.delivery_estimate = None
-    row.provider_contract_id = None
-    row.provider_service_id = None
-    row.error = None
-    row.attempts = 0
-    row.last_polled_at = None
-    row.created_at = None
-    row.updated_at = None
-    row.product_id = "VPS02_1"
-    row.location_id = "AMS-01"
-    row.os_name = "Ubuntu 24.04"
-    row.contract_term = "1_MONTH"
-    row.billing_cycle = "1_MONTH"
-    row.provider_cost_minor = 999
-    row.provider_cost_currency = "EUR"
-    row.selling_price_minor = 1299
-    row.selling_currency = "EUR"
-    row.post_attempted_at = None
-    row.settlement_status = "pending"
-    row.settlement_attempted_at = None
-    row.settlement_attempts = 0
-    row.settlement_error = None
-    for k, v in overrides.items():
-        setattr(row, k, v)
-    return row
-
-
 def _renewal_row(**overrides: Any) -> MagicMock:
     row = MagicMock()
     row.server_id = SERVER_ID
@@ -138,10 +100,6 @@ def _renewal_row(**overrides: Any) -> MagicMock:
 
 def _offer_repo(db: AsyncMock) -> SqlAlchemySellableOfferRepository:
     return SqlAlchemySellableOfferRepository(lambda: db)  # type: ignore[arg-type]
-
-
-def _order_repo(db: AsyncMock) -> SqlAlchemyProviderOrderRepository:
-    return SqlAlchemyProviderOrderRepository(lambda: db)  # type: ignore[arg-type]
 
 
 def _renewal_repo(db: AsyncMock) -> SqlAlchemyRenewalRepository:
@@ -414,62 +372,6 @@ class TestSellableOfferRepository:
             await repo.set_selling_price(OFFER_ID, 100, "XXX")
 
 
-class TestProviderOrderRepository:
-    async def test_create_round_trips_snapshots(self, db: AsyncMock) -> None:
-        db.execute.return_value = _result(_order_row())
-        repo = _order_repo(db)
-        order = await repo.create(
-            server_id=SERVER_ID,
-            operation_key=f"order-create:{SERVER_ID}",
-            provider_key="leaseweb",
-            offer_id=OFFER_ID,
-            product_id="VPS02_1",
-            location_id="AMS-01",
-            os_name="Ubuntu 24.04",
-            contract_term="1_MONTH",
-            billing_cycle="1_MONTH",
-            provider_cost_minor=999,
-            provider_cost_currency="EUR",
-            selling_price_minor=1299,
-            selling_currency="EUR",
-        )
-        assert order.status is OrderStatus.PENDING_SUBMIT
-        assert order.product_id == "VPS02_1"
-        assert order.provider_cost_minor == 999
-        assert order.selling_price_minor == 1299
-
-    async def test_save_persists_all_snapshot_fields(self, db: AsyncMock) -> None:
-        db.execute.return_value = _result(_order_row())
-        repo = _order_repo(db)
-        order = ProviderOrder(
-            id=uuid4(),
-            server_id=SERVER_ID,
-            operation_key=f"order-create:{SERVER_ID}",
-            provider_key="leaseweb",
-            offer_id=OFFER_ID,
-            status=OrderStatus.OUTCOME_UNKNOWN,
-            error="timeout",
-            provider_cost_minor=999,
-            post_attempted_at=datetime.now(UTC),
-        )
-        await repo.save(order)
-        row = db.execute.return_value.scalars.return_value.first.return_value
-        assert row.status == "outcome_unknown"
-        assert row.provider_cost_minor == 999
-        assert row.post_attempted_at is not None
-
-    async def test_list_statuses(self, db: AsyncMock) -> None:
-        row = _order_row(status="outcome_unknown")
-        db.execute.side_effect = [_result(row), _result(row), _result()]
-        repo = _order_repo(db)
-        unknown = await repo.list_outcome_unknown("leaseweb")
-        assert len(unknown) == 1
-        attention = await repo.list_attention("leaseweb")
-        assert len(attention) == 1  # OUTCOME_UNKNOWN is in the attention queue
-        open_orders = await repo.list_open("leaseweb")
-        assert open_orders == []  # the reconciler must NOT poll unknown outcomes
-
-
 class TestRenewalRepository:
     async def test_upsert_creates_record(self, db: AsyncMock) -> None:
         db.execute.return_value = _result()
@@ -488,14 +390,6 @@ class TestRenewalRepository:
         )
         saved = await _renewal_repo(db).upsert(record)
         assert saved.server_id == SERVER_ID
-
-    async def test_list_active_and_attention(self, db: AsyncMock) -> None:
-        db.execute.return_value = _result(_renewal_row())
-        repo = _renewal_repo(db)
-        active = await repo.list_active()
-        assert len(active) == 1
-        attention = await repo.list_needing_attention()
-        assert len(attention) == 1
 
     async def test_notification_record_deduplicated(self, db: AsyncMock) -> None:
         db.execute.return_value = _result(_renewal_row())

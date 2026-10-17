@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends
 from cloud_platform.core.container import get_container
 from cloud_platform.modules.catalog.domain import CatalogRepository
 from cloud_platform.modules.compute.service import MyServersService
+from cloud_platform.modules.servers.test_identity import is_test_resource
 from cloud_platform.modules.sshkeys import SshKeyService
 from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
 from cloud_platform.modules.tokens.service import TokenService
@@ -251,6 +252,10 @@ async def server_action(
     )
 
     container = await get_container()
+    if is_test_resource(await container.server_repository().get(server_id)):
+        # Shared operator assets require the live-RBAC console and its
+        # confirmation/receipt path, even for the historical FK owner.
+        raise ApiError(ErrorCode.NOT_FOUND, f"server {server_id} not found")
     service = container.power_command_service()
     handlers = {
         "power-on": service.power_on,

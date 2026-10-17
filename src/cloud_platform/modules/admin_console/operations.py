@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import secrets
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, cast
 from uuid import UUID
 
 from cloud_platform.core.session_store import BotSessionStore
 from cloud_platform.modules.admin_console.auth import authorize
+from cloud_platform.modules.offers.domain import SellableOffer
+from cloud_platform.modules.users.domain import User
 from cloud_platform.modules.users.superadmins import validate_telegram_user_ids
 
 
@@ -21,10 +24,10 @@ class AdminSalesService:
         reader: Any,
         store: BotSessionStore,
         *,
-        configured_ids=(),
-        ttl_seconds=900,
-        mutations=None,
-    ):
+        configured_ids: Iterable[int] = (),
+        ttl_seconds: int = 900,
+        mutations: Any | None = None,
+    ) -> None:
         self._users, self._offers, self._admin, self._maintenance = (
             users,
             offers,
@@ -39,24 +42,34 @@ class AdminSalesService:
         )
         self._mutations = mutations
 
-    async def list_offers(self, actor, offset=0):
+    async def list_offers(self, actor: User, offset: int = 0) -> tuple[SellableOffer, ...]:
         await authorize(self._users, actor, self._ids)
         if type(offset) is not int or not 0 <= offset <= 10000:
             raise ValueError("offset out of bounds")
-        return await self._reader.list_offers(offset=offset, limit=10)
+        return cast(
+            tuple[SellableOffer, ...], await self._reader.list_offers(offset=offset, limit=10)
+        )
 
-    async def detail(self, actor, offer_id: UUID):
+    async def detail(self, actor: User, offer_id: UUID) -> SellableOffer:
         await authorize(self._users, actor, self._ids)
-        offer = await self._offers.get(offer_id)
+        offer: SellableOffer | None = await self._offers.get(offer_id)
         if offer is None:
             raise ValueError("offer unavailable")
         return offer
 
-    async def clear(self, actor):
+    async def clear(self, actor: User) -> None:
         admin = await authorize(self._users, actor, self._ids)
         await self._store.delete("admin-sales-confirm", str(admin.id))
 
-    async def prepare(self, actor, offer_id: UUID, action: str, reason: str, *, price_minor=None):
+    async def prepare(
+        self,
+        actor: User,
+        offer_id: UUID,
+        action: str,
+        reason: str,
+        *,
+        price_minor: int | None = None,
+    ) -> str:
         admin = await authorize(self._users, actor, self._ids)
         offer = await self.detail(admin, offer_id)
         if (
@@ -95,7 +108,7 @@ class AdminSalesService:
         )
         return nonce
 
-    async def apply(self, actor, nonce: str):
+    async def apply(self, actor: User, nonce: str) -> str:
         admin = await authorize(self._users, actor, self._ids)
         record = await self._store.get("admin-sales-confirm", str(admin.id))
         if record is None or record.get("nonce") != nonce:
@@ -106,24 +119,29 @@ class AdminSalesService:
         if self._mutations is None:
             raise RuntimeError("transactional sales controls are unavailable")
         facts = {key: value for key, value in record.items() if key != "nonce"}
-        return await self._mutations.apply(
-            actor_id=admin.id,
-            configured_ids=self._ids,
-            facts=facts,
-            operation_key=f"admin-sales:{admin.id}:{nonce}",
+        return cast(
+            str,
+            await self._mutations.apply(
+                actor_id=admin.id,
+                configured_ids=self._ids,
+                facts=facts,
+                operation_key=f"admin-sales:{admin.id}:{nonce}",
+            ),
         )
 
 
 class AdminHealthService:
-    def __init__(self, users, operations, reader, *, configured_ids=()):
+    def __init__(
+        self, users: Any, operations: Any, reader: Any, *, configured_ids: Iterable[int] = ()
+    ) -> None:
         self._users, self._operations, self._reader = users, operations, reader
         self._ids = validate_telegram_user_ids(tuple(configured_ids))
 
-    async def snapshot(self, actor):
+    async def snapshot(self, actor: User) -> dict[str, Any]:
         await authorize(self._users, actor, self._ids)
-        return await self._reader.health()
+        return cast(dict[str, Any], await self._reader.health())
 
-    async def failed(self, actor):
+    async def failed(self, actor: User) -> tuple[tuple[UUID, UUID, str, str, int], ...]:
         await authorize(self._users, actor, self._ids)
         rows = await self._operations.list_failed(limit=20)
         # Raw provider errors can contain account data: the UI gets safe facts.

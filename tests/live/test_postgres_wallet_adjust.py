@@ -37,7 +37,7 @@ requires_postgres = pytest.mark.skipif(
     reason="live PostgreSQL tests require CLOUD_PLATFORM_TEST_POSTGRES_URL",
 )
 
-TABLES = ("users", "wallets", "ledger")
+TABLES = ("users", "wallets", "ledger", "business_log_events")
 
 
 @pytest.fixture(scope="module")

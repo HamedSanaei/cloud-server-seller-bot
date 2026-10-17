@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID
 
 from cloud_platform.core.session_store import BotSessionStore
@@ -112,7 +112,7 @@ class AdminMessagingService:
         if record is None or record.get("nonce") != nonce:
             raise ValueError("message confirmation expired")
         return await self._repo.create_campaign(
-            actor_id=admin.id,
+            actor_id=cast(UUID, admin.id),
             recipients=tuple(
                 MessageRecipient(UUID(row["user_id"]), row["telegram_user_id"])
                 for row in record["recipients"]

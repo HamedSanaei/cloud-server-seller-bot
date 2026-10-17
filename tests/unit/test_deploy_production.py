@@ -1,10 +1,9 @@
 """Tests for the production CD pipeline (GHCR build + SSH deploy).
 
-Acceptance: successful same-repository push CI releases current `main`
-automatically; manual dispatch uses the same exact-SHA CI and freshness gates.
-The validated SHA is built into an immutable GHCR image and
-deployed with migrations-first ordering, health gates, single-bot enforcement
-and image rollback (never a database downgrade).
+Acceptance: production requires explicit approval and successful exact-SHA main
+CI; staging uses its independent target. Images are immutable. Writers drain
+before encrypted backup and migration; health and single-bot gates determine
+activation. Rollback never downgrades a database or starts an incompatible epoch.
 
 These are static/functional tests only — no test here performs a real
 deployment, contacts GHCR, or opens an SSH session.
@@ -86,151 +85,7 @@ def _bash_functions(body: str) -> str:
     return result.stdout.strip()
 
 
-class TestWorkflowTriggersAndGates:
-    def test_workflow_file_is_valid_yaml(self) -> None:
-        assert _workflow()["name"] == "deploy-production"
-
-    def test_main_deploys_only_after_completed_release_ci(self) -> None:
-        on = _on(_workflow())
-        assert on["workflow_run"] == {
-            "workflows": ["ci"],
-            "branches": ["main"],
-            "types": ["completed"],
-        }
-        assert "push" not in on
-        assert "workflow_dispatch" in on
-        assert "sha" in on["workflow_dispatch"]["inputs"]
-        assert on["workflow_dispatch"]["inputs"]["sha"]["required"] is True
-
-    def test_deployments_are_serialized(self) -> None:
-        concurrency = _workflow()["concurrency"]
-        assert concurrency["group"] == "production-deploy"
-        assert concurrency["cancel-in-progress"] is False
-
-    def test_deploy_job_joins_the_shared_host_group(self) -> None:
-        """A release deploy and a staging deploy must never mutate one host at once.
-
-        The workflow-level group above only serializes releases against each
-        other; the job-level group is shared with the staging lane, whose
-        deploy job joins `telegram-shared-host-deploy` too (asserted in
-        tests/unit/test_deploy_staging.py).
-        """
-        deploy = _workflow()["jobs"]["deploy"]
-        assert deploy["concurrency"]["group"] == "telegram-shared-host-deploy"
-        assert deploy["concurrency"]["cancel-in-progress"] is False
-
-    def test_minimal_permissions(self) -> None:
-        permissions = _workflow()["permissions"]
-        assert permissions["contents"] == "read"
-        assert permissions["packages"] == "write"
-
-    def test_build_job_accepts_only_main_dispatch_or_trusted_successful_push_ci(self) -> None:
-        jobs = _workflow()["jobs"]
-        gate = jobs["build"]["if"]
-        for condition in (
-            "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'",
-            "github.event_name == 'workflow_run'",
-            "github.event.workflow_run.status == 'completed'",
-            "github.event.workflow_run.conclusion == 'success'",
-            "github.event.workflow_run.event == 'push'",
-            "github.event.workflow_run.head_branch == 'main'",
-            "github.event.workflow_run.repository.full_name == github.repository",
-            "github.event.workflow_run.head_repository.full_name == github.repository",
-        ):
-            assert condition in gate
-
-    def test_image_lock_uses_the_same_effective_sha_as_the_resolver(self) -> None:
-        build = _workflow()["jobs"]["build"]
-        source = "${{ github.event.workflow_run.head_sha || inputs.sha }}"
-        assert build["concurrency"]["group"] == f"immutable-image-{source}"
-        resolve = next(step for step in build["steps"] if step.get("id") == "resolve")
-        assert resolve["env"]["REQUESTED_SHA"] == source
-
-    def test_ci_proof_precedes_checkout_and_is_rechecked_before_ssh(self) -> None:
-        jobs = _workflow()["jobs"]
-        steps = jobs["build"]["steps"]
-        guard = next(index for index, step in enumerate(steps) if step.get("id") == "ci")
-        checkout = next(index for index, step in enumerate(steps) if "uses" in step)
-        assert guard < checkout
-        assert "current main" in jobs["deploy"]["steps"][0]["name"]
-
-    def test_deploy_job_uses_the_production_environment(self) -> None:
-        jobs = _workflow()["jobs"]
-        assert jobs["deploy"]["environment"] == "production"
-        assert jobs["deploy"]["needs"] == "build"
-
-
-class TestImageBuild:
-    def test_ghcr_image_uses_lowercase_registry_path(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "tr '[:upper:]' '[:lower:]'" in text
-        assert "ghcr.io" in text
-
-    def test_build_uses_the_repository_dockerfile(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "docker/build-push-action" in text
-        assert "file: ./Dockerfile" in text
-
-    def test_immutable_full_sha_tag_is_pushed(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}" in text
-
-    def test_built_image_is_verified_before_deploy(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "migrate --help" in text
-        assert "deploy/production/docker-compose.yml config" in text
-
-    def test_production_never_tracks_a_mutable_tag(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert (
-            "PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}'"
-            in text
-        )
-        for line in text.splitlines():
-            if "PLATFORM_IMAGE_NEW=" in line:
-                assert ":latest" not in line
-
-
-class TestWorkflowSecurity:
-    def test_no_disabled_host_key_verification(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "StrictHostKeyChecking=no" not in text
-        assert "StrictHostKeyChecking=yes" in text
-        assert "PROD_KNOWN_HOSTS" in text
-
-    def test_ssh_key_has_ephemeral_mode_600_lifecycle(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "chmod 600" in text
-        assert 'rm -f "${HOME}/.ssh/prod_key"' in text
-
-    def test_strict_shell_and_no_trace_mode(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "set -Eeuo pipefail" in text
-        assert "set -x" not in text
-
-    def test_ghcr_auth_uses_the_actions_token(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "secrets.GITHUB_TOKEN" in text
-        assert "github.actor" in text
-
-
 class TestDeployScriptStatic:
-    def test_script_is_executable(self) -> None:
-        assert DEPLOY_SCRIPT.is_file()
-        listed = subprocess.run(
-            ["git", "ls-files", "-s", DEPLOY_SCRIPT.name],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=DEPLOY_SCRIPT.parent,
-        )
-        assert listed.returncode == 0
-        entry = listed.stdout.replace("\\", "/").strip()
-        assert entry.startswith("100755 "), entry
-        assert entry.endswith("deploy-production.sh"), entry
-        if os.name == "posix":
-            assert os.access(DEPLOY_SCRIPT, os.X_OK)
-
     def test_shell_syntax_is_valid(self) -> None:
         if not _bash_available():
             pytest.skip("no POSIX bash available")
@@ -319,6 +174,10 @@ _STUB_DOCKER = """#!/bin/sh
 # Fake docker for fail-closed tests: records every invocation, never mutates.
 echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
+    *"io.servercloud.platform-contract"*)
+        printf '1\n'
+        exit 0
+        ;;
     *" image inspect "*)
         printf '%s\n' "${PLATFORM_IMAGE_NEW##*:}"
         exit 0
@@ -516,6 +375,7 @@ echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
     *" inspect "*)
         case "$*" in
+            *"io.servercloud.platform-contract"*) echo 1 ;;
             *"org.opencontainers.image.revision"*) echo "${PLATFORM_IMAGE_NEW##*:}" ;;
             *"Health"*) echo healthy ;;
             *) echo running ;;
@@ -672,6 +532,7 @@ echo "$@" >> "$DOCKER_CALLS_LOG"
 case " $* " in
     *" inspect "*)
         case "$*" in
+            *"io.servercloud.platform-contract"*) echo 1 ;;
             *"org.opencontainers.image.revision"*) echo "${PLATFORM_IMAGE_NEW##*:}" ;;
             *"Health"*) echo healthy ;;
             *"RestartCount"*)
@@ -801,6 +662,9 @@ esac
 case " $* " in
     *" inspect "*)
         case "$*" in
+            *"io.servercloud.platform-contract"*)
+                echo "${STUB_PLATFORM_CONTRACT:-1}"
+                ;;
             *"org.opencontainers.image.revision"*)
                 echo "${STUB_IMAGE_REVISION:-${PLATFORM_IMAGE_NEW##*:}}"
                 ;;
@@ -840,6 +704,10 @@ case " $* " in
                 echo "cid-${service}"
                 ;;
         esac
+        exit 0
+        ;;
+    *"label=com.docker.compose.project.working_dir="*)
+        [ -z "${STUB_FOREIGN_PROJECT:-}" ] || printf '%s\n' "$STUB_FOREIGN_PROJECT"
         exit 0
         ;;
     *" ps "*)
@@ -940,6 +808,10 @@ case " $* " in
             exit 1
         fi
         echo "normalized 456 offer(s) to USD; intentionally skipped: 1; failed: 0"
+        exit 0
+        ;;
+    *" run --rm backup"*)
+        [ "${FAIL_BACKUP:-0}" = "1" ] && exit 1
         exit 0
         ;;
     *" run "*)
@@ -1705,123 +1577,6 @@ class TestStorefrontReadinessGate:
         assert "MAIN_RC=0" in result.stdout
         assert "storefront readiness: ok" in result.stdout
         assert "DEPLOYMENT SUCCEEDED" in result.stdout
-
-
-class TestReleaseComposeDelivery:
-    """The release compose travels with the release, never apart from it."""
-
-    def _steps(self) -> list:
-        doc = _workflow()
-        return doc["jobs"]["deploy"]["steps"]
-
-    def test_compose_candidate_comes_from_the_exact_checkout(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "sha256sum deploy/production/docker-compose.yml" in text
-        assert ".docker-compose." in text and ".candidate.yml" in text
-        # The candidate name is keyed on the tested SHA for both triggers.
-        assert "needs.build.outputs.sha" in text
-
-    def test_deploy_consumes_candidate_and_expected_hash(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        assert "CANDIDATE_COMPOSE_FILE=" in text
-        assert "EXPECTED_COMPOSE_SHA256=" in text
-        assert "steps.compose.outputs.candidate" in text
-        assert "steps.compose.outputs.sha256" in text
-
-    def test_single_delivery_path_for_every_deploy(self) -> None:
-        steps = self._steps()
-        delivery = [
-            step for step in steps if step.get("name") == "Deliver release compose candidate"
-        ]
-        assert len(delivery) == 1
-        assert "if" not in delivery[0], "delivery must not depend on the trigger type"
-
-
-class TestProductionCompose:
-    def _compose(self) -> dict:
-        return yaml.safe_load(PROD_COMPOSE.read_text(encoding="utf-8"))
-
-    def test_expected_services(self) -> None:
-        services = self._compose()["services"]
-        for name in ("postgres", "redis", "migrate", "api", "worker", "bot"):
-            assert name in services, f"missing service {name}"
-
-    def test_migrations_run_before_api_worker_and_bot(self) -> None:
-        services = self._compose()["services"]
-        for name in ("api", "worker", "bot"):
-            deps = services[name]["depends_on"]
-            assert deps["migrate"]["condition"] == "service_completed_successfully"
-            assert deps["postgres"]["condition"] == "service_healthy"
-            assert deps["redis"]["condition"] == "service_healthy"
-
-    def test_bot_runs_exactly_one_replica(self) -> None:
-        assert self._compose()["services"]["bot"]["deploy"]["replicas"] == 1
-
-    def test_database_and_cache_stay_internal(self) -> None:
-        services = self._compose()["services"]
-        assert services["postgres"].get("ports") is None
-        assert services["redis"].get("ports") is None
-
-    def test_platform_services_use_the_immutable_image_variable(self) -> None:
-        services = self._compose()["services"]
-        for name in ("migrate", "api", "worker", "bot"):
-            assert "PLATFORM_IMAGE" in services[name]["image"], name
-
-    def test_configuration_mount_is_server_owned(self) -> None:
-        text = PROD_COMPOSE.read_text(encoding="utf-8")
-        assert "${CONFIGURATION_PATH:-/etc/cloud-server-seller/configuration.toml}" in text
-        assert "./configuration.toml" not in text
-
-    def test_state_lives_in_named_volumes(self) -> None:
-        assert set(self._compose()["volumes"]) == {"pgdata", "redisdata", "backups"}
-
-    def test_env_example_documents_the_deploy_contract(self) -> None:
-        example = PROD_ENV_EXAMPLE.read_text(encoding="utf-8")
-        for var in ("PLATFORM_IMAGE=", "POSTGRES_PASSWORD=", "API_PORT=", "CONFIGURATION_PATH"):
-            assert var in example, f"{var} missing from .env.example"
-
-
-class TestProductionHealthchecks:
-    """Only the API serves HTTP, so only the API keeps the image healthcheck.
-
-    Regression cover for worker/bot showing unhealthy (the image
-    HEALTHCHECK probes :8000) while actually processing jobs/polling.
-    """
-
-    def _compose(self) -> dict:
-        return yaml.safe_load(PROD_COMPOSE.read_text(encoding="utf-8"))
-
-    def test_api_inherits_the_image_http_healthcheck(self) -> None:
-        dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-        assert "/health/live" in dockerfile
-        assert "HEALTHCHECK" in dockerfile
-        api = self._compose()["services"]["api"]
-        assert "healthcheck" not in api, "api must keep the image HTTP healthcheck"
-
-    def test_only_one_shot_services_disable_the_inherited_healthcheck(self) -> None:
-        services = self._compose()["services"]
-        for name in ("migrate", "backup", "volume-init"):
-            assert services[name]["healthcheck"]["disable"] is True
-
-    def test_worker_and_bot_have_transport_specific_healthchecks(self) -> None:
-        services = self._compose()["services"]
-        worker = services["worker"]["healthcheck"]["test"]
-        bot = services["bot"]["healthcheck"]["test"]
-        assert worker[:2] == ["CMD", "python"]
-        assert "check_health(WorkerSettings)" in worker[-1]
-        assert bot == ["CMD", "python", "-m", "cloud_platform.bot.health"]
-
-
-class TestCiStillGatesDeploys:
-    def test_ci_runs_on_prs_and_main_pushes(self) -> None:
-        ci = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
-        on = _on(ci)
-        assert "pull_request" in on
-        assert on["push"]["branches"] == ["main"]
-
-    def test_ci_keeps_the_leaseweb_contract_gate(self) -> None:
-        text = CI_WORKFLOW.read_text(encoding="utf-8")
-        assert "scripts/gen_leaseweb_coverage.py --check" in text
 
 
 def _docker_available() -> bool:

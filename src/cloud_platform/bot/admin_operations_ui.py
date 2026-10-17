@@ -3,21 +3,33 @@
 from __future__ import annotations
 
 import secrets
+from typing import Any
 from uuid import UUID
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from cloud_platform.bot.ui import BotScreen
+from cloud_platform.core.i18n import Translator
+from cloud_platform.core.session_store import BotSessionStore
 from cloud_platform.modules.navigation.domain import (
     Callback,
     decode_offer_ref,
     encode_offer_ref,
     encode_telegram_callback,
 )
+from cloud_platform.modules.users.domain import User
 
 
 class _Section:
-    def __init__(self, key, service, store, translator, *, ttl_seconds=900):
+    def __init__(
+        self,
+        key: str,
+        service: Any,
+        store: BotSessionStore,
+        translator: Translator,
+        *,
+        ttl_seconds: int = 900,
+    ) -> None:
         self._key, self._service, self._store, self._t, self._ttl = (
             key,
             service,
@@ -26,24 +38,24 @@ class _Section:
             ttl_seconds,
         )
 
-    def button(self, label, screen, *args):
+    def button(self, label: str, screen: str, *args: str) -> InlineKeyboardButton:
         return InlineKeyboardButton(
             text=label,
             callback_data=encode_telegram_callback(Callback("admin", screen, args), self._key),
         )
 
-    def screen(self, text, rows=None):
+    def screen(self, text: str, rows: list[list[InlineKeyboardButton]] | None = None) -> BotScreen:
         rows = rows or []
         rows.append([self.button(self._t.t("nav.cancel"), "menu")])
         return BotScreen(text, InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 class AdminSupportUi(_Section):
-    async def clear_prompt(self, admin):
+    async def clear_prompt(self, admin: User) -> None:
         await self._service.clear(admin)
         await self._store.delete("admin-support-input", str(admin.id))
 
-    async def _detail(self, admin, server_id):
+    async def _detail(self, admin: User, server_id: UUID) -> BotScreen:
         view = await self._service.detail(admin, server_id)
         ref = secrets.token_urlsafe(6)
         await self._store.put(
@@ -68,7 +80,7 @@ class AdminSupportUi(_Section):
             rows,
         )
 
-    async def handle(self, cb, admin):
+    async def handle(self, cb: Callback, admin: User) -> BotScreen | None:
         if cb.screen == "services":
             await self._store.put(
                 "admin-support-input", str(admin.id), {"step": "server"}, ttl_seconds=self._ttl
@@ -90,7 +102,7 @@ class AdminSupportUi(_Section):
             return self.screen(self._t.t("admin.operation_status", status=status.value))
         return None
 
-    async def handle_text(self, text, admin):
+    async def handle_text(self, text: str, admin: User) -> BotScreen | None:
         pending = await self._store.get("admin-support-input", str(admin.id))
         if pending is None:
             return None
@@ -114,11 +126,11 @@ class AdminSupportUi(_Section):
 
 
 class AdminSalesUi(_Section):
-    async def clear_prompt(self, admin):
+    async def clear_prompt(self, admin: User) -> None:
         await self._service.clear(admin)
         await self._store.delete("admin-sales-input", str(admin.id))
 
-    async def handle(self, cb, admin):
+    async def handle(self, cb: Callback, admin: User) -> BotScreen | None:
         if cb.screen in {"sales", "c_page"}:
             offset = int(cb.args[0]) if cb.args else 0
             offers = await self._service.list_offers(admin, offset)
@@ -195,7 +207,7 @@ class AdminSalesUi(_Section):
             return self.screen(self._t.t("admin.operation_status", status=action))
         return None
 
-    async def handle_text(self, text, admin):
+    async def handle_text(self, text: str, admin: User) -> BotScreen | None:
         record = await self._store.get("admin-sales-input", str(admin.id))
         if record is None:
             return None
@@ -240,13 +252,13 @@ class AdminSalesUi(_Section):
 
 
 class AdminHealthUi(_Section):
-    async def clear_prompt(self, admin):
+    async def clear_prompt(self, admin: User) -> None:
         return None
 
-    async def handle_text(self, text, admin):
+    async def handle_text(self, text: str, admin: User) -> BotScreen | None:
         return None
 
-    async def handle(self, cb, admin):
+    async def handle(self, cb: Callback, admin: User) -> BotScreen | None:
         if cb.screen == "health":
             facts = await self._service.snapshot(admin)
             lines = [self._t.t("admin.health"), f"DB: {facts['database']}"]
@@ -278,11 +290,11 @@ class AdminHealthUi(_Section):
 
 
 class AdminMessagingUi(_Section):
-    async def clear_prompt(self, admin):
+    async def clear_prompt(self, admin: User) -> None:
         await self._service.clear(admin)
         await self._store.delete("admin-message-input", str(admin.id))
 
-    async def handle(self, cb, admin):
+    async def handle(self, cb: Callback, admin: User) -> BotScreen | None:
         if cb.screen == "messages":
             await self._store.put(
                 "admin-message-input", str(admin.id), {"step": "targets"}, ttl_seconds=self._ttl
@@ -293,7 +305,7 @@ class AdminMessagingUi(_Section):
             return self.screen(self._t.t("admin.message_queued", id=identity))
         return None
 
-    async def handle_text(self, text, admin):
+    async def handle_text(self, text: str, admin: User) -> BotScreen | None:
         record = await self._store.get("admin-message-input", str(admin.id))
         if record is None:
             return None

@@ -17,7 +17,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import AuditEvent as _AuditModel
+from cloud_platform.db.base import Server as _ServerModel
 from cloud_platform.modules.audit.domain import ActorType, AuditEvent
+from cloud_platform.modules.notifications.outbox import notice_row
 
 
 def _attr(row: Any, name: str) -> Any:
@@ -61,6 +63,27 @@ class SqlAlchemyAuditRepository:
         )
         async with self._session_factory() as session:
             session.add(row)
+            titles = {
+                "server.deleted": "حذف سرور توسط ارائه‌دهنده تأیید شد",
+                "server.delete_requested": "درخواست حذف سرور ثبت شد",
+                "server.delete_failed": "حذف سرور ناموفق است؛ نیازمند بررسی",
+                "server.state_reconciled": "وضعیت سرور با ارائه‌دهنده همگام شد",
+                "server.power_failed": "عملیات برق سرور ناموفق است؛ وضعیت را بررسی کنید",
+                "server.rebuilt": "بازسازی سرور تأیید شد",
+                "billing.cap_reached": "سقف هزینه سرور رسیده است",
+            }
+            if event.resource_type == "server" and event.action in titles:
+                server = await session.get(_ServerModel, UUID(event.resource_id))
+                if server is not None:
+                    await session.flush()
+                    session.add(
+                        notice_row(
+                            key=f"audit:{row.id}",
+                            user_id=_attr(server, "user_id"),
+                            text=f"{titles[event.action]}\nسرور: {str(server.id)[:8]}",
+                            server_id=str(server.id),
+                        )
+                    )
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)

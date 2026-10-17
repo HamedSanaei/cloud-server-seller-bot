@@ -328,7 +328,8 @@ class VpsContract(LeasewebModel):
     id: str
     type: ContractType
     state: ContractState
-    term: int | None = None
+    # Live trial contracts use labels, not a numeric count of months.
+    term: int | str | None = None
     billing_frequency: int | None = None
     starts_at: str | None = None
     ends_at: str | None = None

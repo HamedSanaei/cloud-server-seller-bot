@@ -460,6 +460,9 @@ otel_sample_ratio = 1.0
 
 [api]
 allow_header_identity = false      # dev/test only; never in production
+# Optional OpenSSH alias for the exact operator test VPS. Empty disables guest changes.
+# See docs/WEBSITE_INTEGRATION.md; credentials/known_hosts stay outside this repository.
+test_server_ssh_alias = ""
 rate_limit_per_minute = 240
 
 # What a paying customer may do from Telegram ("My servers").

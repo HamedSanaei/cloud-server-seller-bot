@@ -1,9 +1,13 @@
 """Configured-RBAC sales controls and their receipt commit in one transaction."""
 
+from collections.abc import Callable, Iterable
+from contextlib import AbstractAsyncContextManager
 from hashlib import sha256
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import AuditEvent, MaintenanceBlock, SellableOffer
 from cloud_platform.modules.fx.domain import minor_to_major
@@ -17,12 +21,25 @@ from cloud_platform.modules.users.superadmin_repository import authorize_superad
 
 
 class SqlAlchemyAdminSalesRepository:
-    def __init__(self, session_factory, *, catalog_currency="USD"):
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+        *,
+        catalog_currency: str = "USD",
+    ) -> None:
         self._sessions = session_factory
         self._currency = catalog_currency
 
-    async def apply(self, *, actor_id: UUID, configured_ids, facts: dict, operation_key: str):
-        action, reason = facts["action"], facts["reason"]
+    async def apply(
+        self,
+        *,
+        actor_id: UUID,
+        configured_ids: Iterable[int],
+        facts: dict[str, Any],
+        operation_key: str,
+    ) -> str:
+        action: str = facts["action"]
+        reason: str = facts["reason"]
         if (
             action
             not in {
@@ -75,6 +92,7 @@ class SqlAlchemyAdminSalesRepository:
             ).scalar_one_or_none()
             if model is None:
                 raise ValueError("offer unavailable")
+            writable = cast(Any, model)
             offer = _to_domain(model)
             if offer.provider_key != facts["provider"] or offer.location_id != facts["location"]:
                 raise ValueError("confirmed sales scope changed")
@@ -88,7 +106,8 @@ class SqlAlchemyAdminSalesRepository:
                     or not has_valid_pricing_provenance(offer, self._currency)
                 ):
                     raise ValueError("offer needs current valid pricing and availability")
-                model.enabled, model.operator_disabled = action == "show", action != "show"
+                writable.enabled = action == "show"
+                writable.operator_disabled = action != "show"
             elif action == "set_price":
                 amount, currency = facts["price_minor"], facts["currency"]
                 if type(amount) is not int or not 0 < amount <= 2**63 - 1:
@@ -102,9 +121,10 @@ class SqlAlchemyAdminSalesRepository:
                     or offer.provider_cost_currency != facts["cost_currency"]
                 ):
                     raise ValueError("provider cost changed since price confirmation")
-                model.selling_price_minor, model.selling_currency = amount, currency
-                model.auto_priced = False
-                model.pricing_metadata = {
+                writable.selling_price_minor = amount
+                writable.selling_currency = currency
+                writable.auto_priced = False
+                writable.pricing_metadata = {
                     "pricing_schema_version": 1,
                     "price_source": "manual",
                     "pricing_mode": "manual",
@@ -143,7 +163,9 @@ class SqlAlchemyAdminSalesRepository:
                         )
                     )
                 else:
-                    block.reason, block.created_by = reason, actor_id
+                    mutable_block = cast(Any, block)
+                    mutable_block.reason = reason
+                    mutable_block.created_by = actor_id
             session.add(
                 AuditEvent(
                     actor_type="admin",

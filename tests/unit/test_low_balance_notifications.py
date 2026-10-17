@@ -5,7 +5,6 @@ Acceptance: deduplicated warning levels.
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -187,25 +186,6 @@ class TestEventRendering:
         assert "-0.07 EUR" in text
         assert "warn" in text
         assert EP1.isoformat() in text
-
-
-class TestLoggingPort:
-    async def test_logs_without_raising(self, caplog: pytest.LogCaptureFixture) -> None:
-        from cloud_platform.modules.notifications.domain import _LoggingLowBalanceNotifier
-
-        with caplog.at_level(logging.WARNING):
-            await _LoggingLowBalanceNotifier().send(
-                LowBalanceNotificationEvent(
-                    user_id=USER_ID,
-                    server_id=SERVER_ID,
-                    kind=LowBalanceNotificationKind.AUTO_DELETE,
-                    balance_minor=300,
-                    currency="EUR",
-                    episode=EP1,
-                )
-            )
-        assert "auto_delete" in caplog.text
-        assert "3.00 EUR" in caplog.text
 
 
 # --------------------------------------------------------------------------

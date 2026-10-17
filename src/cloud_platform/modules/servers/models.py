@@ -116,6 +116,7 @@ class ServerOperation(StrEnum):
     MONITORING = "monitoring"
     MONITORING_ENABLE = "monitoring_enable"
     RENAME = "rename"
+    SSH_PORT_CHANGE = "ssh_port_change"
     # Commercial operations. These never touch a provider API: RENEW_NOW settles
     # one period from the customer's own wallet, AUTO_RENEW flips a durable
     # preference. They are separate identifiers so the policy, the confirmation
@@ -170,6 +171,8 @@ class ServerActionOutcome:
     replayed: bool = False
     outcome_unknown: bool = False
     detail: str | None = None
+    status: str | None = None
+    receipt_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

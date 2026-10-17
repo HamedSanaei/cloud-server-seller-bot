@@ -616,7 +616,7 @@ class SqlAlchemyPrepaidHourlyPeriodRepository:
                     or grant.nominal_amount_minor != period.usd_minor
                     or grant.nominal_currency != period.nominal_currency
                     or expense.grant_id != grant.id
-                    or expense.operation_key != expense_operation_key(grant.operation_key)
+                    or expense.operation_key != expense_operation_key(str(grant.operation_key))
                     or any(
                         getattr(expense, field) != getattr(grant, field)
                         for field in (

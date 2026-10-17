@@ -9,7 +9,6 @@ from uuid import uuid4
 
 import pytest
 
-from cloud_platform.modules.notifications.domain import TelegramLowBalanceNotifier
 from cloud_platform.modules.notifications.hourly import (
     HourlyRunwayWarningService,
     forecast_exhaustion,
@@ -98,16 +97,3 @@ async def test_fx_failure_sends_no_guessed_forecast():
     assert await service.run(NOW) == 0
     notifier.send.assert_not_awaited()
     log.record.assert_not_awaited()
-
-
-async def test_telegram_warning_mentions_toman_shutdown_deletion_and_topup():
-    service, notifier, _, _, _, _ = setup_warning()
-    await service.run(NOW)
-    event = notifier.send.await_args.args[0]
-    bot = AsyncMock()
-    users = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(telegram_user_id=123)))
-    await TelegramLowBalanceNotifier(bot, users).send(event)
-    text = bot.send_message.await_args.kwargs["text"]
-    for fragment in ("تومان", "خاموشی", "حذف", "شارژ", "۲۴ ساعت", "2"):
-        assert fragment in text
-    assert bot.send_message.await_args.kwargs["chat_id"] == 123

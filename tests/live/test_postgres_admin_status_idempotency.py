@@ -22,6 +22,7 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import DefaultClause
 
 from cloud_platform.db.base import AuditEvent as AuditRow
+from cloud_platform.db.base import BusinessLogEvent as BusinessLogRow
 from cloud_platform.db.base import User as UserRow
 from cloud_platform.modules.users.domain import UserNotFound, UserStatus
 from cloud_platform.modules.users.repository import (
@@ -54,7 +55,7 @@ async def database() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
         },
     )
     subset = MetaData()
-    for model in (UserRow, AuditRow):
+    for model in (UserRow, AuditRow, BusinessLogRow):
         table = model.__table__.to_metadata(subset)
         for column in table.columns:
             default = column.server_default

@@ -61,10 +61,10 @@ def _to_domain(row: _ProviderOrderModel) -> ProviderOrder:
         settlement_attempted_at=_attr(row, "settlement_attempted_at"),
         settlement_attempts=int(_attr(row, "settlement_attempts") or 0),
         settlement_error=_attr(row, "settlement_error"),
-        funding_source=FundingSource(row.funding_source),
-        funding_operator_id=row.funding_operator_id,
-        funding_grant_operation_key=row.funding_grant_operation_key,
-        provider_cost_snapshot=row.provider_cost_snapshot,
+        funding_source=FundingSource(_attr(row, "funding_source")),
+        funding_operator_id=_attr(row, "funding_operator_id"),
+        funding_grant_operation_key=_attr(row, "funding_grant_operation_key"),
+        provider_cost_snapshot=_attr(row, "provider_cost_snapshot"),
     )
 
 

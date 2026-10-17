@@ -2,36 +2,43 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
+from contextlib import AbstractAsyncContextManager
 from hashlib import sha256
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import AuditEvent, Operation, Provider, Server
 from cloud_platform.modules.admin_console.support import ACTION_TYPES, server_binding
 from cloud_platform.modules.compute.domain import ServerLifecycleState
 from cloud_platform.modules.compute.repository import _to_domain as server_from_row
+from cloud_platform.modules.operations.domain import Operation as OperationIntent
 from cloud_platform.modules.operations.repository import _to_domain as operation_from_row
 from cloud_platform.modules.users.domain import PermissionDeniedError
 from cloud_platform.modules.users.superadmin_repository import authorize_superadmin_transaction
 
 
 class SqlAlchemyAdminSupportRepository:
-    def __init__(self, session_factory):
+    def __init__(
+        self, session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]]
+    ) -> None:
         self._sessions = session_factory
 
     async def enqueue(
         self,
         *,
-        actor_id,
-        server_id,
-        action,
-        operation_key,
-        reason,
-        expected_binding,
-        expected_state,
-        configured_ids,
-    ):
+        actor_id: UUID,
+        server_id: UUID,
+        action: str,
+        operation_key: str,
+        reason: str,
+        expected_binding: str,
+        expected_state: str,
+        configured_ids: Iterable[int],
+    ) -> OperationIntent:
         if action not in ACTION_TYPES or not 1 <= len(reason.strip()) <= 500:
             raise ValueError("support request is invalid")
         async with self._sessions() as session, session.begin():
@@ -54,7 +61,10 @@ class SqlAlchemyAdminSupportRepository:
                 if (
                     existing.resource_id != server_id
                     or existing.operation_type != ACTION_TYPES[action].value
-                    or (existing.provider_response or {}).get("admin_support") != context
+                    or (cast(dict[str, Any] | None, existing.provider_response) or {}).get(
+                        "admin_support"
+                    )
+                    != context
                 ):
                     raise ValueError("support intent facts differ")
                 return operation_from_row(existing)
@@ -105,7 +115,9 @@ class SqlAlchemyAdminSupportRepository:
             await session.flush()
             return operation_from_row(operation)
 
-    async def authorize_dispatch(self, operation, configured_ids):
+    async def authorize_dispatch(
+        self, operation: OperationIntent, configured_ids: Iterable[int]
+    ) -> UUID:
         """Revalidate durable actor attribution before a queued external mutation."""
         context = (operation.provider_response or {}).get("admin_support")
         if not isinstance(context, dict):

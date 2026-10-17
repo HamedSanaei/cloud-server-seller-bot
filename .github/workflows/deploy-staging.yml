@@ -1,27 +1,8 @@
 name: deploy-staging
 
-# Pushes to staging automatically validate/build and deploy to the shared
-# production host/bot after all financial/migration gates pass.
-#
-# Reused infrastructure configuration (no duplicates, no second stack):
-#   * the existing environment secrets/variables: PROD_SSH_KEY,
-#     PROD_KNOWN_HOSTS, PROD_HOST, PROD_USER, PROD_PORT, PROD_DEPLOY_PATH;
-#   * the same server, the same server-owned deploy.env/configuration.toml
-#     (bot token, database, redis, provider credentials) and the same compose
-#     project `cloud-platform-production`, whose `bot` service is pinned to
-#     replicas: 1 and gated to exactly one container by the deploy script.
-#   * `deploy/staging/docker-compose.yml` (M12-004) is NOT used by this lane:
-#     that artifact describes a separate isolated stack; this lane replaces
-#     the one running stack.
-#
-# Concurrency: never cancel a run that may already be migrating or replacing
-# services. Pending pushes may coalesce, but the active deployment finishes.
-# Critical financial regressions and isolated PostgreSQL migration contracts
-# execute in this lane because it shares production's financial database.
-#
-# The deploy job additionally joins `telegram-shared-host-deploy` with
-# cancel-in-progress: false, because staging and automatic production releases
-# mutate the SAME host and deploy path and must never run concurrently.
+# Staging is the automatic fast release lane for the SAME production runtime.
+# It reuses the production deploy path, private TOML, DB, Redis and Telegram bot;
+# no second stack or bot poller is created. Full CI remains mandatory.
 
 on:
   push:
@@ -30,7 +11,7 @@ on:
 
 concurrency:
   group: staging-deploy
-  # Never cancel a workflow after it has entered shared-host mutations.
+  # Never cancel a deployment that may already be migrating.
   cancel-in-progress: false
 
 permissions:
@@ -43,88 +24,15 @@ env:
   UV_LINK_MODE: copy
 
 jobs:
-  fast-checks:
-    name: Fast staging checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    # This lane shares the financial database with production. Critical
-    # regressions and migration paths must execute before any image deploys.
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: cloud
-          POSTGRES_PASSWORD: cloud # pragma: allowlist secret -- disposable CI service
-          POSTGRES_DB: cloud
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U cloud -d cloud"
-          --health-interval 5s --health-timeout 5s --health-retries 20
-    env:
-      DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud # pragma: allowlist secret -- disposable CI service
-      CLOUD_PLATFORM_TEST_POSTGRES_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud # pragma: allowlist secret -- disposable CI service
-    steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.0
-        with:
-          python-version: "3.13"
-          enable-cache: true
-      # --locked rejects lockfile drift; subsequent commands cannot re-resolve.
-      - name: Install locked dependencies
-        run: uv sync --locked --all-groups
-      - name: Install PostgreSQL 17 backup and restore clients
-        run: |
-          sudo apt-get update
-          if ! apt-cache show postgresql-client-17 >/dev/null 2>&1; then
-            sudo apt-get install --yes postgresql-common
-            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-            sudo apt-get update
-          fi
-          sudo apt-get install --yes postgresql-client-17
-          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
-          /usr/lib/postgresql/17/bin/pg_dump --version
-          /usr/lib/postgresql/17/bin/psql --version
-      # Keep the canonical quick gate and add targeted database/financial
-      # proofs below; staging does not duplicate the full release suite.
-      - name: Fast gates (ruff, formatting, import smoke)
-        run: uv run --no-sync python scripts/verify_ci.py --staging
-      - name: Financial and deployment regression tests
-        run: >-
-          uv run --no-sync pytest tests/unit/test_payment*.py tests/unit/test_wallet*.py
-          tests/unit/test_prepaid_hourly*.py
-          tests/unit/test_hourly_credit_policy.py tests/unit/test_hourly_runway_warnings.py
-          tests/unit/test_prepaid_provider_lifecycle.py tests/unit/test_prepaid_balance_notices.py
-          tests/unit/test_servers_management_service.py tests/unit/test_servers_management_ui.py
-          tests/unit/test_deploy_production.py::TestReleaseComposeContract
-          tests/unit/test_post_deploy_smoke.py tests/unit/test_audit_cicd.py
-          tests/unit/test_financial*.py tests/unit/test_audit_worker_operations.py
-          tests/unit/test_audit_provider_operations.py tests/unit/test_hourly_creation_boundaries.py
-          tests/unit/test_gateway_management.py
-          tests/unit/test_operator_*.py tests/unit/test_admin_console_*.py
-          tests/unit/test_admin_support_execution.py tests/unit/test_nowpayments_*.py
-          tests/unit/test_superadmin_*.py tests/unit/test_bot_admin*.py
-          tests/unit/test_monthly_bot_ui.py
-          tests/unit/test_hetzner_offer_migration_pg.py --no-cov
-      - name: Migration compatibility
-        if: ${{ !cancelled() }}
-        run: uv run --no-sync python scripts/check_migrations.py
-      - name: Historical migration bridge
-        if: ${{ !cancelled() }}
-        run: uv run --no-sync pytest tests/live/test_migration_bridge.py --no-cov
-      - name: Fresh PostgreSQL schema
-        if: ${{ !cancelled() }}
-        run: |
-          uv run --no-sync alembic upgrade head
-          uv run --no-sync python -m cloud_platform.db.schema_parity
-      - name: Live PostgreSQL contracts
-        if: ${{ !cancelled() }}
-        run: >-
-          uv run --no-sync pytest tests/live/test_postgres_*.py
-          tests/live/test_financial_payment_outbox.py --no-cov
+  checks:
+    name: Required release checks
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
 
   build:
     name: Build immutable image
-    needs: fast-checks
+    needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
@@ -202,27 +110,26 @@ jobs:
           build-args: RELEASE_REVISION=${{ steps.resolve.outputs.sha }}
           push: true
           tags: ${{ steps.resolve.outputs.image }}:${{ steps.resolve.outputs.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=platform
+          cache-to: type=gha,scope=platform,mode=max
 
   deploy:
-    name: Deploy to the current server
+    name: Deploy shared production from staging
     needs: build
     if: github.ref == 'refs/heads/staging' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # The existing `production` environment is where PROD_SSH_KEY,
-    # PROD_KNOWN_HOSTS and PROD_HOST/PROD_USER/PROD_PORT/PROD_DEPLOY_PATH live,
-    # and staging intentionally reuses them instead of duplicating
-    # infrastructure secrets. It has NO protection rules, so this adds no
-    # approval step. If required reviewers are ever added to that environment,
-    # staging deploys would inherit them - move those values to a shared
-    # environment (or dedicated staging credentials) BEFORE enabling them.
-    environment: production
+    environment: staging
     # The active deploy is never cancelled. GitHub may coalesce pending jobs.
     concurrency:
-      group: telegram-shared-host-deploy
+      group: platform-production-deploy
       cancel-in-progress: false
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      CONFIGURATION_PATH: ${{ vars.CONFIGURATION_PATH }}
     steps:
       - name: Check out the exact pushed commit
         uses: actions/checkout@v7
@@ -230,20 +137,34 @@ jobs:
           ref: ${{ needs.build.outputs.sha }}
           fetch-depth: 1
 
-      - name: Open SSH (ephemeral key file, verified host key)
+      - name: Require the shared production target and verified SSH identity
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
           set -Eeuo pipefail
-          install -m 700 -d "${HOME}/.ssh"
-          printf '%s\n' "${{ secrets.PROD_SSH_KEY }}" > "${HOME}/.ssh/prod_key"
-          chmod 600 "${HOME}/.ssh/prod_key"
-          printf '%s\n' "${{ secrets.PROD_KNOWN_HOSTS }}" > "${HOME}/.ssh/known_hosts"
-          chmod 600 "${HOME}/.ssh/known_hosts"
-          [ -s "${HOME}/.ssh/prod_key" ] || { echo "PROD_SSH_KEY is empty"; exit 1; }
-          [ -s "${HOME}/.ssh/known_hosts" ] || { echo "PROD_KNOWN_HOSTS is empty"; exit 1; }
-          [ -n "${{ vars.PROD_HOST }}" ] || { echo "PROD_HOST variable is not set"; exit 1; }
-          [ -n "${{ vars.PROD_USER }}" ] || { echo "PROD_USER variable is not set"; exit 1; }
-          [ -n "${{ vars.PROD_DEPLOY_PATH }}" ] || { echo "PROD_DEPLOY_PATH variable is not set"; exit 1; }
-          echo "ssh material ready (key never printed)"
+          [[ -n "$DEPLOY_HOST" && -n "$DEPLOY_USER" && -n "$SSH_KEY" && -n "$KNOWN_HOSTS" ]] || {
+            echo "::error::Configure this staging release lane's DEPLOY_* SSH secrets"; exit 1;
+          }
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$CONFIGURATION_PATH" =~ ^/[A-Za-z0-9._/-]+\\.toml$ ]] || {
+            echo "::error::DEPLOY_PATH and CONFIGURATION_PATH must select the existing production runtime"; exit 1;
+          }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/deploy_key" >/dev/null
+
+      - name: Recheck the tested branch HEAD before any remote mutation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -Eeuo pipefail
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/staging" --jq '.object.sha')"
+          [[ "$current" == "$RELEASE_SHA" ]] || {
+            echo "::error::Refusing a stale staging release"; exit 1;
+          }
 
 
       - name: Deliver release compose candidate
@@ -259,54 +180,46 @@ jobs:
           echo "candidate=${candidate}" >> "${GITHUB_OUTPUT}"
           echo "sha256=${compose_sha}" >> "${GITHUB_OUTPUT}"
           echo "release compose candidate ${candidate}: ${compose_sha}"
-          ssh -i "${HOME}/.ssh/prod_key" \
-            -p "${{ vars.PROD_PORT || 22 }}" \
-            -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+          ssh -i "$HOME/.ssh/deploy_key" \
+            -p "${DEPLOY_PORT:-22}" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
             -o ConnectTimeout=15 \
-            "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
-            "cat > '${{ vars.PROD_DEPLOY_PATH }}/${candidate}'" \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "test -d '$DEPLOY_PATH' && cat > '${DEPLOY_PATH}/${candidate}'" \
             < deploy/production/docker-compose.yml
 
-      - name: Deploy the exact image over SSH (staging profile)
+      - name: Deploy the validated staging image to the shared production runtime
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_ACTOR: ${{ github.actor }}
+          RELEASE_IMAGE: ${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}
+          EXPECTED_HEAD: ${{ needs.build.outputs.head }}
+          CANDIDATE: ${{ steps.compose.outputs.candidate }}
+          COMPOSE_SHA: ${{ steps.compose.outputs.sha256 }}
         run: |
           set -Eeuo pipefail
-          # DEPLOY_PROFILE=staging skips only the scheduled catalog refresh;
-          # migrations, schema parity, single-bot and readiness stay enforced.
-          remote_command="$(cat <<'REMOTE'
-          set -Eeuo pipefail
-          DOCKER_CONFIG="$(mktemp -d)"
-          export DOCKER_CONFIG
-          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
-          IFS= read -r GHCR_TOKEN
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-          unset GHCR_TOKEN
-          DEPLOY_PATH='${{ vars.PROD_DEPLOY_PATH }}' PLATFORM_IMAGE_NEW='${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}' EXPECTED_HEAD='${{ needs.build.outputs.head }}' CANDIDATE_COMPOSE_FILE='${{ vars.PROD_DEPLOY_PATH }}/${{ steps.compose.outputs.candidate }}' EXPECTED_COMPOSE_SHA256='${{ steps.compose.outputs.sha256 }}' DEPLOY_PROFILE='staging' bash -s
-          REMOTE
-          )"
-          remote_command="$(printf '%s' "$remote_command" | base64 -w0)"
+          printf -v invoke 'DEPLOY_PATH=%q CONFIGURATION_PATH=%q PLATFORM_IMAGE_NEW=%q EXPECTED_HEAD=%q CANDIDATE_COMPOSE_FILE=%q EXPECTED_COMPOSE_SHA256=%q DEPLOY_PROFILE=staging bash -s' \
+            "$DEPLOY_PATH" "$CONFIGURATION_PATH" "$RELEASE_IMAGE" "$EXPECTED_HEAD" "$DEPLOY_PATH/$CANDIDATE" "$COMPOSE_SHA"
+          printf -v login 'printf "%%s" "$registry_token" | docker login ghcr.io -u %q --password-stdin >/dev/null' "$GHCR_ACTOR"
+          cleanup='rm -rf -- "$DOCKER_CONFIG"'
+          printf -v remote 'set -Eeuo pipefail; DOCKER_CONFIG="$(mktemp -d)"; export DOCKER_CONFIG; trap %q EXIT; IFS= read -r registry_token; %s; unset registry_token GHCR_TOKEN; %s' "$cleanup" "$login" "$invoke"
           { printf '%s\n' "$GHCR_TOKEN"; cat scripts/deploy-production.sh; } |
-            ssh -i "${HOME}/.ssh/prod_key" \
-              -p "${{ vars.PROD_PORT || 22 }}" \
-              -o BatchMode=yes -o StrictHostKeyChecking=yes \
-              -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
-              -o ConnectTimeout=15 \
-              "${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}" \
-              "bash -c \"\$(printf '%s' '$remote_command' | base64 --decode)\""
+            ssh -i "$HOME/.ssh/deploy_key" -p "${DEPLOY_PORT:-22}" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o ConnectTimeout=15 \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" "$remote"
 
       - name: Report deployment
         if: always()
         run: |
           echo "commit: ${{ needs.build.outputs.sha }}"
           echo "image: ${{ needs.build.outputs.image }}:${{ needs.build.outputs.sha }}"
-          echo "lane: staging (current development server + the same Telegram bot)"
+          echo "lane: staging; runtime: production (cloud-platform-production)"
           echo "expected alembic head: ${{ needs.build.outputs.head }}"
-          echo "target: ${{ vars.PROD_USER }}@${{ vars.PROD_HOST }}:${{ vars.PROD_DEPLOY_PATH }}"
-          echo "bot processes for the token after this deploy: exactly 1 (enforced by the deploy script)"
+          echo "The original website and single Telegram bot are updated."
 
 
       - name: Remove ephemeral SSH key
         if: always()
-        run: rm -f "${HOME}/.ssh/prod_key"
+        run: rm -f "$HOME/.ssh/deploy_key"

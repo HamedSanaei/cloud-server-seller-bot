@@ -1717,7 +1717,7 @@ class BusinessLogEvent(Base):
     id = Column(PG_UUID, primary_key=True, server_default="uuid_generate_v4()")
     event_key = Column(String(200), nullable=False, unique=True)
     event_type = Column(String(64), nullable=False)
-    payload = Column(JSONB, nullable=False, server_default="'{}'::jsonb")
+    payload = Column(JSONB, nullable=False, server_default=sa.text("'{}'::jsonb"))
     status = Column(String(16), nullable=False, server_default="PENDING")
     created_at = Column(DateTime(timezone=True), server_default="CURRENT_TIMESTAMP", nullable=False)
     claimed_at = Column(DateTime(timezone=True), nullable=True)
@@ -1890,7 +1890,9 @@ class OperatorFundingCutover(Base):
     reason = Column(Text, nullable=False)
     #: ``metadata`` is reserved by SQLAlchemy's declarative base, so the ORM
     #: attribute is ``cutover_metadata`` while the DB column stays ``metadata``.
-    cutover_metadata = Column("metadata", JSONB, nullable=False, server_default="'{}'::jsonb")
+    cutover_metadata = Column(
+        "metadata", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
 
 
 class AdminMessageCampaign(Base):

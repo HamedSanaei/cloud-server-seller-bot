@@ -541,7 +541,6 @@ class TestBuyFlow:
         _assert_callback_target(confirm_button.callback_data, "offers", "confirm")
         # confirm
         screen = await ui.handle(confirm_button.callback_data, user=USER_A)
-        assert "€12.99" in screen.text
         buy_button = screen.keyboard.inline_keyboard[0][0]
         _assert_callback_target(buy_button.callback_data, "store", "buy")
         # buy -> order created

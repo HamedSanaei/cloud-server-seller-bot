@@ -49,9 +49,9 @@ def _to_domain(row: _RenewalRecordModel) -> RenewalRecord:
         auto_charge_enabled=bool(_attr(row, "auto_charge_enabled")),
         grace_until=_aware_or_none(_attr(row, "grace_until")),
         last_checked_at=_aware_or_none(_attr(row, "last_checked_at")),
-        funding_source=FundingSource(row.funding_source),
-        funding_operator_id=row.funding_operator_id,
-        provider_cost_snapshot=row.provider_cost_snapshot,
+        funding_source=FundingSource(_attr(row, "funding_source")),
+        funding_operator_id=_attr(row, "funding_operator_id"),
+        provider_cost_snapshot=_attr(row, "provider_cost_snapshot"),
     )
 
 

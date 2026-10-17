@@ -8,11 +8,12 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import Operation as _OperationModel
+from cloud_platform.db.base import Server as _ServerModel
 from cloud_platform.db.timestamps import (
     from_db_utc,
     from_db_utc_or_none,
@@ -57,7 +58,7 @@ def _to_domain(row: _OperationModel) -> Operation:
 class SqlAlchemyOperationRepository:
     """Durable operation ledger with atomic claims."""
 
-    async def authorize_admin_support(self, operation):
+    async def authorize_admin_support(self, operation: Operation) -> UUID:
         from cloud_platform.core.config import get_settings
         from cloud_platform.modules.admin_console.support_repository import (
             SqlAlchemyAdminSupportRepository,
@@ -72,6 +73,69 @@ class SqlAlchemyOperationRepository:
         session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
     ) -> None:
         self._session_factory = session_factory
+
+    async def management_intent(
+        self, *, key: str, server_id: UUID, provider_key: str, digest: str
+    ) -> Operation:
+        """Insert command facts atomically; the unique key binds retries to those facts."""
+        from sqlalchemy.dialects.postgresql import insert
+
+        async with self._session_factory() as session:
+            # Serialize distinct keys for one resource, not provider network I/O.
+            server = (
+                await session.execute(
+                    select(_ServerModel.id).where(_ServerModel.id == server_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if server is None:
+                raise ValueError("management resource no longer exists")
+            previous = await session.scalar(
+                select(_OperationModel.id).where(_OperationModel.operation_key == key)
+            )
+            if previous is None:
+                active = await session.scalar(
+                    select(_OperationModel.id)
+                    .where(
+                        _OperationModel.resource_type == "server",
+                        _OperationModel.resource_id == server_id,
+                        _OperationModel.operation_type == OperationType.SERVER_MANAGEMENT.value,
+                        or_(
+                            _OperationModel.status.in_(["pending", "in_flight", "outcome_unknown"]),
+                            and_(
+                                _OperationModel.status == "completed",
+                                _OperationModel.provider_response["management"][
+                                    "lifecycle"
+                                ].astext.in_(["running", "outcome_unknown"]),
+                            ),
+                        ),
+                    )
+                    .limit(1)
+                )
+                if active is not None:
+                    raise ValueError("another management command is unresolved for this resource")
+            await session.execute(
+                insert(_OperationModel)
+                .values(
+                    operation_key=key,
+                    operation_type=OperationType.SERVER_MANAGEMENT.value,
+                    resource_type="server",
+                    resource_id=server_id,
+                    provider_key=provider_key,
+                    status=OperationStatus.PENDING.value,
+                    attempts=0,
+                    provider_response={"command_digest": digest},
+                )
+                .on_conflict_do_nothing(index_elements=[_OperationModel.operation_key])
+            )
+            await session.commit()
+        operation = await self.get_by_key(key)
+        if (
+            operation is None
+            or operation.resource_id != server_id
+            or (operation.provider_response or {}).get("command_digest") != digest
+        ):
+            raise ValueError("idempotency key carries different server-management facts")
+        return operation
 
     async def get_or_create(
         self,

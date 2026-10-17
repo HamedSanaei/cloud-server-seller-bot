@@ -8,6 +8,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import cast
+from uuid import UUID
 
 from cloud_platform.core.session_store import BotSessionStore
 from cloud_platform.modules.fx.domain import ConversionSnapshot, FxPurpose, FxUnavailableError
@@ -166,7 +168,7 @@ class AdminWalletAdjustmentService:
         reason = record["reason"] + "\nFX: " + json.dumps(snapshot.to_dict(), sort_keys=True)
         return await self._admin.adjust_balance(
             admin=admin,
-            user_id=target.id,
+            user_id=cast(UUID, target.id),
             amount=amount,
             reason=reason,
             idempotency_key=f"admin-adjust:{admin.id}:{nonce}",

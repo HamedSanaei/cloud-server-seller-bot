@@ -110,38 +110,43 @@ class SqlAlchemyServerCredentialStore:
         provider_server_id: str,
         password: str,
         username: str,
+        session: AsyncSession | None = None,
     ) -> None:
         """Seal a newly reset password, superseding an older create credential."""
         if not password or not provider_server_id:
             raise ValueError("a provider-issued password and server identity are required")
         envelope = self._box.encrypt(password)
-        async with self._session_factory() as session:
-            await session.execute(
-                insert(ServerCreateCredential)
-                .values(
-                    server_id=server_id,
-                    provider_server_id=provider_server_id,
-                    ciphertext=envelope.token,
-                    username=username,
-                    key_id=envelope.key_id,
-                    algorithm=envelope.algorithm,
-                    created_at=datetime.now(UTC),
-                )
-                .on_conflict_do_update(
-                    index_elements=["server_id"],
-                    set_={
-                        "provider_server_id": provider_server_id,
-                        "ciphertext": envelope.token,
-                        "username": username,
-                        "key_id": envelope.key_id,
-                        "algorithm": envelope.algorithm,
-                        "claim_id": None,
-                        "claim_expires_at": None,
-                        "created_at": datetime.now(UTC),
-                    },
-                )
+        statement = (
+            insert(ServerCreateCredential)
+            .values(
+                server_id=server_id,
+                provider_server_id=provider_server_id,
+                ciphertext=envelope.token,
+                username=username,
+                key_id=envelope.key_id,
+                algorithm=envelope.algorithm,
+                created_at=datetime.now(UTC),
             )
-            await session.commit()
+            .on_conflict_do_update(
+                index_elements=["server_id"],
+                set_={
+                    "provider_server_id": provider_server_id,
+                    "ciphertext": envelope.token,
+                    "username": username,
+                    "key_id": envelope.key_id,
+                    "algorithm": envelope.algorithm,
+                    "claim_id": None,
+                    "claim_expires_at": None,
+                    "created_at": datetime.now(UTC),
+                },
+            )
+        )
+        if session is not None:
+            await session.execute(statement)
+        else:
+            async with self._session_factory() as own_session:
+                await own_session.execute(statement)
+                await own_session.commit()
 
     async def invalidate_for_owner(
         self, *, server_id: UUID, user_id: UUID, provider_server_id: str

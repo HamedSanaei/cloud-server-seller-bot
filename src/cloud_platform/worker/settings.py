@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from inspect import isawaitable
@@ -15,6 +16,9 @@ logger = logging.getLogger(__name__)
 
 async def startup(ctx: dict[str, object]) -> None:
     ctx["service"] = "cloud-platform-worker"
+    from cloud_platform.worker.health import HEARTBEAT_PATH
+
+    HEARTBEAT_PATH.unlink(missing_ok=True)
     from cloud_platform.core.container import get_container
 
     container = await get_container()
@@ -36,6 +40,12 @@ async def startup(ctx: dict[str, object]) -> None:
     # existed is otherwise considered eligible and is handed the next order.
     # Idempotent (one evidence row per provider operation) and read-only.
     await reconcile_capacity_evidence_once()
+    from cloud_platform.worker.health import observe_heartbeat
+
+    redis = ctx.get("redis")
+    # Without ARQ's context there is no heartbeat; readiness remains fail-closed.
+    if redis is not None:
+        ctx["_heartbeat_task"] = asyncio.create_task(observe_heartbeat(redis))
 
 
 def _log_business_logger_state(settings: object) -> None:
@@ -164,8 +174,24 @@ async def reconcile_cloud_capacity(ctx: dict[str, object]) -> None:
                 await container.close()
 
 
+async def reconcile_server_management(ctx: dict[str, object]) -> None:
+    del ctx
+    from cloud_platform.core.container import get_container
+    from cloud_platform.modules.servers.management_lifecycle import reconcile_management
+
+    async with metrics.job("reconcile_server_management"):
+        await reconcile_management(await get_container())
+
+
 async def shutdown(ctx: dict[str, object]) -> None:
     from cloud_platform.core.container import close_container
+    from cloud_platform.worker.health import HEARTBEAT_PATH
+
+    heartbeat = ctx.pop("_heartbeat_task", None)
+    if isinstance(heartbeat, asyncio.Task):
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    HEARTBEAT_PATH.unlink(missing_ok=True)
 
     await close_container()
     ctx.clear()
@@ -397,14 +423,11 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
             PrepaidBalanceDecision,
             PrepaidBalancePolicyService,
         )
-        from cloud_platform.modules.notifications.domain import (
-            LowBalanceNotifier,
-            TelegramLowBalanceNotifier,
-        )
+        from cloud_platform.modules.notifications.customer import LowBalanceOutboxNotifier
+        from cloud_platform.modules.notifications.domain import LowBalanceNotifier
         from cloud_platform.modules.notifications.repository import (
             SqlAlchemyLowBalanceNotificationLogRepository,
         )
-        from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
 
         container = create_container()
         try:
@@ -422,57 +445,34 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
             )
             decisions = await policy.evaluate()
             errors: list[Exception] = []
-            token = _telegram_bot_token()
-            bot = None
-            if token is not None:
-                from aiogram import Bot
-
-                bot = Bot(token=token)
-            notices = (
-                LowBalanceNotifier(
-                    TelegramLowBalanceNotifier(bot, SqlAlchemyUserRepository(SessionFactory)),
-                    SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
-                )
-                if bot is not None
-                else None
+            notices = LowBalanceNotifier(
+                LowBalanceOutboxNotifier(container.business_log_repository()),
+                SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
             )
-            try:
-                for server_id, decision in decisions.decisions.items():
-                    server = await container.server_repository().get(server_id)
-                    if server is None:
-                        continue
-                    wallet = await container.wallet_repository().get(server.user_id)
-                    if wallet is None or wallet.currency != "IRT":
-                        continue
-                    episode = server.prepaid_zero_since
-                    if (
-                        decision
-                        not in (
-                            PrepaidBalanceDecision.STOP,
-                            PrepaidBalanceDecision.DELETE,
-                        )
-                        or episode is None
-                    ):
-                        continue
-                    if notices is None:
-                        logger.error(
-                            "prepaid balance notice unavailable: Telegram bot is unconfigured"
-                        )
-                        continue
-                    try:
-                        await notices.notify(
-                            server.user_id, server_id, decision, wallet.balance, "IRT", episode
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "prepaid Telegram balance notice failed for %s (%s)",
-                            server_id,
-                            type(exc).__name__,
-                        )
-                        errors.append(RuntimeError(f"prepaid notice failed ({type(exc).__name__})"))
-            finally:
-                if bot is not None:
-                    await bot.session.close()
+            for server_id, decision in decisions.decisions.items():
+                server = await container.server_repository().get(server_id)
+                if server is None:
+                    continue
+                wallet = await container.wallet_repository().get(server.user_id)
+                if wallet is None or wallet.currency != "IRT":
+                    continue
+                episode = server.prepaid_zero_since
+                if (
+                    decision not in (PrepaidBalanceDecision.STOP, PrepaidBalanceDecision.DELETE)
+                    or episode is None
+                ):
+                    continue
+                try:
+                    await notices.notify(
+                        server.user_id, server_id, decision, wallet.balance, "IRT", episode
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "prepaid balance notice enqueue failed for %s (%s)",
+                        server_id,
+                        type(exc).__name__,
+                    )
+                    errors.append(RuntimeError(f"prepaid notice failed ({type(exc).__name__})"))
             lifecycle = container.prepaid_provider_lifecycle_service()
             for server_id in renewal.operator_suspend_server_ids:
                 try:
@@ -536,38 +536,35 @@ async def reconcile_prepaid_hourly(ctx: dict[str, object]) -> None:
 async def warn_hourly_runway(ctx: dict[str, object]) -> None:
     """Independent notification job: Telegram delays must not delay power-off."""
     del ctx
-    from aiogram import Bot
 
     from cloud_platform.core.config import get_settings
     from cloud_platform.core.container import create_container
     from cloud_platform.db.session import SessionFactory
     from cloud_platform.modules.billing.repository import PostgresAdvisoryAccrualLock
-    from cloud_platform.modules.notifications.domain import TelegramLowBalanceNotifier
+    from cloud_platform.modules.notifications.customer import LowBalanceOutboxNotifier
     from cloud_platform.modules.notifications.hourly import HourlyRunwayWarningService
     from cloud_platform.modules.notifications.repository import (
         SqlAlchemyLowBalanceNotificationLogRepository,
     )
-    from cloud_platform.modules.users.repository import SqlAlchemyUserRepository
 
-    settings, token = get_settings(), _telegram_bot_token()
-    if token is None or not (
+    settings = get_settings()
+    if not (
         settings.fx_enabled
         and settings.fx_domestic_enabled
         and settings.fx_allow_usdt_proxy_for_settlement
     ):
         return
-    container, bot = create_container(), Bot(token=token)
+    container = create_container()
     try:
         # Only repositories and the FX resolver are needed, not provider access.
         await HourlyRunwayWarningService(
             servers=container.server_repository(),
             billing=container.prepaid_hourly_billing_service(),
-            notifier=TelegramLowBalanceNotifier(bot, SqlAlchemyUserRepository(SessionFactory)),
+            notifier=LowBalanceOutboxNotifier(container.business_log_repository()),
             log=SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
             lock=PostgresAdvisoryAccrualLock(SessionFactory, key=777_072),
         ).run()
     finally:
-        await bot.session.close()
         await container.close()
 
 
@@ -583,6 +580,7 @@ async def evaluate_low_balance(ctx: dict[str, object]) -> None:
         from uuid import UUID
 
         from cloud_platform.core.config import get_settings
+        from cloud_platform.core.container import get_container
         from cloud_platform.db.session import SessionFactory
         from cloud_platform.modules.audit.repository import SqlAlchemyAuditRepository
         from cloud_platform.modules.billing.service import (
@@ -591,10 +589,8 @@ async def evaluate_low_balance(ctx: dict[str, object]) -> None:
             LowBalancePolicyService,
         )
         from cloud_platform.modules.compute.repository import SqlAlchemyServerRepository
-        from cloud_platform.modules.notifications.domain import (
-            LowBalanceNotifier,
-            _LoggingLowBalanceNotifier,
-        )
+        from cloud_platform.modules.notifications.customer import LowBalanceOutboxNotifier
+        from cloud_platform.modules.notifications.domain import LowBalanceNotifier
         from cloud_platform.modules.notifications.repository import (
             SqlAlchemyLowBalanceNotificationLogRepository,
         )
@@ -603,7 +599,7 @@ async def evaluate_low_balance(ctx: dict[str, object]) -> None:
         settings = get_settings()
         wallet_repository = SqlAlchemyWalletRepository(SessionFactory)
         low_balance_notifier = LowBalanceNotifier(
-            notifier=_LoggingLowBalanceNotifier(),
+            notifier=LowBalanceOutboxNotifier((await get_container()).business_log_repository()),
             log_repo=SqlAlchemyLowBalanceNotificationLogRepository(SessionFactory),
         )
 
@@ -1594,7 +1590,10 @@ async def reconcile_nowpayments_payments(ctx: dict[str, object]) -> None:
         from cloud_platform.providers.nowpayments.client import NowPaymentsGateway
 
         settings = get_settings()
-        if not settings.nowpayments_api_key or settings.nowpayments_api_key == "CHANGE_ME":
+        if (
+            not settings.nowpayments_api_key
+            or settings.nowpayments_api_key == "CHANGE_ME"  # pragma: allowlist secret
+        ):
             return
         container = create_container()
         gateway = None
@@ -1724,6 +1723,7 @@ def _cron_jobs() -> list[Any]:
         cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
         cron(reconcile_provider_resources, minute=every_three_minutes, run_at_startup=True),
+        cron(reconcile_server_management, minute=every_minute, run_at_startup=True),
         cron(process_deletes, minute=every_two_minutes, run_at_startup=True),
         cron(reconcile_deletes, minute=every_three_minutes, run_at_startup=True),
         cron(accrue_usage, minute=every_minute, run_at_startup=True),
@@ -1747,6 +1747,7 @@ class WorkerSettings:
 
     functions: ClassVar[list[Any]] = [
         reconcile_provider_resources,
+        reconcile_server_management,
         accrue_usage,
         reconcile_prepaid_hourly,
         warn_hourly_runway,
@@ -1787,6 +1788,7 @@ class WorkerSettings:
 # ``await redis.enqueue_job("accrue_usage", _queue_name="billing")`` etc.
 PROVISIONING_FUNCTIONS: list[Any] = [
     reconcile_provider_resources,
+    reconcile_server_management,
     process_deletes,
     reconcile_deletes,
     catalog_auto_sync,
@@ -1834,6 +1836,7 @@ def _role_cron_jobs(role: str) -> list[Any]:
             cron(process_cloud_creates, minute=every_two_minutes, run_at_startup=True),
             cron(reconcile_cloud_creates, minute=every_three_minutes, run_at_startup=True),
             cron(reconcile_provider_resources, minute=every_three_minutes, run_at_startup=True),
+            cron(reconcile_server_management, minute=every_minute, run_at_startup=True),
             cron(process_leaseweb_orders, minute=every_two_minutes, run_at_startup=True),
             cron(reconcile_leaseweb_orders, minute=every_three_minutes, run_at_startup=True),
             cron(process_deletes, minute=every_two_minutes, run_at_startup=True),

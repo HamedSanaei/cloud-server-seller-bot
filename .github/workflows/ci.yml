@@ -2,8 +2,10 @@ name: ci
 
 on:
   pull_request:
+    branches: [main, staging]
   push:
     branches: [main]
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -236,13 +238,15 @@ jobs:
       - name: Validate GitHub workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - uses: docker/setup-buildx-action@v4
-      - name: Validate shell and production compose
+      - name: Validate shell and shared production compose
         env:
           PLATFORM_IMAGE: ghcr.io/example/platform:0000000000000000000000000000000000000000
           POSTGRES_PASSWORD: ci-validation-only # pragma: allowlist secret
         run: |
-          bash -n scripts/deploy-production.sh docker-entrypoint.sh
-          docker compose -f deploy/production/docker-compose.yml config --quiet
+          for script in scripts/deploy-production.sh docker-entrypoint.sh; do
+            bash -n "$script"
+          done
+          PLATFORM_NETWORK=cloud-platform-production-bridge docker compose -f deploy/production/docker-compose.yml config --quiet
       - uses: docker/build-push-action@v7
         with:
           context: .

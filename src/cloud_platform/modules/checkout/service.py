@@ -26,7 +26,7 @@ import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -54,7 +54,8 @@ from cloud_platform.modules.funding.domain import (
     ProviderCostSnapshot,
 )
 from cloud_platform.modules.funding.service import FundingService
-from cloud_platform.modules.fx.domain import minor_to_major
+from cloud_platform.modules.fx.domain import ConversionSnapshot, FxError, FxPurpose, minor_to_major
+from cloud_platform.modules.fx.service import FxResolver
 from cloud_platform.modules.markets.domain import (
     FAMILY_BILLINGS,
     FAMILY_ORDER,
@@ -223,6 +224,7 @@ class MonthlyCheckoutService:
         event_market_lookup: Callable[[str], str] | None = None,
         fulfillment_routes: Any | None = None,
         funding_service: FundingService | None = None,
+        fx_resolver: FxResolver | None = None,
     ) -> None:
         self._servers = server_repo
         self._offers = offers_repo
@@ -242,6 +244,7 @@ class MonthlyCheckoutService:
         # and no account is pinned.
         self._routes = fulfillment_routes
         self._funding = funding_service
+        self._fx = fx_resolver
 
     async def _fulfillment_account(
         self,
@@ -476,7 +479,9 @@ class MonthlyCheckoutService:
         )
         cost_snapshot = monthly_provider_cost(offer) if source is FundingSource.OPERATOR else None
         grant_key = order_operation_key(server_id) if source is FundingSource.OPERATOR else None
-        hold: Hold | None = None
+        selling_minor, selling_currency = offer.selling_price_minor, offer.selling_currency
+        settlement_fx: ConversionSnapshot | None = None
+        hold = None
         if source is FundingSource.OPERATOR:
             assert self._funding is not None and cost_snapshot is not None and grant_key is not None
             await self._funding.reserve(
@@ -494,10 +499,27 @@ class MonthlyCheckoutService:
             wallet = await self._wallets.get(user.id)
             if wallet is None or wallet.id is None:
                 raise NoWalletError(f"user {user.id} has no wallet")
+            if wallet.currency != selling_currency:
+                if wallet.currency != "IRT" or self._fx is None:
+                    raise OfferUnavailableError("customer settlement currency or FX is unavailable")
+                try:
+                    settlement_fx = await self._fx.snapshot(
+                        selling_minor, selling_currency, "IRT", FxPurpose.CHARGE
+                    )
+                except FxError:
+                    raise OfferUnavailableError("customer settlement FX is unavailable") from None
+                if (
+                    settlement_fx.stale
+                    or settlement_fx.expires_at is None
+                    or settlement_fx.expires_at <= datetime.now(UTC)
+                ):
+                    raise OfferUnavailableError("customer settlement FX has expired")
+                selling_minor = settlement_fx.target_amount_minor
+                selling_currency = "IRT"
             hold = await self._holds.create_hold(
                 wallet.id,
-                offer.selling_price_minor,
-                offer.selling_currency,
+                selling_minor,
+                selling_currency,
                 hold_key(idempotency_key),
             )
 
@@ -508,6 +530,11 @@ class MonthlyCheckoutService:
             self._routes, "supports_capacity_failover", lambda key: False
         )(offer.provider_key):
             catalog_provenance = {"provider_account_id": offer.provider_account_id}
+        if settlement_fx is not None:
+            catalog_provenance = {
+                **(catalog_provenance or {}),
+                "settlement_fx": settlement_fx.to_dict(),
+            }
         server = CloudServer(
             id=server_id,
             user_id=user.id,
@@ -564,19 +591,15 @@ class MonthlyCheckoutService:
                 billing_cycle=get_settings().leaseweb_billing_cycle,
                 provider_cost_minor=offer.provider_cost_minor,
                 provider_cost_currency=offer.provider_cost_currency,
-                selling_price_minor=offer.selling_price_minor,
-                selling_currency=offer.selling_currency,
+                selling_price_minor=selling_minor,
+                selling_currency=selling_currency,
                 credential_account_id=credential_account_id,
-                **(
-                    {
-                        "funding_source": source,
-                        "funding_operator_id": user.id,
-                        "funding_grant_operation_key": grant_key,
-                        "provider_cost_snapshot": cost_snapshot.to_dict(),
-                    }
-                    if cost_snapshot is not None
-                    else {}
-                ),
+                funding_source=source,
+                funding_operator_id=user.id if cost_snapshot is not None else None,
+                funding_grant_operation_key=grant_key,
+                provider_cost_snapshot=cost_snapshot.to_dict()
+                if cost_snapshot is not None
+                else None,
             )
         except Exception:
             await self._fail_intent(created, hold)
@@ -603,8 +626,8 @@ class MonthlyCheckoutService:
             reason=f"monthly order {offer.ref}",
             metadata={
                 "offer": offer.ref,
-                "selling_price_minor": str(offer.selling_price_minor),
-                "currency": offer.selling_currency,
+                "selling_price_minor": str(selling_minor),
+                "currency": selling_currency,
                 "provider_cost_minor": str(offer.provider_cost_minor),
                 "os": os_name,
                 "control_panel": panel_name or "",
@@ -619,8 +642,8 @@ class MonthlyCheckoutService:
             order.id,
             created.id,
             offer.ref,
-            offer.selling_price_minor,
-            offer.selling_currency,
+            selling_minor,
+            selling_currency,
             os_name,
             hold.id if hold is not None else None,
         )
@@ -639,8 +662,8 @@ class MonthlyCheckoutService:
                 plan_name=offer.name,
                 product_id=offer.product_id,
                 os_name=os_name,
-                selling_price_minor=offer.selling_price_minor,
-                currency=offer.selling_currency,
+                selling_price_minor=selling_minor,
+                currency=selling_currency,
             ),
         )
         return MonthlyCheckoutResult(
@@ -717,6 +740,8 @@ class OfferConfirmView:
     #: Free control panel chosen during configuration (None = no panel).
     panel_name: str | None = None
     funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
+    wallet_currency: str = "IRT"
+    settlement_minor: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -957,10 +982,8 @@ class PanelOptionView:
 
 @dataclass(frozen=True, slots=True)
 class CloudConfirmView:
-    # Hourly creation confirmation: exact hourly price, monthly estimate,
-    # wallet balance and the create action. Billed per quantum by accrual;
-    # nothing is charged upfront, so there is no sufficiency gate here —
-    # non-payment is handled by the existing low-balance suspension.
+    # Customer holds and balance checks use canonical toman settlement, not
+    # the foreign catalog amount. Operator funding remains a separate authority.
     offer: OfferCatalogView
     image_label: str
     image_id: str
@@ -973,6 +996,8 @@ class CloudConfirmView:
     back_callback: str
     cancel_callback: str
     funding_source: FundingSource = FundingSource.CUSTOMER_WALLET
+    wallet_currency: str = "IRT"
+    settlement_minor: int | None = None
 
 
 class OfferCatalogViewService:
@@ -1006,6 +1031,7 @@ class OfferCatalogViewService:
         cloud_providers: Mapping[str, Any] | None = None,
         cloud_resolver: Any | None = None,
         funding_service: FundingService | None = None,
+        fx_resolver: FxResolver | None = None,
     ) -> None:
         if not signing_key:
             raise ValueError("signing_key must not be empty")
@@ -1022,6 +1048,26 @@ class OfferCatalogViewService:
         # single-adapter fallback. No provider-name branching here.
         self._cloud_resolver = cloud_resolver
         self._funding = funding_service
+        self._fx = fx_resolver
+
+    async def toman_price(
+        self, offer: SellableOffer, *, purpose: FxPurpose = FxPurpose.DISPLAY
+    ) -> int:
+        if offer.selling_currency == "IRT":
+            return offer.selling_price_minor
+        if self._fx is None:
+            raise OfferUnavailableError("toman price is unavailable")
+        try:
+            quote = await self._fx.snapshot(
+                offer.selling_price_minor, offer.selling_currency, "IRT", purpose
+            )
+        except FxError:
+            raise OfferUnavailableError("toman price is unavailable") from None
+        if purpose is FxPurpose.CHARGE and (
+            quote.stale or quote.expires_at is None or quote.expires_at <= datetime.now(UTC)
+        ):
+            raise OfferUnavailableError("toman price has expired")
+        return quote.target_amount_minor
 
     # -- storefront: markets / providers / locations -----------------------
 
@@ -2218,9 +2264,8 @@ class OfferCatalogViewService:
     async def cloud_confirmation(
         self, *, user_id: UUID, offer_id: UUID, image_index: int
     ) -> CloudConfirmView:
-        # Hourly creation confirmation: exact hourly price, monthly estimate,
-        # wallet balance and the explicit delete-to-stop-billing warning
-        # (rendered by the UI). Nothing is charged upfront.
+        # Creation reserves the first prepaid quantum at the canonical FX rate;
+        # later quanta use the same wallet authority and stop/delete policy.
         offer = await self._offers.get(offer_id)
         if offer is None or not offer.sellable:
             raise OfferUnavailableError(f"offer {offer_id} is not sellable")
@@ -2232,11 +2277,21 @@ class OfferCatalogViewService:
             if self._funding is not None
             else FundingSource.CUSTOMER_WALLET
         )
+        wallet = None
         if source is FundingSource.OPERATOR:
             balance = None
         else:
             wallet = await self._wallets.get(user_id)
             balance = wallet.balance if wallet is not None else 0
+        settlement_minor = (
+            await self.toman_price(offer, purpose=FxPurpose.CHARGE)
+            if (
+                source is FundingSource.CUSTOMER_WALLET
+                and wallet is not None
+                and wallet.currency == "IRT"
+            )
+            else None
+        )
         names = await self._location_metadata(offer.provider_key)
         return CloudConfirmView(
             offer=self._view(offer),
@@ -2251,6 +2306,10 @@ class OfferCatalogViewService:
             back_callback=self._store_nav_callback("cloud_images", self._offer_ref(offer.id)),
             cancel_callback=self._store_nav_callback("market"),
             funding_source=source,
+            wallet_currency=wallet.currency
+            if source is FundingSource.CUSTOMER_WALLET and wallet
+            else "IRT",
+            settlement_minor=settlement_minor,
         )
 
     async def _card_offers(
@@ -2477,6 +2536,11 @@ class OfferCatalogViewService:
             await self._wallets.get(user_id) if source is FundingSource.CUSTOMER_WALLET else None
         )
         balance = wallet.balance if wallet is not None else 0
+        settlement_minor = (
+            await self.toman_price(offer, purpose=FxPurpose.CHARGE)
+            if (wallet is not None and wallet.currency == "IRT")
+            else None
+        )
 
         back_callback = self._store_nav_callback("panel", self._offer_ref(offer_id), str(os_index))
         cancel_callback = self._store_nav_callback("market")
@@ -2485,11 +2549,15 @@ class OfferCatalogViewService:
             os_name=os_name,
             balance_minor=balance,
             currency=offer.selling_currency,
-            sufficient=source is FundingSource.OPERATOR or balance >= offer.selling_price_minor,
+            sufficient=source is FundingSource.OPERATOR
+            or balance
+            >= (settlement_minor if settlement_minor is not None else offer.selling_price_minor),
             back_callback=back_callback,
             cancel_callback=cancel_callback,
             panel_name=panel_name,
             funding_source=source,
+            wallet_currency=wallet.currency if wallet else "IRT",
+            settlement_minor=settlement_minor,
         )
 
     async def os_screen(

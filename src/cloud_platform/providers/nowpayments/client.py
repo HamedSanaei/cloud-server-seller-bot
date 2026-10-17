@@ -36,7 +36,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import urlsplit
 
 import httpx
@@ -136,7 +136,7 @@ def _reject_constant(token: str) -> Any:
     raise ValueError(f"non-finite JSON number {token!r}")
 
 
-def _hosted_invoice_url(value: Any) -> bool:
+def _hosted_invoice_url(value: Any) -> TypeGuard[str]:
     if not isinstance(value, str) or not _https_url(value):
         return False
     try:

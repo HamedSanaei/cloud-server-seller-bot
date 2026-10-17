@@ -41,9 +41,9 @@ from cloud_platform.providers.nowpayments.client import (
     SUPPORTED_CURRENCY,
 )
 
-API_KEY = "np-fixture-api-key-0001"
+API_KEY = "np-fixture-api-key-0001"  # pragma: allowlist secret
 EMAIL = "merchant@nowpayments.test"
-PASSWORD = "np-fixture-secret-0001"
+PASSWORD = "np-fixture-secret-0001"  # pragma: allowlist secret
 CALLBACK = "https://seller.nowpayments.test/payments/ipn"
 MERCHANT_REF = "wallet-nowpayments-attempt-001"
 ORDER_REF = "cloud-server-seller:wallet-nowpayments-attempt-001"
@@ -715,7 +715,7 @@ async def test_get_payment_details_without_credentials_makes_no_http() -> None:
     [
         {"api_key": ""},
         {"api_key": "   "},
-        {"api_key": "changeme-00000000"},
+        {"api_key": "changeme-00000000"},  # pragma: allowlist secret
         {"base_url": "http://api.nowpayments.io/v1"},
         {"base_url": "https://api.nowpayments.io/v1?x=1"},
         {"callback_url": ""},
@@ -833,7 +833,7 @@ async def test_missing_invoice_in_listing_does_not_match_every_cloud_order() -> 
     [
         "https://nowpayments.io.attacker.test/invoice",
         "https://attacker.test/pay",
-        "https://user:pass@nowpayments.io/payment/",
+        "https://user:pass@nowpayments.io/payment/",  # pragma: allowlist secret
         "https://nowpayments.io/payment/#fragment",
         "https://nowpayments.io:bad/payment/",
     ],
@@ -860,7 +860,7 @@ async def test_password_containing_todo_is_accepted() -> None:
         API_KEY,
         callback_url=CALLBACK,
         auth_email=EMAIL,
-        auth_password="strong-todo-embedded-password",
+        auth_password="strong-todo-embedded-password",  # pragma: allowlist secret
         transport=httpx.MockTransport(lambda request: httpx.Response(500)),
     )
     await gateway.close()

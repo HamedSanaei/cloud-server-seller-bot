@@ -1028,7 +1028,12 @@ class HourlyCloudService:
         ):
             raise HourlyError("first-hour USD/IRT FX binding is missing or inconsistent")
         wallet = await self._wallets.get(server.user_id)
-        if wallet is None or wallet.id != period.wallet_id or wallet.currency != "IRT":
+        if (
+            wallet is None
+            or wallet.id is None
+            or wallet.id != period.wallet_id
+            or wallet.currency != "IRT"
+        ):
             raise HourlyError("first-hour IRT wallet is missing or inconsistent")
         key = f"server-create:{server.idempotency_key}"
         hold = await self._hold_repo.get_by_idempotency(wallet.id, key)
@@ -1073,6 +1078,8 @@ class HourlyCloudService:
         period = await self._prepaid_billing.prepare_first_hour(
             server, wallet.id, server.created_at, snapshot.selling_minor, hold_repo=self._hold_repo
         )
+        if period.irt_minor is None:
+            raise HourlyError("customer first-hour binding has no toman amount")
         key = f"server-create:{server.idempotency_key}"
         previous = await self._hold_repo.get_by_idempotency(wallet.id, key)
         if previous is not None and (

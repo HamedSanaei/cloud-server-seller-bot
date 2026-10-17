@@ -73,7 +73,7 @@ class VpsInfo:
     contract_id: str | None = None
     contract_state: str | None = None
     contract_ends_at: str | None = None
-    contract_term: int | None = None
+    contract_term: int | str | None = None
     billing_frequency: int | None = None
     sla: str | None = None
     control_panel: str | None = None
@@ -156,6 +156,7 @@ class VpsPasswordIssued(VpsActionAccepted):
     """Accepted action with an optional one-time password (none for SSH-key rebuilds)."""
 
     root_password: VpsOneTimePassword | None
+    username: str = "root"
 
 
 @dataclass(frozen=True, slots=True)

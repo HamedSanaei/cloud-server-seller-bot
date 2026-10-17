@@ -13,7 +13,7 @@ from cloud_platform.core.session_store import BotSessionStore
 from cloud_platform.modules.admin_console.auth import authorize
 from cloud_platform.modules.audit.domain import ActorType
 from cloud_platform.modules.compute.domain import CloudServer
-from cloud_platform.modules.operations.domain import OperationStatus, OperationType
+from cloud_platform.modules.operations.domain import Operation, OperationStatus, OperationType
 from cloud_platform.modules.operations.service import (
     DELETE_PRECONDITION_STATES,
     available_power_actions,
@@ -76,7 +76,7 @@ class AdminServerSupportService:
         server = await self._servers.get(server_id)
         if server is None:
             raise ValueError("server unavailable")
-        actions = []
+        actions: list[str] = []
         if server.provider_server_id:
             try:
                 provider = provider_for(
@@ -138,7 +138,7 @@ class AdminServerSupportService:
             raise ValueError("support confirmation expired")
         server_id, action = UUID(record["server_id"]), record["action"]
         key = "admin-support:" + sha256(f"{admin.id}:{nonce}".encode()).hexdigest()
-        existing = await self._ops.get_by_key(key)
+        existing: Operation | None = await self._ops.get_by_key(key)
         if existing is not None and existing.status is not OperationStatus.PENDING:
             return existing.status
         server = await self._servers.get(server_id)
@@ -161,9 +161,13 @@ class AdminServerSupportService:
             operation = existing
         claimed = await self._ops.claim(operation.id)
         if claimed is None:
-            current = await self._ops.get_by_key(key)
-            return current.status if current is not None else OperationStatus.PENDING
+            current: Operation | None = await self._ops.get_by_key(key)
+            if current is None:
+                raise ValueError("persisted support receipt is missing")
+            return current.status
         executor = self._delete if action == "delete" else self._power
         await executor.execute(claimed, actor_type=ActorType.ADMIN, actor_id=admin.id)
         current = await self._ops.get_by_key(key)
+        if current is None:
+            raise ValueError("persisted support receipt is missing")
         return current.status

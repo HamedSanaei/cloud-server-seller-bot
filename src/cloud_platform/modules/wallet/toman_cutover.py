@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Iterable
+from contextlib import AbstractAsyncContextManager
 from hashlib import sha256
+from typing import Any, cast
 from uuid import UUID
 
 from sqlalchemy import or_, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db import base as db
 from cloud_platform.modules.users.superadmin_repository import authorize_superadmin_transaction
 from cloud_platform.modules.wallet.domain import WalletCurrencyMigrationError
 
 
-def invoice_facts(invoice) -> dict:
+def invoice_facts(invoice: Any) -> dict[str, Any]:
     """Retain the exact original financial identity, not just its current status."""
     names = (
         "gateway_key",
@@ -32,10 +36,13 @@ def invoice_facts(invoice) -> dict:
         "fx_proxy_asset",
     )
     # Datetimes/Decimal are serialized as exact text, never float.
-    return json.loads(json.dumps({name: getattr(invoice, name) for name in names}, default=str))
+    return cast(
+        dict[str, Any],
+        json.loads(json.dumps({name: getattr(invoice, name) for name in names}, default=str)),
+    )
 
 
-def invoice_fingerprint(invoice) -> str:
+def invoice_fingerprint(invoice: Any) -> str:
     return sha256(json.dumps(invoice_facts(invoice), sort_keys=True).encode()).hexdigest()
 
 
@@ -48,7 +55,12 @@ class SqlAlchemyEmptyTomanCutover:
     distinguishes an owner's cancellation from a provider-reported failure.
     """
 
-    def __init__(self, session_factory, *, configured_ids):
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+        *,
+        configured_ids: Iterable[int],
+    ) -> None:
         self._sessions, self._ids = session_factory, tuple(configured_ids)
 
     async def apply(

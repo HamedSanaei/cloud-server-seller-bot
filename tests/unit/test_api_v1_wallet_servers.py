@@ -39,6 +39,9 @@ class FakeContainer:
     def power_command_service(self) -> MagicMock:
         return self.power
 
+    def server_repository(self):
+        return type("Servers", (), {"get": AsyncMock(return_value=None)})()
+
 
 @pytest.fixture
 def fake() -> FakeContainer:

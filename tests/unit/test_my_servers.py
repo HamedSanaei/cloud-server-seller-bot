@@ -21,6 +21,7 @@ from cloud_platform.modules.compute.service import (
     MAX_PAGE_SIZE,
     MyServersService,
 )
+from cloud_platform.modules.funding.domain import FundingSource
 
 USER_ID = uuid4()
 OTHER_USER_ID = uuid4()
@@ -176,6 +177,9 @@ class TestRepositoryPaged:
         row.contained_from = None
         row.idempotency_key = None
         row.created_at = NAIVE_TS  # naive UTC, as stored
+        row.funding_source = FundingSource.CUSTOMER_WALLET.value
+        row.funding_operator_id = None
+        row.operator_funding_key = None
         return row
 
     async def test_count_then_page_and_aware_timestamps(self) -> None:

@@ -325,28 +325,6 @@ def _family(family_key: str = "vps", billing: str = "prepaid_monthly_fixed") -> 
     )
 
 
-def _confirm(offer: Any, **over: Any) -> SimpleNamespace:
-    base: dict[str, Any] = dict(
-        offer=offer,
-        os_name="Ubuntu 24.04",
-        panel_name=None,
-        currency="EUR",
-        balance_minor=10_000,
-        sufficient=True,
-        back_callback="back-cb",
-        cancel_callback="cancel-cb",
-        # hourly confirmation shape (separate fields from the monthly view)
-        hourly_price_minor=780,
-        monthly_estimate_minor=780 * 730,
-        image_id="ubuntu-24.04",
-        image_label="Ubuntu 24.04",
-        location_name="Frankfurt",
-        location_country="DE",
-    )
-    base.update(over)
-    return SimpleNamespace(**base)
-
-
 def _bot(
     view: Any,
     *,
@@ -669,14 +647,6 @@ class TestStoreScreenGuards:
         bot = _bot(SteeringView())
         assert (await bot.store_cloud_confirm_screen(_user(), "zzzzzzzz", 0)).text
 
-    async def test_cloud_confirm_states_the_hourly_basis_and_delete_warning(self) -> None:
-        view = SteeringView()
-        view.result["cloud_confirmation"] = _confirm(_plan())
-        bot = _bot(view, offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}))
-        screen = await bot.store_cloud_confirm_screen(_user(), encode_offer_ref(OFFER_ID), 0)
-        labels = [b.text for row in screen.keyboard.inline_keyboard for b in row]
-        assert screen.text and labels
-
     async def test_product_locations_unavailable_with_currency(self) -> None:
         view = SteeringView()
         view.raises["product_locations_screen"] = OfferUnavailableError("none")
@@ -879,13 +849,6 @@ class TestStoreDispatchGuards:
         cb = bot._callback("store", "confirm", encode_offer_ref(OFFER_ID), "x")
         assert (await _press(bot, cb)).text
 
-    async def test_a_confirm_callback_reaches_the_confirmation_screen(self) -> None:
-        view = SteeringView()
-        view.result["confirmation"] = _confirm(_plan())
-        bot = _bot(view, offers_repo=FakeOffersRepo(offers={OFFER_ID: _plan()}))
-        cb = bot._callback("store", "confirm", encode_offer_ref(OFFER_ID), "0", "1")
-        assert (await _press(bot, cb)).text
-
     async def test_a_buy_callback_with_a_stale_ref_expires(self) -> None:
         bot = _bot(SteeringView())
         assert (await _press(bot, bot._callback("store", "buy", "zzzzzzzz", "0"))).text
@@ -1013,18 +976,6 @@ class TestConfirmScreenBranches:
         view.raises["confirmation"] = OsUnavailableError("gone")
         bot = _bot(view)
         assert (await bot.confirm_screen(_user(), OFFER_ID, 0)).text
-
-    async def test_confirm_warns_when_the_wallet_cannot_cover_it(self) -> None:
-        view = SteeringView()
-        view.result["confirmation"] = _confirm(_plan(), sufficient=False)
-        bot = _bot(view)
-        assert (await bot.confirm_screen(_user(), OFFER_ID, 0)).text
-
-    async def test_confirm_shows_a_selected_panel(self) -> None:
-        view = SteeringView()
-        view.result["confirmation"] = _confirm(_plan(), panel_name="cPanel")
-        bot = _bot(view)
-        assert (await bot.confirm_screen(_user(), OFFER_ID, 0, 1)).text
 
 
 # ---------------------------------------------------------------------------

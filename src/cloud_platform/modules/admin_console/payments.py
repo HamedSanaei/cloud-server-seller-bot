@@ -86,6 +86,8 @@ class AdminPaymentService:
 
     async def _authorize(self, actor: User) -> User:
         claimed = require_superadmin(actor, self._ids)
+        if claimed.id is None:
+            raise PermissionDeniedError("persisted administrator required")
         fresh = require_superadmin(await self._users.get(claimed.id), self._ids)
         if fresh.id != claimed.id or fresh.telegram_user_id != claimed.telegram_user_id:
             raise PermissionDeniedError("persisted administrator identity changed")
@@ -137,7 +139,7 @@ class AdminPaymentService:
     async def _load(self, session_id: UUID) -> PaymentSession:
         if not isinstance(session_id, UUID):
             raise ValueError("payment session UUID required")
-        session = await self._payments.get(session_id)
+        session: PaymentSession | None = await self._payments.get(session_id)
         if session is None:
             raise LookupError("payment invoice not found")
         return session

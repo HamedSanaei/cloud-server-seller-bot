@@ -182,9 +182,12 @@ class SqlStore:
         with Session(self.engine) as db:
             return list(db.execute(select(LedgerRow)).scalars())
 
-    def business_events(self):
+    def business_events(self, event_type=None):
+        statement = select(BusinessLogRow)
+        if event_type is not None:
+            statement = statement.where(BusinessLogRow.event_type == event_type)
         with Session(self.engine) as db:
-            return list(db.execute(select(BusinessLogRow)).scalars())
+            return list(db.execute(statement).scalars())
 
 
 @pytest.fixture
@@ -575,7 +578,7 @@ async def test_deposit_balance_ledger_and_outbox_roll_back_and_retry_together(sq
         original.user_id, 10, "outbox-deposit", business_event_factory=event_factory
     )
     assert applied and updated.balance == 17
-    (event,) = sql_store.business_events()
+    (event,) = sql_store.business_events("recharge.succeeded")
     assert event.event_key == f"recharge.succeeded:{original.id}"
     assert event.payload["balance_after"] == "17 تومان"
     assert len(sql_store.ledger()) == 1
@@ -584,7 +587,9 @@ async def test_deposit_balance_ledger_and_outbox_roll_back_and_retry_together(sq
     )
     assert not applied and replayed.balance == 17
     assert factories == [17, 17]  # A replay never constructs another event.
-    assert len(sql_store.business_events()) == len(sql_store.ledger()) == 1
+    assert len(sql_store.business_events("recharge.succeeded")) == len(sql_store.ledger()) == 1
+    (notice,) = sql_store.business_events("customer.notice")
+    assert notice.payload["user_id"] == str(original.user_id)
 
 
 async def test_event_factory_failure_cannot_commit_money_without_its_event(sql_store):
@@ -637,7 +642,8 @@ async def test_concurrent_callbacks_share_one_committed_deposit_and_event(sql_st
         )
     assert all(outcome.session.credited_at is not None for outcome in outcomes)
     assert (await read_wallet(original.user_id)).balance == 10
-    assert len(sql_store.ledger()) == len(sql_store.business_events()) == 1
+    assert len(sql_store.ledger()) == len(sql_store.business_events("recharge.succeeded")) == 1
+    assert len(sql_store.business_events("customer.notice")) == 1
     delivery_sink.emit.assert_not_awaited()
 
 
@@ -663,7 +669,8 @@ async def test_credit_marker_failure_cannot_lose_or_duplicate_committed_outbox(s
         await service.process_callback(
             gateway_key="zarinpal", external_id="authority-one", status="succeeded"
         )
-    assert len(sql_store.ledger()) == len(sql_store.business_events()) == 1
+    assert len(sql_store.ledger()) == len(sql_store.business_events("recharge.succeeded")) == 1
+    assert len(sql_store.business_events("customer.notice")) == 1
     assert (await sql_store.wallets.get(original.user_id)).balance == 10
     assert (await sql_store.payments.get(original.id)).credited_at is None
     sql_store.payments.save = real_save
@@ -671,7 +678,8 @@ async def test_credit_marker_failure_cannot_lose_or_duplicate_committed_outbox(s
         payments_repo=sql_store.payments, webhook_service=service, gateways={}
     ).check_status(SimpleNamespace(id=original.user_id), original.id)
     assert recovered.credited_at is not None
-    assert len(sql_store.ledger()) == len(sql_store.business_events()) == 1
+    assert len(sql_store.ledger()) == len(sql_store.business_events("recharge.succeeded")) == 1
+    assert len(sql_store.business_events("customer.notice")) == 1
     assert (await sql_store.wallets.get(original.user_id)).balance == 10
     delivery_sink.emit.assert_not_awaited()
 
@@ -717,13 +725,16 @@ async def test_atomic_recharge_outbox_respects_sink_category_policy(
     assert outcome.session.credited_at is not None
     assert (await sql_store.wallets.get(original.user_id)).balance == 10
     assert len(sql_store.ledger()) == 1
-    assert len(sql_store.business_events()) == expected_events
+    assert len(sql_store.business_events("recharge.succeeded")) == expected_events
+    (notice,) = sql_store.business_events("customer.notice")
+    assert notice.payload["user_id"] == str(original.user_id)
     separate_enqueue.assert_not_awaited()
     replay = await service.process_callback(
         gateway_key="zarinpal", external_id="authority-one", status="succeeded"
     )
     assert replay.action is WebhookAction.DUPLICATE_IGNORED
     assert len(sql_store.ledger()) == 1
-    assert len(sql_store.business_events()) == expected_events
+    assert len(sql_store.business_events("recharge.succeeded")) == expected_events
+    assert len(sql_store.business_events("customer.notice")) == 1
     if sink_kind == "recording":
         sink.emit.assert_not_awaited()

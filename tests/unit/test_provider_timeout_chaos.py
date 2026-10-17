@@ -613,6 +613,8 @@ class _ChargeHarness:
         reference_type: str = "",
         reference_id: str = "",
         description: str = "",
+        expected_currency: str | None = None,
+        expected_customer_server_id: Any = None,
     ) -> Any:
         from decimal import Decimal
         from uuid import uuid4 as _uuid4
@@ -620,6 +622,8 @@ class _ChargeHarness:
         from cloud_platform.core.money import Money
         from cloud_platform.modules.wallet.domain import LedgerEntry
 
+        if expected_currency is not None and self.wallet.currency != expected_currency:
+            raise ValueError("wallet currency changed")
         new_key = str(key).strip()
         if new_key in self.entries:
             return self.wallet, False

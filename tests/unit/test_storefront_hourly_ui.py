@@ -16,6 +16,7 @@ import pytest
 from cloud_platform.bot.sessions import CheckoutSessions
 from cloud_platform.core.i18n import Translator
 from cloud_platform.core.session_store import InMemoryBotSessionStore, SessionStoreUnavailable
+from cloud_platform.modules.funding.domain import FundingSource
 from cloud_platform.modules.hourly.service import (
     HourlyNotAvailableError,
     HourlyPoolCapacityError,
@@ -66,6 +67,9 @@ class _ConfirmView:
         self.hourly_price_minor = offer.selling_price_minor
         self.monthly_estimate_minor = offer.selling_price_minor * 730
         self.currency = offer.selling_currency
+        self.wallet_currency = "IRT"
+        self.settlement_minor = None
+        self.funding_source = FundingSource.CUSTOMER_WALLET
         self.location_name = "Frankfurt"
         self.location_country = "DE"
         self.back_callback = "PENDING-SIGNED-BY-UI"

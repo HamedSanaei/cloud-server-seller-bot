@@ -26,6 +26,7 @@ from cloud_platform.providers.leaseweb.vps.client import LeaseWebVpsApi
 from cloud_platform.providers.leaseweb.vps.models import (
     CreateNotificationSettingRequest,
     CreateSnapshotRequest,
+    CredentialType,
     NotificationSetting,
     NullRouteIpRequest,
     ReinstallRequest,
@@ -45,6 +46,8 @@ from cloud_platform.providers.vps_ports import (
     VpsIsoRecord,
     VpsMonitoringRecord,
     VpsNotificationRecord,
+    VpsOneTimePassword,
+    VpsPasswordIssued,
     VpsReinstallImage,
     VpsSnapshotRecord,
 )
@@ -288,6 +291,24 @@ class LeaseWebVpsManagementMixin:
         """Credential REFERENCES (type + username) — never a password."""
         rows = await self._vps_api.list_credentials(provider_server_id)
         return [{"type": str(row.type), "username": row.username} for row in rows]
+
+    async def get_vps_root_password(self, provider_server_id: str) -> VpsPasswordIssued | None:
+        """Read the current OS credential privately; no reset and no logging."""
+        rows = await self._vps_api.list_credentials_by_type(
+            provider_server_id, CredentialType.OPERATING_SYSTEM
+        )
+        root = next((row for row in rows if row.username in {"root", "Administrator"}), None)
+        if root is None:
+            return None
+        credential = await self._vps_api.get_credential(
+            provider_server_id, CredentialType.OPERATING_SYSTEM, root.username
+        )
+        return VpsPasswordIssued(
+            provider_server_id,
+            "credential_read",
+            VpsOneTimePassword(credential.reveal_password()),
+            username=credential.username,
+        )
 
     async def reset_vps_password(self, provider_server_id: str) -> VpsActionAccepted:
         """DESTRUCTIVE: resets the password; the new value is read separately."""

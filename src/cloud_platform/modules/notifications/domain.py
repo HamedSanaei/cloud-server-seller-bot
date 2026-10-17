@@ -24,17 +24,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 from uuid import UUID
 
 from cloud_platform.modules.billing.service import LowBalanceDecision, PrepaidBalanceDecision
 from cloud_platform.modules.compute.domain import CloudServer
 from cloud_platform.modules.fx.formatting import format_minor
-
-if TYPE_CHECKING:
-    from aiogram import Bot
-
-    from cloud_platform.modules.users.domain import UserRepository
 
 logger = logging.getLogger(__name__)
 
@@ -217,72 +212,45 @@ class LowBalanceNotifierPort(Protocol):
         ...
 
 
-class _LoggingLowBalanceNotifier:
-    """Default notifier: structured log line (the bot integration replaces it)."""
-
-    async def send(self, event: LowBalanceNotificationEvent) -> None:
-        logger.warning("low-balance %s: %s", event.kind.value, event.render())
-
-
-class TelegramNotificationDeliveryError(RuntimeError):
-    """A prepaid notice could not be sent to the owner's Telegram chat."""
-
-
-class TelegramLowBalanceNotifier:
-    """Send prepaid balance notices to the owning user's Telegram identity."""
-
-    def __init__(self, bot: Bot, users: UserRepository) -> None:
-        self._bot = bot
-        self._users = users
-
-    async def send(self, event: LowBalanceNotificationEvent) -> None:
-        user = await self._users.get(event.user_id)
-        if user is None or user.telegram_user_id is None:
-            raise TelegramNotificationDeliveryError(
-                f"No Telegram identity for prepaid notice on server {event.server_id}"
-            )
-        balance = format_minor(event.balance_minor, event.currency)
-        server = str(event.server_id)[:8]
-        if event.kind is LowBalanceNotificationKind.RUNWAY:
-            minutes = max(0, int((event.runway_hours or Decimal(0)) * 60))
-            hours, remainder = divmod(minutes, 60)
-            text = (
-                f"⚠️ هشدار اعتبار {event.active_servers} سرور ساعتی فعال\n"
-                f"موجودی قابل استفاده: {balance}\n"
-                f"با نرخ فعلی، نخستین خاموشی ناشی از کمبود موجودی تقریباً تا "
-                f"{hours} ساعت و {remainder} دقیقه دیگر رخ می‌دهد (کمتر از ۳ روز).\n"
-                "برای جلوگیری از خاموشی و حذف بعدی سرورها، کیف پول تومانی را شارژ کنید. "
-                "پس از پایان اعتبار پرداخت‌شده و ۲۴ ساعت ناکافی ماندن موجودی، "
-                "سرور خاموش‌شده در معرض حذف است. این برآورد با تغییر نرخ تتر تغییر می‌کند."
-            )
-        elif event.kind is LowBalanceNotificationKind.WARN:
-            text = (
-                f"هشدار موجودی سرور {server}: موجودی کیف پول شما {balance} است "
-                "و به کمتر از 200,000 تومان رسیده است. لطفاً کیف پول را شارژ کنید."
-            )
-        elif event.kind is LowBalanceNotificationKind.STOP:
-            text = (
-                f"اعتبار ساعت پرداخت‌شده پایان یافته و موجودی برای ساعت بعد کافی نیست. "
-                f"سرور {server} در حال خاموش شدن است. "
-                "برای جلوگیری از حذف، کیف پول را شارژ کنید."
-            )
-        elif event.kind is LowBalanceNotificationKind.DELETE:
-            text = (
-                "یک روز (۲۴ ساعت) از ناکافی شدن اعتبار پرداخت‌نشده گذشته است. "
-                f"حذف سرور {server} در حال انجام است."
-            )
-        elif event.kind is LowBalanceNotificationKind.RECOVERED:
-            text = f"موجودی کیف پول شما به {balance} رسیده است؛ وضعیت سرور {server} بازیابی شد."
-        else:
-            raise ValueError(f"Unsupported prepaid notice kind: {event.kind}")
-        try:
-            await self._bot.send_message(chat_id=user.telegram_user_id, text=text)
-        except Exception:
-            # Bot exceptions can embed request URLs (including the bot token)
-            # or chat IDs. Do not log or chain the unredacted exception.
-            raise TelegramNotificationDeliveryError(
-                f"Telegram prepaid notice failed for server {event.server_id}"
-            ) from None
+def render_low_balance_notice(event: LowBalanceNotificationEvent) -> str:
+    if event.currency != "IRT":
+        raise ValueError("customer balance notices require IRT")
+    balance = format_minor(event.balance_minor, event.currency)
+    server = str(event.server_id)[:8]
+    if event.kind is LowBalanceNotificationKind.RUNWAY:
+        minutes = max(0, int((event.runway_hours or Decimal(0)) * 60))
+        hours, remainder = divmod(minutes, 60)
+        return (
+            f"⚠️ هشدار اعتبار {event.active_servers} سرور ساعتی فعال\n"
+            f"موجودی قابل استفاده: {balance}\n"
+            f"با نرخ فعلی، نخستین خاموشی ناشی از کمبود موجودی تقریباً تا "
+            f"{hours} ساعت و {remainder} دقیقه دیگر رخ می‌دهد (کمتر از ۳ روز).\n"
+            "برای جلوگیری از خاموشی و حذف بعدی سرورها، کیف پول تومانی را شارژ کنید. "
+            "پس از پایان اعتبار پرداخت‌شده و ۲۴ ساعت ناکافی ماندن موجودی، "
+            "سرور خاموش‌شده در معرض حذف است. این برآورد با تغییر نرخ تتر تغییر می‌کند.\n"
+            f"زمان برآورد: {(event.at or event.episode).isoformat()}"
+        )
+    if event.kind is LowBalanceNotificationKind.WARN:
+        return (
+            f"هشدار موجودی سرور {server}: موجودی کیف پول شما {balance} است "
+            "و به کمتر از 200,000 تومان رسیده است. لطفاً کیف پول را شارژ کنید."
+        )
+    if event.kind is LowBalanceNotificationKind.STOP:
+        return (
+            "اعتبار ساعت پرداخت‌شده پایان یافته و موجودی برای ساعت بعد کافی نیست. "
+            f"سرور {server} در حال خاموش شدن است. "
+            "برای جلوگیری از حذف، کیف پول را شارژ کنید."
+        )
+    if event.kind is LowBalanceNotificationKind.DELETE:
+        return (
+            "یک روز (۲۴ ساعت) از ناکافی شدن اعتبار پرداخت‌نشده گذشته است. "
+            f"حذف سرور {server} در حال انجام است."
+        )
+    if event.kind is LowBalanceNotificationKind.AUTO_DELETE:
+        return f"مهلت افزایش موجودی سرور {server} پایان یافته و حذف آن در حال انجام است."
+    if event.kind is LowBalanceNotificationKind.RECOVERED:
+        return f"موجودی کیف پول شما به {balance} رسیده است؛ وضعیت سرور {server} بازیابی شد."
+    raise ValueError(f"Unsupported prepaid notice kind: {event.kind}")
 
 
 class LowBalanceNotificationLogRepository(Protocol):

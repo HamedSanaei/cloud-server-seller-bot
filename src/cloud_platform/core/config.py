@@ -130,6 +130,7 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("observability", "otel_exporter_endpoint"): "otel_exporter_endpoint",
     ("observability", "otel_sample_ratio"): "otel_sample_ratio",
     ("api", "allow_header_identity"): "api_allow_header_identity",
+    ("api", "test_server_ssh_alias"): "test_server_ssh_alias",
     ("api", "rate_limit_per_minute"): "api_rate_limit_per_minute",
     # --- Customer-facing server management (Telegram My Servers) ----------
     # Which customer capabilities the deployment exposes. Defaults live on
@@ -966,6 +967,9 @@ class Settings(BaseSettings):
     # DEV/TEST fallback and MUST stay disabled in production, where requests
     # authenticate with revocable hashed bearer tokens.
     api_allow_header_identity: bool = False
+    # Optional pinned OpenSSH host alias for the operator test VPS only.
+    # The alias must resolve to its verified public IPv4; keys stay in OpenSSH.
+    test_server_ssh_alias: str = ""
     # REST v1 rate limiting (M14-006): per-identity sliding window; each
     # API token (or dev identity) gets its own bucket per API process.
     api_rate_limit_per_minute: int = Field(default=240, ge=1)

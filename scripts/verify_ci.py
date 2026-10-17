@@ -13,21 +13,9 @@ Usage:
         --test tests/unit/test_business_log.py \
         --test tests/unit/test_hourly_state_machine.py   # targeted + staging gate
 
-Steps (--staging) - what `.github/workflows/deploy-staging.yml` runs before
-building and deploying; also available locally as `make staging-check`:
-    1. ruff check
-    2. ruff format check
-    3. compileall over src
-    4. import smoke of the api/worker/bot entrypoints
-Deliberately NO pytest, NO coverage, NO mypy and NO pre-commit: staging is the
-fast development lane, and the release lane (`ci` + `--push-ready`) keeps the
-high-confidence gates.
-
-`--test <path-or-test-id>` (only with `--staging`) runs exactly the explicitly
-named tests, then the staging steps, then stops. It never discovers tests on
-its own, never adds coverage or mypy and never starts Docker: it exists so the
-whole staging contract is ONE command, and so there is no reason to reach for
-`--push-ready` on a staging change.
+Steps (--staging): the same complete gates as --push-ready. Staging is isolated,
+not a lower-confidence release lane. --test runs explicitly named regressions
+first, but never skips the full suite, type checking, secret scan or coverage.
 
 Steps (--push-ready):
     1. ruff check
@@ -58,25 +46,6 @@ STATIC_STEPS: list[list[str]] = [
     ["uv", "run", "mypy", "src"],
 ]
 
-# The staging lane gate: cheap checks that catch an obviously broken commit
-# before it is built and deployed to the shared development server. Targeted
-# feature tests are the coding agent's job before the push; repository-wide
-# tests/coverage belong to the release lane (PUSH_READY_STEPS).
-STAGING_STEPS: list[list[str]] = [
-    ["uv", "run", "ruff", "check", "."],
-    ["uv", "run", "ruff", "format", "--check", "."],
-    ["uv", "run", "python", "-m", "compileall", "-q", "src"],
-    [
-        "uv",
-        "run",
-        "python",
-        "-c",
-        # Import smoke: a syntax-clean tree can still fail to start when an
-        # import is missing or circular, which is the fastest way to break the
-        # deployed bot/worker/api.
-        "import cloud_platform.api.app, cloud_platform.bot.main, cloud_platform.worker.settings",
-    ],
-]
 
 PUSH_READY_STEPS: list[list[str]] = [
     ["uv", "run", "ruff", "check", "."],
@@ -100,6 +69,18 @@ PUSH_READY_STEPS: list[list[str]] = [
     ["uv", "run", "python", "scripts/check_generated_artifacts.py"],
 ]
 
+# A local staging check cannot quietly bypass the gates in reusable ci.yml.
+STAGING_STEPS = [
+    *PUSH_READY_STEPS,
+    [
+        "uv",
+        "run",
+        "python",
+        "-c",
+        "import cloud_platform.api.app, cloud_platform.bot.main, cloud_platform.worker.settings",
+    ],
+]
+
 
 def _run(cmd: list[str]) -> int:
     print(f"+ {' '.join(cmd)}")
@@ -115,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument(
         "--staging",
         action="store_true",
-        help="staging-lane gates (ruff + compileall + import smoke; no tests)",
+        help="full staging release gates, including tests, coverage and types",
     )
     parser.add_argument(
         "--test",
@@ -124,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="TARGET",
         help=(
             "explicit test path/test id to run before the staging steps "
-            "(repeatable; requires --staging). No discovery, no coverage, no mypy."
+            "(repeatable; requires --staging). Full release gates still run afterward."
         ),
     )
     args = parser.parse_args(argv)
@@ -138,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         (ROOT / ".ci-artifacts").mkdir(parents=True, exist_ok=True)
     elif args.staging:
         steps = STAGING_STEPS
+        (ROOT / ".ci-artifacts").mkdir(parents=True, exist_ok=True)
     else:
         steps = STATIC_STEPS
     if targets:

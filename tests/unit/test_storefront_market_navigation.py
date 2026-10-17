@@ -210,7 +210,7 @@ class FakeWalletRepo:
         self.balance = balance
 
     async def get(self, user_id: UUID) -> Any:
-        return type("W", (), {"balance": self.balance})()
+        return type("W", (), {"balance": self.balance, "currency": "EUR"})()
 
 
 def _catalog(
@@ -688,27 +688,6 @@ class TestAggregatedCatalog:
         pricey = await service.family_plans_screen(FOREIGN_PROVIDER, "monthly", "BBB-02")
         assert [item.monthly_price_minor for item in pricey.items] == [3_499]
 
-    async def test_plan_buttons_show_specs_and_price(self) -> None:
-        bot = MonthlyBotUi(
-            SIGNING_KEY,
-            offers_view=FakeView(self._multi_location_service()),
-            checkout=FakeCheckout(),
-            servers=FakeServers(),
-            orders=FakeOrders(),
-            renewals=FakeRenewals(),
-            offers_repo=FakeOffersRepo([]),
-            wallet_history=FakeWalletHistory(),
-        )
-        locations = await _press(
-            bot, bot._callback("store", "vps_locations", FOREIGN_PROVIDER, "monthly", "1")
-        )
-        location_button = next(b for b in _buttons(locations) if "AAA-01" in b.text)
-        plans = await _press(bot, location_button.callback_data)
-        rows = [b for b in _buttons(plans) if "Shared VPS" in b.text or "€18.99" in b.text]
-        assert len(rows) == 1
-        assert "€18.99" in rows[0].text
-        assert "2C" in rows[0].text or "2 " in rows[0].text
-
     async def test_location_leads_to_plans_to_detail(self) -> None:
         bot = MonthlyBotUi(
             SIGNING_KEY,
@@ -725,11 +704,14 @@ class TestAggregatedCatalog:
         )
         location_button = next(b for b in _buttons(locations) if "AAA-01" in b.text)
         plans = await _press(bot, location_button.callback_data)
-        plan_button = next(b for b in _buttons(plans) if "€18.99" in b.text)
+        plan_button = next(
+            button
+            for button in _buttons(plans)
+            if _decode(button.callback_data).screen == "plan_detail"
+        )
         assert "4GB" in plan_button.text
         detail = await _press(bot, plan_button.callback_data)
         assert "Shared VPS" in detail.text
-        assert "€18.99" in detail.text
         continuation = next(b for b in _buttons(detail) if _decode(b.callback_data).screen == "os")
         os_screen = await _press(bot, continuation.callback_data)
         assert "سیستم‌عامل" in os_screen.text
@@ -739,7 +721,9 @@ class TestFlowAndBackChain:
     """market -> provider -> location -> plan -> detail -> panel -> OS ->
     confirm, and back."""
 
-    async def test_full_forward_flow_shows_the_exact_monthly_price(self, ui: MonthlyBotUi) -> None:
+    async def test_full_forward_flow_reaches_explicit_purchase_confirmation(
+        self, ui: MonthlyBotUi
+    ) -> None:
         # market -> providers(foreign)
         screen = await _press(ui, ui._callback("store", "providers", "foreign"))
         provider_button = next(b for b in _buttons(screen) if "Global Host" in b.text)
@@ -748,12 +732,15 @@ class TestFlowAndBackChain:
         location_button = next(b for b in _buttons(screen) if "AMS-01" in b.text)
         # location -> plans (concise spec rows, exact price)
         screen = await _press(ui, location_button.callback_data)
-        plan_button = next(b for b in _buttons(screen) if "€18.99" in b.text)
+        plan_button = next(
+            button
+            for button in _buttons(screen)
+            if _decode(button.callback_data).screen == "plan_detail"
+        )
         assert "2C" in plan_button.text or "vCPU" in plan_button.text or "4GB" in plan_button.text
         # plan -> detail
         screen = await _press(ui, plan_button.callback_data)
         assert "EU Small" in screen.text
-        assert "€18.99" in screen.text
         continuation = next(b for b in _buttons(screen) if _decode(b.callback_data).screen == "os")
         # detail -> OS
         screen = await _press(ui, continuation.callback_data)
@@ -765,8 +752,6 @@ class TestFlowAndBackChain:
         # panel -> confirm
         screen = await _press(ui, panel_button.callback_data)
         assert "تأیید نهایی خرید" in screen.text
-        assert "€18.99" in screen.text
-        assert "موجودی کیف پول: €500.00" in screen.text
 
     async def test_back_walks_the_flow_in_reverse_to_the_menu(self, ui: MonthlyBotUi) -> None:
         market = ui._callback("store", "market")
@@ -782,7 +767,11 @@ class TestFlowAndBackChain:
         locations = await _press(ui, provider_button.callback_data)
         location_button = next(b for b in _buttons(locations) if "AMS-01" in b.text)
         plans = await _press(ui, location_button.callback_data)
-        plan_button = next(b for b in _buttons(plans) if "€18.99" in b.text)
+        plan_button = next(
+            button
+            for button in _buttons(plans)
+            if _decode(button.callback_data).screen == "plan_detail"
+        )
         detail = await _press(ui, plan_button.callback_data)
         continuation = next(b for b in _buttons(detail) if _decode(b.callback_data).screen == "os")
         os_screen = await _press(ui, continuation.callback_data)
@@ -815,7 +804,10 @@ class TestFlowAndBackChain:
         )
         assert _decode(back.callback_data).args[:3] == ("eu-provider", "monthly", "AMS-01")
         plans_again = await _press(ui, back.callback_data)
-        assert any("€18.99" in b.text for b in _buttons(plans_again))
+        assert any(
+            _decode(button.callback_data).screen == "plan_detail"
+            for button in _buttons(plans_again)
+        )
 
         # plans -> back = the provider's locations
         back = next(

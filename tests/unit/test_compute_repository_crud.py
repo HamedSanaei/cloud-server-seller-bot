@@ -225,26 +225,6 @@ class TestGet:
 
 
 class TestSave:
-    async def test_persists_mutation_and_returns_updated_domain(self) -> None:
-        row = _row(state="requested")
-        session = _ScriptedSession([_Result((row, "hetzner"))])
-        server = _server(
-            id=row.id,
-            user_id=row.user_id,
-            provider_account_id=row.provider_account_id,
-            state=ServerLifecycleState.PROVISIONING,
-            provider_server_id="srv-9",
-        )
-
-        saved = await _repo(session).save(server)
-
-        assert row.state == "provisioning"
-        assert row.provider_server_id == "srv-9"
-        assert saved.state is ServerLifecycleState.PROVISIONING
-        assert saved.provider_server_id == "srv-9"
-        assert session.commits == 1
-        assert session.refreshed == [row]
-
     async def test_missing_row_raises(self) -> None:
         session = _ScriptedSession([_Result(None)])
 

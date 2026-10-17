@@ -30,7 +30,7 @@ from cloud_platform.api.v1.dependencies import (
 )
 from cloud_platform.api.v1.router import _catalog_repo, _ssh_key_service, _token_service
 from cloud_platform.modules.sshkeys.domain import SshKeyNotFoundError
-from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
+from cloud_platform.modules.tokens.domain import InvalidTokenError, TokenAuthentication, TokenScope
 
 USER_ID = uuid4()
 ALL_SCOPES_AUTH = TokenAuthentication(
@@ -343,3 +343,26 @@ class TestDevelopmentHeaderIdentity:
         with build_app(auth=None) as client:
             response = client.get("/v1/catalog/offers", headers={"x-platform-user": str(USER_ID)})
         assert response.status_code == 401
+
+
+def test_invalid_bearer_is_unauthorized_without_header_fallback(monkeypatch):
+    monkeypatch.setattr(
+        "cloud_platform.core.config.get_settings",
+        lambda: SimpleNamespace(app_env="test", api_allow_header_identity=True),
+    )
+
+    async def rejected_token(_raw):
+        raise InvalidTokenError("private authentication diagnostic")
+
+    with build_app(auth=None) as client:
+        client.app.state.authenticate_token = rejected_token
+        response = client.get(
+            "/v1/catalog/offers",
+            headers={
+                "authorization": "Bearer cpt_invalid-test-credential",
+                "x-platform-user": str(USER_ID),
+            },
+        )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == ErrorCode.UNAUTHORIZED.value
+    assert "private authentication diagnostic" not in response.text
