@@ -28,6 +28,56 @@ def _render(command: str, values: dict[str, str]) -> str:
     return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: values[match[1]], command)
 
 
+def test_shared_runtime_reaps_children_without_weakening_probes_or_single_bot() -> None:
+    compose = yaml.safe_load((ROOT / "deploy/production/docker-compose.yml").read_text())
+    for name in ("api", "worker", "bot", "migrate"):
+        assert compose["services"][name]["init"] is True
+        assert compose["services"][name]["pids_limit"] == 256
+    assert compose["services"]["bot"]["deploy"]["replicas"] == 1
+    assert compose["services"]["worker"]["healthcheck"]["test"] == [
+        "CMD",
+        "python",
+        "-m",
+        "cloud_platform.worker.health",
+    ]
+    assert compose["services"]["api"]["networks"]["platform-bridge"]["aliases"] == [
+        "cloud-platform-api",
+    ]
+
+
+@pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")
+@pytest.mark.parametrize(
+    "path, success",
+    [
+        ("/etc/platform/configuration.toml", True),
+        ("/etc/platform/configurationXtoml", False),
+        ("/etc/platform/configuration.toml;echo invalid", False),
+    ],
+)
+def test_staging_identity_gate_validates_literal_toml_suffix_before_publishing(
+    path: str,
+    success: bool,
+) -> None:
+    workflow = _workflow()
+    command = workflow["jobs"]["deployment-access"]["steps"][0]["run"]
+    result = subprocess.run(
+        [BASH, "-c", command],
+        capture_output=True,
+        timeout=10,
+        env={
+            **os.environ,
+            "DEPLOY_HOST": "fixture",
+            "DEPLOY_USER": "fixture",
+            "SSH_KEY": "fixture-non-secret",
+            "KNOWN_HOSTS": "fixture-non-secret",
+            "DEPLOY_PATH": "/opt/platform",
+            "CONFIGURATION_PATH": path,
+        },
+    )
+    assert (result.returncode == 0) is success
+    assert "deployment-access" in workflow["jobs"]["build"]["needs"]
+
+
 @pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")
 @pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/feature", "refs/tags/staging"])
 def test_staging_resolver_rejects_other_branches_before_resolving_an_image(

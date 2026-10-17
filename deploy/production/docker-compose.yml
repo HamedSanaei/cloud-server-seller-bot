@@ -36,6 +36,9 @@ name: cloud-platform-production
 
 x-platform: &platform
   image: ${PLATFORM_IMAGE:?set PLATFORM_IMAGE in deploy.env (ghcr.io/<org>/<repo>:<full-sha>)}
+  # Reap orphaned children (including completed Docker health probes). Without
+  # an init process they accumulate under PID 1 until pids_limit blocks exec.
+  init: true
   environment:
     # Bootstrap only: names the file, contains no secret.
     CLOUD_PLATFORM_CONFIG_FILE: /etc/cloud-server-seller/configuration.toml

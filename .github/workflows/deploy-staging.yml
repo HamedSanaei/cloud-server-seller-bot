@@ -24,6 +24,28 @@ env:
   UV_LINK_MODE: copy
 
 jobs:
+  deployment-access:
+    name: Validate staging deployment prerequisites
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Require environment-scoped CI deployment identity before publishing
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          CONFIGURATION_PATH: ${{ vars.CONFIGURATION_PATH }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$DEPLOY_HOST" && -n "$DEPLOY_USER" && -n "$SSH_KEY" && -n "$KNOWN_HOSTS" ]] || {
+            echo "::error::staging requires DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY and DEPLOY_KNOWN_HOSTS; production secrets are not inherited"; exit 1;
+          }
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$CONFIGURATION_PATH" =~ ^/[A-Za-z0-9._/-]+\.toml$ ]] || {
+            echo "::error::Configure staging DEPLOY_PATH and CONFIGURATION_PATH for the existing runtime"; exit 1;
+          }
+
   checks:
     name: Required release checks
     uses: ./.github/workflows/ci.yml
@@ -32,7 +54,7 @@ jobs:
 
   build:
     name: Build immutable image
-    needs: checks
+    needs: [checks, deployment-access]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
@@ -146,7 +168,7 @@ jobs:
           [[ -n "$DEPLOY_HOST" && -n "$DEPLOY_USER" && -n "$SSH_KEY" && -n "$KNOWN_HOSTS" ]] || {
             echo "::error::Configure this staging release lane's DEPLOY_* SSH secrets"; exit 1;
           }
-          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$CONFIGURATION_PATH" =~ ^/[A-Za-z0-9._/-]+\\.toml$ ]] || {
+          [[ "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ && "$CONFIGURATION_PATH" =~ ^/[A-Za-z0-9._/-]+\.toml$ ]] || {
             echo "::error::DEPLOY_PATH and CONFIGURATION_PATH must select the existing production runtime"; exit 1;
           }
           install -m 700 -d "$HOME/.ssh"

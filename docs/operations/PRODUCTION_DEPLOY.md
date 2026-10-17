@@ -8,6 +8,17 @@ approved dispatch after successful exact-SHA main CI. Companion documents:
 
 ## 1. Pipeline overview
 
+The `staging` Environment must own its `DEPLOY_HOST`, `DEPLOY_PORT`,
+`DEPLOY_USER`, `DEPLOY_SSH_KEY`, `DEPLOY_KNOWN_HOSTS` secrets and its
+`DEPLOY_PATH` / `CONFIGURATION_PATH` variables; GitHub does not inherit these
+from `production`. Use a dedicated CI identity, not an operator's personal key.
+The identity gate runs before image publication, and deploy still verifies the
+current branch SHA and strict pinned host key before any remote mutation.
+
+All application containers use Compose `init: true` to reap orphaned subprocesses.
+Do not fix PID exhaustion by disabling health probes or raising the PID ceiling.
+The API retains its HTTP probe; worker and bot retain their progress probes.
+
 ```mermaid
 flowchart TD
   PR[Pull request: main or staging] --> CI[Full CI gates]
