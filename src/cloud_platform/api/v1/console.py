@@ -108,6 +108,7 @@ async def integration_contract() -> dict[str, Any]:
     return {
         "data": {
             "version": CONSOLE_CONTRACT_VERSION,
+            "features": ["website-link-revoke:v1", "website-charge-requests:v1"],
             "environment": settings.app_env.strip().lower(),
             "walletCurrency": settings.default_currency,
             "headerIdentityEnabled": settings.api_allow_header_identity,
@@ -438,6 +439,67 @@ async def account(auth: Read) -> dict[str, Any]:
             "testPortManagement": guest_management_configured(),
         }
     }
+
+
+@router.post("/link/revoke")
+async def revoke_website_link(auth: Read, key: Key) -> dict[str, Any]:
+    """Revoke only the bearer used for this request, never another user's token."""
+    container = await get_container()
+    del key
+    await container.token_service().revoke(actor_user_id=auth.user_id, token_id=auth.token_id)
+    return {"data": {"revoked": True}}
+
+
+@router.get("/charge-requests")
+async def charge_requests(auth: WalletRead) -> dict[str, Any]:
+    """Read existing payment facts. No settlement, invoice fabrication or FX lookup."""
+    from cloud_platform.db.base import PaymentSession
+    from cloud_platform.modules.fx.formatting import format_minor
+
+    container = await get_container()
+    user = await active_user(container, auth)
+    async with container.session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(PaymentSession)
+                    .where(PaymentSession.user_id == user.id)
+                    .order_by(PaymentSession.created_at.desc(), PaymentSession.id.desc())
+                    .limit(50)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        amount = (
+            row.credit_amount_minor if row.credit_amount_minor is not None else row.amount_minor
+        )
+        currency = row.credit_currency if row.credit_amount_minor is not None else row.currency
+        if not currency or not isinstance(amount, int) or abs(amount) > 2**53 - 1:
+            raise ApiError(ErrorCode.CONFLICT, "مبلغ پرداخت برای نمایش امن معتبر نیست")
+        status = (
+            "approved"
+            if row.status == "succeeded" and row.credited_at is not None
+            else "processing"
+            if row.status in {"succeeded", "manual_review"}
+            else "rejected"
+            if row.status == "failed"
+            else "pending"
+        )
+        result.append(
+            {
+                "id": str(row.id),
+                "number": str(row.id),
+                "amount": amount,
+                "currency": currency,
+                "formattedAmount": format_minor(amount, currency),
+                "status": status,
+                "date": row.created_at.isoformat(),
+            }
+        )
+    return {"data": result}
 
 
 @router.get("/wallet")

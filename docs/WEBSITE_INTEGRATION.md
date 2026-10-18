@@ -15,7 +15,7 @@ or wallet credit is applied in unified mode.
    use Redis, not process memory. Keep `api.allow_header_identity = false`.
 2. Complete normal bot onboarding (including applicable terms/identity checks).
    Send `/website` **in the private chat**. Paste the five-minute single-use code
-   into the website's **پلتفرم مشترک** page. The code is bearer material: do not
+   into the website's **تنظیمات ← اتصال تلگرام** page. The code is bearer material: do not
    forward it, put it in URLs, log it or send it to support.
 3. Configure the website backend's `PLATFORM_API_URL` to the Python API **origin**
    (no path/query/embedded credentials), through trusted private networking or
@@ -35,6 +35,29 @@ or wallet credit is applied in unified mode.
 Do not expose pairing codes or tokens in telemetry, request/response-body logs,
 analytics or reverse-proxy traces. Restrict the exchange route to the website
 backend at ingress where practical. No new shared global master token is needed.
+
+## Additive website capabilities and deployment order
+
+The console contract advertises `website-link-revoke:v1` and
+`website-charge-requests:v1` in its `data.features` array. Publish the platform
+image containing these capabilities before the website that requires them.
+A healthy API with contract version `1` alone is not sufficient. Website
+preflight rejects missing capabilities before stopping its live writers.
+
+- `POST /v1/console/link/revoke` requires a scoped bearer and an idempotency
+  key. It revokes only the authenticated bearer, never a caller-supplied token
+  or another account. The website retains its identity binding on disconnect.
+- `GET /v1/console/charge-requests` requires wallet-read scope and an active
+  account. It reads only the owner's latest 50 payment sessions, preserving
+  frozen credit amount/currency when present and provider-native facts
+  otherwise. It does not settle payments, credit wallets or fabricate invoices.
+- Readiness probes use no bearer and require `401 unauthorized` on both routes.
+  They must never revoke a real account token or read customer financial data.
+
+No schema change is required by these two endpoints. Retain the normal backup,
+migration/schema, single-poller and health gates during the platform-first
+rollout. Only retry the website deployment after the running platform image
+advertises both features and the endpoint-auth probes succeed.
 
 ## Shared operator test server
 
