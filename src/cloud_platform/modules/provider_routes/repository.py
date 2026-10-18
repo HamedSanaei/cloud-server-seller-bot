@@ -12,8 +12,10 @@ from collections.abc import Callable, Iterable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import case, func, or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import ProviderRoute as _ProviderRouteModel
@@ -151,6 +153,80 @@ class SqlAlchemyProviderRouteRepository:
             )
             await self.upsert(route, products_fresh=state is RouteState.ELIGIBLE_AVAILABLE)
             written += 1
+        return written
+
+    async def upsert_observations_batch(
+        self,
+        *,
+        provider_key: str,
+        observations: Iterable[RouteObservation],
+        priority_of: Callable[[str], int],
+        account_state_of: Callable[[str], CredentialAccountState],
+        at: datetime | None = None,
+    ) -> int:
+        """Catalog-only bulk evidence refresh; preserve products on failed probes.
+
+        PostgreSQL resolves first-insert races through the existing unique key.
+        Freshness is a required write, not an economic change. Older concurrent
+        observations cannot replace newer evidence. No checkout path uses this.
+        """
+        checked_at = at or datetime.now(UTC)
+        observations = list(observations)
+        written = 0
+        for offset in range(0, len(observations), 100):
+            chunk = sorted(
+                observations[offset : offset + 100],
+                key=lambda obs: (obs.credential_account_id, obs.location_id),
+            )
+            if len({(o.credential_account_id, o.location_id) for o in chunk}) != len(chunk):
+                raise ValueError("duplicate route identities in catalog batch")
+            values = [
+                dict(
+                    id=uuid4(),
+                    provider_key=provider_key,
+                    credential_account_id=o.credential_account_id,
+                    location_id=o.location_id,
+                    state=o.state.value,
+                    priority=priority_of(o.credential_account_id),
+                    account_state=account_state_of(o.credential_account_id).value,
+                    product_ids=list(o.product_ids),
+                    last_checked_at=checked_at,
+                    last_success_at=checked_at if o.succeeded else None,
+                    last_error_class=o.error_class,
+                )
+                for o in chunk
+            ]
+            statement = insert(_ProviderRouteModel).values(values)
+            incoming = statement.excluded
+            statement = statement.on_conflict_do_update(
+                constraint="uq_provider_routes_account_location",
+                set_=dict(
+                    state=incoming.state,
+                    priority=incoming.priority,
+                    account_state=incoming.account_state,
+                    last_checked_at=incoming.last_checked_at,
+                    last_error_class=incoming.last_error_class,
+                    last_success_at=func.coalesce(
+                        incoming.last_success_at, _ProviderRouteModel.last_success_at
+                    ),
+                    product_ids=case(
+                        (
+                            incoming.state == RouteState.ELIGIBLE_AVAILABLE.value,
+                            incoming.product_ids,
+                        ),
+                        else_=_ProviderRouteModel.product_ids,
+                    ),
+                    updated_at=func.current_timestamp(),
+                ),
+                where=or_(
+                    _ProviderRouteModel.last_checked_at.is_(None),
+                    _ProviderRouteModel.last_checked_at <= incoming.last_checked_at,
+                ),
+            )
+            async with self._session_factory() as session:
+                await session.execute(statement)
+                await session.commit()
+            written += len(chunk)
         return written
 
     async def list_for_provider(self, provider_key: str) -> list[ProviderRoute]:

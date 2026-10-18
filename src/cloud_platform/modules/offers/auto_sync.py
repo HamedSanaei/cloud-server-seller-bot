@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 
 from cloud_platform.modules.catalog.domain import CatalogSyncLock
 from cloud_platform.modules.fx.service import ReferenceRateResolution
@@ -56,6 +56,7 @@ from cloud_platform.modules.offers.pricing import (
     ReferenceRateResolver,
     resolve_catalog_rate,
 )
+from cloud_platform.observability.catalog import stage
 
 logger = logging.getLogger(__name__)
 
@@ -234,8 +235,10 @@ class CatalogAutoSyncCoordinator:
         catalog_currency: str = "USD",
         identity_ttl_seconds: int = 3600,
         catalog_min_fresh_lifetime_seconds: int = 0,
+        batch_enabled: bool = True,
     ) -> None:
         self._sources = list(sources)
+        self._batch_enabled = batch_enabled
         self._offers = offers
         self._state = state
         self._lock = lock
@@ -277,7 +280,8 @@ class CatalogAutoSyncCoordinator:
         # writes, and every row of this run must survive until the next one.
         sync_started_at = datetime.now(UTC)
         try:
-            report = await source.sync_catalog()
+            with stage("provider_sync"):
+                report = await source.sync_catalog()
         except Exception as exc:  # pragma: no cover - sources report, not raise
             logger.warning("catalog auto-sync for %s failed: %s", provider_key, exc)
             report = CatalogSyncReport(
@@ -312,15 +316,17 @@ class CatalogAutoSyncCoordinator:
             # sync that repaired catalog data still showed "never" in the
             # doctor. Record the failure visibly and always persist state.
             try:
-                prices_updated = await self._auto_price(
-                    provider_key,
-                    report,
-                    warnings,
-                    pricing_errors,
-                    catalog_horizon_anchor=sync_started_at,
-                    fx_observations=fx_observations,
-                )
-                published = await self._auto_publish(provider_key, report, warnings)
+                with stage("pricing"):
+                    prices_updated = await self._auto_price(
+                        provider_key,
+                        report,
+                        warnings,
+                        pricing_errors,
+                        catalog_horizon_anchor=sync_started_at,
+                        fx_observations=fx_observations,
+                    )
+                with stage("publication"):
+                    published = await self._auto_publish(provider_key, report, warnings)
             except Exception as exc:
                 message = f"pricing/publication failed: {type(exc).__name__}: {exc}"
                 logger.warning("catalog auto-sync for %s: %s", provider_key, message)
@@ -560,15 +566,9 @@ class CatalogAutoSyncCoordinator:
         updated = 0
         horizon_anchor = catalog_horizon_anchor or datetime.now(UTC)
         eligible: list[tuple[SellableOffer, PricingPolicy]] = []
+        pending_prices: list[dict[str, Any]] = []
         currencies: set[str] = set()
-        for account_id, product_id, location_id in _verified_offer_keys(report):
-            row = await self._offers.get_by_ref(
-                provider_key,
-                product_id,
-                location_id,
-                provider_account_id=account_id,
-                billing_model=report.billing_model,
-            )
+        for row in await self._verified_rows(provider_key, report):
             if row is None or not row.provider_available:
                 continue
             if row.billing_model != report.billing_model:
@@ -670,6 +670,22 @@ class CatalogAutoSyncCoordinator:
                 )
                 await self._record_fx_failure(row, reason, warnings, pricing_errors)
                 continue
+            if self._batch_enabled and callable(
+                getattr(type(self._offers), "set_auto_prices_batch_if_current", None)
+            ):
+                pending_prices.append(
+                    dict(
+                        offer_id=row.id,
+                        expected_cost_minor=row.provider_cost_minor,
+                        expected_cost_currency=currency,
+                        selling_price_minor=priced.selling_price_minor,
+                        selling_currency=priced.selling_currency,
+                        pricing_metadata=priced.pricing_metadata,
+                        expected_provider_rate=_exact_provider_rate(row),
+                        expected_observation=row,
+                    )
+                )
+                continue
             try:
                 result = await self._offers.set_auto_price_if_current(
                     row.id,
@@ -695,6 +711,28 @@ class CatalogAutoSyncCoordinator:
                 warnings.append(f"{row.ref}: manual/operator change won pricing race")
                 continue
             updated += 1
+        for offset in range(0, len(pending_prices), 100):
+            chunk = pending_prices[offset : offset + 100]
+            try:
+                results = await cast(Any, self._offers).set_auto_prices_batch_if_current(chunk)
+            except Exception:
+                # Whole chunk is rolled back before the compatibility path.
+                results = []
+                for request in chunk:
+                    try:
+                        result = await self._offers.set_auto_price_if_current(**request)
+                    except Exception as exc:
+                        await self._record_fx_failure(
+                            request["expected_observation"],
+                            f"automatic price rejected: {type(exc).__name__}",
+                            warnings,
+                            pricing_errors,
+                        )
+                        result = None
+                    results.append(result)
+            updated += sum(result is not None for result in results)
+            if any(result is None for result in results):
+                warnings.append("manual/operator/ownership change won a batch pricing race")
         publish_now = datetime.now(UTC)
         if fx_observations is not None:
             fx_observations.extend(
@@ -845,14 +883,7 @@ class CatalogAutoSyncCoordinator:
     ) -> int:
         """Put verified, eligible rows on sale (never over an operator block)."""
         published = 0
-        for account_id, product_id, location_id in _verified_offer_keys(report):
-            row = await self._offers.get_by_ref(
-                provider_key,
-                product_id,
-                location_id,
-                provider_account_id=account_id,
-                billing_model=report.billing_model,
-            )
+        for row in await self._verified_rows(provider_key, report):
             if row is None:
                 continue
             if row.billing_model != report.billing_model:
@@ -898,3 +929,25 @@ class CatalogAutoSyncCoordinator:
                 else:
                     published += 1
         return published
+
+    async def _verified_rows(
+        self, provider_key: str, report: CatalogSyncReport
+    ) -> list[SellableOffer]:
+        refs = list(_verified_offer_keys(report))
+        if self._batch_enabled and callable(getattr(type(self._offers), "get_many_by_refs", None)):
+            rows: list[SellableOffer] = await cast(Any, self._offers).get_many_by_refs(
+                provider_key, report.billing_model, refs
+            )
+            return rows
+        result = []
+        for account, product, location in refs:
+            row = await self._offers.get_by_ref(
+                provider_key,
+                product,
+                location,
+                provider_account_id=account,
+                billing_model=report.billing_model,
+            )
+            if row is not None:
+                result.append(row)
+        return result

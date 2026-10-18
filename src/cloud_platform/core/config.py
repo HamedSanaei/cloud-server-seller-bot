@@ -213,6 +213,11 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ),
     # --- Automatic catalog sync (the periodic offer-sync coordinator) -------
     ("storefront", "catalog_sync", "enabled"): "storefront_catalog_sync_enabled",
+    ("storefront", "catalog_sync", "batch_enabled"): "catalog_batch_enabled",
+    ("storefront", "catalog_sync", "probe_cache_enabled"): "catalog_probe_cache_enabled",
+    ("storefront", "catalog_sync", "probe_cache_ttl_seconds"): "catalog_probe_cache_ttl_seconds",
+    ("worker", "metrics_enabled"): "worker_metrics_enabled",
+    ("worker", "metrics_port"): "worker_metrics_port",
     ("storefront", "catalog_sync", "interval_seconds"): (
         "storefront_catalog_sync_interval_seconds"
     ),
@@ -837,6 +842,11 @@ class Settings(BaseSettings):
     # offers with the configured markup and publishes eligible ones — no
     # manual sync-offers / price-book / enable commands needed afterwards.
     storefront_catalog_sync_enabled: bool = True
+    catalog_batch_enabled: bool = True
+    catalog_probe_cache_enabled: bool = True
+    catalog_probe_cache_ttl_seconds: int = Field(default=3600, ge=0, le=86400)
+    worker_metrics_enabled: bool = True
+    worker_metrics_port: int = Field(default=9101, ge=1024, le=65535)
     storefront_catalog_sync_interval_seconds: int = Field(default=900, ge=60)
     #: Dedicated job timeout for ONE ``catalog_auto_sync`` cron run. The
     #: periodic refresh walks every product of every account/region, so it

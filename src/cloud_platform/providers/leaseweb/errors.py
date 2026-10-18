@@ -330,6 +330,8 @@ class LeasewebError(ProviderError):
 
     #: Whether the transport may retry the call that produced this error.
     retryable = False
+    #: Optional discovery cooldown; never authorizes a mutation retry.
+    reset_at_unix: int | None = None
 
     def __init__(
         self,

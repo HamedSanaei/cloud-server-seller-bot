@@ -52,12 +52,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cloud_platform.modules.catalog.domain import LocationRecord
+from cloud_platform.modules.offers.batch import ObservationBuffer
 from cloud_platform.modules.offers.domain import BILLING_MODEL_MONTHLY, OfferSpecUpdate
 from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 from cloud_platform.modules.provider_routes.domain import RouteObservation, RouteState
 from cloud_platform.modules.provider_routes.repository import (
     SqlAlchemyProviderRouteRepository,
 )
+from cloud_platform.observability.catalog import stage
 from cloud_platform.providers.leaseweb.errors import (
     LeasewebAuthenticationError,
 )
@@ -455,7 +457,12 @@ class LeaseWebOrderingCatalogSyncer:
     # ------------------------------------------------------------------
 
     async def sync_products(self) -> SyncResult:
-        offers_repo = SqlAlchemySellableOfferRepository(self._session_factory)
+        from cloud_platform.core.config import get_settings
+
+        offers_repo = ObservationBuffer(
+            SqlAlchemySellableOfferRepository(self._session_factory),
+            enabled=get_settings().catalog_batch_enabled,
+        )
         route_repo = SqlAlchemyProviderRouteRepository(self._session_factory)
         errors: list[str] = []
         # Provider-data advisories vs DURABLE-WRITE failures are different
@@ -477,8 +484,11 @@ class LeaseWebOrderingCatalogSyncer:
         from cloud_platform.modules.catalog.repository import SqlAlchemyLocationRepository
 
         loc_repo = SqlAlchemyLocationRepository(self._session_factory)
+        persisted_locations: tuple[str, ...] = ()
         try:
-            await loc_repo.list_for_provider(PROVIDER_KEY)
+            persisted_locations = tuple(
+                row.location_id for row in await loc_repo.list_for_provider(PROVIDER_KEY)
+            )
         except Exception as exc:
             logger.warning("leaseweb persisted locations unreadable: %s", exc)
 
@@ -520,7 +530,12 @@ class LeaseWebOrderingCatalogSyncer:
         discoveries: dict[str, _AccountDiscovery] = {}
         for account_id, provider in self._accounts.items():
             discovery = await self._discover_account(
-                account_id, provider, loc_repo, prior_states, errors
+                account_id,
+                provider,
+                loc_repo,
+                prior_states,
+                errors,
+                persisted_locations=persisted_locations,
             )
             discoveries[account_id] = discovery
             # DISCOVERED counts the provider's own LIST observations — the
@@ -611,15 +626,27 @@ class LeaseWebOrderingCatalogSyncer:
         skipped = max(0, len(prior_available_locations - resolved))
 
         # --- Persist the routing observations -------------------------
+        if offers_repo.enabled:
+            upserted, batch_failures = await offers_repo.flush()
+            persistence_failures.extend(batch_failures)
+            if batch_failures:
+                verified_pairs.clear()
+                verified_owner.clear()
         observations = self._route_observations(discoveries)
         routes_persisted = 0
         try:
-            await route_repo.upsert_observations(
-                provider_key=PROVIDER_KEY,
-                observations=observations,
-                priority_of=self._priority_of,
-                account_state_of=self._state_of,
-            )
+            writer = route_repo.upsert_observations
+            if offers_repo.enabled and callable(
+                getattr(type(route_repo), "upsert_observations_batch", None)
+            ):
+                writer = route_repo.upsert_observations_batch
+            with stage("routing_persistence"):
+                await writer(
+                    provider_key=PROVIDER_KEY,
+                    observations=observations,
+                    priority_of=self._priority_of,
+                    account_state_of=self._state_of,
+                )
             routes_persisted = len(observations)
         except Exception as exc:
             # A durable-write failure is NOT a normal sync outcome: without
@@ -794,7 +821,7 @@ class LeaseWebOrderingCatalogSyncer:
         location: str,
         serving_accounts: list[str],
         discoveries: Mapping[str, _AccountDiscovery],
-        offers_repo: SqlAlchemySellableOfferRepository,
+        offers_repo: SqlAlchemySellableOfferRepository | ObservationBuffer,
         available: set[tuple[str, str]],
         current_available: set[tuple[str, str]] | None,
         errors: list[str],
@@ -960,7 +987,7 @@ class LeaseWebOrderingCatalogSyncer:
 
     @staticmethod
     async def _write_offer(
-        offers_repo: SqlAlchemySellableOfferRepository,
+        offers_repo: SqlAlchemySellableOfferRepository | ObservationBuffer,
         *,
         provider_account_id: str,
         product: LeasewebProduct,
@@ -1021,6 +1048,8 @@ class LeaseWebOrderingCatalogSyncer:
         loc_repo: Any,
         prior_states: Mapping[str, Mapping[str, LocationEligibility]],
         errors: list[str],
+        *,
+        persisted_locations: tuple[str, ...] | None = None,
     ) -> _AccountDiscovery:
         """Run the READ-ONLY discovery pipeline for ONE credential account."""
         discovery = _AccountDiscovery(account_id=account_id)
@@ -1040,11 +1069,14 @@ class LeaseWebOrderingCatalogSyncer:
             unscoped = []
         unscoped_locations = [product.location for product in unscoped if product.location]
 
-        persisted: tuple[str, ...] = ()
-        try:
-            persisted = tuple(r.location_id for r in await loc_repo.list_for_provider(PROVIDER_KEY))
-        except Exception:  # pragma: no cover - best effort
-            persisted = ()
+        persisted = persisted_locations
+        if persisted is None:
+            try:
+                persisted = tuple(
+                    r.location_id for r in await loc_repo.list_for_provider(PROVIDER_KEY)
+                )
+            except Exception:  # pragma: no cover - best effort
+                persisted = ()
 
         queue = list(
             merge_candidates(

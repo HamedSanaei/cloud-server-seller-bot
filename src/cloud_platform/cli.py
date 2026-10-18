@@ -4470,6 +4470,11 @@ def _parser() -> argparse.ArgumentParser:
 
     catalog = sub.add_parser("catalog", help="automatic catalog sync operations")
     catalog_sub = catalog.add_subparsers(dest="subcommand", required=True)
+    probe = catalog_sub.add_parser("probe-cache", help="operator-only discovery cache control")
+    probe_sub = probe.add_subparsers(dest="probe_action", required=True)
+    invalidate = probe_sub.add_parser("invalidate", help="invalidate an account or account/region")
+    invalidate.add_argument("--account", required=True)
+    invalidate.add_argument("--region", default=None)
     auto_sync = catalog_sub.add_parser("auto-sync", help="periodic offer refresh")
     auto_sync_sub = auto_sync.add_subparsers(dest="subsubcommand", required=True)
     auto_sync_sub.add_parser("doctor", help="read-only sync configuration and status")
@@ -4678,6 +4683,32 @@ async def _dispatch(args: argparse.Namespace) -> int:
         print(f"unknown command business-log {args.subcommand}")  # pragma: no cover
         return 2
     if args.command == "catalog":
+        if args.subcommand == "probe-cache":
+            import re
+
+            from redis.asyncio import Redis
+
+            from cloud_platform.providers.leaseweb.discovery_cache import RedisProbeCache
+
+            account = args.account.strip().casefold()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,62}", account):
+                print("invalid account identifier")
+                return 2
+            if args.region is not None and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.region):
+                print("invalid region identifier")
+                return 2
+            redis = Redis.from_url(
+                get_settings().redis_url,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            try:
+                removed = await RedisProbeCache(redis).invalidate(account, args.region)
+                print(f"invalidated entries={removed}; credential/region epoch advanced")
+                return 0
+            finally:
+                await redis.aclose()
         if args.subcommand == "auto-sync" and args.subsubcommand == "doctor":
             return await catalog_auto_sync_doctor()
         if args.subcommand == "auto-sync" and args.subsubcommand == "run":

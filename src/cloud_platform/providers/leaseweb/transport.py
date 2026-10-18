@@ -35,8 +35,11 @@ classified as:
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from collections.abc import Mapping
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any
 
@@ -117,13 +120,16 @@ class Throttle:
 
 
 def parse_retry_after(value: str | None) -> int | None:
-    """Parse a ``Retry-After`` header (delta-seconds) into whole seconds."""
+    """Parse delta-seconds or an HTTP date into a bounded caller delay."""
     if not value:
         return None
     try:
         return max(0, int(float(value)))
-    except ValueError:
-        return None
+    except (ValueError, OverflowError):
+        try:
+            return max(0, int((parsedate_to_datetime(value) - datetime.now(UTC)).total_seconds()))
+        except (ValueError, TypeError, OverflowError):
+            return None
 
 
 def operation_label(method: str, path: str) -> str:
@@ -134,6 +140,14 @@ def operation_label(method: str, path: str) -> str:
             shaped.append("{id}")
         else:
             shaped.append(segment)
+    if len(shaped) > 4 and shaped[:4] == ["ordering", "v1", "products", "vps"]:
+        shaped[4:] = ["{id}"]
+    if (
+        len(shaped) > 3
+        and shaped[0] in {"publicCloud", "vps"}
+        and shaped[2] in {"instances", "servers"}
+    ):
+        shaped[3:] = ["{id}"]
     return f"{method} /{'/'.join(shaped)}"
 
 
@@ -200,6 +214,7 @@ class LeasewebTransport:
         self._throttle = throttle or Throttle()
         self._max_retries = max_retries
         self._provider_key = provider_key
+        self.discovery_account_id = "default"
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers=default_headers,
@@ -265,15 +280,55 @@ class LeasewebTransport:
         """
         operation = operation_label(method, path)
         async with metrics.provider_call(self._provider_key, operation):
-            return await self._perform(
-                method,
-                path,
-                params=params,
-                json=json,
-                headers=headers,
-                mutating=mutating,
-                operation=operation,
-            )
+            from hashlib import sha256
+
+            from cloud_platform.providers.leaseweb.discovery_cache import ProbeScope, current_policy
+
+            policy = current_policy.get()
+            resolved_headers = await self._request_headers(headers)
+
+            async def perform() -> Any:
+                return await self._perform(
+                    method,
+                    path,
+                    params=params,
+                    json=json,
+                    headers=headers,
+                    mutating=mutating,
+                    operation=operation,
+                    resolved_headers=resolved_headers,
+                )
+
+            if policy is not None and method.upper() == "GET" and not mutating:
+                import json as json_module
+
+                key = httpx.Headers(resolved_headers).get("X-LSW-Auth") or self._client.headers.get(
+                    "X-LSW-Auth", ""
+                )
+                safe_params = {
+                    k: v
+                    for k, v in (params or {}).items()
+                    if k
+                    in {
+                        "region",
+                        "location",
+                        "contractTerm",
+                        "billingCycle",
+                        "limit",
+                        "offset",
+                        "page",
+                    }
+                }
+                scope = ProbeScope(
+                    self.discovery_account_id,
+                    sha256(key.encode()).hexdigest(),
+                    self.base_url,
+                    path,
+                    str(safe_params.get("region", safe_params.get("location", ""))),
+                    json_module.dumps(safe_params, sort_keys=True),
+                )
+                return await policy.run(scope, perform)
+            return await perform()
 
     async def request_raw(
         self,
@@ -289,10 +344,21 @@ class LeasewebTransport:
         inspect the status without raising.
         """
         await self._throttle.acquire()
+        from cloud_platform.observability.catalog import http_attempts, http_duration
+
+        operation = operation_label(method, path)
+        started, outcome = time.perf_counter(), "transport_error"
         try:
-            return await self._client.request(method, path, params=params, headers=headers)
+            response = await self._client.request(method, path, params=params, headers=headers)
+            outcome = str(response.status_code)
+            return response
         except httpx.TransportError as exc:
             raise self._transport_error(exc, endpoint=operation_label(method, path)) from exc
+        finally:
+            http_attempts.labels(self._provider_key, operation, outcome).inc()
+            http_duration.labels(self._provider_key, operation).observe(
+                time.perf_counter() - started
+            )
 
     async def _perform(
         self,
@@ -304,21 +370,65 @@ class LeasewebTransport:
         headers: Mapping[str, str] | None,
         mutating: bool,
         operation: str,
+        resolved_headers: dict[str, str] | None = None,
     ) -> Any:
-        request_headers = await self._request_headers(headers)
+        request_headers = (
+            resolved_headers
+            if resolved_headers is not None
+            else await self._request_headers(headers)
+        )
         kwargs: dict[str, Any] = {"params": params, "json": json, "headers": request_headers}
         attempt = 0
+        from cloud_platform.observability.catalog import http_attempts, http_duration
+        from cloud_platform.providers.leaseweb.discovery_cache import current_policy
+
+        discovery_read = (
+            current_policy.get() is not None and method.upper() == "GET" and not mutating
+        )
+        retries = min(2, self._max_retries) if discovery_read else self._max_retries
         while True:
             await self._throttle.acquire()
+            started = time.perf_counter()
+            outcome = "transport_error"
+            finished = None
             try:
                 response = await self._client.request(method, path, **kwargs)
+                outcome = str(response.status_code)
             except httpx.TransportError as exc:
+                finished = time.perf_counter()
+                if discovery_read and attempt < retries:
+                    await self._throttle.wait(random.uniform(0.5, 1.0) * 2**attempt)
+                    attempt += 1
+                    continue
                 raise self._transport_error(exc, endpoint=operation, mutating=mutating) from exc
-            if response.status_code != 429 or mutating or attempt >= self._max_retries:
+            finally:
+                http_attempts.labels(self._provider_key, operation, outcome).inc()
+                http_duration.labels(self._provider_key, operation).observe(
+                    (finished if finished is not None else time.perf_counter()) - started
+                )
+            retry_status = response.status_code == 429 or (
+                discovery_read and response.status_code >= 500
+            )
+            retry_after = parse_retry_after(response.headers.get("Retry-After"))
+            if (
+                retry_status
+                and discovery_read
+                and retry_after is not None
+                and retry_after > MAX_RETRY_AFTER_SECONDS
+            ):
+                error = error_for_response(
+                    parse_error_payload(response, secrets=self._known_secrets), endpoint=operation
+                )
+                error.reset_at_unix = int(time.time()) + min(retry_after, 86400)
+                raise error
+            if not retry_status or mutating or attempt >= retries:
                 break
             # Read-only requests may honor the pause in-adapter; a mutation is
             # never re-sent here (a mutating 429 is an unknown outcome).
-            await self._throttle.wait(self._retry_delay(response, attempt))
+            delay = self._retry_delay(response, attempt)
+            if discovery_read and retry_after is None:
+                delay *= random.uniform(0.8, 1.2)
+            await self._throttle.wait(delay)
             attempt += 1
         return self._decode(response, endpoint=operation, mutating=mutating)
 

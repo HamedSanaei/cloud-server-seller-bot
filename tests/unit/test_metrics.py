@@ -9,6 +9,7 @@ in the same process also drive the same code paths and accumulate counts.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -108,7 +109,13 @@ class TestMetricLayer:
 
 
 class TestApiMetrics:
-    def test_requests_and_metrics_endpoint(self) -> None:
+    def test_requests_and_metrics_endpoint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # This metrics contract must not reconcile real users through lifespan.
+        monkeypatch.setattr(
+            "cloud_platform.core.container.get_container",
+            AsyncMock(return_value=SimpleNamespace(reconcile_superadmins=AsyncMock())),
+        )
+        monkeypatch.setattr("cloud_platform.core.container.close_container", AsyncMock())
         app = create_app()
         before = _value(
             "cloud_platform_api_requests_total",

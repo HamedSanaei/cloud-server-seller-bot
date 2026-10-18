@@ -297,6 +297,9 @@ display_name = "کلود"
 # ---------------------------------------------------------------------------
 
 [storefront.catalog_sync]
+batch_enabled = true
+probe_cache_enabled = true
+probe_cache_ttl_seconds = 3600 # Definitive failures only; credential rotation bypasses.
 enabled = true
 interval_seconds = 900
 # Dedicated timeout for ONE catalog refresh job, in seconds. A full Leaseweb
@@ -520,3 +523,9 @@ stop_server_after_grace = false
 
 # Automatic catalog pricing policies live under [storefront.pricing.*] above.
 # Foreign offers use the configured [fx] catalog_pricing_currency (USD).
+
+[worker]
+# Worker-process metrics, reachable only on the private container network.
+# Do not publish this port on the host or expose it through the public proxy.
+metrics_enabled = true
+metrics_port = 9101

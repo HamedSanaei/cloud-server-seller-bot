@@ -287,6 +287,9 @@ class LeasewebAccountRouter:
             self._providers[account.account_id] = self._build_provider(
                 account, holder, self._credential_sources.get(account.account_id)
             )
+            transport = getattr(self._providers[account.account_id], "_transport", None)
+            if transport is not None:
+                transport.discovery_account_id = account.account_id
 
     def _build_provider(
         self,

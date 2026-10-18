@@ -170,6 +170,7 @@ services:
   worker:
     <<: *platform
     command: ["worker"]
+    expose: ["9101"]  # Internal worker metrics; no host port is published.
     # ARQ's expiring Redis sentinel proves the event loop actually ran.
     healthcheck:
       test: ["CMD", "python", "-I", "-S", "/app/src/cloud_platform/worker/health.py"]

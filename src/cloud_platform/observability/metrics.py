@@ -100,6 +100,17 @@ class PlatformMetrics:
             buckets=JOB_BUCKETS,
             registry=self.registry,
         )
+        self.job_process_cpu_seconds = Counter(
+            "cloud_platform_job_process_cpu_inclusive_seconds",
+            "Process CPU during a job, inclusive of overlapping tasks (NOT exclusive job CPU)",
+            ("job",),
+            registry=self.registry,
+        )
+        self.jobs_active = Gauge(
+            "cloud_platform_jobs_active",
+            "Concurrent running jobs",
+            registry=self.registry,
+        )
 
         # -- Provider ------------------------------------------------------
         self.provider_calls_total = Counter(
@@ -195,6 +206,8 @@ class PlatformMetrics:
         trace, while the job span itself records the periodic run.
         """
         started = time.perf_counter()
+        cpu_started = time.process_time()
+        self.jobs_active.inc()
         status = "ok"
         with job_span(name) as span:
             try:
@@ -204,6 +217,10 @@ class PlatformMetrics:
                 set_span_status_error(span, exc)
                 raise
             finally:
+                self.jobs_active.dec()
+                self.job_process_cpu_seconds.labels(name).inc(
+                    max(0, time.process_time() - cpu_started)
+                )
                 self.job_runs_total.labels(job=name, status=status).inc()
                 self.job_duration_seconds.labels(job=name).observe(time.perf_counter() - started)
 

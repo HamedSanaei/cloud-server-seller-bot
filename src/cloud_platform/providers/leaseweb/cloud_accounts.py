@@ -128,6 +128,9 @@ class LeasewebCloudAccountRouter:
                 base_url=base_url,
                 timeout_seconds=timeout_seconds,
             )
+            transport = getattr(self._providers[account.account_id], "_transport", None)
+            if transport is not None:
+                transport.discovery_account_id = account.account_id
 
     # ------------------------------------------------------------------
     # Identity and lookup

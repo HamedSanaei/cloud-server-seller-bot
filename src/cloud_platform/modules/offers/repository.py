@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from contextlib import AbstractAsyncContextManager
 from decimal import Decimal, InvalidOperation
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import insert, inspect, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import CatalogSyncState as _CatalogSyncStateModel
@@ -24,6 +24,7 @@ from cloud_platform.modules.offers.domain import (
     SellableOffer,
     has_valid_pricing_provenance,
 )
+from cloud_platform.observability.catalog import records
 
 
 def _attr(row: Any, name: str) -> Any:
@@ -251,7 +252,7 @@ class SqlAlchemySellableOfferRepository:
             }
             return sorted(pairs)
 
-    async def upsert_from_provider(
+    def _observation_values(
         self,
         *,
         provider_key: str,
@@ -260,19 +261,7 @@ class SqlAlchemySellableOfferRepository:
         update: OfferSpecUpdate,
         provider_account_id: str | None = None,
         adopt_legacy_catalog_row: bool = False,
-    ) -> SellableOffer:
-        """Refresh one provider observation (idempotent per billing model/product/location).
-
-        ``provider_account_id`` records WHICH credential account supplied this
-        observation; omitting it leaves the existing provenance untouched so a
-        caller that does not know about credential accounts cannot erase it.
-
-        A provider observation WITHOUT a proven currency is refused here as
-        well as at the sync boundary: the columns carry a database default of
-        EUR, so storing an observation that omitted its currency would silently
-        reprice inventory that bills in GBP (or anything else). Sales
-        Organizations bill in different currencies — this fails CLOSED.
-        """
+    ) -> tuple[str, str | None, str]:
         currency = str(update.provider_cost_currency or "").strip().upper()
         if not currency:
             raise ValueError(
@@ -294,6 +283,150 @@ class SqlAlchemySellableOfferRepository:
             raise ValueError("provider account arguments disagree")
         account_id = str(supplied_accounts[0]).strip().casefold() if supplied_accounts else None
         billing_model = update.billing_model or BILLING_MODEL_MONTHLY
+        return currency, account_id, billing_model
+
+    def _apply_provider_row(
+        self,
+        session: AsyncSession,
+        candidates: Sequence[Any],
+        *,
+        provider_key: str,
+        product_id: str,
+        location_id: str,
+        update: OfferSpecUpdate,
+        currency: str,
+        account_id: str | None,
+        billing_model: str,
+        adopt_legacy_catalog_row: bool = False,
+        provider_account_id: str | None = None,
+    ) -> Any:
+        if account_id is None:
+            if len(candidates) > 1:
+                raise ValueError(
+                    "provider observation is ambiguous; credential account is required"
+                )
+            if candidates and candidates[0].provider_account_id:
+                raise ValueError("provider observation already belongs to a credential account")
+            row = candidates[0] if candidates else None
+        else:
+            matching = [
+                candidate
+                for candidate in candidates
+                if str(candidate.provider_account_id or "").strip().casefold()
+                == str(account_id).strip().casefold()
+            ]
+            if any(candidate.provider_account_id is None for candidate in candidates) and not (
+                adopt_legacy_catalog_row and len(candidates) == 1
+            ):
+                raise ValueError(
+                    "legacy unscoped offer conflicts with an account-scoped observation"
+                )
+            if len(matching) > 1:
+                raise ValueError("duplicate account-scoped provider observations exist")
+            if matching:
+                row = matching[0]
+            elif len(candidates) == 1:
+                # ELIGIBILITY CHANGE: the pair moved to another credential
+                # account (the previous owner was drained/removed or hit its
+                # provider limit, and a higher-priority account newly proved
+                # it). The offer identity is
+                # ``(provider_key, product_id, location_id)`` — the row is
+                # UNIQUE on exactly that — so the observation is re-pinned
+                # in place instead of inserted (which would violate the
+                # constraint and, as production showed, fail the whole sync
+                # source). Accepted contracts are unaffected: a server or
+                # order carries its own pinned account and immutable
+                # fingerprint, and no accepted row is ever rewritten here.
+                row = candidates[0]
+            elif not candidates:
+                row = None
+            else:
+                raise ValueError(
+                    "provider observation is ambiguous; a credential account "
+                    "cannot be reassigned across duplicate rows"
+                )
+        if row is None:
+            row = _SellableOfferModel(
+                provider_key=provider_key,
+                product_id=product_id,
+                location_id=location_id,
+                name=update.name,
+                vcpu=update.vcpu,
+                ram_gb=update.ram_gb,
+                disk_gb=update.disk_gb,
+                traffic=update.traffic,
+                provider_cost_minor=update.provider_cost_minor,
+                provider_cost_currency=currency,
+                billing_parameters=update.billing_parameters,
+                technical_metadata=dict(update.technical_metadata or {}),
+                pricing_metadata={},
+                billing_model=billing_model,
+                provider_available=(
+                    False if update.provider_observation_inconclusive else update.provider_available
+                ),
+                selling_currency=currency,
+                provider_account_id=account_id,
+            )
+            session.add(row)
+        else:
+            cast_any: Any = row
+            # Capture every prior pricing fact before writing the new
+            # observation.  Comparing after assignment loses same-minor
+            # exact-rate changes and can leave a stale customer price live.
+            prior_cost = int(cast_any.provider_cost_minor or 0)
+            prior_currency = str(cast_any.provider_cost_currency or "").strip().upper()
+            prior_rate = _pricing_rate(cast_any)
+            next_rate = _pricing_rate(
+                cast_any,
+                dict(update.billing_parameters or {}),
+            )
+            cost_changed = prior_cost != update.provider_cost_minor or prior_currency != currency
+            rate_changed = not _rate_equal(prior_rate, next_rate)
+            if bool(cast_any.auto_priced) and (cost_changed or rate_changed):
+                pending = dict(cast_any.pricing_metadata or {})
+                pending["fx_repricing_pending"] = True
+                pending["catalog_observation_pending"] = True
+                cast_any.pricing_metadata = pending
+            # The operator's selling price and currency are NEVER written
+            # here: a catalog refresh must not reprice the storefront.
+            cast_any.name = update.name
+            cast_any.vcpu = update.vcpu
+            cast_any.ram_gb = update.ram_gb
+            cast_any.disk_gb = update.disk_gb
+            cast_any.traffic = update.traffic
+            cast_any.provider_cost_minor = update.provider_cost_minor
+            cast_any.provider_cost_currency = currency
+            cast_any.billing_parameters = update.billing_parameters
+            if update.technical_metadata is not None:
+                cast_any.technical_metadata = dict(update.technical_metadata)
+            if update.billing_model:
+                cast_any.billing_model = update.billing_model
+            if not update.provider_observation_inconclusive:
+                cast_any.provider_available = update.provider_available
+            if account_id:
+                cast_any.provider_account_id = account_id
+        return row
+
+    async def upsert_from_provider(
+        self,
+        *,
+        provider_key: str,
+        product_id: str,
+        location_id: str,
+        update: OfferSpecUpdate,
+        provider_account_id: str | None = None,
+        adopt_legacy_catalog_row: bool = False,
+    ) -> SellableOffer:
+        """Compatibility single-row writer; identical ownership and price guards."""
+        arguments: dict[str, Any] = dict(
+            provider_key=provider_key,
+            product_id=product_id,
+            location_id=location_id,
+            update=update,
+            provider_account_id=provider_account_id,
+            adopt_legacy_catalog_row=adopt_legacy_catalog_row,
+        )
+        currency, account_id, billing_model = self._observation_values(**arguments)
         async with self._session_factory() as session:
             candidates = (
                 (
@@ -311,118 +444,175 @@ class SqlAlchemySellableOfferRepository:
                 .scalars()
                 .all()
             )
-            if account_id is None:
-                if len(candidates) > 1:
-                    raise ValueError(
-                        "provider observation is ambiguous; credential account is required"
-                    )
-                if candidates and candidates[0].provider_account_id:
-                    raise ValueError("provider observation already belongs to a credential account")
-                row = candidates[0] if candidates else None
-            else:
-                matching = [
-                    candidate
-                    for candidate in candidates
-                    if str(candidate.provider_account_id or "").strip().casefold()
-                    == str(account_id).strip().casefold()
-                ]
-                if any(candidate.provider_account_id is None for candidate in candidates) and not (
-                    adopt_legacy_catalog_row and len(candidates) == 1
-                ):
-                    raise ValueError(
-                        "legacy unscoped offer conflicts with an account-scoped observation"
-                    )
-                if len(matching) > 1:
-                    raise ValueError("duplicate account-scoped provider observations exist")
-                if matching:
-                    row = matching[0]
-                elif len(candidates) == 1:
-                    # ELIGIBILITY CHANGE: the pair moved to another credential
-                    # account (the previous owner was drained/removed or hit its
-                    # provider limit, and a higher-priority account newly proved
-                    # it). The offer identity is
-                    # ``(provider_key, product_id, location_id)`` — the row is
-                    # UNIQUE on exactly that — so the observation is re-pinned
-                    # in place instead of inserted (which would violate the
-                    # constraint and, as production showed, fail the whole sync
-                    # source). Accepted contracts are unaffected: a server or
-                    # order carries its own pinned account and immutable
-                    # fingerprint, and no accepted row is ever rewritten here.
-                    row = candidates[0]
-                elif not candidates:
-                    row = None
-                else:
-                    raise ValueError(
-                        "provider observation is ambiguous; a credential account "
-                        "cannot be reassigned across duplicate rows"
-                    )
-            if row is None:
-                row = _SellableOfferModel(
-                    provider_key=provider_key,
-                    product_id=product_id,
-                    location_id=location_id,
-                    name=update.name,
-                    vcpu=update.vcpu,
-                    ram_gb=update.ram_gb,
-                    disk_gb=update.disk_gb,
-                    traffic=update.traffic,
-                    provider_cost_minor=update.provider_cost_minor,
-                    provider_cost_currency=currency,
-                    billing_parameters=update.billing_parameters,
-                    technical_metadata=dict(update.technical_metadata or {}),
-                    pricing_metadata={},
-                    billing_model=billing_model,
-                    provider_available=(
-                        False
-                        if update.provider_observation_inconclusive
-                        else update.provider_available
-                    ),
-                    selling_currency=currency,
-                    provider_account_id=account_id,
-                )
-                session.add(row)
-            else:
-                cast_any: Any = row
-                # Capture every prior pricing fact before writing the new
-                # observation.  Comparing after assignment loses same-minor
-                # exact-rate changes and can leave a stale customer price live.
-                prior_cost = int(cast_any.provider_cost_minor or 0)
-                prior_currency = str(cast_any.provider_cost_currency or "").strip().upper()
-                prior_rate = _pricing_rate(cast_any)
-                next_rate = _pricing_rate(
-                    cast_any,
-                    dict(update.billing_parameters or {}),
-                )
-                cost_changed = (
-                    prior_cost != update.provider_cost_minor or prior_currency != currency
-                )
-                rate_changed = not _rate_equal(prior_rate, next_rate)
-                if bool(cast_any.auto_priced) and (cost_changed or rate_changed):
-                    pending = dict(cast_any.pricing_metadata or {})
-                    pending["fx_repricing_pending"] = True
-                    pending["catalog_observation_pending"] = True
-                    cast_any.pricing_metadata = pending
-                # The operator's selling price and currency are NEVER written
-                # here: a catalog refresh must not reprice the storefront.
-                cast_any.name = update.name
-                cast_any.vcpu = update.vcpu
-                cast_any.ram_gb = update.ram_gb
-                cast_any.disk_gb = update.disk_gb
-                cast_any.traffic = update.traffic
-                cast_any.provider_cost_minor = update.provider_cost_minor
-                cast_any.provider_cost_currency = currency
-                cast_any.billing_parameters = update.billing_parameters
-                if update.technical_metadata is not None:
-                    cast_any.technical_metadata = dict(update.technical_metadata)
-                if update.billing_model:
-                    cast_any.billing_model = update.billing_model
-                if not update.provider_observation_inconclusive:
-                    cast_any.provider_available = update.provider_available
-                if account_id:
-                    cast_any.provider_account_id = account_id
+            row = self._apply_provider_row(
+                session,
+                candidates,
+                **arguments,
+                currency=currency,
+                account_id=account_id,
+                billing_model=billing_model,
+            )
             await session.commit()
             await session.refresh(row)
             return _to_domain(row)
+
+    async def upsert_provider_batch(
+        self, observations: list[dict[str, Any]]
+    ) -> list[SellableOffer]:
+        """One bounded transaction; provider-only fields, no operator/contract writes.
+
+        A caller rolls back the entire chunk on failure before single-row recovery.
+        Sorted row locks match observation identity and preserve account adoption rules.
+        """
+        if len(observations) > 100:
+            raise ValueError("catalog observation batches are limited to 100 rows")
+        prepared = [(args, self._observation_values(**args)) for args in observations]
+        keys = [(a["provider_key"], v[2], a["product_id"], a["location_id"]) for a, v in prepared]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate identities in catalog batch")
+        async with self._session_factory() as session:
+            found = (
+                (
+                    await session.execute(
+                        select(_SellableOfferModel)
+                        .where(
+                            tuple_(
+                                _SellableOfferModel.provider_key,
+                                _SellableOfferModel.billing_model,
+                                _SellableOfferModel.product_id,
+                                _SellableOfferModel.location_id,
+                            ).in_(keys)
+                        )
+                        .order_by(
+                            _SellableOfferModel.provider_key,
+                            _SellableOfferModel.billing_model,
+                            _SellableOfferModel.product_id,
+                            _SellableOfferModel.location_id,
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            grouped: dict[tuple[str, str, str, str], list[Any]] = {}
+            for row in found:
+                grouped.setdefault(
+                    (
+                        str(row.provider_key),
+                        str(row.billing_model),
+                        str(row.product_id),
+                        str(row.location_id),
+                    ),
+                    [],
+                ).append(row)
+            rows = []
+            new_rows = []
+            changed_count = 0
+            for args, (currency, account_id, billing_model) in sorted(
+                prepared,
+                key=lambda item: (
+                    item[0]["provider_key"],
+                    item[1][2],
+                    item[0]["product_id"],
+                    item[0]["location_id"],
+                ),
+            ):
+                key = (args["provider_key"], billing_model, args["product_id"], args["location_id"])
+                candidates = grouped.get(key, [])
+                row = self._apply_provider_row(
+                    session,
+                    candidates,
+                    **args,
+                    currency=currency,
+                    account_id=account_id,
+                    billing_model=billing_model,
+                )
+                if row in session.new:
+                    row.id = uuid4()
+                    new_rows.append(row)
+                rows.append(row)
+                changed = row in session.new or session.is_modified(row, include_collections=False)
+                changed_count += int(changed)
+            # Explicit unordered RETURNING avoids SQLAlchemy's per-row ordered
+            # server-default correlation. IDs map results without order guesses.
+            if new_rows:
+                values = []
+                columns = set(_SellableOfferModel.__table__.columns.keys())
+                for row in new_rows:
+                    values.append({k: v for k, v in vars(row).items() if k in columns})
+                    session.expunge(row)
+                inserted = (
+                    await session.scalars(
+                        insert(_SellableOfferModel).values(values).returning(_SellableOfferModel)
+                    )
+                ).all()
+                inserted_by_id = {row.id: row for row in inserted}
+                rows = [inserted_by_id.get(row.id, row) for row in rows]
+            await session.flush()
+            await self._refresh_batch_defaults(session, rows)
+            by_key = {
+                (r.provider_key, r.billing_model, r.product_id, r.location_id): _to_domain(r)
+                for r in rows
+            }
+            await session.commit()
+            records.labels("observation", "changed").inc(changed_count)
+            records.labels("observation", "unchanged").inc(len(rows) - changed_count)
+            return [by_key[key] for key in keys]
+
+    @staticmethod
+    async def _refresh_batch_defaults(session: AsyncSession, rows: Sequence[Any]) -> None:
+        ids = [row.id for row in rows if inspect(row).expired_attributes]
+        if ids:
+            await session.execute(
+                select(_SellableOfferModel)
+                .where(_SellableOfferModel.id.in_(ids))
+                .execution_options(populate_existing=True)
+            )
+
+    async def get_many_by_refs(
+        self, provider_key: str, billing_model: str, refs: list[tuple[str | None, str, str]]
+    ) -> list[SellableOffer]:
+        if not refs:
+            return []
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(_SellableOfferModel).where(
+                            _SellableOfferModel.provider_key == provider_key,
+                            _SellableOfferModel.billing_model == billing_model,
+                            tuple_(
+                                _SellableOfferModel.product_id, _SellableOfferModel.location_id
+                            ).in_(sorted({(product, location) for _, product, location in refs})),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            scoped = {
+                (
+                    str(r.provider_account_id or "").strip().casefold(),
+                    str(r.product_id),
+                    str(r.location_id),
+                ): r
+                for r in rows
+            }
+            result = []
+            for account, product, location in refs:
+                if account is not None:
+                    row = scoped.get((str(account).strip().casefold(), product, location))
+                else:
+                    matches = [
+                        r for r in rows if r.product_id == product and r.location_id == location
+                    ]
+                    if len(matches) > 1:
+                        raise ValueError("ambiguous unscoped catalog observation")
+                    row = matches[0] if matches else None
+                if row is not None:
+                    result.append(_to_domain(row))
+            return result
 
     async def hourly_account_owners(self, provider_key: str) -> dict[tuple[str, str], str]:
         """``(product_id, location_id) -> credential account`` for hourly rows.
@@ -733,6 +923,60 @@ class SqlAlchemySellableOfferRepository:
             await session.refresh(row)
             return _to_domain(row)
 
+    def _auto_price_row(
+        self,
+        row: Any,
+        *,
+        expected_cost_minor: int,
+        expected_cost_currency: str,
+        selling_price_minor: int,
+        selling_currency: str,
+        pricing_metadata: dict[str, object],
+        expected_provider_rate: str | None = None,
+        expected_observation: SellableOffer | None = None,
+    ) -> Any:
+        selling_price_minor = _positive_int64(selling_price_minor, name="selling price")
+        code = _audited_currency(selling_currency)
+        if not isinstance(pricing_metadata, dict):
+            raise ValueError("pricing_metadata must be a mapping")
+        expected_currency = _audited_currency(expected_cost_currency)
+        if row is None:
+            raise OfferNotFoundError("offer not found")
+        if (
+            not bool(row.auto_priced)
+            or bool(row.operator_disabled)
+            or int(row.provider_cost_minor or 0) != expected_cost_minor
+            or str(row.provider_cost_currency or "").strip().upper() != expected_currency
+            or not _rate_equal(
+                _pricing_rate(row),
+                expected_provider_rate or _metadata_rate(row, pricing_metadata),
+            )
+        ):
+            return None
+        if expected_observation is not None and (
+            row.provider_account_id != expected_observation.provider_account_id
+            or row.billing_model != expected_observation.billing_model
+            or dict(row.pricing_metadata or {}) != expected_observation.pricing_metadata
+        ):
+            return None
+        source = str(row.provider_cost_currency or "").strip().upper()
+        required_currency = (
+            source if source in DOMESTIC_PROVIDER_COST_CURRENCIES else self._catalog_currency
+        )
+        if code != required_currency:
+            raise ValueError(f"selling currency must be {required_currency!r} for this offer")
+        cast_any: Any = row
+        cast_any.selling_price_minor = selling_price_minor
+        cast_any.selling_currency = code
+        cast_any.pricing_metadata = dict(pricing_metadata)
+        if not has_valid_pricing_provenance(
+            _to_domain(row),
+            self._catalog_currency,
+            catalog_stale_limit_seconds=self._catalog_stale_limit_seconds,
+        ):
+            raise ValueError("automatic price lacks valid pricing provenance")
+        return row
+
     async def set_auto_price_if_current(
         self,
         offer_id: UUID,
@@ -743,56 +987,80 @@ class SqlAlchemySellableOfferRepository:
         selling_currency: str,
         pricing_metadata: dict[str, object],
         expected_provider_rate: str | None = None,
+        expected_observation: SellableOffer | None = None,
     ) -> SellableOffer | None:
-        """Lock and conditionally write one auto-price plus its audit snapshot.
-
-        Manual pricing and operator disable take the same row lock. Whichever
-        wins is authoritative; automation never overwrites it.
-        """
-        selling_price_minor = _positive_int64(selling_price_minor, name="selling price")
-        code = _audited_currency(selling_currency)
-        if not isinstance(pricing_metadata, dict):
-            raise ValueError("pricing_metadata must be a mapping")
-        expected_currency = _audited_currency(expected_cost_currency)
+        """Single-row compatibility path with the same CAS as batch pricing."""
         async with self._session_factory() as session:
-            statement = (
-                select(_SellableOfferModel)
-                .where(_SellableOfferModel.id == offer_id)
-                .with_for_update()
-            )
-            row = (await session.execute(statement)).scalar_one_or_none()
-            if row is None:
-                raise OfferNotFoundError(f"offer {offer_id} not found")
-            if (
-                not bool(row.auto_priced)
-                or bool(row.operator_disabled)
-                or int(row.provider_cost_minor or 0) != expected_cost_minor
-                or str(row.provider_cost_currency or "").strip().upper() != expected_currency
-                or not _rate_equal(
-                    _pricing_rate(row),
-                    expected_provider_rate or _metadata_rate(row, pricing_metadata),
+            row = (
+                await session.execute(
+                    select(_SellableOfferModel)
+                    .where(_SellableOfferModel.id == offer_id)
+                    .with_for_update()
                 )
-            ):
-                return None
-            source = str(row.provider_cost_currency or "").strip().upper()
-            required_currency = (
-                source if source in DOMESTIC_PROVIDER_COST_CURRENCIES else self._catalog_currency
+            ).scalar_one_or_none()
+            result = self._auto_price_row(
+                row,
+                expected_cost_minor=expected_cost_minor,
+                expected_cost_currency=expected_cost_currency,
+                selling_price_minor=selling_price_minor,
+                selling_currency=selling_currency,
+                pricing_metadata=pricing_metadata,
+                expected_provider_rate=expected_provider_rate,
+                expected_observation=expected_observation,
             )
-            if code != required_currency:
-                raise ValueError(f"selling currency must be {required_currency!r} for this offer")
-            cast_any: Any = row
-            cast_any.selling_price_minor = selling_price_minor
-            cast_any.selling_currency = code
-            cast_any.pricing_metadata = dict(pricing_metadata)
-            if not has_valid_pricing_provenance(
-                _to_domain(row),
-                self._catalog_currency,
-                catalog_stale_limit_seconds=self._catalog_stale_limit_seconds,
-            ):
-                raise ValueError("automatic price lacks valid pricing provenance")
+            if result is None:
+                return None
             await session.commit()
-            await session.refresh(row)
-            return _to_domain(row)
+            await session.refresh(result)
+            return _to_domain(result)
+
+    async def set_auto_prices_batch_if_current(
+        self, requests: list[dict[str, Any]]
+    ) -> list[SellableOffer | None]:
+        if len(requests) > 100 or len({r["offer_id"] for r in requests}) != len(requests):
+            raise ValueError("pricing batch must have at most 100 unique rows")
+        async with self._session_factory() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(_SellableOfferModel)
+                        .where(_SellableOfferModel.id.in_([r["offer_id"] for r in requests]))
+                        .order_by(_SellableOfferModel.id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            indexed = {row.id: row for row in rows}
+            result = []
+            changed_count = 0
+            economic_count = 0
+            evidence_count = 0
+            for request in requests:
+                arguments = dict(request)
+                row = indexed.get(arguments.pop("offer_id"))
+                prior_price = (row.selling_price_minor, row.selling_currency) if row else None
+                prior_evidence = dict(row.pricing_metadata or {}) if row else None
+                value = self._auto_price_row(row, **arguments)
+                result.append(value)
+                if value is not None:
+                    changed_count += int(session.is_modified(value, include_collections=False))
+                    economic_count += int(
+                        prior_price != (value.selling_price_minor, value.selling_currency)
+                    )
+                    evidence_count += int(prior_evidence != dict(value.pricing_metadata or {}))
+            await session.flush()
+            await self._refresh_batch_defaults(session, rows)
+            domains = [_to_domain(row) if row is not None else None for row in result]
+            await session.commit()
+            records.labels("pricing", "changed").inc(changed_count)
+            records.labels("pricing", "economic_changed").inc(economic_count)
+            records.labels("pricing", "evidence_refreshed").inc(evidence_count)
+            records.labels("pricing", "unchanged").inc(
+                sum(r is not None for r in result) - changed_count
+            )
+            return domains
 
     async def publish_if_current(
         self,

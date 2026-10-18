@@ -29,6 +29,12 @@ async def startup(ctx: dict[str, object]) -> None:
     from cloud_platform.observability.tracing import setup_tracing
 
     settings = get_settings()
+    if getattr(settings, "worker_metrics_enabled", False):
+        from prometheus_client import start_http_server
+
+        ctx["_metrics_server"] = start_http_server(
+            settings.worker_metrics_port, addr="0.0.0.0", registry=metrics.registry
+        )[0]
     setup_tracing(
         "cloud-platform-worker",
         otlp_endpoint=settings.otel_exporter_endpoint,
@@ -153,7 +159,18 @@ async def reconcile_cloud_capacity(ctx: dict[str, object]) -> None:
             if service is None:
                 logger.info("capacity recovery skipped: no leaseweb cloud scope")
                 return
-            report = await service.run("leaseweb")
+            from cloud_platform.providers.leaseweb.discovery_cache import discovery_scope
+
+            settings = get_settings()
+            from cloud_platform.observability.catalog import stage
+
+            async with discovery_scope(
+                settings.redis_url,
+                enabled=settings.catalog_probe_cache_enabled,
+                ttl=settings.catalog_probe_cache_ttl_seconds,
+            ):
+                with stage("capacity_recovery"):
+                    report = await service.run("leaseweb")
             logger.info("capacity recovery: %s", report.summary())
             for outcome in report.outcomes:
                 logger.info(
@@ -184,6 +201,10 @@ async def reconcile_server_management(ctx: dict[str, object]) -> None:
 
 
 async def shutdown(ctx: dict[str, object]) -> None:
+    server: Any = ctx.pop("_metrics_server", None)
+    if server is not None:
+        await asyncio.to_thread(server.shutdown)
+        server.server_close()
     from cloud_platform.core.container import close_container
     from cloud_platform.worker.health import HEARTBEAT_PATH
 
@@ -1225,8 +1246,18 @@ async def run_catalog_auto_sync_once() -> Any:
                 catalog_min_fresh_lifetime_seconds=(
                     settings.catalog_fx_min_remaining_lifetime_seconds
                 ),
+                batch_enabled=settings.catalog_batch_enabled,
             )
-            report = await coordinator.run()
+            from cloud_platform.observability.catalog import stage
+            from cloud_platform.providers.leaseweb.discovery_cache import discovery_scope
+
+            async with discovery_scope(
+                settings.redis_url,
+                enabled=settings.catalog_probe_cache_enabled,
+                ttl=settings.catalog_probe_cache_ttl_seconds,
+            ):
+                with stage("catalog_sync"):
+                    report = await coordinator.run()
             if not report.ran:
                 logger.info("catalog auto-sync skipped: %s", report.reason)
                 return

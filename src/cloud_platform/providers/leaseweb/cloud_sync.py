@@ -385,9 +385,14 @@ class LeasewebHourlyCloudSyncer:
         read routes away (or marks the pair unavailable when no account can
         serve images for it).
         """
+        from cloud_platform.core.config import get_settings
         from cloud_platform.modules.catalog.repository import SqlAlchemyLocationRepository
+        from cloud_platform.modules.offers.batch import ObservationBuffer
 
-        offers_repo = SqlAlchemySellableOfferRepository(self._session_factory)
+        offers_repo = ObservationBuffer(
+            SqlAlchemySellableOfferRepository(self._session_factory),
+            enabled=get_settings().catalog_batch_enabled,
+        )
         locations_repo = SqlAlchemyLocationRepository(self._session_factory)
         warnings: list[str] = []
         errors: list[str] = []
@@ -591,6 +596,13 @@ class LeasewebHourlyCloudSyncer:
             if region_failed:
                 account_failed = True
 
+        if offers_repo.enabled:
+            written, batch_failures = await offers_repo.flush()
+            persistence_failures.extend(batch_failures)
+            if batch_failures:
+                verified.clear()
+                verified_owner.clear()
+                account_failed = True
         reports = tuple(per_region[region_id] for region_id in sorted(per_region))
         if not reports and not errors:
             # No readable regions from any account (empty catalog): keep the
