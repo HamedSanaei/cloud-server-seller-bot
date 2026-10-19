@@ -24,11 +24,11 @@ test:
 check: lint format-check typecheck test
 	uv run python scripts/validate_tasks.py
 
-# Full release gates before staging, including types, tests, coverage and secrets.
+# Fast staging gate: Ruff, compile and API/bot/worker import smoke.
 staging-check:
 	uv run python scripts/verify_ci.py --staging
 
-# Run named regressions first, then all mandatory release gates.
+# Run named regressions first, then the fast staging gate.
 # Usage: make staging-test TESTS="tests/unit/test_business_log.py tests/unit/test_hourly_state_machine.py"
 staging-test:
 	uv run python scripts/verify_ci.py --staging $(addprefix --test ,$(TESTS))

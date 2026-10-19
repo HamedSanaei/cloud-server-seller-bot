@@ -77,7 +77,7 @@ async def test_official_shaped_quotes_use_requested_pair_and_reference_contract(
     request = requests[0]
     assert request.method == "GET"
     assert request.url.path == f"/v2/rate/{base.lower()}/{quote.lower()}"
-    assert request.url.query == b""
+    assert dict(request.url.params) == {"date": before.date().isoformat()}
     assert request.url.userinfo == b""
     assert "authorization" not in {name.lower() for name in request.headers}
     assert "x-api-key" not in {name.lower() for name in request.headers}
@@ -93,6 +93,46 @@ async def test_official_shaped_quotes_use_requested_pair_and_reference_contract(
     assert result.observed_at.utcoffset() is not None
     assert result.expires_at == result.observed_at + timedelta(seconds=900)
     assert before <= result.observed_at <= after
+
+
+@pytest.mark.parametrize("provider_ignores_date", [False, True])
+async def test_latest_business_date_ahead_of_utc_is_bounded_without_weakening_validation(
+    monkeypatch: pytest.MonkeyPatch, provider_ignores_date: bool
+) -> None:
+    from cloud_platform.modules.fx import domain
+    from cloud_platform.providers.frankfurter_fx import client as adapter
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz == UTC
+            return instant
+
+    instant = FrozenDatetime(2026, 10, 18, 23, 30, tzinfo=UTC)
+    monkeypatch.setattr(adapter, "datetime", FrozenDatetime)
+    monkeypatch.setattr(domain, "datetime", FrozenDatetime)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert dict(request.url.params) == {"date": "2026-10-18"}
+        business_date = "2026-10-19" if provider_ignores_date else "2026-10-18"
+        return _json_response(request, _quote_body(provider_date=business_date))
+
+    client = FrankfurterFxClient(transport=httpx.MockTransport(handler))
+    try:
+        if provider_ignores_date:
+            with pytest.raises(FxInvalidQuoteError, match="future"):
+                await client.get_reference_rate("EUR", "USD")
+        else:
+            result = await client.get_reference_rate("EUR", "USD")
+            assert result.provider_date == instant.date()
+            assert result.observed_at == instant
+            assert result.rate == Decimal("1.145")
+            assert result.source == "frankfurter"
+    finally:
+        await client.close()
+    assert len(requests) == 1  # No guessed fallback or retry of invalid quotes.
 
 
 async def test_numeric_rate_is_parsed_as_decimal_without_precision_loss() -> None:

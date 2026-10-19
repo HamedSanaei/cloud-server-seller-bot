@@ -165,10 +165,14 @@ class FrankfurterFxClient:
         base = _normalize_currency(base_currency, field="base_currency")
         quote = _normalize_currency(quote_currency, field="quote_currency")
         endpoint = f"{self._base_url}{RATE_PATH}/{base.lower()}/{quote.lower()}"
+        # The blended latest endpoint can advance its business date before
+        # UTC midnight. Ask for an explicit as-of date; never accept a future
+        # quote or weaken the domain's timestamp/provenance validation.
+        as_of = datetime.now(UTC).date().isoformat()
 
         async with metrics.provider_call(self.source_name, "GET /v2/rate"):
             try:
-                response = await self._client.get(endpoint)
+                response = await self._client.get(endpoint, params={"date": as_of})
             except httpx.RequestError as exc:
                 raise FxUnavailableError(
                     f"Frankfurter reference rate {base}/{quote} is unavailable"

@@ -1,7 +1,7 @@
 # Staging — automatic fast release to the original production runtime
 
 The operator explicitly selected **one shared runtime**, not an independent test
-stack. A successful push to `staging` runs complete reusable CI, publishes the
+stack. A successful push to `staging` runs targeted staging checks, publishes the
 exact commit image in GHCR and updates the original API, worker and Telegram bot.
 It uses the **existing** production database, Redis, deployment directory,
 server-owned `configuration.toml`, bot token and Compose project
@@ -11,6 +11,20 @@ server-owned `configuration.toml`, bot token and Compose project
 worker's scheduled coordinator still refreshes the catalog; migration, financial,
 health, reconciliation and storefront-readiness gates are unchanged. The actual
 application environment remains `production`, including Console contract headers.
+
+## Fast validation contract
+
+`staging-checks.yml` runs two parallel jobs: Ruff/compile/import smoke plus targeted
+financial/deployment regressions, and real PostgreSQL migration/locking/catalog
+CAS/wallet-ledger-outbox contracts. Secret scanning and actionlint remain enabled.
+The cached immutable image build follows both successful jobs. No full coverage
+suite, mypy, historical migration bridge or redundant image build runs in this
+lane; those stay in unchanged `ci.yml` for main/release. Fresh migration and
+physical schema parity still run before deployment, as do all shared-host gates.
+
+Locally run `uv run python scripts/verify_ci.py --staging --test <affected-test>`.
+This is targeted evidence, not a claim of full release validation. Do not use the
+shared server for synthetic tests or bypass a failed storefront price gate.
 
 ## GitHub configuration
 

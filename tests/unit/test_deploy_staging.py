@@ -152,7 +152,9 @@ def test_production_resolver_emits_only_the_validated_sha_image(tmp_path: Path) 
 
 
 @pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")
-@pytest.mark.parametrize("name", ["ci.yml", "deploy-staging.yml", "deploy-production.yml"])
+@pytest.mark.parametrize(
+    "name", ["ci.yml", "staging-checks.yml", "deploy-staging.yml", "deploy-production.yml"]
+)
 def test_all_workflow_shell_commands_parse_after_expression_interpolation(name: str) -> None:
     for job in _workflow(name)["jobs"].values():
         for step in job.get("steps", []):
@@ -168,6 +170,46 @@ def test_all_workflow_shell_commands_parse_after_expression_interpolation(name: 
                 timeout=10,
             )
             assert result.returncode == 0, (name, step.get("name"), result.stderr)
+
+
+def test_staging_uses_targeted_checks_without_weakening_main_or_shared_host_guards() -> None:
+    staging = _workflow()
+    assert staging["jobs"]["checks"]["uses"] == "./.github/workflows/staging-checks.yml"
+    assert "checks" in staging["jobs"]["build"]["needs"]
+    checks = _workflow("staging-checks.yml")
+    assert checks["permissions"] == {"contents": "read"}
+    commands = "\n".join(
+        step.get("run", "") for job in checks["jobs"].values() for step in job["steps"]
+    )
+    for contract in (
+        "--staging",
+        "detect-secrets --all-files",
+        "actionlint@",
+        "test_frankfurter_fx.py",
+        "test_offers_pricing_failclosed.py",
+        "test_offers_readiness.py",
+        "test_financial_payment_invariants.py",
+        "test_postgres_migration_lock.py",
+        "test_postgres_catalog_batch.py",
+        "test_postgres_catalog_sync.py",
+        "test_postgres_wallet_adjust.py",
+        "test_financial_payment_outbox.py",
+        "alembic upgrade head",
+        "cloud_platform.db.schema_parity",
+    ):
+        assert contract in commands
+    assert "--cov=" not in commands
+    assert "mypy" not in commands
+    assert "pre-commit run --all-files" not in commands
+    assert checks["jobs"]["postgres"]["services"]["postgres"]["image"] == "postgres:17-alpine"
+    main = _workflow("ci.yml")["jobs"]
+    assert "--cov-fail-under=88" in str(main["test"])
+    assert "mypy src" in str(main["static"])
+    assert "test_migration_bridge.py" in str(main["migration-smoke"])
+    for name in ("deploy-staging.yml", "deploy-production.yml"):
+        deploy = _workflow(name)["jobs"]["deploy"]
+        assert deploy["concurrency"]["group"] == "platform-production-deploy"
+        assert deploy["concurrency"]["cancel-in-progress"] is False
 
 
 @pytest.mark.skipif(BASH is None, reason="POSIX shell unavailable")

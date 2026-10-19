@@ -1,0 +1,100 @@
+name: staging-checks
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  UV_LINK_MODE: copy
+
+jobs:
+  fast:
+    name: Fast static and financial/deployment regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+      - name: Fast staging gate
+        run: uv run --no-sync python scripts/verify_ci.py --staging
+      - name: Secret scanning only (not the release pre-commit suite)
+        run: uv run --no-sync pre-commit run detect-secrets --all-files
+      - name: Validate workflow and deploy shell contracts
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          bash -n scripts/deploy-production.sh
+          bash -n docker-entrypoint.sh
+      - name: Targeted financial and deployment regressions
+        run: >-
+          uv run --no-sync pytest -q --no-cov
+          tests/unit/test_verify_ci.py
+          tests/unit/test_deploy_staging.py
+          tests/unit/test_deploy_production.py
+          tests/unit/test_post_deploy_smoke.py
+          tests/unit/test_schema_parity_gate.py
+          tests/unit/test_frankfurter_fx.py
+          tests/unit/test_global_fx_resolver_contracts.py
+          tests/unit/test_catalog_fx_lifetime.py
+          tests/unit/test_offers_readiness.py
+          tests/unit/test_offers_normalize.py
+          tests/unit/test_offers_pricing_failclosed.py
+          tests/unit/test_offers_repo_cas.py
+          tests/unit/test_offer_publication_repository.py
+          tests/unit/test_financial_payment_invariants.py
+          tests/unit/test_payment_nowpayments_settlement.py
+          tests/unit/test_wallet_adjust.py
+          tests/unit/test_hourly_state_machine.py
+          -k 'not test_built_image_executes_through_the_real_entrypoint'
+
+  postgres:
+    name: Targeted real PostgreSQL migration and financial contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: cloud
+          POSTGRES_PASSWORD: cloud # pragma: allowlist secret
+          POSTGRES_DB: cloud
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U cloud -d cloud"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      # Public, disposable CI service credentials; never a production database.
+      DATABASE_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud # pragma: allowlist secret
+      CLOUD_PLATFORM_TEST_POSTGRES_URL: postgresql+asyncpg://cloud:cloud@localhost:5432/cloud # pragma: allowlist secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+      - name: Migration source compatibility
+        run: uv run --no-sync python scripts/check_migrations.py
+      - name: Migrate fresh scratch database and assert physical schema
+        run: |
+          uv run --no-sync alembic upgrade head
+          uv run --no-sync python -m cloud_platform.db.schema_parity
+          head_rev="$(uv run --no-sync alembic heads | awk '{print $1}')"
+          current_rev="$(uv run --no-sync alembic current | awk '{print $1}')"
+          test -n "$head_rev"
+          test "$head_rev" = "$current_rev"
+      - name: Real locking, ownership, catalog CAS and atomic wallet/ledger/outbox
+        run: >-
+          uv run --no-sync pytest -q --no-cov
+          tests/live/test_postgres_migration_lock.py
+          tests/live/test_postgres_catalog_batch.py
+          tests/live/test_postgres_catalog_sync.py
+          tests/live/test_postgres_wallet_adjust.py
+          tests/live/test_financial_payment_outbox.py

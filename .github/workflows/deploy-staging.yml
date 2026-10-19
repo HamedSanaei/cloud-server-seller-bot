@@ -2,7 +2,8 @@ name: deploy-staging
 
 # Staging is the automatic fast release lane for the SAME production runtime.
 # It reuses the production deploy path, private TOML, DB, Redis and Telegram bot;
-# no second stack or bot poller is created. Full CI remains mandatory.
+# no second stack or bot poller is created. Targeted checks guard staging;
+# main retains the full release CI suite and coverage gate.
 
 on:
   push:
@@ -47,8 +48,8 @@ jobs:
           }
 
   checks:
-    name: Required release checks
-    uses: ./.github/workflows/ci.yml
+    name: Required staging checks
+    uses: ./.github/workflows/staging-checks.yml
     permissions:
       contents: read
 

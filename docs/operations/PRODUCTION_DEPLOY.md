@@ -1,6 +1,7 @@
 # Deployment (GHCR image + SSH)
 
-Pushes and pull requests run the full CI gate. Staging delivery automatically
+Main pushes and pull requests run the full CI gate. Staging pushes run the
+targeted `staging-checks.yml` lane. Staging delivery automatically
 updates the SAME live Production runtime. The main lane remains an explicit
 approved dispatch after successful exact-SHA main CI. Companion documents:
 [`PRODUCTION_HARDENING.md`](PRODUCTION_HARDENING.md) (topology and guarantees),
@@ -22,7 +23,7 @@ The API retains its HTTP probe; worker and bot retain their progress probes.
 ```mermaid
 flowchart TD
   PR[Pull request: main or staging] --> CI[Full CI gates]
-  Stage[Push staging] --> SCI[Reusable full CI]
+  Stage[Push staging] --> SCI[Targeted staging checks and real PostgreSQL contracts]
   SCI --> Image[Build immutable exact-SHA image in CI]
   Image --> StageDeploy[Automatic shared production deploy]
   Main[Push main] --> MainCI[Full main CI]
@@ -40,18 +41,19 @@ Both lanes use `scripts/deploy-production.sh` and Compose project
 `cloud-platform-production`: one existing directory, private configuration,
 database, Redis, volumes, production bridge and original bot token. Staging
 only skips the one-shot provider catalog refresh; scheduled refresh and every
-release/financial/readiness gate remain active. See [staging lane](../../deploy/staging/README.md).
+deployment/financial/readiness gate remain active. See [staging lane](../../deploy/staging/README.md).
 
-Staging uses the same lint, format, mypy, secret scan, complete pytest/coverage,
-migration bridge, physical schema, PostgreSQL contracts, provider-neutrality,
-generated-contract and image-smoke gates as release CI; no fast-check exemption.
+Staging uses Ruff lint/format, compile/import smoke, secret scan, actionlint,
+targeted financial/deployment regressions, fresh migration/physical schema and
+real PostgreSQL locking/catalog/wallet contracts. Main keeps the complete
+pytest/coverage, mypy, historical migration bridge and other release gates.
 Images and Compose candidates come from that same tested commit. SHA tags are
 immutable, and OCI revision plus platform-contract labels are checked.
 Workflow validation requires Linux ShellCheck plus actionlint, not just a
 Windows-only syntax pass. The SSH wrapper's runtime regressions verify token
 stdin, a private temporary registry directory and cleanup on every exit.
-The coverage floor remains **88%**. Reports use six-digit precision; both CI
-and `scripts/verify_ci.py` also run `scripts/check_coverage.py` against the XML's
+The main/release coverage floor remains **88%**. Reports use six-digit precision;
+release CI and `scripts/verify_ci.py --push-ready` run `scripts/check_coverage.py` against the XML's
 integer line counts. A rounded display or successful plugin exit cannot authorize
 a result below the exact floor. The gate rejects the observed 39112/44452-line
 artifact rather than treating its rounded 88% display as success.

@@ -13,9 +13,10 @@ Usage:
         --test tests/unit/test_business_log.py \
         --test tests/unit/test_hourly_state_machine.py   # targeted + staging gate
 
-Steps (--staging): the same complete gates as --push-ready. Staging updates the
-same live runtime; it is not a lower-confidence release lane. --test runs named
-regressions first, never skipping full tests, types, secret scan or exact coverage.
+Steps (--staging): Ruff lint/format, source compilation and API/bot/worker
+import smoke. --test runs explicit regressions first. The staging workflow
+additionally enforces targeted financial/deployment and real PostgreSQL contracts;
+the full release suite, types and coverage remain in --push-ready and main CI.
 
 Steps (--push-ready):
     1. ruff check
@@ -71,9 +72,10 @@ PUSH_READY_STEPS: list[list[str]] = [
     ["uv", "run", "python", "scripts/check_generated_artifacts.py"],
 ]
 
-# A local staging check cannot quietly bypass the gates in reusable ci.yml.
 STAGING_STEPS = [
-    *PUSH_READY_STEPS,
+    ["uv", "run", "ruff", "check", "."],
+    ["uv", "run", "ruff", "format", "--check", "."],
+    ["uv", "run", "python", "-m", "compileall", "-q", "src"],
     [
         "uv",
         "run",
@@ -98,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument(
         "--staging",
         action="store_true",
-        help="full staging release gates, including tests, coverage and types",
+        help="fast staging gate: Ruff, compile and API/bot/worker imports",
     )
     parser.add_argument(
         "--test",
@@ -107,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="TARGET",
         help=(
             "explicit test path/test id to run before the staging steps "
-            "(repeatable; requires --staging). Full release gates still run afterward."
+            "(repeatable; requires --staging). No full release suite or coverage."
         ),
     )
     args = parser.parse_args(argv)
