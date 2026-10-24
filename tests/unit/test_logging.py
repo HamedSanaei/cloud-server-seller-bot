@@ -111,48 +111,36 @@ def test_password_pattern_in_string() -> None:
     assert "supersecret" not in str(result)
 
 
-def test_setup_logging_configures_structlog() -> None:
-    setup_logging()
-    # Verify structlog is configured
-    assert structlog.contextvars
-
-
-def test_get_logger_returns_bound_logger() -> None:
-    logger = get_logger("test.module")
-    assert logger is not None
-
-
-def test_get_logger_without_name() -> None:
-    logger = get_logger()
-    assert logger is not None
-
-
-def test_structured_log_output_is_json() -> None:
-    """Test that structured log output is valid JSON with redaction applied."""
-    setup_logging()
-    logger = get_logger("test")
-
-    # Capture log output
-    log_output = StringIO()
-    handler = logging.StreamHandler(log_output)
-    handler.setLevel(logging.DEBUG)
-    root_logger = logging.getLogger()
-    root_logger.addHandler(handler)
-    root_logger.setLevel(logging.DEBUG)
-
-    logger.info("test_event", token="secret_token", user_id=42)
-
-    # Get the log output
-    raw_output = log_output.getvalue().strip()
-    root_logger.removeHandler(handler)
-
-    if raw_output:
-        data: dict = json.loads(raw_output)
-        assert data.get("event") == "test_event" or data.get("event_id") == "test_event"
-        # Token should be redacted
-        token_value = data.get("token")
-        if token_value is not None:
-            assert token_value == _REDACTED_PLACEHOLDER
+def test_json_logging_redacts_structured_secrets_and_sdk_payloads() -> None:
+    output = StringIO()
+    handler = logging.StreamHandler(output)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    previous_level = root.level
+    try:
+        # Configure the actual destination, not a handler added after startup.
+        setup_logging()
+        get_logger("test").info("payment_unavailable", token="fixture-secret")
+        try:
+            raise ValueError("fixture-private-message token=fixture-secret")
+        except ValueError:
+            logging.getLogger("aiogram.event").exception(
+                "update 999 from user 123: fixture-private-message"
+            )
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        assert len(events) == 2
+        assert events[0]["token"] == _REDACTED_PLACEHOLDER
+        assert events[1]["level"] == "error"
+        assert events[1]["exception_type"] == "ValueError"
+        assert events[1]["frames"][-1]["function"] == (
+            "test_json_logging_redacts_structured_secrets_and_sdk_payloads"
+        )
+        assert "fixture-secret" not in output.getvalue()
+        assert "fixture-private-message" not in output.getvalue()
+        assert "999" not in events[1]["event"]
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
 
 
 def test_redaction_in_nested_structures() -> None:

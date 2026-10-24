@@ -87,6 +87,11 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("telegram", "callback_signing_key"): "callback_signing_key",
     ("telegram", "admin_chat_id"): "telegram_admin_chat_id",
     ("telegram", "superadmin_user_ids"): "telegram_superadmin_user_ids",
+    ("telegram", "polling", "timeout_seconds"): "telegram_polling_timeout_seconds",
+    ("telegram", "polling", "handler_concurrency"): "telegram_handler_concurrency",
+    ("telegram", "polling", "shutdown_seconds"): "telegram_shutdown_seconds",
+    ("telegram", "diagnostics", "interval_seconds"): "telegram_diagnostics_interval_seconds",
+    ("telegram", "diagnostics", "slow_handler_seconds"): "telegram_slow_handler_seconds",
     ("telegram", "support_contact"): "support_contact",
     ("telegram", "logger", "enabled"): "telegram_logger_enabled",
     ("telegram", "logger", "chat_id"): "telegram_logger_chat_id",
@@ -731,6 +736,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://cloud:cloud@localhost:5432/cloud"
     redis_url: str = "redis://localhost:6379/0"
     telegram_bot_token: str = ""
+    telegram_polling_timeout_seconds: int = Field(default=30, ge=1, le=50)
+    telegram_handler_concurrency: int = Field(default=16, ge=1, le=128)
+    telegram_shutdown_seconds: float = Field(default=25, gt=0, le=30)
+    # Opt-in aggregates. No per-update logs or dependency hooks while disabled.
+    telegram_diagnostics_interval_seconds: float = Field(default=0, ge=0, le=3600)
+    telegram_slow_handler_seconds: float = Field(default=2, gt=0)
     # M08-001: HMAC key for signed Telegram callback buttons. Must be set
     # whenever the bot runs; empty disables callback-driven flows (services
     # reject an empty key at construction time).

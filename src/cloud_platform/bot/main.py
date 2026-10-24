@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,14 +35,17 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardMarkup, Mess
 
 from cloud_platform.backup.job import BackupError, PostgresBackupJob, build_backup_config
 from cloud_platform.bot.admin_ui import AdminBotUi
+from cloud_platform.bot.diagnostics import BotDiagnostics
 from cloud_platform.bot.health import PollingHeartbeat
 from cloud_platform.bot.identity_flow import IdentityFlow
 from cloud_platform.bot.identity_ui import is_identity_cancel
 from cloud_platform.bot.monthly_ui import MonthlyBotUi
+from cloud_platform.bot.runtime import BoundedDispatcher
 from cloud_platform.bot.ui import BotScreen, BotUi, code_entities
 from cloud_platform.core.config import get_settings
 from cloud_platform.core.container import Container, close_container, get_container
 from cloud_platform.core.i18n import Locale, Translator, get_catalog
+from cloud_platform.core.logging import setup_logging
 from cloud_platform.core.session_store import SessionStoreUnavailable
 from cloud_platform.modules.navigation.domain import Callback, CallbackError, decode_callback
 from cloud_platform.modules.users.domain import PermissionDeniedError, User
@@ -56,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 _t = Translator()
 
-dp = Dispatcher()
+dp = BoundedDispatcher(disable_fsm=True)
 
 
 def _configured_superadmins() -> tuple[int, ...]:
@@ -693,7 +697,7 @@ def register_handlers(
         await query.answer()
 
 
-async def main() -> None:
+async def _run_bot(stack: AsyncExitStack) -> None:
     settings = get_settings()
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required to run the bot")
@@ -705,6 +709,7 @@ async def main() -> None:
     # Apply configured grants/revocations before Telegram can receive any update.
     await container.reconcile_superadmins()
     bot = Bot(token=settings.telegram_bot_token)
+    stack.push_async_callback(bot.session.close)
     heartbeat = PollingHeartbeat()
     bot.session.middleware(heartbeat)
     ui = BotUi(
@@ -716,7 +721,9 @@ async def main() -> None:
         create=container.create_server_service(),
     )
     gateways = container.payment_gateways()  # one HTTP client each per bot process
+    stack.push_async_callback(Container.aclose_gateways, gateways)
     fx_resolver = container.fx_resolver_or_none()  # one FX source+cache per bot process
+    stack.push_async_callback(Container.aclose_fx, fx_resolver)
     monthly_ui = MonthlyBotUi(
         settings.callback_signing_key,
         offers_view=container.offer_catalog_view_service(),
@@ -775,14 +782,38 @@ async def main() -> None:
     )
     register_handlers(dp, ui, monthly_ui, container, admin_ui=admin_ui, identity_flow=identity_flow)
 
+    diagnostics = BotDiagnostics(
+        interval_seconds=settings.telegram_diagnostics_interval_seconds,
+        slow_handler_seconds=settings.telegram_slow_handler_seconds,
+    )
+    stack.push_async_callback(diagnostics.stop)
+    if diagnostics.enabled:
+        bot.session.middleware(diagnostics.request_middleware)
+        dp.message.middleware(diagnostics.handler_middleware)
+        dp.callback_query.middleware(diagnostics.handler_middleware)
+        diagnostics.attach_engine(container.engine)
+        diagnostics.attach_redis(getattr(container.session_store(), "client", None))
+        diagnostics.start()
     logger.info("starting Telegram bot polling")
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot,
+            polling_timeout=settings.telegram_polling_timeout_seconds,
+            tasks_concurrency_limit=settings.telegram_handler_concurrency,
+            close_bot_session=False,
+        )
     finally:
-        heartbeat.clear()
-        await Container.aclose_gateways(gateways)
-        await Container.aclose_fx(fx_resolver)
-        await close_container()
+        try:
+            await dp.drain_handlers(settings.telegram_shutdown_seconds)
+        finally:
+            heartbeat.clear()
+
+
+async def main() -> None:
+    setup_logging()
+    async with AsyncExitStack() as stack:
+        stack.push_async_callback(close_container)
+        await _run_bot(stack)
 
 
 if __name__ == "__main__":

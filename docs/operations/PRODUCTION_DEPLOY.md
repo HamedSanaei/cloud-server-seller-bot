@@ -414,3 +414,187 @@ do not repair unavailable CPU capacity.
    partial migration, or incompatible financial epoch, do not restart old
    writers and do not run `alembic downgrade`. Keep writers drained and review
    a forward fix or separately authorized isolated-restore recovery.
+
+## 11. Bot CPU diagnostics and bounded polling
+
+The bot uses one polling consumer, a 30-second Telegram long poll and a
+configurable admission limit of 16 update handlers. Intake waits for a free
+slot **before** creating a task; excess updates stay in the current bounded
+Telegram batch or at Telegram, not in an unbounded local task queue.
+Network/API failures use bounded exponential backoff with jitter; HTTP 429
+waits at least Telegram's `retry_after`. Successful polls reset backoff.
+No delay is added to successful requests or normal handler execution.
+
+`[telegram.polling] timeout_seconds`, `handler_concurrency` and
+`shutdown_seconds` are documented in `configuration.example.toml`. Shutdown
+stops and awaits intake, gives accepted handlers 25 seconds to finish, then
+cancels and awaits remaining handlers before closing HTTP/Redis/DB resources.
+The existing Compose 45-second stop grace, one replica, Redis session backend,
+1-vCPU/1-GiB limits and 3 × 10-MiB Docker log rotation are unchanged.
+Unused aiogram in-memory FSM middleware is disabled; application sessions
+remain Redis-backed. Authentication, checkout, wallet and payment contracts
+are unchanged. Telegram polling still advances offsets on dispatch, not on
+business transaction completion: it is **not** an exactly-once delivery
+guarantee across process crashes. Application mutation idempotency remains
+authoritative.
+
+### Opt-in incident sampling
+
+After separately authorized configuration editing, set the following in the
+**existing server-owned** TOML; do not create duplicate tables or copy secrets:
+
+```toml
+[telegram.diagnostics]
+interval_seconds = 30
+slow_handler_seconds = 2
+```
+
+These fields also accept `TELEGRAM_DIAGNOSTICS_INTERVAL_SECONDS` and
+`TELEGRAM_SLOW_HANDLER_SECONDS` environment overrides. Interval zero (default)
+installs no sampler, middleware or dependency hooks. No new secret, service,
+port, dependency or migration is required. Configuration is read at startup;
+this is not permission to restart an intentionally stopped bot.
+
+`bot_diagnostics` JSON records include:
+
+- Process CPU seconds, CPU percent (100% = one occupied core), current RSS
+  and live asyncio task count.
+- Maximum sampled event-loop wake drift in the reporting interval, sampled
+  every `min(1, interval_seconds)` seconds; not every possible short stall.
+- GetUpdates attempts/completions, success/error/cancellation, durations,
+  retries following errors, 429 count and received updates per second.
+- Other Telegram API duration/outcome aggregates.
+- Active/completed/failed/cancelled handlers and per-static-handler duration
+  histograms, capped at 64 names including overflow. Slow warnings are capped
+  at one per interval; counters retain all slow executions.
+- Database cursor execution and session-store Redis command duration/outcomes.
+  SQL timings exclude pool acquisition/whole transactions; Redis includes
+  client-internal retries. These hooks do not cover unrelated FX Redis clients.
+
+Durations use fixed buckets. `p95_upper_seconds` is the containing bucket's
+upper boundary (or observed maximum for overflow), **not an exact percentile**.
+No update/chat/user identifiers, messages, callback contents, SQL, Redis keys,
+credentials or exception text are emitted. SDK warning/error records retain
+severity, exception class and source frames, not SDK payload text. Routine
+SDK per-update INFO writes are disabled; warnings/errors remain visible.
+Bot startup now invokes the shared JSON/redacting logging setup.
+
+Read-only monitoring after an approved activation:
+
+```sh
+docker inspect --format '{{.State.Status}} {{.State.Health.Status}} {{.RestartCount}}' cloud-platform-production-bot-1
+docker stats --no-stream cloud-platform-production-bot-1
+docker logs --since 10m --tail 100 cloud-platform-production-bot-1
+vmstat 1 10
+```
+
+Correlate process CPU and loop lag with handler concurrency, DB/Redis latency
+and polling errors. High VPS steal is unavailable hypervisor capacity, not
+process CPU usage. Docker health proves recent successful polling, not a CPU
+budget. For a suspicious Docker CPU sample, compare cgroup-v2
+`cpu.stat` `usage_usec` deltas over a monotonic interval:
+`100 * delta_usage_usec / delta_wall_usec`. Also record `cpu.max`,
+`nr_throttled`, `throttled_usec` and host steal over the same interval.
+An isolated percentage without its interval/counters cannot establish
+sustained quota violation; a stopped cgroup cannot supply historical counters.
+
+Do not start a second polling process to obtain a profile. Prefer the synthetic
+benchmark below. If real-handler attribution remains necessary, require a
+separate approval for a bounded statistical profile of the single active
+process; retain artifacts privately, disable locals capture and never publish
+profiles containing request data.
+
+### Repeatable isolated performance check
+
+Run every arm as a fresh process:
+
+```sh
+uv run python scripts/benchmark_bot_runtime.py --mode baseline --scenario idle
+uv run python scripts/benchmark_bot_runtime.py --mode corrected --scenario idle
+uv run python scripts/benchmark_bot_runtime.py --mode baseline --scenario burst --seconds 10 --updates 1000 --handler-delay 0.05
+uv run python scripts/benchmark_bot_runtime.py --mode corrected --scenario burst --seconds 10 --updates 1000 --handler-delay 0.05
+uv run python scripts/benchmark_bot_runtime.py --mode baseline --scenario sustained --seconds 10 --updates 10000 --handler-delay 0.01
+uv run python scripts/benchmark_bot_runtime.py --mode corrected --scenario sustained --seconds 10 --updates 10000 --handler-delay 0.01
+```
+
+The benchmark exercises actual aiogram dispatch/polling with synthetic Telegram
+responses and fixed JSON work plus simulated asynchronous dependency latency.
+Baseline is the locked SDK's 10-second/unbounded scheduler; corrected is
+30-second/16-handler scheduling. It deliberately excludes real business routes,
+network, DB, Redis, settings, diagnostic hooks and logging. It does not recreate
+an unknown production workload or prove the incident's root cause.
+
+JSON output records CPU/wall, sampled RSS/task peaks, loop lag, handler p95,
+release-to-completion p95 (including backpressure), duplicates, offsets and
+cleanup. Imports/setup/drain are excluded from CPU measurement; completed
+handler percentiles include drain. Final in-flight long polls count as started
+requests, so short-window requests/minute include a boundary effect.
+Idle sampling defaults to 250 ms; load sampling to 10 ms. Use
+`--sample-interval` to quantify observer overhead. A high-frequency RSS/task
+observer can dominate otherwise idle CPU, so compare like-for-like intervals.
+For constrained validation use an **isolated Linux OCI runner**, one CPU and
+1 GiB, no network, no production config/volumes/token. Verify output
+`environment.cgroup.cpu.max = "100000 100000"` and
+`memory.max = "1073741824"`. Do not use Docker Desktop for staging preparation.
+
+### Activation and rollback require separate approval
+
+Prefer the existing reviewed pipeline. For a current-main release with its
+successful exact-SHA CI, the owner-approved invocation is:
+
+```sh
+gh workflow run deploy-production.yml --repo HamedSanaei/cloud-server-seller-bot --ref main -f sha="$APPROVED_SHA" -f confirm_production=true
+```
+
+That pipeline can replace other application services and run migrations; it
+requires approval for that broader operation. Do not push/dispatch staging as
+an experiment: inspect the actual workflow first, since its trigger policy may
+activate the shared production runtime.
+
+For an explicitly approved **bot-only** activation of this no-migration patch,
+first verify the immutable candidate image, unchanged schema/financial epoch
+and compatibility with running API/worker, and exclude concurrent deployment
+or another token consumer. Run in the existing deployment directory with the
+deployment locks below; do not edit `deploy.env` or the server's secrets.
+
+```sh
+set -eu
+cd /opt/cloud-server-seller
+exec 9>.deployment.lock
+flock -n 9
+exec 8>/var/lock/servercloud-platform-release.lock
+flock -n 8
+DC='cloud-platform-production'
+PREVIOUS_IMAGE=$(docker inspect --format '{{.Config.Image}}' cloud-platform-production-bot-1)
+NEW_IMAGE="ghcr.io/hamedsanaei/cloud-server-seller-bot:$APPROVED_SHA"
+docker pull "$NEW_IMAGE"
+docker compose --project-name "$DC" --env-file deploy.env -f docker-compose.yml stop -t 35 bot
+PLATFORM_IMAGE="$NEW_IMAGE" docker compose --project-name "$DC" --env-file deploy.env -f docker-compose.yml up -d --no-deps --scale bot=1 bot
+docker inspect --format '{{.Config.Image}} {{.State.Status}} {{.State.Health.Status}}' cloud-platform-production-bot-1
+```
+
+Record `PREVIOUS_IMAGE` privately before activation; keep the same lock-holding
+shell open through health/CPU/lag/latency observation and a private test-message
+round trip. Require stable task counts, no conflicts, dependency errors or
+unexpected handler failures, and acceptable queue latency under representative
+load. Backpressure can increase burst queue time; choose concurrency from
+measurements, not from CPU-limit changes.
+
+If the candidate misbehaves, first stop it without disturbing other services:
+
+```sh
+docker compose --project-name "$DC" --env-file deploy.env -f docker-compose.yml stop -t 35 bot
+```
+
+Because the prior image is the suspected incident image, **leaving the bot
+stopped is the safe rollback state**. Only with separate authorization to
+resume that exact compatible image, and with no schema/financial-epoch change:
+
+```sh
+PLATFORM_IMAGE="$PREVIOUS_IMAGE" docker compose --project-name "$DC" --env-file deploy.env -f docker-compose.yml up -d --no-deps --scale bot=1 bot
+```
+
+Do not downgrade schema or overlap pollers. Bot-only overrides intentionally
+leave the global `deploy.env` image unchanged; record that temporary drift and
+reconcile it through the next approved pipeline. None of these commands is
+permission to start the currently stopped production bot.

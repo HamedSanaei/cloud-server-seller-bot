@@ -74,6 +74,18 @@ admin_chat_id = 0                  # renewals / attention alerts (0 = unset)
 superadmin_user_ids = []
 support_contact = "@support"
 
+# One polling consumer only. Backpressure is applied before task creation.
+[telegram.polling]
+timeout_seconds = 30
+handler_concurrency = 16
+shutdown_seconds = 25             # below compose stop_grace_period (45s)
+
+# Opt-in, bounded aggregates; no messages, identifiers, SQL or Redis keys.
+# CPU is process CPU / wall time (100% = one fully occupied core).
+[telegram.diagnostics]
+interval_seconds = 0              # disabled; use 30 for incident monitoring
+slow_handler_seconds = 2
+
 # Telegram TRANSIENT state: callback references, remembered selections,
 # one-time destructive confirmations and free-text prompts.
 #

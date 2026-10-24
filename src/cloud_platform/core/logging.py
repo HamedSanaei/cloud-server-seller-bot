@@ -17,12 +17,11 @@ from __future__ import annotations
 
 import logging
 import re
+import traceback
 from collections.abc import Mapping
 
 import structlog
 from structlog.types import EventDict
-
-from cloud_platform.core.config import get_settings
 
 # Fields whose values must always be redacted from log output.
 _REDACTED_KEYS: frozenset[str] = frozenset(
@@ -163,21 +162,58 @@ def _configure_structlog(level: str) -> None:
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
             redact_sensitive_fields,
-            structlog.processors.JSONRenderer(),
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, level.upper(), logging.INFO)
-        ),
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
 
 
+class _SafeForeignLog:
+    """Keep SDK failures visible without SDK payloads, identities or tokens."""
+
+    def __call__(self, _: object, __: str, event: EventDict) -> EventDict:
+        record = event.get("_record")
+        if isinstance(record, logging.LogRecord) and record.name.startswith("aiogram"):
+            event["event"] = "telegram_sdk_event"
+            event["sdk_logger"] = record.name
+            event.pop("stack", None)
+        # Exception strings can contain URLs, SQL values or private messages.
+        # Retain type + source locations, never exception text or frame locals.
+        info = event.pop("exc_info", None)
+        if isinstance(info, tuple) and len(info) == 3 and info[0] is not None:
+            event["exception_type"] = info[0].__name__
+            event["frames"] = [
+                {"file": frame.filename, "line": frame.lineno, "function": frame.name}
+                for frame in traceback.extract_tb(info[2])
+            ]
+        return event
+
+
 def _configure_stdlib_logging(level: str) -> None:
-    """Configure standard library logging to integrate with structlog."""
-    logging.basicConfig(
-        format="%(message)s",
-        level=getattr(logging, level.upper(), logging.INFO),
+    """JSON + redaction for stdlib and structlog through the same handler."""
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+        ],
+        processors=[
+            _SafeForeignLog(),
+            redact_sensitive_fields,
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.JSONRenderer(),
+        ],
     )
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    # Per-update SDK INFO logs add synchronous writes even with diagnostics off.
+    # Keep its warnings/errors; opt-in aggregates own routine performance data.
+    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+    if not root.handlers:
+        root.addHandler(logging.StreamHandler())
+    for handler in root.handlers:
+        handler.setFormatter(formatter)
 
 
 def setup_logging() -> None:
@@ -186,6 +222,8 @@ def setup_logging() -> None:
     Reads ``LOG_LEVEL`` from application settings and configures both
     ``structlog`` and the standard library ``logging`` module.
     """
+    from cloud_platform.core.config import get_settings
+
     settings = get_settings()
     level = settings.log_level
     _configure_structlog(level)
