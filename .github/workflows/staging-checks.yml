@@ -50,6 +50,9 @@ jobs:
           tests/unit/test_financial_payment_invariants.py
           tests/unit/test_payment_nowpayments_settlement.py
           tests/unit/test_wallet_adjust.py
+          tests/unit/test_server_delegation.py
+          tests/unit/test_website_bridge.py
+          tests/unit/test_servers_management_service.py
           tests/unit/test_hourly_state_machine.py
           -k 'not test_built_image_executes_through_the_real_entrypoint'
 
@@ -97,4 +100,5 @@ jobs:
           tests/live/test_postgres_catalog_batch.py
           tests/live/test_postgres_catalog_sync.py
           tests/live/test_postgres_wallet_adjust.py
+          tests/live/test_postgres_server_access_grants.py
           tests/live/test_financial_payment_outbox.py

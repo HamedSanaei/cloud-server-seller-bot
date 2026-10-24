@@ -480,6 +480,27 @@ class Server(Base):
     catalog_entry = relationship("Catalog", back_populates="servers")
 
 
+class ServerAccessGrant(Base):
+    """Revocable access, never resource ownership or a funding contract."""
+
+    __tablename__ = "server_access_grants"
+    __table_args__ = (
+        sa.UniqueConstraint("server_id", "delegate_user_id", name="uq_server_access_delegate"),
+        sa.CheckConstraint("delegate_user_id <> owner_user_id", name="ck_server_access_not_owner"),
+    )
+
+    id = Column(PG_UUID, primary_key=True)
+    server_id = Column(PG_UUID, ForeignKey("servers.id", ondelete="RESTRICT"), nullable=False)
+    delegate_user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    owner_user_id = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    binding = Column(String(64), nullable=False)
+    operations = Column(JSONB, nullable=False)
+    granted_by = Column(PG_UUID, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    reason = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class ServerCreateCredential(Base):
     """Encrypted, one-time provider-issued login for an owned server.
 

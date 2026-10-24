@@ -1806,6 +1806,11 @@ class Container:
             can_fund_hour=self.prepaid_hourly_billing_service().can_fund_hour,
         )
 
+    def server_access_repository(self) -> Any:
+        from cloud_platform.modules.servers.delegation_repository import ServerAccessRepository
+
+        return ServerAccessRepository(self.session_factory)
+
     def server_management_service(self, *, actor_user_id: UUID | None = None) -> Any:
         """Customer-facing, ownership-safe server management (Telegram).
 
@@ -1830,6 +1835,7 @@ class Container:
             PowerOperationFailedError,
             PowerOperationInProgressError,
         )
+        from cloud_platform.modules.servers.models import ServerOperation
         from cloud_platform.modules.servers.service import ServerManagementService
         from cloud_platform.modules.servers.test_identity import is_test_server
         from cloud_platform.modules.users.superadmins import is_superadmin
@@ -1840,12 +1846,31 @@ class Container:
                 if actor_user_id is not None
                 else None
             )
-            return is_test_server(server) and is_superadmin(
-                actor, get_settings().telegram_superadmin_user_ids
+            if not is_test_server(server):
+                return False
+            return is_superadmin(actor, get_settings().telegram_superadmin_user_ids) or (
+                actor is not None
+                and "view" in await self.server_access_repository().permissions(actor.id, server)
+            )
+
+        async def test_server_operations(server: Any) -> frozenset[str]:
+            actor = await self.user_repository().get(actor_user_id) if actor_user_id else None
+            if not is_test_server(server):
+                return frozenset()
+            if is_superadmin(actor, get_settings().telegram_superadmin_user_ids):
+                return frozenset(op.value for op in ServerOperation)
+            return (
+                await self.server_access_repository().permissions(actor.id, server)
+                if actor
+                else frozenset()
             )
 
         async def operator_power(server: Any, action: str, key: str) -> PowerCommandResult:
-            if actor_user_id is None or not await authorize_test_server(server):
+            # Delegated visibility is NEVER administrator support authority.
+            actor = await self.user_repository().get(actor_user_id) if actor_user_id else None
+            if not is_test_server(server) or not is_superadmin(
+                actor, get_settings().telegram_superadmin_user_ids
+            ):
                 raise NotServerOwnerError("server not found")
             operations = SqlAlchemyOperationRepository(self.session_factory)
             intent = await SqlAlchemyAdminSupportRepository(self.session_factory).enqueue(
@@ -1895,6 +1920,7 @@ class Container:
             renewal_collector=self.renewal_checker(),
             hourly_can_start=self.prepaid_hourly_billing_service().can_start,
             authorize_test_server=authorize_test_server,
+            test_server_operations=test_server_operations,
             actor_user_id=actor_user_id,
             operator_power=operator_power,
         )

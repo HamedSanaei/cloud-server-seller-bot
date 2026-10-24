@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Coroutine
 from dataclasses import asdict, replace
 from hashlib import sha256
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -108,7 +108,11 @@ async def integration_contract() -> dict[str, Any]:
     return {
         "data": {
             "version": CONSOLE_CONTRACT_VERSION,
-            "features": ["website-link-revoke:v1", "website-charge-requests:v1"],
+            "features": [
+                "website-link-revoke:v1",
+                "website-charge-requests:v1",
+                "website-server-delegation:v1",
+            ],
             "environment": settings.app_env.strip().lower(),
             "walletCurrency": settings.default_currency,
             "headerIdentityEnabled": settings.api_allow_header_identity,
@@ -180,7 +184,7 @@ async def claim_credentials(
     del key
     container = await get_container()
     user = await active_user(container, auth)
-    owner = await target_owner(container, user, server_id)
+    owner = await target_owner(container, user, server_id, operation="credentials")
     claimed = await container.server_management_service(actor_user_id=user.id).claim_ssh_password(
         owner, server_id
     )
@@ -203,7 +207,7 @@ async def acknowledge_credentials(
     del key
     container = await get_container()
     user = await active_user(container, auth)
-    owner = await target_owner(container, user, server_id)
+    owner = await target_owner(container, user, server_id, operation="credentials")
     ok = await container.server_management_service(actor_user_id=user.id).finish_ssh_password(
         owner, server_id, body.claimId, delivered=True
     )
@@ -243,6 +247,64 @@ async def admin_users(auth: AdminRead, q: str = "") -> dict[str, Any]:
     }
 
 
+class DelegationChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=4, max_length=500)
+    operations: list[Literal["view", "refresh", "traffic", "ip_list", "monitoring"]] = Field(
+        min_length=1, max_length=5
+    )
+
+
+class DelegationRevoke(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=4, max_length=500)
+
+
+@router.post("/admin/servers/{server_id}/delegations/{user_id}")
+async def delegate_server(
+    auth: AdminWrite, server_id: UUID, user_id: UUID, body: DelegationChange, key: Key
+) -> dict[str, Any]:
+    container = await get_container()
+    actor = await superadmin(container, auth)
+    try:
+        data = await container.server_access_repository().change(
+            actor_id=actor.id,
+            server_id=server_id,
+            user_id=user_id,
+            operations=body.operations,
+            reason=body.reason,
+            key=key,
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+        )
+    except ValueError:
+        raise ApiError(
+            ErrorCode.CONFLICT, "Delegation identity, scope or idempotency conflict"
+        ) from None
+    return {"data": data}
+
+
+@router.post("/admin/servers/{server_id}/delegations/{user_id}/revoke")
+async def revoke_server_delegation(
+    auth: AdminWrite, server_id: UUID, user_id: UUID, body: DelegationRevoke, key: Key
+) -> dict[str, Any]:
+    container = await get_container()
+    actor = await superadmin(container, auth)
+    try:
+        data = await container.server_access_repository().change(
+            actor_id=actor.id,
+            server_id=server_id,
+            user_id=user_id,
+            operations=[],
+            reason=body.reason,
+            key=key,
+            configured_ids=get_settings().telegram_superadmin_user_ids,
+            revoke=True,
+        )
+    except ValueError:
+        raise ApiError(ErrorCode.CONFLICT, "Delegation identity or idempotency conflict") from None
+    return {"data": data}
+
+
 @router.post("/admin/users/{user_id}/wallet-adjustments")
 async def wallet_adjust(
     auth: AdminWrite, user_id: UUID, body: WalletAdjustment, key: Key
@@ -272,20 +334,33 @@ async def active_user(container: Any, auth: TokenAuthentication) -> User:
     return user
 
 
-async def target_owner(container: Any, user: User, server_id: UUID) -> UUID:
-    """Normal ownership, or exact shared operator test fixture for configured superadmins."""
+async def target_owner(
+    container: Any, user: User, server_id: UUID, *, operation: str = "view"
+) -> UUID:
+    """Authorize access, retaining the real owner (never transfer it to a delegate)."""
     server = await container.server_repository().get(server_id)
     if server is None:
         raise ApiError(ErrorCode.NOT_FOUND, "سرور یافت نشد")
     if is_test_resource(server):
-        if not is_test_server(server) or not is_superadmin(
-            user, get_settings().telegram_superadmin_user_ids
-        ):
+        if not is_test_server(server) or not await test_resource_visible(container, user, server):
             raise ApiError(ErrorCode.NOT_FOUND, "سرور یافت نشد")
+        if not is_superadmin(user, get_settings().telegram_superadmin_user_ids):
+            allowed = await container.server_access_repository().permissions(user.id, server)
+            if operation not in allowed:
+                raise ApiError(ErrorCode.FORBIDDEN, "Operation outside explicit delegation")
         return cast(UUID, server.user_id)
     if server.user_id == user.id:
         return cast(UUID, server.user_id)
     raise ApiError(ErrorCode.NOT_FOUND, "سرور یافت نشد")
+
+
+async def test_resource_visible(container: Any, user: User, server: Any) -> bool:
+    if not is_test_server(server):
+        return False
+    if is_superadmin(user, get_settings().telegram_superadmin_user_ids):
+        return True
+    factory = getattr(container, "server_access_repository", None)
+    return factory is not None and "view" in await factory().permissions(user.id, server)
 
 
 def command_key(user_id: UUID, key: str) -> str:
@@ -305,7 +380,22 @@ async def run_action(
     actor_id = user.id
     if actor_id is None:
         raise ApiError(ErrorCode.FORBIDDEN, "حساب کاربری ثبت‌شده لازم است")
-    await target_owner(container, user, server_id)
+    if action not in {
+        "power-on",
+        "power-off",
+        "reboot",
+        "reinstall",
+        "reset-password",
+        "delete",
+        "ssh-port",
+    }:
+        raise ApiError(ErrorCode.ACTION_NOT_ALLOWED, "Unsupported management action")
+    await target_owner(
+        container,
+        user,
+        server_id,
+        operation={"power-on": "start", "power-off": "stop"}.get(action, action),
+    )
     server = await container.server_repository().get(server_id)
     try:
         if action in {"reinstall", "reset-password"}:
@@ -337,7 +427,12 @@ async def _dispatch_action(
     actor_id = user.id
     if actor_id is None:
         raise ApiError(ErrorCode.FORBIDDEN, "حساب کاربری ثبت‌شده لازم است")
-    owner = await target_owner(container, user, server_id)
+    owner = await target_owner(
+        container,
+        user,
+        server_id,
+        operation={"power-on": "start", "power-off": "stop"}.get(action, action),
+    )
     management = container.server_management_service(actor_user_id=user.id)
     try:
         if action == "ssh-port":
@@ -571,6 +666,7 @@ async def servers(auth: Read) -> dict[str, Any]:
     items = list(first_page.items)
     for page in range(2, first_page.pages + 1):
         items.extend((await management.list_servers(user.id, page=page)).items)
+    ids = []
     if is_superadmin(user, get_settings().telegram_superadmin_user_ids):
         from cloud_platform.db.base import Server
 
@@ -588,18 +684,25 @@ async def servers(auth: Read) -> dict[str, Any]:
                 .scalars()
                 .all()
             )
-        existing = {item.server_id for item in items}
-        for server_id in ids:
-            if server_id not in existing:
+    else:
+        factory = getattr(container, "server_access_repository", None)
+        if factory is not None:
+            ids = await factory().server_ids(user.id)
+    existing = {item.server_id for item in items}
+    for server_id in ids:
+        if server_id not in existing:
+            try:
                 owner = await target_owner(container, user, server_id)
                 items.append(await management.get_server(owner, server_id))
+                existing.add(server_id)
+            except (ApiError, ServerNotFoundError):
+                # A concurrent revoke fails closed, not a partial-authority row.
+                continue
     projected = []
     for item in items:
         stored = await container.server_repository().get(item.server_id)
         if is_test_resource(stored):
-            if not is_test_server(stored) or not is_superadmin(
-                user, get_settings().telegram_superadmin_user_ids
-            ):
+            if not await test_resource_visible(container, user, stored):
                 continue
             item = replace(item, display_name=TEST_NAME)
         projected.append(asdict(item))
@@ -623,6 +726,8 @@ async def detail(auth: Read, server_id: UUID) -> dict[str, Any]:
         "data": {
             "server": jsonable_encoder(asdict(view)),
             "operations": jsonable_encoder(operations),
+            "credentialsAllowed": not shared_test
+            or is_superadmin(user, get_settings().telegram_superadmin_user_ids),
         }
     }
 
@@ -631,7 +736,7 @@ async def detail(auth: Read, server_id: UUID) -> dict[str, Any]:
 async def images(auth: Read, server_id: UUID) -> dict[str, Any]:
     container = await get_container()
     user = await active_user(container, auth)
-    owner = await target_owner(container, user, server_id)
+    owner = await target_owner(container, user, server_id, operation="reinstall")
     result = await container.server_management_service(actor_user_id=user.id).reinstall_images(
         owner, server_id
     )
@@ -655,7 +760,12 @@ async def confirmation(
     del key
     container = await get_container()
     user = await active_user(container, auth)
-    owner = await target_owner(container, user, server_id)
+    owner = await target_owner(
+        container,
+        user,
+        server_id,
+        operation={"power-on": "start", "power-off": "stop"}.get(action, action),
+    )
     if action == "ssh-port":
         from cloud_platform.modules.servers.guest import port_binding
 

@@ -258,6 +258,7 @@ class ServerManagementService:
         delete_command: DeleteCommandService | None = None,
         hourly_can_start: Callable[[CloudServer], Awaitable[bool]] | None = None,
         authorize_test_server: Callable[[CloudServer], Awaitable[bool]] | None = None,
+        test_server_operations: Callable[[CloudServer], Awaitable[frozenset[str]]] | None = None,
         actor_user_id: UUID | None = None,
         operator_power: Callable[[CloudServer, str, str], Awaitable[PowerCommandResult]]
         | None = None,
@@ -273,6 +274,7 @@ class ServerManagementService:
         self._delete_command = delete_command
         self._hourly_can_start = hourly_can_start
         self._authorize_test_server = authorize_test_server
+        self._test_server_operations = test_server_operations
         self._actor_user_id = actor_user_id
         self._operator_power = operator_power
         self._events = event_sink
@@ -354,7 +356,9 @@ class ServerManagementService:
         context = await self._context(server) if server.provider_server_id else None
         view = (
             await self.refresh_server(customer_id, server_id)
-            if context is not None and context.capabilities.authoritative_inventory
+            if context is not None
+            and context.capabilities.authoritative_inventory
+            and await self._test_operation_allowed(server, ServerOperation.REFRESH)
             else await self._detail_view(server)
         )
         return await self._with_failure_reason(view)
@@ -369,6 +373,8 @@ class ServerManagementService:
 
     async def has_ssh_password(self, customer_id: UUID, server_id: UUID) -> bool:
         server = await self._owned(customer_id, server_id)
+        if not await self._test_operation_allowed(server, ServerOperation.PASSWORD_RESET):
+            return False
         return bool(
             self._credential_store is not None
             and server.provider_server_id
@@ -377,6 +383,7 @@ class ServerManagementService:
 
     async def claim_ssh_password(self, customer_id: UUID, server_id: UUID) -> Any | None:
         server = await self._owned(customer_id, server_id)
+        await self._require_test_operation(server, ServerOperation.PASSWORD_RESET)
         if self._credential_store is None or not server.provider_server_id:
             return None
         return await self._credential_store.claim_for_owner(
@@ -386,7 +393,8 @@ class ServerManagementService:
     async def finish_ssh_password(
         self, customer_id: UUID, server_id: UUID, claim_id: UUID, *, delivered: bool
     ) -> bool:
-        await self._owned(customer_id, server_id)
+        server = await self._owned(customer_id, server_id)
+        await self._require_test_operation(server, ServerOperation.PASSWORD_RESET)
         if self._credential_store is None:
             return False
         action = (
@@ -403,16 +411,26 @@ class ServerManagementService:
         server = await self._owned(customer_id, server_id)
         context = await self._context(server)
         capabilities = context.capabilities if context is not None else _NO_PROVIDER_CAPABILITIES
+        granted = (
+            await self._test_server_operations(server)
+            if is_test_resource(server) and self._test_server_operations
+            else frozenset()
+            if is_test_resource(server)
+            else None
+        )
         operations = frozenset(
-            operation
-            for operation in ServerOperation
-            if policies.operation_allowed(
-                operation,
-                policy=self._policy,
-                capabilities=capabilities,
-                state=server.state,
-            )
-            is None
+            [
+                operation
+                for operation in ServerOperation
+                if policies.operation_allowed(
+                    operation,
+                    policy=self._policy,
+                    capabilities=capabilities,
+                    state=server.state,
+                )
+                is None
+                and (granted is None or operation.value in granted)
+            ]
         )
         if ServerOperation.START in operations and not await self._can_start_hourly(server):
             return operations - {ServerOperation.START}
@@ -430,6 +448,7 @@ class ServerManagementService:
         unchanged local row plus a ``refresh_error`` on the view.
         """
         server = await self._owned(customer_id, server_id)
+        await self._require_test_operation(server, ServerOperation.REFRESH)
         info: VpsInfo | None = None
         error: str | None = None
         context: _ProviderContext | None = None
@@ -1427,6 +1446,7 @@ class ServerManagementService:
 
     async def _require_commercial(self, server: CloudServer, operation: ServerOperation) -> None:
         """Policy gate for the commercial operations (no provider needed)."""
+        await self._require_test_operation(server, operation)
         unmet = policies.operation_allowed(
             operation,
             policy=self._policy,
@@ -1545,8 +1565,28 @@ class ServerManagementService:
         management = getattr(provider, "vps_management", provider)
         return _ProviderContext(provider=management, capabilities=vps_capabilities_of(management))
 
+    async def _test_operation_allowed(
+        self, server: CloudServer, operation: ServerOperation
+    ) -> bool:
+        if not is_test_resource(server):
+            return True
+        if self._test_server_operations is None:
+            return False
+        return operation.value in await self._test_server_operations(server)
+
+    async def _require_test_operation(
+        self, server: CloudServer, operation: ServerOperation
+    ) -> None:
+        if not await self._test_operation_allowed(server, operation):
+            raise ServerOperationNotAllowedError(
+                "operation is outside the explicit delegation",
+                operation=operation,
+                reason="delegation_denied",
+            )
+
     async def _require(self, server: CloudServer, operation: ServerOperation) -> _ProviderContext:
         """The provider context, or the specific reason the operation is denied."""
+        await self._require_test_operation(server, operation)
         context = await self._context(server)
         if context is None:
             raise ServerOperationNotAllowedError(

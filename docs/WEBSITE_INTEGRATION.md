@@ -38,11 +38,19 @@ backend at ingress where practical. No new shared global master token is needed.
 
 ## Additive website capabilities and deployment order
 
-The console contract advertises `website-link-revoke:v1` and
-`website-charge-requests:v1` in its `data.features` array. Publish the platform
+The console contract advertises `website-link-revoke:v1`,
+`website-charge-requests:v1` and `website-server-delegation:v1` in its
+`data.features` array. Publish the platform
 image containing these capabilities before the website that requires them.
 A healthy API with contract version `1` alone is not sufficient. Website
 preflight rejects missing capabilities before stopping its live writers.
+
+Reserved test-VPS visibility uses independent, revocable read-only grants, never
+ownership reassignment or customer billing. See
+[Test server delegation](operations/TEST_SERVER_DELEGATION.md) for migration 0061,
+exact authorization rules, grant/revoke endpoints and the approved activation
+procedure. A provider VPS existing by itself does not prove the platform has
+registered it or that a linked website user has an access grant.
 
 - `POST /v1/console/link/revoke` requires a scoped bearer and an idempotency
   key. It revokes only the authenticated bearer, never a caller-supplied token
