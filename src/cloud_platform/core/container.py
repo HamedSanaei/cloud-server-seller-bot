@@ -1867,7 +1867,9 @@ class Container:
 
         async def operator_power(server: Any, action: str, key: str) -> PowerCommandResult:
             # Delegated visibility is NEVER administrator support authority.
-            actor = await self.user_repository().get(actor_user_id) if actor_user_id else None
+            if actor_user_id is None:
+                raise NotServerOwnerError("server not found")
+            actor = await self.user_repository().get(actor_user_id)
             if not is_test_server(server) or not is_superadmin(
                 actor, get_settings().telegram_superadmin_user_ids
             ):

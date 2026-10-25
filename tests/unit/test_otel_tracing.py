@@ -15,7 +15,9 @@ in-memory exporter:
 from __future__ import annotations
 
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -145,6 +147,15 @@ class TestTraceparent:
 
 
 class TestApiSpan:
+    @pytest.fixture(autouse=True)
+    def _isolated_container(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Middleware spans do not depend on a database or startup reconciliation.
+        container = SimpleNamespace(reconcile_superadmins=AsyncMock())
+        monkeypatch.setattr(
+            "cloud_platform.core.container.get_container", AsyncMock(return_value=container)
+        )
+        monkeypatch.setattr("cloud_platform.core.container.close_container", AsyncMock())
+
     def test_request_creates_a_span(self, exporter: _InMemoryExporter) -> None:
         from cloud_platform.api.app import create_app
 

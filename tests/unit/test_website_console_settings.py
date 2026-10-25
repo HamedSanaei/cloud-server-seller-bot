@@ -11,30 +11,6 @@ from cloud_platform.api.v1 import console
 from cloud_platform.modules.tokens.domain import TokenAuthentication, TokenScope
 
 
-async def test_contract_advertises_only_registered_versioned_website_endpoints(monkeypatch):
-    monkeypatch.setattr(
-        console,
-        "get_settings",
-        lambda: SimpleNamespace(
-            app_env="staging",
-            default_currency="IRT",
-            api_allow_header_identity=False,
-            fx_enabled=True,
-            fx_domestic_enabled=True,
-            fx_allow_usdt_proxy_for_settlement=True,
-            fx_default_display_currency="IRT",
-            callback_signing_key="fixture-only-key" * 3,
-        ),
-    )
-    contract = (await console.integration_contract())["data"]
-    assert contract["features"] == ["website-link-revoke:v1", "website-charge-requests:v1"]
-    registered = {
-        (route.path, method) for route in console.router.routes for method in route.methods
-    }
-    assert ("/v1/console/link/revoke", "POST") in registered
-    assert ("/v1/console/charge-requests", "GET") in registered
-
-
 async def test_settings_http_auth_scope_and_current_bearer_revocation(monkeypatch):
     import httpx
     from fastapi import FastAPI

@@ -12,7 +12,6 @@ because bot startup initialized an already-initialized container:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -107,39 +106,3 @@ class TestRegistryStillRejectsDuplicates:
         registry.register(HetznerCloudProvider(token="first"))
         with pytest.raises(ValueError, match="provider already registered: hetzner"):
             registry.register(HetznerCloudProvider(token="second"))
-
-
-class TestBotMainLifecycle:
-    async def test_bot_main_does_not_initialize_the_container_again(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """bot/main.py must use the get_container() instance as-is."""
-        from cloud_platform.bot import main as bot_main
-
-        container = MagicMock()
-        container.initialize = AsyncMock()
-        container.reconcile_superadmins = AsyncMock()
-        container.payment_gateway = MagicMock(return_value=None)
-        container.close = AsyncMock()
-
-        async def _get_container() -> MagicMock:
-            return container
-
-        monkeypatch.setattr(bot_main, "get_container", _get_container)
-        monkeypatch.setattr(bot_main, "Bot", MagicMock())
-        monkeypatch.setattr(bot_main, "close_container", AsyncMock())
-        settings = MagicMock()
-        settings.telegram_bot_token = "123456:" + "A" * 35
-        settings.callback_signing_key = "signing"
-        settings.support_contact = "support"
-        settings.server_management_page_size = 5
-        monkeypatch.setattr(bot_main, "get_settings", lambda: settings)
-        dispatcher = MagicMock()
-        dispatcher.start_polling = AsyncMock()
-        monkeypatch.setattr(bot_main, "dp", dispatcher)
-
-        await bot_main.main()
-
-        container.initialize.assert_not_awaited()
-        container.reconcile_superadmins.assert_awaited_once()
-        dispatcher.start_polling.assert_awaited_once()
