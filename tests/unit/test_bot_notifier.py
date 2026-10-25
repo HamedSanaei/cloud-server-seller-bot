@@ -8,6 +8,7 @@ card, renewal reminders, admin alerts) without touching Telegram.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
@@ -255,9 +256,10 @@ class TestRenewalNotifier:
     async def test_alert_without_admin_chat_logs_error(self, caplog: Any) -> None:
         bot = FakeBot()
         notifier = TelegramRenewalNotifier(bot, FakeUsers(_user()))  # type: ignore[arg-type]
+        server_id = uuid4()
         with caplog.at_level("ERROR"):
             await notifier.alert(
-                server_id=uuid4(),
+                server_id=server_id,
                 renewal_at=datetime.now(UTC) + timedelta(days=1),
                 price_minor=1299,
                 currency="EUR",
@@ -266,7 +268,9 @@ class TestRenewalNotifier:
                 reason="manual_cancellation required",
             )
         assert bot.sent == []
-        assert any("RENEWAL ATTENTION" in r.message for r in caplog.records)
+        assert any(
+            r.levelno == logging.ERROR and str(server_id) in r.getMessage() for r in caplog.records
+        )
 
     async def test_send_failure_is_swallowed(self) -> None:
         bot = FakeBot()

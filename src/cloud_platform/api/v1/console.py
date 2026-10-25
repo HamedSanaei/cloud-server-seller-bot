@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import asdict, replace
 from hashlib import sha256
 from typing import Annotated, Any, Literal, cast
@@ -666,7 +666,7 @@ async def servers(auth: Read) -> dict[str, Any]:
     items = list(first_page.items)
     for page in range(2, first_page.pages + 1):
         items.extend((await management.list_servers(user.id, page=page)).items)
-    ids = []
+    ids: Sequence[UUID] = ()
     if is_superadmin(user, get_settings().telegram_superadmin_user_ids):
         from cloud_platform.db.base import Server
 

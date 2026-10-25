@@ -86,6 +86,42 @@ async def test_definitive_failures_survive_adapter_recreation_but_not_ttl_or_rot
     assert call.await_count == 5
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/ordering/v1/products/vps", "/ordering/v1/products/vps/VPS02_1"],
+)
+async def test_ordering_catalog_400_is_cached_only_for_same_discovery_scope(path):
+    """A failing optional catalog endpoint must not be queried every 15 minutes."""
+    now = [1000]
+    scope = replace(SCOPE, path=path, region="FRA-10", parameters="billingCycle=1_MONTH")
+    cache = MemoryCache()
+    call = AsyncMock(side_effect=LeasewebValidationError("HTTP 400"))
+    for _ in range(3):
+        with pytest.raises(LeasewebValidationError):
+            await DiscoveryPolicy(cache, clock=lambda: now[0]).run(scope, call)
+    assert call.await_count == 1
+
+    # Credential rotation, a different region, and different contract parameters
+    # must never receive a previous catalog failure as evidence.
+    for other in (
+        replace(scope, fingerprint="new-credential"),
+        replace(scope, region="AMS-01"),
+        replace(scope, parameters="billingCycle=1_YEAR"),
+    ):
+        with pytest.raises(LeasewebValidationError):
+            await DiscoveryPolicy(cache, clock=lambda: now[0]).run(other, call)
+    assert call.await_count == 4
+
+    # Bounded freshness: Leaseweb is retried after TTL and can recover without
+    # waiting for a worker restart.
+    now[0] += 3600
+    call.side_effect = None
+    call.return_value = {"products": []}
+    assert await DiscoveryPolicy(cache, clock=lambda: now[0]).run(scope, call) == {"products": []}
+    assert call.await_count == 5
+    assert await cache.get(repr(scope)) is None
+
+
 async def test_unrelated_validation_is_not_cached_or_converted_to_empty_inventory():
     cache = MemoryCache()
     call = AsyncMock(side_effect=LeasewebValidationError("invalid disk size"))

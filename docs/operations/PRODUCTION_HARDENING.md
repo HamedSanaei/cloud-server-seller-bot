@@ -217,6 +217,12 @@ Notes on two of them:
   non-destructive and must not override a revision.
 * `gen_leaseweb_coverage.py --check` fails if
   `docs/leaseweb/VPS_API_COVERAGE.md` has drifted from the provider contract.
+* `tests/live/test_migration_bridge.py` upgrades historical schemas to the
+  current Alembic head and checks physical schema parity and preserved data;
+  it must not pin a previous head revision.
+* The locked dependency audit covers runtime and development packages. Update
+  affected packages in `uv.lock` (including coupled OpenTelemetry packages),
+  then repeat the audit and affected regressions; do not suppress advisories.
 
 Repository policy: do not lower coverage, do not weaken a gate, and do not claim
 a gate passed unless it was actually run.

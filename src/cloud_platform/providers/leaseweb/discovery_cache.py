@@ -39,6 +39,7 @@ ERRORS = {
     "forbidden": LeasewebForbiddenError,
     "detail_not_found": LeasewebNotFoundError,
     "invalid_region": LeasewebValidationError,
+    "ordering_validation": LeasewebValidationError,
     "rate_limited": LeasewebRateLimitError,
     "unavailable": LeasewebUnavailableError,
 }
@@ -165,6 +166,12 @@ def failure_kind(error: Exception, path: str, region: str = "") -> str | None:
     if isinstance(error, LeasewebForbiddenError):
         return "forbidden"
     if isinstance(error, LeasewebValidationError):
+        # Ordering catalog LIST/DETAIL reads repeatedly return definitive 400s
+        # for the same credential, product, and location. Cache only within the
+        # discovery scope (never checkout/mutations), with bounded TTL and
+        # credential/parameter-scoped invalidation just like other negatives.
+        if path == "/ordering/v1/products/vps" or path.startswith("/ordering/v1/products/vps/"):
+            return "ordering_validation"
         from cloud_platform.providers.leaseweb.cloud import is_region_filter_rejection
 
         details = getattr(getattr(error, "payload", None), "error_details", None)

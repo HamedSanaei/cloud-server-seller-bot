@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cloud_platform.core.config import Settings
 from cloud_platform.core.container import Container
 
 
@@ -95,11 +96,18 @@ async def test_bot_process_builds_once_reuses_and_closes_once(
     class _Dispatcher:
         def __init__(self) -> None:
             self.start_polling = AsyncMock()
+            self.drain_handlers = AsyncMock()
 
     dispatcher = _Dispatcher()
-    monkeypatch.setattr(bot_main, "get_settings", lambda: MagicMock(telegram_bot_token="1:x"))
+    settings = Settings.model_construct(
+        telegram_bot_token="123456:fixture",
+        telegram_diagnostics_interval_seconds=0,
+    )
+    monkeypatch.setattr(bot_main, "get_settings", lambda: settings)
     monkeypatch.setattr(bot_main, "get_container", _get_container)
-    monkeypatch.setattr(bot_main, "Bot", lambda token: MagicMock())
+    bot = MagicMock()
+    bot.session.close = AsyncMock()
+    monkeypatch.setattr(bot_main, "Bot", lambda token: bot)
     # ``dp`` is a module-level singleton, so replace the object itself.
     monkeypatch.setattr(bot_main, "dp", dispatcher)
     monkeypatch.setattr(bot_main, "BotUi", lambda *args, **kwargs: MagicMock())
