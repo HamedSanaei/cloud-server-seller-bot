@@ -516,7 +516,7 @@ async def test_region_filter_backoff_expires_and_only_cached_warnings_are_downgr
             assert verdict.discovery_cache_hit is (index > 0)
             assert [image.id for image in verdict.images] == ["UBUNTU_24_04"]
         assert scoped_calls == 1
-        records = [r for r in caplog.records if "provider rejected the region filter" in r.message]
+        records = [r for r in caplog.records if r.name == "cloud_platform.providers.leaseweb.cloud"]
         assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
 
         now[0] += 60
@@ -530,7 +530,7 @@ async def test_region_filter_backoff_expires_and_only_cached_warnings_are_downgr
             await provider.region_images_verdict("eu-west-3")
         ).state is RegionImagesState.UNSERVED
         assert scoped_calls == 3
-        records = [r for r in caplog.records if "provider rejected the region filter" in r.message]
+        records = [r for r in caplog.records if r.name == "cloud_platform.providers.leaseweb.cloud"]
         assert records[-1].levelno == logging.WARNING
     finally:
         current_policy.reset(token)
