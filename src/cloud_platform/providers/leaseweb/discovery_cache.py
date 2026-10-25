@@ -23,10 +23,14 @@ from typing import Any
 from cloud_platform.observability.catalog import discovery_active, probe_cache
 from cloud_platform.providers.leaseweb.errors import (
     LeasewebAuthenticationError,
+    LeasewebCapacityError,
+    LeasewebError,
+    LeasewebErrorPayload,
     LeasewebForbiddenError,
     LeasewebNotFoundError,
     LeasewebRateLimitError,
     LeasewebServerError,
+    LeasewebTimeoutError,
     LeasewebUnavailableError,
     LeasewebValidationError,
 )
@@ -42,6 +46,20 @@ ERRORS = {
     "ordering_validation": LeasewebValidationError,
     "rate_limited": LeasewebRateLimitError,
     "unavailable": LeasewebUnavailableError,
+}
+ERROR_TYPES: dict[str, type[LeasewebError]] = {
+    cls.__name__: cls
+    for cls in (
+        LeasewebAuthenticationError,
+        LeasewebCapacityError,
+        LeasewebForbiddenError,
+        LeasewebNotFoundError,
+        LeasewebRateLimitError,
+        LeasewebServerError,
+        LeasewebTimeoutError,
+        LeasewebUnavailableError,
+        LeasewebValidationError,
+    )
 }
 _limit_loop: Any = None
 _global_limit: asyncio.Semaphore | None = None
@@ -174,17 +192,8 @@ def failure_kind(error: Exception, path: str, region: str = "") -> str | None:
             return "ordering_validation"
         from cloud_platform.providers.leaseweb.cloud import is_region_filter_rejection
 
-        details = getattr(getattr(error, "payload", None), "error_details", None)
-        region_field = isinstance(details, dict) and any(
-            str(field).strip().casefold() == "region" for field in details
-        )
-        # An image/storage validation that mentions a region is not evidence
-        # that this account's region FILTER is invalid. Prefer field evidence.
-        if (
-            region
-            and path.startswith("/publicCloud/")
-            and (region_field or (not details and is_region_filter_rejection(error)))
-        ):
+        # Only documented field/message evidence proves filter rejection.
+        if region and path.startswith("/publicCloud/") and is_region_filter_rejection(error):
             return "invalid_region"
     if isinstance(error, LeasewebNotFoundError) and path.startswith("/ordering/v1/products/vps/"):
         return "detail_not_found"
@@ -193,6 +202,38 @@ def failure_kind(error: Exception, path: str, region: str = "") -> str | None:
     if isinstance(error, (LeasewebServerError, LeasewebUnavailableError)):
         return "unavailable"
     return None
+
+
+def _restore_error(record: dict[str, Any], scope: ProbeScope) -> LeasewebError | None:
+    # Older records lost the original subtype/evidence. Reprobe rather than
+    # inventing a classification or trusting their generic cached message.
+    name = record.get("error_type")
+    if name is None:
+        return None
+    cls = ERROR_TYPES.get(name)
+    if cls is None:
+        raise ValueError("invalid discovery exception type")
+    status = record.get("status")
+    reset = record.get("reset_at_unix")
+    if (status is not None and type(status) is not int) or (
+        reset is not None and type(reset) is not int
+    ):
+        raise ValueError("invalid discovery exception metadata")
+    kind = record["kind"]
+    payload = None
+    if kind == "invalid_region":
+        # A canonical proof, not the provider's message, region value or payload.
+        payload = LeasewebErrorPayload(
+            http_status=400, error_details={"region": ("cached region filter rejection",)}
+        )
+    elif status is not None:
+        payload = LeasewebErrorPayload(http_status=status)
+    error = cls("cached discovery " + kind, payload=payload, endpoint=scope.path)
+    error.reset_at_unix = reset
+    if failure_kind(error, scope.path, scope.region) != kind:
+        raise ValueError("inconsistent discovery exception classification")
+    error.discovery_cache_hit = True
+    return error
 
 
 class DiscoveryPolicy:
@@ -216,33 +257,36 @@ class DiscoveryPolicy:
         # across newly constructed adapters and independent inventory jobs.
         async with discovery_slot(scope.account):
             key, previous = None, None
+            cached_error = None
             if self.cache is not None and self.ttl > 0 and self.clock() >= self.backend_retry_at:
                 try:
                     key = await self.cache.key(scope)
                     previous = await self.cache.get(key)
+                    if previous is not None:
+                        cached_error = _restore_error(previous, scope)
                 except Exception:
                     key, previous = None, None
                     self._backend_failed()
             if (
-                previous
-                and previous.get("kind") in ERRORS
+                cached_error is not None
+                and previous is not None
                 and previous.get("retry_at", 0) > self.clock()
             ):
-                kind = previous["kind"]
                 probe_cache.labels("hit").inc()
-                # Keep the exception type visible to every existing caller.
-                message = (
-                    "cached invalid region filter"
-                    if kind == "invalid_region"
-                    else "cached discovery " + kind
-                )
-                raise ERRORS[kind](message)
+                raise cached_error
             probe_cache.labels("miss").inc()
             try:
                 result = await call()
             except Exception as error:
                 kind = failure_kind(error, scope.path, scope.region)
-                if kind and key and self.cache is not None:
+                if (
+                    kind
+                    and key
+                    and self.cache is not None
+                    and isinstance(error, LeasewebError)
+                    and type(error).__name__ in ERROR_TYPES
+                    and ERROR_TYPES[type(error).__name__] is type(error)
+                ):
                     attempt = min(10, int((previous or {}).get("attempt", 0)) + 1)
                     delay = self.ttl
                     if kind in {"unavailable", "rate_limited"}:
@@ -254,7 +298,14 @@ class DiscoveryPolicy:
                         await self.cache.put(
                             key,
                             scope,
-                            dict(kind=kind, attempt=attempt, retry_at=self.clock() + delay),
+                            dict(
+                                kind=kind,
+                                attempt=attempt,
+                                retry_at=self.clock() + delay,
+                                error_type=type(error).__name__,
+                                status=error.status,
+                                reset_at_unix=error.reset_at_unix,
+                            ),
                             max(self.ttl, int(delay) + 1),
                         )
                     except Exception:

@@ -481,7 +481,12 @@ class LeasewebHourlyCloudSyncer:
                     # INCONCLUSIVE: a timeout, a 5xx or a throttle says nothing
                     # about whether this credential serves the pair, so it must
                     # never cost the current owner its offer.
-                    logger.warning(
+                    log = (
+                        logger.debug
+                        if getattr(exc, "discovery_cache_hit", False)
+                        else logger.warning
+                    )
+                    log(
                         "leaseweb cloud images of account %s region %s inconclusive: %s",
                         account_id,
                         region.id,
@@ -494,7 +499,12 @@ class LeasewebHourlyCloudSyncer:
                     # the region. Never "unknown" — an account that cannot prove
                     # a pair must not be handed it (production moved a region
                     # to a credential that could not serve it exactly this way).
-                    logger.warning(
+                    log = (
+                        logger.debug
+                        if getattr(exc, "discovery_cache_hit", False)
+                        else logger.warning
+                    )
+                    log(
                         "leaseweb cloud images of account %s region %s rejected: %s",
                         account_id,
                         region.id,
@@ -506,7 +516,12 @@ class LeasewebHourlyCloudSyncer:
                     # adapter that does not implement the strict probe). That
                     # proves nothing about the credential, so it is treated as
                     # inconclusive rather than as "this account cannot serve".
-                    logger.warning(
+                    log = (
+                        logger.debug
+                        if getattr(exc, "discovery_cache_hit", False)
+                        else logger.warning
+                    )
+                    log(
                         "leaseweb cloud images of account %s region %s inconclusive: %s",
                         account_id,
                         region.id,

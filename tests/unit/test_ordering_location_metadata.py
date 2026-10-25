@@ -131,13 +131,17 @@ class _LocationRepo:
         self._rows[record.location_id] = record
         return created
 
+    async def upsert_batch(self, records: list[LocationRecord]) -> None:
+        for record in records:
+            await self.upsert(record)
+
 
 class _OffersRepo:
     def __init__(self) -> None:
         self._available: set[tuple[str, str]] = set()
 
-    async def list_all(self) -> list[Any]:
-        return []
+    async def available_refs(self, provider_key: str, *, billing_model: str) -> set[Any]:
+        return set()
 
     async def upsert_from_provider(self, **kwargs: Any) -> Any:
         self._available.add((kwargs["product_id"], kwargs["location_id"]))

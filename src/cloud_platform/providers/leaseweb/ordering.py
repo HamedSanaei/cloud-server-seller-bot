@@ -230,8 +230,9 @@ class LocationProbe:
     note: str = ""
 
 
-#: Location codes look like ``FRA-01``: uppercase alpha, dash, digits.
-_LOCATION_CODE_RE = re.compile(r"\b([A-Z]{2,5}-\d{1,3})\b")
+#: Ordering datacenters and Public Cloud regions are separate API namespaces.
+#: Match complete tokens so ``EU-WEST-3`` cannot yield the bogus hall ``WEST-3``.
+_LOCATION_CODE_RE = re.compile(r"(?<![A-Za-z0-9-])([A-Z]{2,5}-\d{1,3})(?![A-Za-z0-9-])")
 
 
 def extract_location_codes(text: str) -> tuple[str, ...]:
@@ -277,17 +278,18 @@ def classify_location_error(exc: BaseException) -> tuple[LocationEligibility, st
 
 
 def merge_candidates(*sources: Iterable[str]) -> tuple[str, ...]:
-    """Ordered, de-duplicated union of candidate location codes.
+    """Ordered union of Ordering datacenter identifiers, not Cloud regions.
 
-    Normalizes to stripped upper-case and drops empties. Order is
-    deterministic: earlier sources win.
+    The adapter's datacenter grammar is open-ended (not the built-in seed
+    allowlist), so newly supported halls are still discovered. Shared legacy
+    location/route rows are display/history data, never namespace authority.
     """
     seen: set[str] = set()
     merged: list[str] = []
     for source in sources:
         for raw in source:
             code = (raw or "").strip().upper()
-            if code and code not in seen:
+            if _LOCATION_CODE_RE.fullmatch(code) and code not in seen:
                 seen.add(code)
                 merged.append(code)
     return tuple(merged)
@@ -688,7 +690,7 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
         decided per location by the live eligibility probe
         (:meth:`probe_location`), never by this list.
         """
-        return [self.describe_location(code) for code in self._locations]
+        return [self.describe_location(code) for code in merge_candidates(self._locations)]
 
     async def list_plans(self) -> list[ProviderPlan]:
         """Union of ordering products across the configured locations."""
@@ -808,6 +810,10 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
         code = (location or "").strip().upper()
         if not code:
             return LocationProbe("", LocationEligibility.TRANSIENT_UNKNOWN, (), (), "empty code")
+        if not _LOCATION_CODE_RE.fullmatch(code):
+            return LocationProbe(
+                code, LocationEligibility.TRANSIENT_UNKNOWN, (), (), "not an Ordering datacenter"
+            )
         try:
             products = await self.list_products(code)
         except Exception as exc:
@@ -820,7 +826,8 @@ class LeaseWebOrderingProvider(LeaseWebVpsManagementMixin, OrderingProvider):
             elif eligibility is LocationEligibility.INELIGIBLE_ACCOUNT:
                 logger.info("leaseweb location %s not eligible for this account (%s)", code, note)
             else:
-                logger.warning("leaseweb location %s probe inconclusive: %s", code, note)
+                log = logger.debug if getattr(exc, "discovery_cache_hit", False) else logger.warning
+                log("leaseweb location %s probe inconclusive: %s", code, note)
             return LocationProbe(code, eligibility, (), discovered, note)
         if not products:
             return LocationProbe(code, LocationEligibility.ELIGIBLE_EMPTY, (), (), "catalog empty")

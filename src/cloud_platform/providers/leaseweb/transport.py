@@ -300,32 +300,20 @@ class LeasewebTransport:
                 )
 
             if policy is not None and method.upper() == "GET" and not mutating:
-                import json as json_module
-
                 key = httpx.Headers(resolved_headers).get("X-LSW-Auth") or self._client.headers.get(
                     "X-LSW-Auth", ""
                 )
-                safe_params = {
-                    k: v
-                    for k, v in (params or {}).items()
-                    if k
-                    in {
-                        "region",
-                        "location",
-                        "contractTerm",
-                        "billingCycle",
-                        "limit",
-                        "offset",
-                        "page",
-                    }
-                }
+                query = httpx.QueryParams(params or {})
+                # Every effective parameter participates, including filters not
+                # known to this adapter. Store only a digest, never query secrets.
+                parameters = [(name, query.get_list(name)) for name in sorted(query)]
                 scope = ProbeScope(
                     self.discovery_account_id,
                     sha256(key.encode()).hexdigest(),
                     self.base_url,
                     path,
-                    str(safe_params.get("region", safe_params.get("location", ""))),
-                    json_module.dumps(safe_params, sort_keys=True),
+                    query.get("region", query.get("location", "")),
+                    sha256(repr(parameters).encode()).hexdigest(),
                 )
                 return await policy.run(scope, perform)
             return await perform()

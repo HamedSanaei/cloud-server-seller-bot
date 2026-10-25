@@ -345,6 +345,79 @@ class TestImages:
             await provider.list_images("eu-west-3")
         assert provider._transport.request.await_count == 1
 
+    @pytest.mark.parametrize("field", [None, "imageId", "rootDiskSize"])
+    async def test_region_words_without_region_field_are_not_routing_evidence(
+        self, field: str | None
+    ) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebErrorPayload
+
+        error = LeasewebValidationError(
+            "invalid region for this image",
+            payload=LeasewebErrorPayload(
+                http_status=400,
+                error_details={field: ("invalid region",)} if field else {},
+            ),
+        )
+        provider = _provider()
+        provider._transport.request = AsyncMock(side_effect=error)
+        with pytest.raises(LeasewebValidationError) as caught:
+            await provider.region_images_verdict("eu-west-3")
+        assert caught.value is error
+        assert provider._transport.request.await_count == 1
+
+    async def test_region_field_on_forbidden_is_still_an_authorization_failure(self) -> None:
+        from cloud_platform.providers.errors import ProviderAuthError
+        from cloud_platform.providers.leaseweb.errors import (
+            LeasewebErrorPayload,
+            LeasewebForbiddenError,
+        )
+
+        error = LeasewebForbiddenError(
+            "invalid region",
+            payload=LeasewebErrorPayload(
+                http_status=403, error_details={"region": ("access denied",)}
+            ),
+        )
+        provider = _provider()
+        provider._transport.request = AsyncMock(side_effect=error)
+        with pytest.raises(ProviderAuthError) as caught:
+            await provider.region_images_verdict("eu-west-3")
+        assert caught.value is error
+        assert provider._transport.request.await_count == 1
+
+    @pytest.mark.parametrize("global_fallback", [False, True])
+    async def test_transient_image_failure_never_becomes_a_region_verdict(
+        self, global_fallback: bool
+    ) -> None:
+        from cloud_platform.providers.leaseweb.errors import LeasewebUnavailableError
+
+        error = LeasewebUnavailableError("temporary provider failure")
+        provider = _provider()
+        provider._transport.request = AsyncMock(
+            side_effect=[_documented_region_rejection(), error] if global_fallback else error
+        )
+        with pytest.raises(LeasewebUnavailableError) as caught:
+            await provider.region_images_verdict("eu-west-3")
+        assert caught.value is error
+        assert provider._transport.request.await_count == (2 if global_fallback else 1)
+
+    @pytest.mark.parametrize("method", ["probe_region_images", "installable_images"])
+    @pytest.mark.parametrize("cached", [False, True])
+    async def test_synthetic_region_rejections_preserve_cache_provenance_and_evidence(
+        self, method: str, cached: bool
+    ) -> None:
+        from cloud_platform.providers.leaseweb.cloud import is_region_filter_rejection
+
+        error = _documented_region_rejection()
+        error.discovery_cache_hit = cached
+        provider = _provider()
+        provider._transport.request = AsyncMock(side_effect=[error, {"images": []}])
+        with pytest.raises(LeasewebValidationError) as caught:
+            await getattr(provider, method)("eu-west-3")
+        assert caught.value.discovery_cache_hit is cached
+        assert caught.value.status == 400
+        assert is_region_filter_rejection(caught.value)
+
     async def test_one_verdict_for_doctor_sync_and_checkout(self) -> None:
         """The doctor, the catalog sync and the checkout revalidation answer the
         SAME question the same way.
