@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -19,9 +21,13 @@ from cloud_platform.providers.leaseweb.discovery_cache import (
 )
 from cloud_platform.providers.leaseweb.errors import (
     LeasewebAuthenticationError,
+    LeasewebCapacityError,
+    LeasewebErrorPayload,
     LeasewebForbiddenError,
     LeasewebNotFoundError,
     LeasewebRateLimitError,
+    LeasewebServerError,
+    LeasewebTimeoutError,
     LeasewebUnavailableError,
     LeasewebValidationError,
 )
@@ -55,7 +61,12 @@ SCOPE = ProbeScope(
     [
         LeasewebAuthenticationError("no auth"),
         LeasewebForbiddenError("no access"),
-        LeasewebValidationError("invalid region"),
+        LeasewebValidationError(
+            "invalid region",
+            payload=LeasewebErrorPayload(
+                http_status=400, error_details={"region": ("unknown region",)}
+            ),
+        ),
         LeasewebNotFoundError("no detail"),
     ],
 )
@@ -76,14 +87,16 @@ async def test_definitive_failures_survive_adapter_recreation_but_not_ttl_or_rot
         replace(scope, account="account-b"),
         replace(scope, region="other"),
         replace(scope, fingerprint="rotated"),
+        replace(scope, base_url="https://other-provider.test"),
+        replace(scope, parameters="imageId=other"),
     ):
         with pytest.raises(type(error)):
             await DiscoveryPolicy(cache, clock=lambda: now[0]).run(changed, call)
-    assert call.await_count == 4
+    assert call.await_count == 6
     now[0] += 3600
     with pytest.raises(type(error)):
         await DiscoveryPolicy(cache, clock=lambda: now[0]).run(scope, call)
-    assert call.await_count == 5
+    assert call.await_count == 7
 
 
 @pytest.mark.parametrize(
@@ -135,11 +148,99 @@ async def test_image_field_region_message_and_unscoped_reads_are_not_region_nega
     from cloud_platform.providers.leaseweb.discovery_cache import failure_kind
 
     error = LeasewebValidationError("invalid region for selected image")
-    error.payload = SimpleNamespace(error_details={"imageId": ("invalid region",)})
+    error.payload = LeasewebErrorPayload(
+        http_status=400, error_details={"imageId": ("invalid region",)}
+    )
     assert failure_kind(error, SCOPE.path, SCOPE.region) is None
-    error.payload = SimpleNamespace(error_details={"region": ("unknown value",)})
+    error.payload = LeasewebErrorPayload(
+        http_status=400, error_details={"region": ("unknown value",)}
+    )
     assert failure_kind(error, SCOPE.path, SCOPE.region) == "invalid_region"
     assert failure_kind(error, SCOPE.path, "") is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "invalid region",
+        "invalid region for selected image",
+        "region filter temporarily unavailable",
+    ],
+)
+async def test_ambiguous_region_text_is_not_negative_evidence(message):
+    cache = MemoryCache()
+    call = AsyncMock(side_effect=LeasewebValidationError(message))
+    for _ in range(2):
+        with pytest.raises(LeasewebValidationError):
+            await DiscoveryPolicy(cache).run(SCOPE, call)
+    assert call.await_count == 2
+    assert not cache.rows
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        LeasewebForbiddenError,
+        LeasewebCapacityError,
+        LeasewebRateLimitError,
+        LeasewebServerError,
+        LeasewebTimeoutError,
+    ],
+)
+async def test_cached_errors_preserve_subtype_status_retry_after_without_provider_payload(
+    error_type,
+):
+    status = {
+        LeasewebForbiddenError: 403,
+        LeasewebCapacityError: 400,
+        LeasewebRateLimitError: 429,
+        LeasewebServerError: 503,
+        LeasewebTimeoutError: None,
+    }[error_type]
+    error = error_type(
+        "synthetic-private-provider-diagnostic",
+        payload=(
+            LeasewebErrorPayload(
+                http_status=status,
+                error_message="synthetic-private-provider-diagnostic",
+                error_details={"region": ("synthetic-private-region",)},
+            )
+            if status is not None
+            else None
+        ),
+    )
+    error.reset_at_unix = 2000
+    scope = (
+        replace(SCOPE, path="/ordering/v1/products/vps/product-1")
+        if error_type is LeasewebCapacityError
+        else SCOPE
+    )
+    cache = MemoryCache()
+    call = AsyncMock(side_effect=error)
+    with pytest.raises(error_type) as fresh:
+        await DiscoveryPolicy(cache, clock=lambda: 1000).run(scope, call)
+    assert fresh.value is error
+    assert fresh.value.discovery_cache_hit is False
+    # Use a serialized record, as independent workers do, not Python object identity.
+    cache.rows = json.loads(json.dumps(cache.rows))
+    assert "synthetic-private" not in json.dumps(cache.rows)
+    with pytest.raises(error_type) as cached:
+        await DiscoveryPolicy(cache, clock=lambda: 1000).run(scope, call)
+    assert type(cached.value) is error_type
+    assert cached.value.status == status
+    assert cached.value.retryable is error.retryable
+    assert cached.value.reset_at_unix == 2000
+    assert cached.value.discovery_cache_hit is True
+    assert call.await_count == 1
+
+
+async def test_legacy_region_record_without_preserved_evidence_is_reprobed():
+    cache = MemoryCache()
+    cache.rows[repr(SCOPE)] = {"kind": "invalid_region", "attempt": 1, "retry_at": 2000}
+    call = AsyncMock(return_value={"images": []})
+    assert await DiscoveryPolicy(cache, clock=lambda: 1000).run(SCOPE, call) == {"images": []}
+    assert call.await_count == 1
+    assert not cache.rows
 
 
 async def test_transient_backoff_and_retry_after_are_not_permanent_negatives(monkeypatch):
@@ -326,7 +427,7 @@ async def test_timeout_retries_are_bounded_counted_and_cached_without_empty_inve
     try:
         with pytest.raises(LeasewebTimeoutError):
             await transport.request("GET", "/publicCloud/v1/instances")
-        with pytest.raises(LeasewebUnavailableError):
+        with pytest.raises(LeasewebTimeoutError):
             await transport.request("GET", "/publicCloud/v1/instances")
         assert calls == 3
     finally:
@@ -360,3 +461,124 @@ async def test_lowercase_auth_header_rotation_bypasses_old_negative_cache():
     finally:
         current_policy.reset(token)
         await transport.aclose()
+
+
+@pytest.mark.parametrize("structured", [False, True])
+async def test_region_filter_backoff_expires_and_only_cached_warnings_are_downgraded(
+    caplog, structured
+):
+    from cloud_platform.providers.leaseweb.cloud import (
+        LeasewebHourlyCloudProvider,
+        RegionImagesState,
+    )
+
+    now = [1000]
+    scoped_calls = 0
+    rejected = True
+
+    async def handler(request):
+        nonlocal scoped_calls
+        if request.url.params.get("region"):
+            scoped_calls += 1
+            if rejected:
+                return httpx.Response(
+                    400,
+                    json=(
+                        {
+                            "errorMessage": "Validation Failed",
+                            "errorDetails": {"region": ["synthetic invalid region"]},
+                        }
+                        if structured
+                        else {"errorMessage": 'The value "eu-west-3" is not valid region.'}
+                    ),
+                )
+        return httpx.Response(200, json={"images": [{"id": "UBUNTU_24_04"}]})
+
+    transport = LeasewebTransport("synthetic-key", base_url="https://provider.test")
+    await transport.aclose()
+    transport.set_client(
+        httpx.AsyncClient(
+            base_url="https://provider.test",
+            headers={"X-LSW-Auth": "synthetic-key"},
+            transport=httpx.MockTransport(handler),
+        )
+    )
+    provider = LeasewebHourlyCloudProvider.__new__(LeasewebHourlyCloudProvider)
+    provider._transport = transport
+    policy = DiscoveryPolicy(MemoryCache(), ttl=60, clock=lambda: now[0])
+    token = current_policy.set(policy)
+    caplog.set_level(logging.DEBUG, logger="cloud_platform.providers.leaseweb.cloud")
+    try:
+        for index in range(3):
+            verdict = await provider.region_images_verdict("eu-west-3")
+            assert verdict.state is RegionImagesState.UNSERVED
+            assert verdict.region_scoped is False
+            assert verdict.discovery_cache_hit is (index > 0)
+            assert [image.id for image in verdict.images] == ["UBUNTU_24_04"]
+        assert scoped_calls == 1
+        records = [r for r in caplog.records if r.name == "cloud_platform.providers.leaseweb.cloud"]
+        assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+
+        now[0] += 60
+        rejected = False
+        assert (await provider.region_images_verdict("eu-west-3")).state is RegionImagesState.PROVEN
+        assert scoped_calls == 2
+
+        # A genuinely new failure after recovery must warn again.
+        rejected = True
+        assert (
+            await provider.region_images_verdict("eu-west-3")
+        ).state is RegionImagesState.UNSERVED
+        assert scoped_calls == 3
+        records = [r for r in caplog.records if r.name == "cloud_platform.providers.leaseweb.cloud"]
+        assert records[-1].levelno == logging.WARNING
+    finally:
+        current_policy.reset(token)
+        await transport.aclose()
+
+
+async def test_unlisted_query_filters_are_separate_without_storing_their_values():
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(403, json={"errorMessage": "synthetic denial"})
+
+    transport = LeasewebTransport("synthetic-key", base_url="https://provider.test")
+    await transport.aclose()
+    transport.set_client(
+        httpx.AsyncClient(
+            base_url="https://provider.test",
+            headers={"X-LSW-Auth": "synthetic-key"},
+            transport=httpx.MockTransport(handler),
+        )
+    )
+    cache = MemoryCache()
+    token = current_policy.set(DiscoveryPolicy(cache))
+    try:
+        for image in ("synthetic-private-a", "synthetic-private-a", "synthetic-private-b"):
+            with pytest.raises(LeasewebForbiddenError):
+                await transport.request(
+                    "GET",
+                    "/publicCloud/v1/images",
+                    params={"region": "eu-west-3", "imageId": image},
+                )
+        assert calls == 2
+        assert "synthetic-private" not in repr(cache.rows)
+    finally:
+        current_policy.reset(token)
+        await transport.aclose()
+
+
+async def test_unknown_exception_subtypes_are_not_silently_reclassified():
+    class FutureUnavailable(LeasewebUnavailableError):
+        pass
+
+    cache = MemoryCache()
+    call = AsyncMock(side_effect=FutureUnavailable("new failure semantics"))
+    for _ in range(2):
+        with pytest.raises(FutureUnavailable):
+            await DiscoveryPolicy(cache).run(SCOPE, call)
+    assert call.await_count == 2
+    assert not cache.rows

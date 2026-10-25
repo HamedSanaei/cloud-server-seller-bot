@@ -17,6 +17,7 @@ the generic UI never invents categories.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import StrEnum
@@ -33,7 +34,7 @@ from cloud_platform.providers.errors import (
     ProviderError,
     ProviderNotFound,
 )
-from cloud_platform.providers.leaseweb.errors import LeasewebValidationError
+from cloud_platform.providers.leaseweb.errors import LeasewebErrorPayload, LeasewebValidationError
 from cloud_platform.providers.leaseweb.transport import (
     DEFAULT_BASE_URL,
     DEFAULT_TIMEOUT_SECONDS,
@@ -78,6 +79,7 @@ class RegionImageRead:
     images: tuple[CloudImage, ...]
     region_scoped: bool
     detail: str | None = None
+    discovery_cache_hit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +91,7 @@ class RegionImageVerdict:
     region_scoped: bool
     images: tuple[CloudImage, ...] = ()
     detail: str | None = None
+    discovery_cache_hit: bool = False
 
     @property
     def proven(self) -> bool:
@@ -110,19 +113,26 @@ class RegionImageVerdict:
 def is_region_filter_rejection(exc: BaseException) -> bool:
     """Whether a 400 provably rejected the ``?region=`` FILTER itself.
 
-    Only the documented shape counts: Leaseweb answers
-    ``400 Validation Failed`` with ``errorDetails.region`` for a region this
-    Sales Organization does not own. Anything else — an image, storage or
-    request-shape complaint — is NOT this condition and must fail closed.
+    Leaseweb answers ``400 Validation Failed`` with ``errorDetails.region``
+    for a region this Sales Organization does not own. The exact documented
+    ``The value "<region>" is not valid region.`` message also counts when
+    field details are absent. Other image/storage/request complaints do not.
     """
-    payload = getattr(exc, "payload", None)
-    details = getattr(payload, "error_details", None)
-    if isinstance(details, dict):
-        for field_name in details:
-            if str(field_name).strip().casefold() == "region":
-                return True
-    text = str(exc or "").casefold()
-    return "not valid region" in text or "invalid region" in text
+    if not isinstance(exc, LeasewebValidationError):
+        return False
+    payload = exc.payload
+    if payload is not None:
+        if payload.http_status != 400:
+            return False
+        if payload.error_details:
+            return any(str(field).strip().casefold() == "region" for field in payload.error_details)
+    message = payload.error_message if payload is not None else str(exc)
+    return (
+        re.fullmatch(
+            r'The value "[^"\r\n]+" is not valid region\.?', (message or "").strip(), re.IGNORECASE
+        )
+        is not None
+    )
 
 
 #: Hourly contract marker sent on every instance create.
@@ -1032,7 +1042,8 @@ class LeasewebHourlyCloudProvider:
         except LeasewebValidationError as exc:
             if not is_region_filter_rejection(exc):
                 raise
-            logger.warning(
+            log = logger.debug if exc.discovery_cache_hit else logger.warning
+            log(
                 "images: provider rejected the region filter for %r (%s); "
                 "reading the global image catalog (display only)",
                 region,
@@ -1044,6 +1055,7 @@ class LeasewebHourlyCloudProvider:
                 images=tuple(self._images_from(payload)),
                 region_scoped=False,
                 detail=REGION_FILTER_UNSUPPORTED,
+                discovery_cache_hit=exc.discovery_cache_hit,
             )
         return RegionImageRead(
             region=region, images=tuple(self._images_from(payload)), region_scoped=True
@@ -1072,6 +1084,7 @@ class LeasewebHourlyCloudProvider:
                 region_scoped=False,
                 images=read.images,
                 detail=read.detail,
+                discovery_cache_hit=read.discovery_cache_hit,
             )
         state = RegionImagesState.PROVEN if read.images else RegionImagesState.EMPTY
         return RegionImageVerdict(
@@ -1100,11 +1113,17 @@ class LeasewebHourlyCloudProvider:
         """
         verdict = await self.region_images_verdict(region)
         if verdict.state is RegionImagesState.UNSERVED:
-            raise LeasewebValidationError(
+            error = LeasewebValidationError(
                 f"region {region!r}: this credential cannot serve the region "
                 f"({verdict.detail or REGION_FILTER_UNSUPPORTED}); the global image "
-                "catalog is display-only and proves nothing about new instances"
+                "catalog is display-only and proves nothing about new instances",
+                payload=LeasewebErrorPayload(
+                    http_status=400, error_details={"region": ("region filter rejected",)}
+                ),
+                endpoint="/publicCloud/v1/images",
             )
+            error.discovery_cache_hit = verdict.discovery_cache_hit
+            raise error
         return list(verdict.images)
 
     async def probe_region_images(self, region: str) -> list[CloudImage]:
@@ -1119,10 +1138,16 @@ class LeasewebHourlyCloudProvider:
         """
         verdict = await self.region_images_verdict(region)
         if verdict.state is RegionImagesState.UNSERVED:
-            raise LeasewebValidationError(
+            error = LeasewebValidationError(
                 f"region {region!r}: this credential is not entitled to the "
-                f"region-scoped image read ({verdict.detail or REGION_FILTER_UNSUPPORTED})"
+                f"region-scoped image read ({verdict.detail or REGION_FILTER_UNSUPPORTED})",
+                payload=LeasewebErrorPayload(
+                    http_status=400, error_details={"region": ("region filter rejected",)}
+                ),
+                endpoint="/publicCloud/v1/images",
             )
+            error.discovery_cache_hit = verdict.discovery_cache_hit
+            raise error
         return list(verdict.images)
 
     def _images_from(self, payload: Any) -> list[CloudImage]:

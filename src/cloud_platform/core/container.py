@@ -738,11 +738,9 @@ class Container:
 
         settings = get_settings()
         currency = str(settings.fx_catalog_pricing_currency).strip().upper()
-        rows = await self.sellable_offer_repository().list_all()
+        rows = await self.sellable_offer_repository().published_candidates(billing_model="hourly")
         count = 0
         for row in rows:
-            if str(getattr(row, "billing_model", "") or "") != "hourly":
-                continue
             if not is_sellable_in_currency(row, currency):
                 continue
             count += 1

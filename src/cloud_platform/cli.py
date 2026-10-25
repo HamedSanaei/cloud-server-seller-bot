@@ -2534,13 +2534,10 @@ async def _cloud_sellable_offer_count() -> int:
         from cloud_platform.modules.offers.repository import SqlAlchemySellableOfferRepository
 
         currency = str(get_settings().fx_catalog_pricing_currency).strip().upper()
-        rows = await SqlAlchemySellableOfferRepository(SessionFactory).list_all()
-        return sum(
-            1
-            for row in rows
-            if str(getattr(row, "billing_model", "") or "") == "hourly"
-            and is_sellable_in_currency(row, currency)
+        rows = await SqlAlchemySellableOfferRepository(SessionFactory).published_candidates(
+            billing_model="hourly"
         )
+        return sum(1 for row in rows if is_sellable_in_currency(row, currency))
     except Exception:
         return 0
 

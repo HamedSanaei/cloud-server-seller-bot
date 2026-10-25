@@ -231,7 +231,7 @@ async def probe_account_catalog(
                 type(exc).__name__,
             )
             continue
-        for extra in probe.discovered_locations:
+        for extra in merge_candidates(probe.discovered_locations):
             if extra not in probed and extra not in queue:
                 queue.append(extra)
         if probe.eligibility is LocationEligibility.FATAL_AUTHENTICATION:
@@ -431,7 +431,7 @@ class LeaseWebOrderingCatalogSyncer:
                 errors.append(f"locations[{account_id}]: {exc}")
                 continue
             for loc in locations:
-                if loc.id in seen:
+                if not merge_candidates((loc.id,)) or loc.id in seen:
                     continue
                 seen.add(loc.id)
                 fetched += 1
@@ -496,23 +496,17 @@ class LeaseWebOrderingCatalogSyncer:
         # per-account eligibility (so an account that fails this run does not
         # erase what it previously proved).
         try:
-            current_rows = await offers_repo.list_all()
+            current_refs: set[tuple[str, str, str]] | None = await offers_repo.available_refs(
+                PROVIDER_KEY, billing_model=BILLING_MODEL_MONTHLY
+            )
             current_available: set[tuple[str, str]] | None = {
-                (str(row.product_id), str(row.location_id))
-                for row in current_rows
-                if row.provider_key == PROVIDER_KEY and row.provider_available
+                (product, location) for _, product, location in current_refs or ()
             }
         except Exception as exc:
             errors.append(f"current offers unreadable, availability left untouched: {exc}")
+            current_refs = None
             current_available = None
-        try:
-            prior_available_locations = {
-                str(row.location_id)
-                for row in (current_rows if current_available is not None else [])
-                if row.provider_key == PROVIDER_KEY and row.provider_available
-            }
-        except Exception:  # pragma: no cover - defensive
-            prior_available_locations = set()
+        prior_available_locations = {location for _, _, location in current_refs or ()}
 
         prior_states: dict[str, dict[str, LocationEligibility]] = {}
         try:
@@ -682,19 +676,9 @@ class LeaseWebOrderingCatalogSyncer:
             # Preserve last-known rows of unresolved locations with their
             # exact account qualification (legacy NULL-account rows keep
             # the "" account triple, which is what the reconciler matches).
-            for row in current_rows or []:
-                if (
-                    row.provider_key == PROVIDER_KEY
-                    and row.provider_available
-                    and str(row.location_id) not in resolved
-                ):
-                    reconciled.add(
-                        (
-                            str(row.provider_account_id or ""),
-                            str(row.product_id),
-                            str(row.location_id),
-                        )
-                    )
+            for account, product, location in current_refs or ():
+                if location not in resolved:
+                    reconciled.add((account, product, location))
             availability_reconciled = True
             try:
                 marked_count = await offers_repo.mark_unavailable(
@@ -708,14 +692,11 @@ class LeaseWebOrderingCatalogSyncer:
                         "leaseweb ordering sync marked %d products unavailable", marked_count
                     )
 
-        # --- Guarantee normalized location metadata ---------------------
-        # Every definitively eligible location must have a normalized
-        # ProviderLocation row (the storefront flag/name path reads ONLY
-        # these rows): describe + upsert each resolved location, best effort
-        # per row. A metadata write failure is reported but never touches
-        # availability and never hides a valid product.
+        # Persist display metadata once per Ordering candidate, not once per
+        # credential plus another pass over eligible locations. Legacy Cloud
+        # rows/routes remain stored but never enter this candidate namespace.
         try:
-            metadata_warnings = await self._ensure_location_metadata(loc_repo, resolved)
+            metadata_warnings = await self._ensure_location_metadata(loc_repo, set(candidates))
         except Exception as exc:  # pragma: no cover - defensive; per-row handling above
             metadata_warnings = [f"location metadata pass failed: {type(exc).__name__}"]
         warnings.extend(metadata_warnings)
@@ -746,20 +727,19 @@ class LeaseWebOrderingCatalogSyncer:
     # ------------------------------------------------------------------
 
     async def _ensure_location_metadata(self, loc_repo: Any, locations: set[str]) -> list[str]:
-        """Persist normalized metadata for definitively eligible locations.
+        """Persist normalized display metadata once for each Ordering candidate.
 
-        The storefront flag/name path reads ONLY ProviderLocation rows, so
-        every location the sync proved eligible must have one with a usable
-        country and city. Normalization lives in the adapter
-        (``describe_location``: exact table, then city-prefix fallback).
-        Best effort per row: failures are reported as warnings and never
-        touch product availability.
+        Unknown eligibility remains unknown; a location row is only a discovery
+        hint, never sellability evidence. Batch failures cannot hide an offer.
         """
+        from cloud_platform.core.config import get_settings
+
         warnings: list[str] = []
+        records = []
         for location in sorted(locations):
             try:
                 described = self._provider.describe_location(location)
-                await loc_repo.upsert(
+                records.append(
                     LocationRecord(
                         provider_key=PROVIDER_KEY,
                         location_id=described.id,
@@ -770,6 +750,22 @@ class LeaseWebOrderingCatalogSyncer:
                 )
             except Exception as exc:
                 warnings.append(f"location metadata {location}: {type(exc).__name__}")
+        if get_settings().catalog_batch_enabled:
+            for offset in range(0, len(records), 100):
+                chunk = records[offset : offset + 100]
+                try:
+                    await loc_repo.upsert_batch(chunk)
+                except Exception as exc:
+                    warnings.extend(
+                        f"location metadata {record.location_id}: {type(exc).__name__}"
+                        for record in chunk
+                    )
+        else:
+            for record in records:
+                try:
+                    await loc_repo.upsert(record)
+                except Exception as exc:
+                    warnings.append(f"location metadata {record.location_id}: {type(exc).__name__}")
         return warnings
 
     def _discovered_extras(
@@ -780,7 +776,7 @@ class LeaseWebOrderingCatalogSyncer:
             probe = discovery.probes.get(location)
             if probe is None:
                 continue
-            for extra in probe.discovered_locations:
+            for extra in merge_candidates(probe.discovered_locations):
                 if extra not in extras:
                     extras.append(extra)
         return tuple(extras)
@@ -1122,27 +1118,7 @@ class LeaseWebOrderingCatalogSyncer:
                 discovery.note = "authentication failed"
                 errors.append(f"account {account_id}: authentication failed")
                 return discovery
-            # Persist the discovery itself (display metadata included), so a
-            # newly seen location is probed again automatically next run.
-            # Best effort: a location-row write failure must not stop products.
-            try:
-                described = provider.describe_location(location)
-                from cloud_platform.modules.catalog.repository import (
-                    SqlAlchemyLocationRepository,
-                )
-
-                await SqlAlchemyLocationRepository(self._session_factory).upsert(
-                    LocationRecord(
-                        provider_key=PROVIDER_KEY,
-                        location_id=described.id,
-                        name=described.name,
-                        country_code=described.country_code or None,
-                        city=described.city,
-                    )
-                )
-            except Exception as exc:
-                errors.append(f"location {location}: {exc}")
-            for extra in probe.discovered_locations:
+            for extra in merge_candidates(probe.discovered_locations):
                 if extra not in probed and extra not in queue:
                     queue.append(extra)
             if probe.eligibility is not LocationEligibility.ELIGIBLE_AVAILABLE:
@@ -1150,7 +1126,7 @@ class LeaseWebOrderingCatalogSyncer:
             for product in probe.products:
                 pair = (product.id, location)
                 if await self._optional_detail(account_id, discovery, location, product, errors):
-                    for extra in discovery.details[pair].available_locations:
+                    for extra in merge_candidates(discovery.details[pair].available_locations):
                         if extra not in probed and extra not in queue:
                             queue.append(extra)
         return discovery
@@ -1182,7 +1158,8 @@ class LeaseWebOrderingCatalogSyncer:
             detail = await self._accounts[account_id].get_product(location, product.id)
         except Exception as exc:
             discovery.detail_failures.add(pair)
-            logger.warning(
+            log = logger.debug if getattr(exc, "discovery_cache_hit", False) else logger.warning
+            log(
                 "leaseweb detail endpoint unavailable for %s at %s (%s); "
                 "keeping the product from the location list response",
                 product.id,

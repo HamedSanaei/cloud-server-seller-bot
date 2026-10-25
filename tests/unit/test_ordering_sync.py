@@ -86,7 +86,7 @@ def _fake_repo(return_value: Any = None) -> AsyncMock:
     repo.upsert = AsyncMock(return_value=1)
     repo.upsert_from_provider = AsyncMock(return_value=MagicMock(id="o1"))
     repo.mark_unavailable = AsyncMock(return_value=0)
-    repo.list_all = AsyncMock(return_value=[])
+    repo.available_refs = AsyncMock(return_value=set())
     repo.list_for_provider = AsyncMock(return_value=[])
     return repo
 
@@ -251,14 +251,7 @@ class TestDynamicEligibilityDiscovery:
         repos = _patch_repos(monkeypatch)
         from cloud_platform.providers.errors import ProviderUnavailable
 
-        current = MagicMock(
-            provider_key="leaseweb",
-            product_id="VPS02_1",
-            location_id="AMS-01",
-            provider_available=True,
-            provider_account_id=None,
-        )
-        repos["offers"].list_all = AsyncMock(return_value=[current])
+        repos["offers"].available_refs = AsyncMock(return_value={("", "VPS02_1", "AMS-01")})
 
         class _Provider(_DiscoveryProvider):
             async def probe_location(self, location: str) -> Any:
@@ -284,29 +277,6 @@ class TestDynamicEligibilityDiscovery:
         # Every candidate probed empty: nothing to sell, nothing hidden loudly.
         assert result["products"].total_upserted == 0
         assert result["products"].total_fetched == 0
-
-    async def test_newly_discovered_location_is_probed_automatically(
-        self, monkeypatch: Any
-    ) -> None:
-        repos = _patch_repos(monkeypatch)
-
-        class _Detail:
-            product = _FakeProduct()
-            # A location nobody configured: must be persisted AND probed.
-            available_locations = ("AMS-01", "FRA-10")
-
-        class _Provider(_DiscoveryProvider):
-            async def get_product(self, location_id: str, product_id: str) -> Any:
-                return _Detail()
-
-        provider = _Provider({})
-        syncer = LeaseWebOrderingCatalogSyncer(lambda: MagicMock(), provider)  # type: ignore[arg-type]
-        await syncer.sync_all()
-        assert "FRA-10" in provider.probed
-        upserted_locations = [
-            call.args[0].location_id for call in repos["locations"].upsert.await_args_list
-        ]
-        assert "FRA-10" in upserted_locations
 
     async def test_unscoped_failure_does_not_fail_sync(self, monkeypatch: Any) -> None:
         _patch_repos(monkeypatch)

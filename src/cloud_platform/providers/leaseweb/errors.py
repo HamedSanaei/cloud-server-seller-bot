@@ -332,6 +332,9 @@ class LeasewebError(ProviderError):
     retryable = False
     #: Optional discovery cooldown; never authorizes a mutation retry.
     reset_at_unix: int | None = None
+    #: Active discovery-cache replay; callers may reduce duplicate log severity
+    #: without changing failure handling. Fresh provider failures remain false.
+    discovery_cache_hit: bool = False
 
     def __init__(
         self,

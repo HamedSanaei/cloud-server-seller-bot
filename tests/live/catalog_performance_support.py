@@ -19,7 +19,9 @@ from cloud_platform.modules.offers.domain import OfferSpecUpdate
 
 
 @asynccontextmanager
-async def scratch_catalog(*, pool_size: int = 1) -> AsyncIterator[tuple[Any, Any]]:
+async def scratch_catalog(
+    *, pool_size: int = 1, extra_tables: tuple[Any, ...] = ()
+) -> AsyncIterator[tuple[Any, Any]]:
     raw = os.environ.get("CLOUD_PLATFORM_TEST_POSTGRES_URL", "")
     if not raw:
         raise RuntimeError("explicit scratch PostgreSQL URL required")
@@ -51,6 +53,8 @@ async def scratch_catalog(*, pool_size: int = 1) -> AsyncIterator[tuple[Any, Any
 
     include(SellableOffer.__table__)
     include(ProviderRoute.__table__)
+    for table in extra_tables:
+        include(table)
     for table in metadata.tables.values():
         for column in table.columns:
             if column.server_default is not None and "uuid_generate_v4" in str(

@@ -199,6 +199,44 @@ class SqlAlchemySellableOfferRepository:
             )
             return [_to_domain(row) for row in rows]
 
+    async def available_refs(
+        self, provider_key: str, *, billing_model: str
+    ) -> set[tuple[str, str, str]]:
+        """Available account/product/location identities, without offer hydration."""
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(
+                        _SellableOfferModel.provider_account_id,
+                        _SellableOfferModel.product_id,
+                        _SellableOfferModel.location_id,
+                    ).where(
+                        _SellableOfferModel.provider_key == provider_key,
+                        _SellableOfferModel.billing_model == billing_model,
+                        _SellableOfferModel.provider_available.is_(True),
+                    )
+                )
+            ).all()
+        return {
+            (str(account or ""), str(product), str(location)) for account, product, location in rows
+        }
+
+    async def published_candidates(self, *, billing_model: str) -> list[SellableOffer]:
+        """Cheap publication filters only; the caller still validates pricing evidence."""
+        async with self._session_factory() as session:
+            rows = (
+                await session.scalars(
+                    select(_SellableOfferModel).where(
+                        _SellableOfferModel.billing_model == billing_model,
+                        _SellableOfferModel.provider_available.is_(True),
+                        _SellableOfferModel.enabled.is_(True),
+                        _SellableOfferModel.operator_disabled.is_(False),
+                        _SellableOfferModel.selling_price_minor > 0,
+                    )
+                )
+            ).all()
+            return [_to_domain(row) for row in rows]
+
     async def list_sellable(self, provider_key: str | None = None) -> list[SellableOffer]:
         stmt = select(_SellableOfferModel).where(
             _SellableOfferModel.provider_available.is_(True),

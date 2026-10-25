@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import insert, select, text, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cloud_platform.db.base import Catalog as _CatalogModel
@@ -308,6 +308,67 @@ class SqlAlchemyLocationRepository:
                 created = False
             await session.commit()
             return created
+
+    async def upsert_batch(self, records: list[LocationRecord]) -> None:
+        """Bounded display-metadata write; unchanged rows keep their timestamp.
+
+        Location freshness is not fulfillment/price evidence. Resolve each
+        provider once, lock existing identities in order, and commit only
+        actual metadata changes. Historical rows are never removed.
+        """
+        if not records:
+            return
+        if len(records) > 100:
+            raise ValueError("location batches are limited to 100 rows")
+        identities = {(r.provider_key, r.location_id) for r in records}
+        if len(identities) != len(records):
+            raise ValueError("duplicate identities in location batch")
+        async with self._session_factory() as session:
+            providers = {
+                key: await self._provider_id(session, key)
+                for key in sorted({r.provider_key for r in records})
+            }
+            keys = [(providers[r.provider_key], r.location_id) for r in records]
+            found = (
+                await session.scalars(
+                    select(_ProviderLocationModel)
+                    .where(
+                        tuple_(
+                            _ProviderLocationModel.provider_id, _ProviderLocationModel.location_id
+                        ).in_(keys)
+                    )
+                    .order_by(
+                        _ProviderLocationModel.provider_id, _ProviderLocationModel.location_id
+                    )
+                    .with_for_update()
+                )
+            ).all()
+            existing: dict[tuple[uuid.UUID, str], Any] = {
+                (_attr(row, "provider_id"), _attr(row, "location_id")): row for row in found
+            }
+            inserted = []
+            changed = False
+            for record in records:
+                key = (providers[record.provider_key], record.location_id)
+                values = dict(
+                    name=record.name,
+                    country_code=record.country_code,
+                    city=record.city,
+                    network_zone=record.network_zone,
+                )
+                row = existing.get(key)
+                if row is None:
+                    inserted.append(
+                        dict(id=uuid.uuid4(), provider_id=key[0], location_id=key[1], **values)
+                    )
+                else:
+                    for field, value in values.items():
+                        setattr(row, field, value)
+                    changed = changed or session.is_modified(row, include_collections=False)
+            if inserted:
+                await session.execute(insert(_ProviderLocationModel).values(inserted))
+            if inserted or changed:
+                await session.commit()
 
     async def list_for_provider(self, provider_key: str) -> list[LocationRecord]:
         async with self._session_factory() as session:

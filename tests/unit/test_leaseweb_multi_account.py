@@ -653,7 +653,7 @@ def _fake_repo(**methods: Any) -> AsyncMock:
     repo.upsert = AsyncMock(return_value=1)
     repo.upsert_from_provider = AsyncMock(return_value=MagicMock(id="o1"))
     repo.mark_unavailable = AsyncMock(return_value=0)
-    repo.list_all = AsyncMock(return_value=[])
+    repo.available_refs = AsyncMock(return_value=set())
     repo.list_for_provider = AsyncMock(return_value=[])
     repo.upsert_observations = AsyncMock(return_value=0)
     repo.account_ids_for_provider = AsyncMock(return_value=[])
@@ -670,7 +670,9 @@ def _patch_sync_repos(
     **methods: Any,
 ) -> dict[str, AsyncMock]:
     locations = _fake_repo()
-    offers = _fake_repo(**{k: v for k, v in methods.items() if k in {"list_all"}}, **(offers or {}))
+    offers = _fake_repo(
+        **{k: v for k, v in methods.items() if k == "available_refs"}, **(offers or {})
+    )
     routes = _fake_repo(**(routes or {}))
     monkeypatch.setattr(
         "cloud_platform.modules.catalog.repository.SqlAlchemyLocationRepository",
@@ -730,16 +732,6 @@ class TestMultiAccountCatalogSync:
         await syncer.sync_all()
         locations = {location for _, location in _offered_pairs(repos)}
         assert locations == {FRA, AMS, SIN}
-        # Every discovered location is persisted through the SAME idempotent
-        # upsert keyed by (provider, location), so three accounts probing the
-        # same code still yield one logical location row.
-        upserted = {
-            call.kwargs["record"].location_id
-            if "record" in call.kwargs
-            else call.args[0].location_id
-            for call in repos["locations"].upsert.await_args_list
-        }
-        assert {FRA, AMS, SIN} <= upserted
 
     async def test_same_product_and_location_is_deduplicated(self, monkeypatch: Any) -> None:
         repos = _patch_sync_repos(monkeypatch)
@@ -897,7 +889,7 @@ class TestAggregatedInventory:
         # The location is resolved (the account serves it) and the product is
         # reported, so the pair may not be hidden merely because enrichment
         # failed.
-        repos = _patch_sync_repos(monkeypatch, list_all=AsyncMock(return_value=[]))
+        repos = _patch_sync_repos(monkeypatch)
         syncer = _syncer(
             {
                 "north": _AccountProvider(
@@ -998,17 +990,7 @@ class TestPerAccountFailureIsolation:
     async def test_transient_failure_preserves_last_known_offers(self, monkeypatch: Any) -> None:
         repos = _patch_sync_repos(
             monkeypatch,
-            list_all=AsyncMock(
-                return_value=[
-                    MagicMock(
-                        provider_key="leaseweb",
-                        product_id="VPS02_1",
-                        location_id=FRA,
-                        provider_available=True,
-                        provider_account_id=None,
-                    )
-                ]
-            ),
+            available_refs=AsyncMock(return_value={("", "VPS02_1", FRA)}),
         )
         syncer = _syncer(
             {"lw-eu": _AccountProvider(account_id="lw-eu", transient=(FRA,))},
@@ -1025,23 +1007,8 @@ class TestPerAccountFailureIsolation:
     ) -> None:
         repos = _patch_sync_repos(
             monkeypatch,
-            list_all=AsyncMock(
-                return_value=[
-                    MagicMock(
-                        provider_key="leaseweb",
-                        product_id="VPS02_1",
-                        location_id=FRA,
-                        provider_available=True,
-                        provider_account_id="lw-eu",
-                    ),
-                    MagicMock(
-                        provider_key="leaseweb",
-                        product_id="VPS02_1",
-                        location_id=AMS,
-                        provider_available=True,
-                        provider_account_id="lw-asia",
-                    ),
-                ]
+            available_refs=AsyncMock(
+                return_value={("lw-eu", "VPS02_1", FRA), ("lw-asia", "VPS02_1", AMS)}
             ),
         )
         syncer = _syncer(
@@ -2254,16 +2221,7 @@ class TestCatalogPersistenceIsReportedHonestly:
         repos = _patch_sync_repos(
             monkeypatch,
             offers={"upsert_from_provider": self._fail("schema is behind the image")},
-            list_all=AsyncMock(
-                return_value=[
-                    MagicMock(
-                        provider_key="leaseweb",
-                        product_id="VPS02_1",
-                        location_id=FRA,
-                        provider_available=True,
-                    )
-                ]
-            ),
+            available_refs=AsyncMock(return_value={("", "VPS02_1", FRA)}),
         )
         syncer = _syncer({"lw-eu": _AccountProvider(account_id="lw-eu", serves=(AMS,))})
         result = await syncer.sync_all()
@@ -2488,16 +2446,7 @@ class TestCurrencyIsProviderEvidence:
         """
         repos = _patch_sync_repos(
             monkeypatch,
-            list_all=AsyncMock(
-                return_value=[
-                    MagicMock(
-                        provider_key="leaseweb",
-                        product_id="VPS02_1",
-                        location_id=LON,
-                        provider_available=True,
-                    )
-                ]
-            ),
+            available_refs=AsyncMock(return_value={("", "VPS02_1", LON)}),
         )
         from cloud_platform.providers.leaseweb.errors import LeasewebServerError
 

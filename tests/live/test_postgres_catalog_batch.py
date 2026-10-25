@@ -303,3 +303,255 @@ async def test_batch_routes_keep_inventory_and_reject_older_evidence():
             r.state is RouteState.TRANSIENT_UNKNOWN
             for r in await repo.list_for_provider("leaseweb")
         )
+
+
+async def test_location_batch_noop_preserves_legacy_rows_and_metadata_timestamps():
+    from sqlalchemy import select
+
+    from cloud_platform.db.base import ProviderLocation
+    from cloud_platform.modules.catalog.domain import LocationRecord
+    from cloud_platform.modules.catalog.repository import SqlAlchemyLocationRepository
+
+    async with scratch_catalog(extra_tables=(ProviderLocation.__table__,)) as (engine, factory):
+        install_sql_instrumentation(engine)
+        repo = SqlAlchemyLocationRepository(factory)
+        legacy = LocationRecord("leaseweb", "EU-WEST-3", "historical display row")
+        await repo.upsert(legacy)
+        locations = [
+            LocationRecord("leaseweb", f"PAR-{i:02}", "Paris", country_code="FR", city="Paris")
+            for i in range(15)
+        ]
+        await repo.upsert_batch(locations)
+        async with factory() as session:
+            before = (await session.execute(select(ProviderLocation.__table__))).mappings().all()
+        with stage("location_noop") as sample:
+            await repo.upsert_batch(locations)
+        assert sample.queries == 2 and sample.commits == 0
+        async with factory() as session:
+            after = (await session.execute(select(ProviderLocation.__table__))).mappings().all()
+        assert sorted(before, key=lambda r: r["location_id"]) == sorted(
+            after, key=lambda r: r["location_id"]
+        )
+        await repo.upsert_batch([replace(locations[0], name="Paris updated")])
+        rows = {r.location_id: r for r in await repo.list_for_provider("leaseweb")}
+        assert rows["PAR-00"].name == "Paris updated"
+        assert rows["EU-WEST-3"] == legacy
+
+
+async def test_narrow_catalog_reads_keep_family_ownership_and_full_sellability_gate(monkeypatch):
+    from sqlalchemy import update
+
+    from cloud_platform.core.container import Container
+    from cloud_platform.modules.offers.domain import (
+        BILLING_MODEL_MONTHLY,
+        is_sellable_in_currency,
+    )
+
+    async with scratch_catalog() as (_, factory):
+        repo = SqlAlchemySellableOfferRepository(factory)
+        items = [observation(i) for i in range(8)]
+        items[1]["provider_key"] = "hetzner"  # count is not Leaseweb-only
+        items[7]["provider_account_id"] = None  # legacy unscoped ownership
+        items[7]["update"] = replace(
+            items[7]["update"],
+            billing_model=BILLING_MODEL_MONTHLY,
+            billing_parameters={"provider_monthly_rate": "1"},
+        )
+        offers = await repo.upsert_provider_batch(items)
+        async with factory.begin() as session:
+            await session.execute(
+                update(Row).values(
+                    enabled=True, auto_priced=False, selling_price_minor=150, selling_currency="USD"
+                )
+            )
+            await session.execute(update(Row).where(Row.id == offers[2].id).values(enabled=False))
+            await session.execute(
+                update(Row).where(Row.id == offers[3].id).values(operator_disabled=True)
+            )
+            await session.execute(
+                update(Row).where(Row.id == offers[4].id).values(provider_available=False)
+            )
+            await session.execute(
+                update(Row).where(Row.id == offers[5].id).values(selling_price_minor=0)
+            )
+            await session.execute(
+                update(Row)
+                .where(Row.id == offers[6].id)
+                .values(
+                    auto_priced=True,
+                    pricing_metadata={},  # published but unproven
+                )
+            )
+        assert await repo.available_refs("leaseweb", billing_model=BILLING_MODEL_MONTHLY) == {
+            ("", items[7]["product_id"], "AMS-01")
+        }
+        expected = {
+            row.id
+            for row in await repo.list_all()
+            if row.billing_model == "hourly" and is_sellable_in_currency(row, "USD")
+        }
+        assert expected == {offers[0].id, offers[1].id}
+        narrowed = await repo.published_candidates(billing_model="hourly")
+        assert {row.id for row in narrowed if is_sellable_in_currency(row, "USD")} == expected
+        monkeypatch.setattr(Container, "sellable_offer_repository", lambda _: repo)
+        assert await Container.sellable_cloud_offer_count(object.__new__(Container)) == 2
+
+
+async def test_legacy_namespace_sync_preserves_orders_resources_and_manual_prices():
+    from sqlalchemy import insert, select, update
+
+    from cloud_platform.db.base import (
+        ProviderAccount,
+        ProviderLocation,
+        ProviderOrder,
+        ProviderRoute,
+        Server,
+        User,
+    )
+    from cloud_platform.modules.catalog.domain import LocationRecord
+    from cloud_platform.modules.catalog.repository import (
+        SqlAlchemyLocationRepository,
+        provider_key_to_uuid,
+    )
+    from cloud_platform.modules.offers.domain import BILLING_MODEL_MONTHLY
+    from cloud_platform.providers.leaseweb.errors import LeasewebValidationError
+    from cloud_platform.providers.leaseweb.ordering_sync import LeaseWebOrderingCatalogSyncer
+    from tests.live.test_postgres_catalog_sync import _OrderingProvider
+
+    class Provider(_OrderingProvider):
+        async def get_product(self, location_id, product_id):
+            raise LeasewebValidationError("product not available in this location")
+
+    extras = (ProviderLocation.__table__, ProviderOrder.__table__)
+    async with scratch_catalog(extra_tables=extras) as (_, factory):
+        locations = SqlAlchemyLocationRepository(factory)
+        for code in ("eu-west-3", "EU-WEST-3"):
+            await locations.upsert(LocationRecord("leaseweb", code, "legacy cloud row"))
+        repo = SqlAlchemySellableOfferRepository(factory)
+        monthly = dict(observation(1, account="north"), product_id="VPS02_1", location_id="FRA-10")
+        monthly["update"] = replace(
+            monthly["update"],
+            billing_model=BILLING_MODEL_MONTHLY,
+            billing_parameters={"provider_monthly_rate": "1"},
+        )
+        cloud = dict(observation(2), location_id="eu-west-3")
+        offer, _ = await repo.upsert_provider_batch([monthly, cloud])
+        user_id, account_id, server_id, order_id, route_id = (uuid4() for _ in range(5))
+        provider_id = provider_key_to_uuid("leaseweb")
+        async with factory.begin() as session:
+            await session.execute(
+                update(Row)
+                .where(Row.id == offer.id)
+                .values(
+                    selling_price_minor=777,
+                    selling_currency="USD",
+                    auto_priced=False,
+                    enabled=False,
+                    operator_disabled=True,
+                )
+            )
+            await session.execute(
+                insert(User).values(
+                    id=user_id, username="catalog-fixture", email="catalog@example.test"
+                )
+            )
+            await session.execute(
+                insert(ProviderAccount).values(
+                    id=account_id, user_id=user_id, provider_id=provider_id
+                )
+            )
+            await session.execute(
+                insert(Server).values(
+                    id=server_id,
+                    user_id=user_id,
+                    provider_id=provider_id,
+                    provider_account_id=account_id,
+                    credential_account_id="north",
+                    state="running",
+                    provider_server_id="existing-customer-vps",
+                    price_per_quantum=777,
+                    currency="USD",
+                    billing_model=BILLING_MODEL_MONTHLY,
+                    idempotency_key="existing-server-command",
+                )
+            )
+            await session.execute(
+                insert(ProviderOrder).values(
+                    id=order_id,
+                    server_id=server_id,
+                    offer_id=offer.id,
+                    provider_key="leaseweb",
+                    credential_account_id="north",
+                    operation_key="existing-order-command",
+                    provider_order_id="existing-provider-order",
+                    status="active",
+                    provider_cost_minor=100,
+                    provider_cost_currency="USD",
+                    selling_price_minor=777,
+                    selling_currency="USD",
+                )
+            )
+            await session.execute(
+                insert(ProviderRoute).values(
+                    id=route_id,
+                    provider_key="leaseweb",
+                    credential_account_id="north",
+                    location_id="EU-WEST-3",
+                    state="transient_unknown",
+                    account_state="active",
+                    priority=100,
+                    product_ids=[],
+                )
+            )
+
+        async def protected_snapshot():
+            async with factory() as session:
+                return {
+                    model.__tablename__: (await session.execute(select(model.__table__)))
+                    .mappings()
+                    .all()
+                    for model in (Server, ProviderOrder)
+                }
+
+        before = await protected_snapshot()
+        async with factory() as session:
+            cloud_before = (
+                (await session.execute(select(Row.__table__).where(Row.location_id == "eu-west-3")))
+                .mappings()
+                .one()
+            )
+            route_before = (
+                (
+                    await session.execute(
+                        select(ProviderRoute.__table__).where(ProviderRoute.id == route_id)
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        syncer = LeaseWebOrderingCatalogSyncer(
+            factory, accounts={"north": Provider(("FRA-10",)), "uk": Provider(("LON-11",))}
+        )
+        await syncer.sync_products()
+        first = await repo.get(offer.id)
+        await syncer.sync_products()
+        current = await repo.get(offer.id)
+        assert current == first
+        assert current.provider_cost_minor == 624
+        assert current.provider_cost_currency == "EUR"
+        assert current.billing_parameters["provider_monthly_rate"] == "6.24"
+        assert current.provider_account_id == "north" and current.provider_available
+        assert current.selling_price_minor == 777 and current.operator_disabled
+        assert not current.enabled and not current.auto_priced
+        assert await protected_snapshot() == before
+        async with factory() as session:
+            assert (
+                await session.execute(select(Row.__table__).where(Row.location_id == "eu-west-3"))
+            ).mappings().one() == cloud_before
+            assert (
+                await session.execute(
+                    select(ProviderRoute.__table__).where(ProviderRoute.id == route_id)
+                )
+            ).mappings().one() == route_before
+        records = {r.location_id: r for r in await locations.list_for_provider("leaseweb")}
+        assert records["eu-west-3"].name == records["EU-WEST-3"].name == "legacy cloud row"

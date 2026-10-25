@@ -1,5 +1,144 @@
 # Catalog worker performance: local investigation and rollback
 
+## 2026-10-25: Ordering/Public Cloud namespace follow-up
+
+This follow-up is a **source-only candidate, not an authorized deployment**.
+Read-only inspection at 02:14:34 UTC found the running image at `b699335`,
+including merged PR #6, rather than the older `93f1819` reported initially.
+No provider request, production write, restart, cache invalidation or statistics
+reset was performed during this investigation.
+
+### Confirmed causes and boundaries
+
+- `cloud_sync.sync_all()` legitimately persists lower-case Public Cloud regions
+  into the shared provider-location display table. Ordering
+  `sync_products()` read every Leaseweb location and prior route;
+  `merge_candidates()` uppercased them without checking their namespace.
+  `_discover_account()` then probed and persisted those identifiers for each
+  credential. Production contained 35 display rows: 15 datacenters, 10 Cloud
+  regions and 10 upper-case copies. This fed 25 candidates to each of two
+  accounts, including 20 invalid cross-family probes per cold discovery round.
+- `extract_location_codes()` could also extract `WEST-3` from `EU-WEST-3`.
+  Candidate merging, provider hints and direct Ordering probes now require
+  whole datacenter identifiers. This is an open-ended adapter grammar, **not
+  membership in `KNOWN_VPS_DATACENTERS`**: new halls such as `PAR-99` remain
+  discoverable. Cloud discovery and its lower-case region IDs are unchanged.
+- Historical display rows and routes remain stored. They no longer authorize
+  Ordering discovery. Existing offer billing models already distinguish
+  monthly from hourly reconciliation, so no schema migration is needed.
+- Leaseweb's own inconsistency remains: the location-specific LIST includes
+  `VPS02_1` at `FRA-10`, while DETAIL returns 400 “not available”; the same
+  occurs for `LON-11` under its UK sales organization. Omitting contract/billing
+  parameters did not help in the owner-confirmed tests. LIST still controls
+  membership; failed optional enrichment neither invents a price nor removes
+  a valid LIST observation. Checkout/fulfillment checks are unchanged.
+- PR #6 already supplied discovery-only Ordering-400 caching. This follow-up
+  preserves exact allowlisted error subtype, status, Retry-After and minimal
+  region-filter proof through cache replay. All request filter parameters
+  participate in hashed identity. Old entries without sufficient evidence
+  are reprobed once. No provider message/body or credential is cached.
+- A generic mention of a region is not proof that a filter is unsupported.
+  Only structured `400/errorDetails.region` or the narrowly recognized
+  provider message qualifies. Cached failures remain typed failures in
+  reports; only duplicate replay logs become DEBUG. Fresh/reprobe failures
+  keep their normal severity. A global image list still does not prove
+  region/account fulfillment capability.
+
+### Production baseline, not post-fix measurements
+
+The catalog interval was 900 seconds, timeout 600 seconds, with observation
+batching and negative caching enabled (3,600-second negative TTL).
+
+| Observed worker metric | Value |
+| --- | --- |
+| Completed catalog jobs / summed wall time | 2 / 208.39 s |
+| Inclusive catalog-job process CPU | 41.27 s |
+| Cgroup CPU since container start | 179.49 s over 983.80 s (~18.2% of one CPU average, not peak) |
+| Catalog cursor executions / commits | 624 / 292 |
+| Provider-sync cursor executions / commits / read cleanup rollbacks | 586 / 285 / 178 |
+| Changed / unchanged provider observations | 0 / 536 |
+| Economic price changes / evidence refreshes | 0 / 2 |
+| Discovery-cache hits / misses | 49 / 92 |
+| Ordering LIST 400 / DETAIL 400 | 22 / 24 |
+| Cloud image 400 / image 200 | 0 / 10 |
+| Worker cgroup throttled periods / periods | 117 / 4,682 |
+| Worker cgroup throttled time / CPU quota | 4.80 s / 1 CPU |
+
+The counters reset with the worker. The owner's earlier 1,008 DETAIL-400,
+924 LIST-400 and 72 image-400 observations are a different measurement window,
+not a directly comparable after/before pair. Stage CPU is inclusive and can
+overlap capacity recovery; it is not exclusive attribution.
+
+`pg_stat_statements` had been reset at 01:36:29 UTC. Its cumulative window
+includes deployment/readiness and other jobs, not only scheduled catalog work.
+Normalized projections below are abbreviated; query IDs identify exact rows.
+
+| Query ID | Normalized SQL shape | Calls | Total execution ms | Mean ms |
+| --- | --- | --- | --- | --- |
+| `-1335413168768839628` | `SELECT <offer columns> FROM sellable_offers ORDER BY provider_key, location_id, product_id` | 18 | 3121.24 | 173.402 |
+| `-1953548502095612218` | `SELECT <offer columns> FROM sellable_offers WHERE (provider_key,billing_model,product_id,location_id) IN (...)` | 10 | 362.72 | 36.272 |
+| `5037813231549613731` | `SELECT <offer columns> FROM sellable_offers WHERE id=$1::UUID` | 854 | 219.27 | 0.257 |
+| `1194180340443044238` | `UPDATE sellable_offers SET pricing_metadata=$1::JSONB, updated_at=CURRENT_TIMESTAMP WHERE id=$2::UUID` | 729 | 49.89 | 0.068 |
+| `-7064786512269629625` | `SELECT <location columns> FROM provider_locations WHERE provider_id=$1::UUID AND location_id=$2::VARCHAR` | 203 | 5.90 | 0.029 |
+
+The full ordered offer read maps to `list_all()`, used both by monthly discovery
+and periodic capacity counting. Monthly discovery now uses
+`available_refs(provider, billing_model=monthly)`, selecting only account,
+product and location. Capacity/CLI counts use `published_candidates(hourly)`
+and retain the exact existing currency/provenance gate, across all providers.
+Do not replace that gate with an unaudited SQL COUNT.
+
+Metadata previously incurred a session/provider lookup/location lookup/commit
+per account and candidate, plus a second pass over resolved halls.
+`SqlAlchemyLocationRepository.upsert_batch()` now resolves providers once,
+locks identities in order and writes only actual display-metadata changes.
+Ordering persists the union once. Offer/route batches, pricing audit and
+necessary freshness timestamps remain; no billing cron was changed.
+
+### Isolated smoke and regression evidence
+
+Five alternating repetitions against disposable local PostgreSQL 18, using the
+exact deployed repository and the 25/15 candidate sets captured above. This is
+the **warm metadata component**, not an end-to-end catalog/CPU benchmark.
+Historical rows were verified retained.
+
+| Metadata component metric | Deployed implementation | Candidate |
+| --- | --- | --- |
+| Cursor executions | 112 | 2 |
+| Commits | 56 | 0 |
+| Read-session cleanup rollbacks | 0 | 1 |
+| Median wall time | 165.42 ms | 3.35 ms |
+| Median process CPU | 93.75 ms | Below Windows clock resolution |
+
+The candidate CPU samples rounded to zero; this does not mean zero CPU usage.
+The one rollback closes a read-only transaction, not a failed catalog write.
+
+HTTP estimate with stable account scope and the existing one-hour TTL:
+contamination contributes 20 cold LIST attempts per TTL window today and zero
+after separation. Without PR #6's cache it would contribute up to 80 attempts
+over four 15-minute runs. The 24 optional-detail failures remain provider-side
+and are bounded, not “fixed”; successful catalog reads remain fresh. Real
+rollout measurements must account for one-time cache-key/legacy-entry misses.
+
+Targeted validation covers namespace separation and new datacenters, legacy
+rows/routes, both sales organizations, optional DETAIL 400, 403, transient and
+ambiguous failures, negative expiry/invalidation, pricing evidence, unchanged
+metadata timestamps, manual price/disable state, and byte-for-byte retained
+order/server snapshots across repeated real-PostgreSQL syncs.
+Raw local benchmark files remain ignored under `.ci-artifacts/`.
+
+**No claim of solved Production CPU:** after an explicitly approved deployment,
+compare at least a cold round and a full warm TTL window on the exact image:
+endpoint/status deltas, cache outcomes, catalog wall/inclusive CPU, cgroup
+throttling deltas, SQL calls/time, transactions, changed/unchanged observations
+and unchanged customer/financial contracts. Do not clear Production caches or
+reset PostgreSQL statistics merely to make the comparison easier.
+
+## Historical f609 investigation
+
+The remaining sections describe the earlier baseline and its original
+measurements; they are not current Production facts.
+
 ## Scope and evidence boundaries
 
 Baseline: `f609f617e4223c85fec2073371c9dbfaf637a3ff`, branch `staging` in
