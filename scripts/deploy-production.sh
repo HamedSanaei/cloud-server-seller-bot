@@ -245,7 +245,7 @@ rollback() {
     log "ROLLBACK: restoring ${PREV_IMAGE}"
     set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
     if [ "${WRITERS_STOPPED}" = "yes" ] || [ "${APP_START_ATTEMPTED}" = "yes" ]; then
-        PLATFORM_IMAGE="${PREV_IMAGE}" compose_current up -d --no-deps api worker bot >/dev/null || {
+        PLATFORM_IMAGE="${PREV_IMAGE}" compose_current up -d --no-deps "${APP_SERVICES[@]}" >/dev/null || {
             compose_current stop --timeout 45 api worker bot >/dev/null || true
             fail "ROLLBACK: cannot restart the previous application image; writers stopped"
             return 1
@@ -257,9 +257,10 @@ rollback() {
             return 1
         }
         count="$(printf '%s\n' "${ids}" | grep -c . || true)"
-        if [ "${count}" != "1" ] || ! container_running "${ids}"; then
+        if [ "${count}" != "${EXPECTED_BOT_REPLICAS}" ] ||
+            { [ "${EXPECTED_BOT_REPLICAS}" = "1" ] && ! container_running "${ids}"; }; then
             compose_current stop --timeout 45 api worker bot >/dev/null || true
-            fail "ROLLBACK: single running bot not established; writers stopped"
+            fail "ROLLBACK: expected bot topology not established; writers stopped"
             return 1
         fi
     fi
@@ -364,6 +365,22 @@ deploy() {
     command -v sha256sum >/dev/null || { fail "sha256sum is not installed (needed for compose integrity)"; return 1; }
 
     [ -f "${ENV_FILE}" ] || { fail "deployment env file missing: ${ENV_FILE}"; return 1; }
+    local runtime_mode
+    runtime_mode="$(dotenv_value "${ENV_FILE}" PLATFORM_RUNTIME_MODE)"
+    case "${runtime_mode:-full}" in
+        full)
+            APP_SERVICES=(api worker bot)
+            EXPECTED_BOT_REPLICAS=1
+            ;;
+        web)
+            APP_SERVICES=(api worker)
+            EXPECTED_BOT_REPLICAS=0
+            ;;
+        *)
+            fail "PLATFORM_RUNTIME_MODE must be full or web"
+            return 1
+            ;;
+    esac
     # Server-owned configuration: required, but never created or modified here.
     [ -f "${CONFIGURATION_PATH}" ] || {
         fail "server configuration missing: ${CONFIGURATION_PATH} (bootstrap it once, deploys never touch it)"
@@ -479,7 +496,7 @@ deploy() {
     fi
 
     log "pulling application image"
-    if ! compose_candidate pull migrate api worker bot; then
+    if ! compose_candidate pull migrate "${APP_SERVICES[@]}"; then
         log "pull failed — restoring previous image reference"
         if [ -n "${PREV_IMAGE}" ]; then
             set_platform_image "${ENV_FILE}" "${PREV_IMAGE}" || return 1
@@ -610,11 +627,11 @@ deploy() {
         log "[WARN] catalog normalization reported failures (counts above); the storefront readiness gate below is authoritative"
     fi
 
-    log "starting api + worker + bot (bot replicas = 1)"
+    log "starting application services: ${APP_SERVICES[*]} (bot replicas = ${EXPECTED_BOT_REPLICAS})"
     APP_START_ATTEMPTED="yes"
     # Migration already completed and schema/dependency health were verified.
     # Resolving Compose dependencies here would run the migrate service again.
-    compose_candidate up -d --no-deps api worker bot >/dev/null || { fail "cannot start api/worker/bot"; return 1; }
+    compose_candidate up -d --no-deps "${APP_SERVICES[@]}" >/dev/null || { fail "cannot start application services"; return 1; }
 
     local api_port
     api_port="$(dotenv_value "${ENV_FILE}" API_PORT)"
@@ -647,17 +664,21 @@ deploy() {
         worker_id="${id}"
     done
 
-    # Telegram long polling is a single-consumer transport: exactly one bot.
+    # Full mode requires one poller. Web mode explicitly requires zero.
     local bot_count bot_id
     bot_id="$(compose_candidate ps -q bot)" || return 1
     bot_count="$(printf '%s\n' "${bot_id}" | grep -c . || true)"
-    [ "${bot_count}" = "1" ] || {
-        fail "bot replica invariant violated: ${bot_count} bot containers (want exactly 1)"
+    [ "${bot_count}" = "${EXPECTED_BOT_REPLICAS}" ] || {
+        fail "bot replica invariant violated: ${bot_count} bot containers (want exactly ${EXPECTED_BOT_REPLICAS})"
         return 1
     }
-    container_running "${bot_id}" || { fail "bot container is not running"; return 1; }
-    log "bot replicas: exactly 1, running"
-    for service in api worker bot; do
+    if [ "${EXPECTED_BOT_REPLICAS}" = "1" ]; then
+        container_running "${bot_id}" || { fail "bot container is not running"; return 1; }
+        log "bot replicas: exactly 1, running"
+    else
+        log "bot replicas: zero (web runtime mode)"
+    fi
+    for service in "${APP_SERVICES[@]}"; do
         id="$(compose_candidate ps -q "${service}")" || return 1
         [ -n "${id}" ] && wait_healthy "${id}" "${HEALTH_ATTEMPTS}" "${HEALTH_INTERVAL}" || {
             fail "${service} did not establish its service-specific health signal"
@@ -670,13 +691,16 @@ deploy() {
     # to still be running with unchanged restart counts after a short
     # bounded wait. No HTTP probing: neither service serves HTTP.
     local bot_restarts_before worker_restarts_before
-    bot_restarts_before="$(restart_count "${bot_id}")" || { fail "cannot inspect bot restart count"; return 1; }
+    bot_restarts_before=0
+    if [ "${EXPECTED_BOT_REPLICAS}" = "1" ]; then
+        bot_restarts_before="$(restart_count "${bot_id}")" || { fail "cannot inspect bot restart count"; return 1; }
+    fi
     worker_restarts_before="$(restart_count "${worker_id}")" || { fail "cannot inspect worker restart count"; return 1; }
     printf '%s:%s' "${bot_restarts_before}" "${worker_restarts_before}" | grep -Eq '^[0-9]+:[0-9]+$' || {
         fail "invalid worker/bot restart counters"
         return 1
     }
-    log "waiting ${STABILIZE_SECONDS}s for worker/bot startup stabilization"
+    log "waiting ${STABILIZE_SECONDS}s for application startup stabilization"
     sleep "${STABILIZE_SECONDS}"
     local bot_id_after worker_id_after
     bot_id_after="$(compose_candidate ps -q bot)" || return 1
@@ -686,20 +710,26 @@ deploy() {
         fail "worker container changed during stabilization"
         return 1
     }
-    container_running "${bot_id}" || { fail "bot container is not running after stabilization"; return 1; }
+    if [ "${EXPECTED_BOT_REPLICAS}" = "1" ]; then
+        container_running "${bot_id}" || { fail "bot container is not running after stabilization"; return 1; }
+        if [ "$(restart_count "${bot_id}")" != "${bot_restarts_before}" ]; then
+            fail "bot restarted during stabilization (crash loop?)"
+            return 1
+        fi
+    fi
     container_running "${worker_id}" || {
         fail "worker container is not running after stabilization"
         return 1
     }
-    if [ "$(restart_count "${bot_id}")" != "${bot_restarts_before}" ]; then
-        fail "bot restarted during stabilization (crash loop?)"
-        return 1
-    fi
     if [ "$(restart_count "${worker_id}")" != "${worker_restarts_before}" ]; then
         fail "worker restarted during stabilization"
         return 1
     fi
-    log "worker + bot stable (same containers running, no restarts)"
+    if [ "${EXPECTED_BOT_REPLICAS}" = "1" ]; then
+        log "worker + bot stable (same containers running, no restarts)"
+    else
+        log "worker stable and no bot running"
+    fi
 
     log "verifying migration revision"
     local current

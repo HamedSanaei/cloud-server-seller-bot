@@ -793,6 +793,7 @@ case " $* " in
     *" ps -q "*)
         case " $* " in
             *" ps -q bot "*)
+                [ "${STUB_NO_BOT:-0}" = "1" ] && exit 0
                 n="$(cat "$BOT_PS_COUNTER" 2>/dev/null || echo 0)"
                 n=$((n + 1))
                 printf '%s' "$n" > "$BOT_PS_COUNTER"
@@ -927,7 +928,7 @@ case " $* " in
         [ "$FAIL_MIGRATE" = "1" ] && exit 1
         exit 0
         ;;
-    *" up -d api worker bot "*|*" up -d --no-deps api worker bot "*)
+    *" up -d --no-deps api worker bot "*|*" up -d --no-deps api worker "*)
         n="$(cat "$UP_FAIL_COUNTER" 2>/dev/null || echo 0)"
         n=$((n + 1))
         printf '%s' "$n" > "$UP_FAIL_COUNTER"
@@ -982,6 +983,7 @@ def _release_harness(
     fail_rollback_schema: bool = False,
     crash_loop: bool = False,
     deploy_profile: str = "production",
+    runtime_mode: str | None = None,
     alembic_image_head: str = "0034 (head)",
     alembic_db_head: str = "0034 (head)",
     expected_head: str = "0034",
@@ -1005,7 +1007,7 @@ def _release_harness(
         "# deployment values (server-owned)\n"
         f"PLATFORM_IMAGE={previous_image}\n"
         "POSTGRES_PASSWORD=s3cret-server-value\n"
-        "API_PORT=8000\n"
+        "API_PORT=8000\n" + (f"PLATFORM_RUNTIME_MODE={runtime_mode}\n" if runtime_mode else "")
     )
     env_file.write_text(env_before, encoding="utf-8", newline="\n")
     current, candidate, candidate_sha = _write_compose_files(deploy_dir)
@@ -1057,6 +1059,7 @@ def _release_harness(
         f"ENV_FILE='{env_file.as_posix()}' "
         f"CONFIGURATION_PATH='{config.as_posix()}' EXPECTED_HEAD='{expected_head}' "
         f"DEPLOY_PROFILE='{deploy_profile}' "
+        f"STUB_NO_BOT='{'1' if runtime_mode == 'web' else ''}' "
         f"STABILIZE_SECONDS=1 HEALTH_ATTEMPTS=3 HEALTH_INTERVAL=1; "
         + "".join(
             f"export {key}={shlex.quote(value)}; " for key, value in (env_overrides or {}).items()
@@ -1613,6 +1616,43 @@ class TestDeployProfiles:
         )
         assert "DEPLOY_PROFILE must be" in result.stderr
         _assert_no_mutation(tmp_path, result, deploy_dir, canonical, env_before, config_before)
+
+
+class TestWebRuntimeMode:
+    @needs_bash
+    def test_web_mode_promotes_api_and_worker_with_zero_bots(self, tmp_path: Path) -> None:
+        result, _, canonical, _, _, _ = _release_harness(tmp_path, runtime_mode="web")
+        assert "MAIN_RC=0" in result.stdout, result.stderr
+        assert "worker stable and no bot running" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        starts = [call for call in calls if "up -d --no-deps api worker" in call]
+        assert len(starts) == 1 and starts[0].endswith("api worker")
+        assert canonical.read_bytes() == b"# release candidate contract\nservices: {}\n"
+
+    @needs_bash
+    def test_web_mode_rolls_back_an_unhealthy_worker_without_starting_bot(
+        self, tmp_path: Path
+    ) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, runtime_mode="web", env_overrides={"STUB_UNHEALTHY_SERVICE": "worker"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "worker did not establish" in result.stderr
+        assert "ROLLBACK DONE" in result.stdout
+        calls = _stub_calls(tmp_path, "docker-calls.log").splitlines()
+        starts = [call for call in calls if "up -d --no-deps api worker" in call]
+        assert len(starts) == 2 and all(call.endswith("api worker") for call in starts)
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
+
+    @needs_bash
+    def test_web_mode_refuses_to_promote_with_a_running_poller(self, tmp_path: Path) -> None:
+        result, _, canonical, _, _, _ = _release_harness(
+            tmp_path, runtime_mode="web", env_overrides={"STUB_NO_BOT": "0"}
+        )
+        assert "MAIN_RC=1" in result.stdout
+        assert "want exactly 0" in result.stderr
+        assert "ROLLBACK DONE" not in result.stdout
+        assert canonical.read_bytes() == b"# canonical release contract\nservices: {}\n"
 
 
 class TestStorefrontReadinessGate:
