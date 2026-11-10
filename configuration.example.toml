@@ -384,6 +384,14 @@ base_url = "https://api.tetraminator.com/v1"
 callback_url = "https://example.com/webhooks/payments/tetraminator"
 timeout_seconds = 30
 
+[payments.tabapay]
+enabled = false
+merchant_id = ""
+sandbox = false
+callback_url = "https://example.com/webhooks/payments/tabapay"
+return_url = "https://example.com/charge-requests"
+timeout_seconds = 15
+
 [payments.atlaspay]
 # AtlasPay orders are integer Toman. The exact provider total (including its
 # unique suffix) is shown separately from the frozen wallet credit amount.

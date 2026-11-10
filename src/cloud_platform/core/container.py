@@ -1337,6 +1337,7 @@ class Container:
         """
         from cloud_platform.providers.atlaspay.client import AtlasPayGateway
         from cloud_platform.providers.nowpayments.client import NowPaymentsGateway
+        from cloud_platform.providers.tabapay.client import TabaPayGateway
         from cloud_platform.providers.tetraminator.client import TetraminatorGateway
         from cloud_platform.providers.zarinpal.client import ZarinPalGateway
 
@@ -1363,6 +1364,8 @@ class Container:
                 base_url=settings.atlaspay_base_url,
                 timeout_seconds=settings.atlaspay_timeout_seconds,
             )
+        if settings.tabapay_merchant_id:
+            gateways[TabaPayGateway.key] = TabaPayGateway.from_settings(settings)
         # Register configured adapters independently of creation policy: old
         # invoices must remain queryable after an operator disables new orders.
         if settings.nowpayments_api_key and settings.nowpayments_api_key.strip() != "CHANGE_ME":
@@ -1427,6 +1430,7 @@ class Container:
         return {
             "atlaspay": settings.atlaspay_enabled,
             "nowpayments": settings.nowpayments_enabled,
+            "tabapay": settings.tabapay_enabled,
         }
 
     def payment_inquiry_service(self, gateways: dict[str, Any]) -> Any:

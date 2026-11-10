@@ -585,6 +585,7 @@ _PERSIAN: Mapping[str, str] = MappingProxyType(
         "recharge.gateway_row": "پرداخت با {name}",
         "payments.gateway.tetraminator": "تترامیناتور",
         "payments.gateway.zarinpal": "زرین‌پال",
+        "payments.gateway.tabapay": "تاباپی",
         "payments.gateway.atlaspay": "اطلس‌پی",
         # The escaped newline + `{amount}` make this literal mixed-script, which
         # the ambiguous-unicode rule flags even though the Persian text is fine.
@@ -1179,6 +1180,7 @@ _ENGLISH: Mapping[str, str] = MappingProxyType(
         "recharge.gateway_row": "Pay with {name}",
         "payments.gateway.tetraminator": "Tetraminator",
         "payments.gateway.zarinpal": "ZarinPal",
+        "payments.gateway.tabapay": "TabaPay",
         "payments.gateway.atlaspay": "AtlasPay",
         "recharge.created": "🧾 Top-up of {amount} created.\nUse the button below to pay.",
         "recharge.unavailable": "Online top-up is currently disabled. Please contact support.",

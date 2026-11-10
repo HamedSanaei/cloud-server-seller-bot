@@ -1,0 +1,1 @@
+"""TabaPay hosted payment adapter."""

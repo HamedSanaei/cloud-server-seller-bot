@@ -107,6 +107,12 @@ _TOML_FIELDS: Mapping[tuple[str, ...], str] = {
     ("payments", "zarinpal", "base_url"): "zarinpal_base_url",
     ("payments", "zarinpal", "sandbox"): "zarinpal_sandbox",
     ("payments", "zarinpal", "callback_url"): "zarinpal_callback_url",
+    ("payments", "tabapay", "enabled"): "tabapay_enabled",
+    ("payments", "tabapay", "merchant_id"): "tabapay_merchant_id",
+    ("payments", "tabapay", "sandbox"): "tabapay_sandbox",
+    ("payments", "tabapay", "callback_url"): "tabapay_callback_url",
+    ("payments", "tabapay", "return_url"): "tabapay_return_url",
+    ("payments", "tabapay", "timeout_seconds"): "tabapay_timeout_seconds",
     ("payments", "tetraminator", "enabled"): "tetraminator_enabled",
     ("payments", "tetraminator", "api_key"): "tetraminator_api_key",
     ("payments", "tetraminator", "base_url"): "tetraminator_base_url",
@@ -905,6 +911,12 @@ class Settings(BaseSettings):
     zarinpal_base_url: str = "https://api.zarinpal.com/pg/v4/payment"
     zarinpal_sandbox: bool = False
     zarinpal_callback_url: str = ""
+    tabapay_enabled: bool = False
+    tabapay_merchant_id: str = Field(default="", repr=False)
+    tabapay_sandbox: bool = False
+    tabapay_callback_url: str = ""
+    tabapay_return_url: str = ""
+    tabapay_timeout_seconds: float = Field(default=15.0, gt=0, le=30, allow_inf_nan=False)
     tetraminator_enabled: bool = False
     tetraminator_api_key: str = ""
     tetraminator_base_url: str = "https://api.tetraminator.com/v1"
@@ -1252,6 +1264,51 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "payments.nowpayments.callback_url must use the native cloud IPN path"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_tabapay_configuration(self) -> Settings:
+        if not self.tabapay_enabled and not self.tabapay_merchant_id:
+            return self
+
+        from urllib.parse import urlsplit
+        from uuid import UUID
+
+        merchant = self.tabapay_merchant_id.strip()
+        try:
+            identifier = UUID(merchant)
+        except ValueError:
+            raise ValueError("payments.tabapay.merchant_id must be a UUID") from None
+        if identifier.int == 0 or str(identifier) != merchant.lower():
+            raise ValueError("payments.tabapay.merchant_id must be a UUID")
+        self.tabapay_merchant_id = merchant
+        production = self.app_env.strip().lower() == "production"
+        if production and self.tabapay_sandbox:
+            raise ValueError("TabaPay sandbox is unavailable in production")
+        for name, value in (
+            ("callback_url", self.tabapay_callback_url),
+            ("return_url", self.tabapay_return_url),
+        ):
+            url = urlsplit(value)
+            local = (
+                self.tabapay_sandbox
+                and not production
+                and url.scheme == "http"
+                and url.hostname in {"127.0.0.1", "localhost", "::1"}
+            )
+            if (
+                not url.hostname
+                or (url.scheme != "https" and not local)
+                or url.username is not None
+                or url.password is not None
+                or url.query
+                or url.fragment
+                or any(ord(char) < 33 for char in value)
+                or len(value) > 2048
+            ):
+                raise ValueError(f"payments.tabapay.{name} must be a safe absolute URL")
+            if name == "callback_url" and url.path != "/webhooks/payments/tabapay":
+                raise ValueError("payments.tabapay.callback_url must use the native callback path")
         return self
 
     @model_validator(mode="after")

@@ -96,6 +96,9 @@ def create_app() -> FastAPI:
     _setup_otel(app)
     app.middleware("http")(_observe_api)
     app.include_router(health_router)
+    from cloud_platform.api.routes.tabapay import router as tabapay_router
+
+    app.include_router(tabapay_router)
     app.include_router(webhooks_router)
     from cloud_platform.api.routes.tetraminator import router as tetraminator_router
 

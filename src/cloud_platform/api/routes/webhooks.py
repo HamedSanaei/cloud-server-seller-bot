@@ -37,7 +37,7 @@ async def get_gateway_payment_secret(gateway_key: str) -> str:
     """Resolve the shared secret for a gateway; 404 for unknown gateways."""
     # AtlasPay has no trusted signed-callback contract: only provider GET
     # verification in its polling reconciler may settle an AtlasPay order.
-    if gateway_key in {"atlaspay", "nowpayments"}:
+    if gateway_key in {"atlaspay", "nowpayments", "tabapay"}:
         raise HTTPException(status_code=404, detail="unknown gateway")
     settings = get_settings()
     secret = settings.payment_gateway_secrets.get(gateway_key)
@@ -112,7 +112,7 @@ async def payment_webhook(
     service: Annotated[PaymentWebhookService, Depends(get_payment_webhook_service)],
     secret: Annotated[str, Depends(get_gateway_payment_secret)],
 ) -> dict[str, str]:
-    if gateway_key in {"atlaspay", "nowpayments"}:
+    if gateway_key in {"atlaspay", "nowpayments", "tabapay"}:
         raise HTTPException(status_code=404, detail="unknown gateway")
     body = await request.body()
     signature = request.headers.get(SIGNATURE_HEADER, "")

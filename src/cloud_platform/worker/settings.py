@@ -1487,30 +1487,39 @@ async def reconcile_payments(ctx: dict[str, object]) -> None:
         )
 
         settings = get_settings()
-        if not settings.zarinpal_merchant_id:
+        if not settings.zarinpal_merchant_id and not settings.tabapay_merchant_id:
             return
+        from cloud_platform.providers.tabapay.client import TabaPayGateway
         from cloud_platform.providers.zarinpal.client import ZarinPalGateway
 
-        gateway = ZarinPalGateway(
-            merchant_id=settings.zarinpal_merchant_id,
-            base_url=settings.zarinpal_base_url,
-            sandbox=settings.zarinpal_sandbox,
-            callback_url=settings.zarinpal_callback_url,
-        )
-        try:
-            service = PaymentReconciliationService(
-                payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
-                webhook_service=PaymentWebhookService(
-                    payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
-                    wallet_repo=SqlAlchemyWalletRepository(SessionFactory),
-                    ledger_repo=SqlAlchemyLedgerRepository(SessionFactory),
-                ),
-                gateway=gateway,
-                audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+        gateways: list[ZarinPalGateway | TabaPayGateway] = []
+        if settings.zarinpal_merchant_id:
+            gateways.append(
+                ZarinPalGateway(
+                    merchant_id=settings.zarinpal_merchant_id,
+                    base_url=settings.zarinpal_base_url,
+                    sandbox=settings.zarinpal_sandbox,
+                    callback_url=settings.zarinpal_callback_url,
+                )
             )
-            await service.run()
+        if settings.tabapay_merchant_id:
+            gateways.append(TabaPayGateway.from_settings(settings))
+        try:
+            for gateway in gateways:
+                service = PaymentReconciliationService(
+                    payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                    webhook_service=PaymentWebhookService(
+                        payments_repo=SqlAlchemyPaymentSessionRepository(SessionFactory),
+                        wallet_repo=SqlAlchemyWalletRepository(SessionFactory),
+                        ledger_repo=SqlAlchemyLedgerRepository(SessionFactory),
+                    ),
+                    gateway=gateway,
+                    audit_repo=SqlAlchemyAuditRepository(SessionFactory),
+                )
+                await service.run()
         finally:
-            await gateway.close()
+            for gateway in gateways:
+                await gateway.close()
 
 
 async def reconcile_tetraminator_payments(ctx: dict[str, object]) -> None:
